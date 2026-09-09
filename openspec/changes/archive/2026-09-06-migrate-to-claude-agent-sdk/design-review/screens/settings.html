@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Reference: settings</title>
+<link rel="stylesheet" href="../../../../../extension/ui/tokens.css" />
+<link rel="stylesheet" href="../../../../../extension/ui/base.css" />
+<link rel="stylesheet" href="../../../../../extension/ui/components.css" />
+<link rel="stylesheet" href="../../../../../extension/ui/prose.css" />
+<link rel="stylesheet" href="../shell.css" />
+<script type="module" src="../../../../../extension/ui/theme.js"></script>
+<script type="module" src="../../../../../extension/ui/behaviors.js"></script>
+</head>
+<body>
+<div class="qa-frame-label">settings</div>
+<div class="panel-shell">
+  <header class="panel-header">
+    <button class="btn-icon" aria-label="Quay lại" id="btn-back"></button>
+    <span class="panel-header-title" style="font-size:var(--font-size-h2)">Cài đặt</span>
+    <div class="panel-header-actions">
+      <ui-menu>
+        <button slot="trigger" class="btn-icon" aria-label="Chọn giao diện" aria-haspopup="menu"></button>
+        <div slot="menu" class="menu" role="menu" aria-label="Giao diện">
+          <button class="menu-item" role="menuitem" id="theme-system"><span id="ic-monitor"></span>Theo hệ thống</button>
+          <button class="menu-item" role="menuitem" id="theme-light"><span id="ic-sun"></span>Sáng</button>
+          <button class="menu-item" role="menuitem" id="theme-dark"><span id="ic-moon"></span>Tối</button>
+        </div>
+      </ui-menu>
+    </div>
+  </header>
+
+  <main class="panel-scroll">
+  <p class="section-heading">Nhà cung cấp</p>
+  <div class="field-group">
+    <div class="field-group-item">
+      <div class="field" style="margin-bottom:0">
+        <label class="field-label" for="base-url">Base URL</label>
+        <input class="input" id="base-url" type="text" value="https://api.anthropic.com" autocomplete="off">
+        <p class="field-hint">Origin có thể kèm tiền tố cổng gateway. Bắt buộc HTTPS trừ điểm cuối loopback dành cho phát triển.</p>
+      </div>
+    </div>
+    <div class="field-group-item">
+      <div class="field" style="margin-bottom:0">
+        <label class="field-label" for="api-key">API key</label>
+        <input class="input" id="api-key" type="password" value="sk-ant-••••••••••••1a2b" autocomplete="off">
+        <p class="field-hint">Được lưu trong Windows Credential Manager. Không bao giờ ghi ra dạng văn bản thuần.</p>
+      </div>
+    </div>
+    <div class="field-group-item">
+      <div class="field-row">
+        <span class="connection-state is-ready"><span class="connection-dot"></span> Đã kiểm tra kết nối · vừa xong</span>
+        <div class="field-row-actions">
+          <button class="btn btn-ghost btn-sm" type="button">Xóa key</button>
+          <button class="btn btn-secondary btn-sm" type="button">Kiểm tra kết nối</button>
+          <button class="btn btn-primary btn-sm" type="button">Lưu</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <p class="section-heading">Mô hình</p>
+  <div class="field-group">
+    <div class="field-group-item">
+      <div class="field-row">
+        <div>
+          <div class="list-item-title">claude-sonnet-5-20260101</div>
+          <div class="list-item-sub">Mặc định</div>
+        </div>
+        <button class="btn-icon" aria-label="Xóa mô hình" id="ic-trash1"></button>
+      </div>
+    </div>
+    <div class="field-group-item">
+      <div class="field-row">
+        <div>
+          <div class="list-item-title">claude-haiku-5-20260101</div>
+          <div class="list-item-sub">Nhanh, chi phí thấp</div>
+        </div>
+        <button class="btn-icon" aria-label="Xóa mô hình" id="ic-trash2"></button>
+      </div>
+    </div>
+    <div class="field-group-item">
+      <div class="field-row-actions">
+        <button class="btn btn-secondary btn-sm" type="button"><span id="ic-refresh"></span>Tìm mô hình</button>
+        <button class="btn btn-ghost btn-sm" type="button"><span id="ic-plus"></span>Thêm thủ công</button>
+      </div>
+    </div>
+  </div>
+
+  <p class="section-heading">Khác</p>
+  <div class="field-group">
+    <div class="field-group-item">
+      <button class="list-item" type="button" style="width:100%;border:none;box-shadow:none;text-align:left" id="nav-skills">
+        <span class="list-item-icon" id="ic-skills"></span>
+        <span class="list-item-main">
+          <span class="list-item-title">Skills</span>
+          <span class="list-item-sub">Nhập, bật/tắt các gói skill</span>
+        </span>
+        <span id="ic-chevr"></span>
+      </button>
+    </div>
+    <div class="field-group-item">
+      <button class="list-item" type="button" style="width:100%;border:none;box-shadow:none;text-align:left" id="nav-recorder">
+        <span class="list-item-icon" id="ic-mic"></span>
+        <span class="list-item-main">
+          <span class="list-item-title">Ghi lại thao tác (Recorder)</span>
+          <span class="list-item-sub">Khóa OpenAI, quyền micro, danh sách bản ghi</span>
+        </span>
+        <span id="ic-chevr2"></span>
+      </button>
+    </div>
+  </div>
+  </main>
+</div>
+
+<script type="module">
+  import { iconMarkup } from "../../../../../extension/ui/icons.js";
+  document.getElementById("btn-back").innerHTML = iconMarkup("chevronRight", { size: 18, title: "Quay lại" });
+  document.getElementById("btn-back").style.transform = "scaleX(-1)";
+  document.getElementById("ic-monitor").innerHTML = iconMarkup("monitor", { size: 16 });
+  document.getElementById("ic-sun").innerHTML = iconMarkup("sun", { size: 16 });
+  document.getElementById("ic-moon").innerHTML = iconMarkup("moon", { size: 16 });
+  document.getElementById("ic-trash1").innerHTML = iconMarkup("trash", { size: 16, title: "Xóa mô hình" });
+  document.getElementById("ic-trash2").innerHTML = iconMarkup("trash", { size: 16, title: "Xóa mô hình" });
+  document.getElementById("ic-refresh").innerHTML = iconMarkup("refresh", { size: 15 });
+  document.getElementById("ic-plus").innerHTML = iconMarkup("plus", { size: 15 });
+  document.getElementById("ic-skills").innerHTML = iconMarkup("skills", { size: 18 });
+  document.getElementById("ic-mic").innerHTML = iconMarkup("mic", { size: 18 });
+  document.getElementById("ic-chevr").innerHTML = iconMarkup("chevronRight", { size: 16 });
+  document.getElementById("ic-chevr2").innerHTML = iconMarkup("chevronRight", { size: 16 });
+</script>
+</body>
+</html>

@@ -1,0 +1,73 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap">
+  <style>
+    body { margin: 0; }
+    a { color: #7ce8b4; } a:hover { color: #a8f2cd; }
+    @keyframes march { to { stroke-dashoffset: -24; } }
+    @keyframes tick { 50% { opacity: .3; } }
+    @media (prefers-reduced-motion: reduce) { .anim { animation: none !important; } }
+  </style>
+</helmet>
+
+<div style="position: relative; width: 900px; height: 620px; overflow: hidden; background: #06120c; font-family: 'JetBrains Mono', ui-monospace, Consolas, monospace;">
+
+  <!-- page underneath, desaturated -->
+  <div style="position: absolute; inset: 0; background: #f2f1ec; color: #22221e; filter: saturate(.55);">
+    <div style="display: flex; align-items: center; gap: 12px; height: 38px; padding: 0 16px; background: #e4e2db; border-bottom: 1px solid #d2cfc6;">
+      <span style="font-size: 10.5px; color: #7a766c;">dauthau.asia/thongbao/moithau/goi-so-03</span>
+    </div>
+    <div style="display: flex; flex-direction: column; gap: 18px; padding: 30px 34px;">
+      <h1 style="margin: 0; font-family: system-ui, sans-serif; font-size: 22px; font-weight: 700; letter-spacing: -0.015em; max-width: 24ch;">Gói số 03 — Thi công xây dựng công trình</h1>
+      <div style="display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px;">
+        <div style="display: flex; flex-direction: column; gap: 4px; padding: 12px 14px; border: 1px solid #ddd9d1; border-radius: 4px; background: #fbfaf8;"><span style="font-size: 9.5px; letter-spacing: .1em; color: #9a958a;">ĐÓNG THẦU</span><span style="font-family: system-ui, sans-serif; font-size: 13px; font-weight: 600;">09:00 · 16/09</span></div>
+        <div style="display: flex; flex-direction: column; gap: 4px; padding: 12px 14px; border: 1px solid #ddd9d1; border-radius: 4px; background: #fbfaf8;"><span style="font-size: 9.5px; letter-spacing: .1em; color: #9a958a;">TỈNH</span><span style="font-family: system-ui, sans-serif; font-size: 13px; font-weight: 600;">Thái Nguyên</span></div>
+        <div style="display: flex; flex-direction: column; gap: 4px; padding: 12px 14px; border: 1px solid #ddd9d1; border-radius: 4px; background: #fbfaf8;"><span style="font-size: 9.5px; letter-spacing: .1em; color: #9a958a;">HÌNH THỨC</span><span style="font-family: system-ui, sans-serif; font-size: 13px; font-weight: 600;">Qua mạng</span></div>
+      </div>
+      <div id="btn" style="position: relative; align-self: flex-start; margin-top: 4px;">
+        <button style="height: 40px; padding: 0 20px; border: 0; border-radius: 4px; background: #22221e; color: #f2f1ec; font-family: system-ui, sans-serif; font-size: 13.5px; font-weight: 600;">Tải về nhanh</button>
+        <!-- measured selection box, technical-drawing style -->
+        <span style="position: absolute; inset: -8px; border: 1px dashed #3fe08f;"></span>
+        <span style="position: absolute; left: -8px; top: -26px; font-size: 9.5px; letter-spacing: .08em; color: #3fe08f;">button ▸ 152×40</span>
+        <span style="position: absolute; right: -8px; bottom: -22px; font-size: 9.5px; color: #3fe08f;">x 214 · y 452</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- technical frame -->
+  <svg width="900" height="620" viewBox="0 0 900 620" fill="none" style="position: absolute; inset: 0; pointer-events: none;">
+    <rect class="anim" x="7" y="7" width="886" height="606" stroke="#3fe08f" stroke-width="1" stroke-dasharray="14 10" style="animation: march 1.6s linear infinite;"/>
+    <path d="M7 30V7h23M870 7h23v23M893 590v23h-23M30 613H7v-23" stroke="#3fe08f" stroke-width="2.5" stroke-linecap="square"/>
+    <!-- crosshair rules through the cursor -->
+    <path d="M0 452h900M214 0v620" stroke="#3fe08f" stroke-width="1" stroke-opacity=".22" stroke-dasharray="3 5"/>
+  </svg>
+
+  <!-- cursor -->
+  <div style="position: absolute; left: 214px; top: 452px; pointer-events: none;">
+    <svg width="24" height="24" viewBox="0 0 26 26" fill="none"><path d="M4 3.2 20.4 12.1 13.2 13.6 10.4 20.6z" fill="#3fe08f" stroke="#06120c" stroke-width="1.6" stroke-linejoin="round"/></svg>
+    <span style="position: absolute; left: 19px; top: 18px; padding: 3px 8px; background: #3fe08f; color: #06120c; font-size: 10px; font-weight: 700; letter-spacing: .06em; white-space: nowrap;">BROWZY ▸ CLICK</span>
+  </div>
+
+  <!-- readout strip, top-left, like an instrument -->
+  <div style="position: absolute; left: 22px; top: 22px; display: flex; flex-direction: column; gap: 5px; padding: 12px 14px; background: rgba(6,18,12,.94); border: 1px solid #1c4d35;">
+    <div style="display: flex; align-items: center; gap: 8px;">
+      <span class="anim" style="width: 7px; height: 7px; background: #3fe08f; animation: tick 1s steps(2) infinite;"></span>
+      <span style="font-size: 10.5px; font-weight: 700; letter-spacing: .18em; color: #3fe08f;">REMOTE ACTIVE</span>
+    </div>
+    <span style="font-size: 10px; line-height: 1.75; color: #6ba98a;">SESSION 53s · STEP 07<br>ACTION click(214, 452)<br>TARGET button[Tải về nhanh]</span>
+  </div>
+
+  <!-- stop, bottom-right -->
+  <button style="position: absolute; right: 22px; bottom: 22px; height: 34px; padding: 0 16px; border: 1px solid #3fe08f; background: rgba(6,18,12,.94); color: #3fe08f; font-family: inherit; font-size: 11px; font-weight: 700; letter-spacing: .14em;">■ DỪNG</button>
+
+</div>
+</x-dc>
+</body>
+</html>

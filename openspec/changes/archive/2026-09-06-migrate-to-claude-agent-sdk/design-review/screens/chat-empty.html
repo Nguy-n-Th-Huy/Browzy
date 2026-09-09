@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Reference: chat empty state</title>
+<link rel="stylesheet" href="../../../../../extension/ui/tokens.css" />
+<link rel="stylesheet" href="../../../../../extension/ui/base.css" />
+<link rel="stylesheet" href="../../../../../extension/ui/components.css" />
+<link rel="stylesheet" href="../../../../../extension/ui/prose.css" />
+<link rel="stylesheet" href="../shell.css" />
+<script type="module" src="../../../../../extension/ui/theme.js"></script>
+<script type="module" src="../../../../../extension/ui/behaviors.js"></script>
+</head>
+<body>
+<div class="qa-frame-label">chat-empty</div>
+<div class="panel-shell">
+  <header class="panel-header">
+    <span class="panel-header-title">Open Claude in Chrome</span>
+    <div class="panel-header-actions">
+      <span class="connection-state is-ready"><span class="connection-dot"></span> Sẵn sàng</span>
+      <button class="btn-icon" aria-label="Lịch sử trò chuyện" id="btn-history"></button>
+      <button class="btn-icon" aria-label="Cài đặt" id="btn-settings"></button>
+    </div>
+  </header>
+
+  <main class="panel-scroll">
+    <div class="empty-state">
+      <div class="empty-state-icon" id="icon-empty"></div>
+      <h1>Chào bạn, tôi có thể giúp gì?</h1>
+      <p>Tôi có thể đọc trang hiện tại và trả lời câu hỏi, hoặc điều khiển trình duyệt khi bạn cần.</p>
+      <div class="suggestion-list">
+        <button class="suggestion-item" type="button">
+          <span id="icon-s1"></span>
+          <span>Tóm tắt bài viết</span>
+        </button>
+        <button class="suggestion-item" type="button">
+          <span id="icon-s2"></span>
+          <span>Phân tích nội dung</span>
+        </button>
+      </div>
+    </div>
+  </main>
+
+  <div class="panel-composer-wrap">
+    <div class="context-chip-row">
+      <span class="chip">
+        <span class="chip-icon" id="chip-favicon"></span>
+        <span class="chip-label">vnexpress.net — Kinh tế Việt Nam quý III</span>
+      </span>
+      <button class="btn-icon" aria-label="Bỏ ghim ngữ cảnh trang" style="margin-left:auto" id="icon-pin"></button>
+    </div>
+    <div class="composer">
+      <textarea rows="1" placeholder="Nhắn tin…" aria-label="Soạn tin nhắn"></textarea>
+      <div class="composer-actions">
+        <button class="model-select-trigger" type="button" id="model-trigger">
+          <span>Claude</span>
+          <span id="icon-chev"></span>
+        </button>
+        <button class="btn-icon" aria-label="Gửi" disabled id="icon-send"></button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+  import { iconMarkup } from "../../../../../extension/ui/icons.js";
+  document.getElementById("icon-empty").innerHTML = iconMarkup("skills", { size: 24 });
+  document.getElementById("icon-s1").innerHTML = iconMarkup("page", { size: 18 });
+  document.getElementById("icon-s2").innerHTML = iconMarkup("search", { size: 18 });
+  document.getElementById("icon-pin").innerHTML = iconMarkup("pinOff", { size: 16, title: "Bỏ ghim ngữ cảnh trang" });
+  document.getElementById("icon-chev").innerHTML = iconMarkup("chevronDown", { size: 14 });
+  document.getElementById("icon-send").innerHTML = iconMarkup("send", { size: 18, title: "Gửi" });
+  document.getElementById("btn-history").innerHTML = iconMarkup("history", { size: 18, title: "Lịch sử trò chuyện" });
+  document.getElementById("btn-settings").innerHTML = iconMarkup("settings", { size: 18, title: "Cài đặt" });
+  document.getElementById("chip-favicon").innerHTML = iconMarkup("page", { size: 12 });
+</script>
+</body>
+</html>

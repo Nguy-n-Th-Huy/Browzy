@@ -1,0 +1,55 @@
+{
+  "artboards": [
+    {
+      "file": "Main.dc.html",
+      "x": 0,
+      "y": 0,
+      "w": 1920,
+      "h": 900,
+      "title": "Aurora — trang đang bị điều khiển"
+    },
+    {
+      "file": "Anatomy.dc.html",
+      "x": 2040,
+      "y": 0,
+      "w": 1240,
+      "h": 1020,
+      "title": "Chi tiết từng thành phần"
+    },
+    {
+      "file": "AltBlueprint.dc.html",
+      "x": 0,
+      "y": 1140,
+      "w": 900,
+      "h": 620,
+      "title": "Hướng khác — Blueprint"
+    },
+    {
+      "file": "AltAmbient.dc.html",
+      "x": 1000,
+      "y": 1140,
+      "w": 900,
+      "h": 620,
+      "title": "Hướng khác — Ambient"
+    }
+  ],
+  "annotations": [
+    {
+      "id": "brief",
+      "x": 0,
+      "y": -190,
+      "w": 620,
+      "text": "Trạng thái “trang đang bị điều khiển từ xa”.\n\nBản đang chạy: viền cam đặc 2px + quầng sáng 22px, badge nhảy góc theo con trỏ, con trỏ trơn không nhãn. Đọc ra như một cảnh báo lỗi.\n\nHướng chính (Aurora): dải sáng chạy vòng quanh mép thay cho quầng đứng yên, con trỏ có nhãn tên + việc đang làm, thanh trạng thái neo cố định giữa đáy."
+    },
+    {
+      "id": "alts",
+      "x": 0,
+      "y": 1030,
+      "w": 620,
+      "text": "Hai hướng thay thế, để so — không phải để cộng vào hướng chính.\n\nBlueprint: bản vẽ kỹ thuật, phosphor xanh, có số đo và toạ độ. Chính xác, hợp người kỹ thuật; nặng và ồn với người dùng thường.\n\nAmbient: chỉ một lớp ám màu ở mép + một chip nhỏ. Ít xâm lấn nhất; đổi lại dễ bị bỏ qua trên trang nhiều màu."
+    }
+  ],
+  "launch": {
+    "view": "canvas"
+  }
+}

@@ -1,0 +1,769 @@
+/*
+ * Real panel shell for extension/sidepanel/sidepanel.html.
+ *
+ * Ports the panel-shell/header/scroll/composer/list/error-banner layout
+ * design-review/shell.css demonstrated for visual QA (see
+ * reports/05-visual-system.md) into the actual shipped panel, extended with
+ * the pieces that file explicitly left to this task: the history/recordings
+ * screen toggle, the model menu's own item list, a real permission-card
+ * slot above the composer, and the connection/recording status row.
+ *
+ * Depends on (loaded by sidepanel.html before this file):
+ *   extension/ui/tokens.css, base.css, components.css, prose.css
+ * Those own all color/spacing/type tokens and every shared primitive
+ * (.btn*, .card, .menu, .status-pill, .permission-card, .tool-row,
+ * .slash-picker, .chip, .connection-state, .switch) — this file only adds
+ * panel-shell-specific layout, never redefines a shared class.
+ */
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  overflow: hidden; /* the panel manages its own internal scroll regions only */
+}
+
+.panel-shell {
+  width: 100%;
+  height: 100vh;
+  min-width: 320px;
+  display: flex;
+  flex-direction: column;
+  background: var(--color-canvas);
+  overflow: hidden;
+}
+
+.panel-header {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--panel-gutter);
+  border-bottom: 1px solid var(--color-border-subtle);
+  background: var(--color-canvas);
+}
+
+/* ===================== Busy/working indicator (Section 6) ================ */
+/* A narrow, explicit amendment to the panel's standing rule against looping
+ * decorative animation (archived migration design.md section 5a): it covers
+ * exactly these two elements — the busy glyph's rotation and the busy
+ * label's brightness sweep — and only while .busy-indicator exists in the
+ * DOM. Removal mid-cycle is what stops both: the animation stops the instant
+ * its element is gone (renderTranscript() removes the indicator in place,
+ * never covers it). No other panel surface, including the visible-agent-
+ * pointer overlay's own click/drag feedback, gains looping motion from this
+ * block.
+ *
+ * Neither loop uses var(--motion-duration)/var(--motion-easing): those are
+ * scoped by tokens.css to one-shot 120-180ms opacity/color transitions; a
+ * decelerate-to-stop curve is not a seamless loop shape. Both loops are
+ * linear, with their own durations. Every color here comes from an existing
+ * token, and there is no new literal outside tokens.css. */
+
+.busy-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+/* 18px (--icon-size-md) filled starburst in --color-accent-text (the AA-safe
+ * accent-for-text token, not raw --color-accent, which is ~3.1:1 on the
+ * light canvas). iconMarkup() already sizes the <svg> and marks it
+ * aria-hidden/role=presentation; this rule only supplies color and motion. */
+.busy-indicator-glyph {
+  display: inline-flex;
+  flex: none;
+  color: var(--color-accent-text);
+}
+.busy-indicator-glyph .ui-icon {
+  display: block;
+  animation: busy-spin 3.2s linear infinite;
+}
+
+/* A brightness sweep travelling across the label, --color-text (peak) moving
+ * over --color-text-secondary (base): a linear gradient clipped to the text
+ * glyphs, sliding its background position. The transparent color is safe
+ * because the gradient paint is what renders the glyphs, and both
+ * motion-preference signals below restore a solid readable color when this
+ * animation is stripped. */
+.busy-indicator-label {
+  font-size: var(--font-size-body);
+  line-height: var(--line-height-body);
+  color: transparent;
+  background-image: linear-gradient(90deg, var(--color-text-secondary) 0%, var(--color-text) 50%, var(--color-text-secondary) 100%);
+  background-size: 200% 100%;
+  background-repeat: no-repeat;
+  -webkit-background-clip: text;
+  background-clip: text;
+  animation: busy-shimmer 1.6s linear infinite;
+}
+
+.busy-elapsed {
+  font-size: var(--font-size-small);
+  color: var(--color-text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+.busy-elapsed[hidden] {
+  display: none;
+}
+
+@keyframes busy-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+@keyframes busy-shimmer {
+  from { background-position: 200% 0; }
+  to { background-position: 0% 0; }
+}
+
+/* Reduced motion removes only the two loops; the glyph stays a static
+ * filled shape, the label falls back to a constant readable tone, and the
+ * busy fact plus elapsed count stay visible and current for as long as the
+ * run is actually busy. Both signals covered: the OS preference and the
+ * panel's explicit data-motion override. */
+@media (prefers-reduced-motion: reduce) {
+  .busy-indicator-glyph .ui-icon,
+  .busy-indicator-label {
+    animation: none;
+  }
+  .busy-indicator-label {
+    color: var(--color-text);
+    -webkit-background-clip: border-box;
+    background-clip: border-box;
+    background-image: none;
+  }
+}
+:root[data-motion="reduce"] .busy-indicator-glyph .ui-icon,
+:root[data-motion="reduce"] .busy-indicator-label {
+  animation: none;
+}
+:root[data-motion="reduce"] .busy-indicator-label {
+  color: var(--color-text);
+  -webkit-background-clip: border-box;
+  background-clip: border-box;
+  background-image: none;
+}
+
+.panel-header-title {
+  font-weight: 700;
+  font-size: var(--font-size-ui);
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.panel-header-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  flex: none;
+}
+
+.panel-scroll {
+  position: relative; /* containing block for .jump-latest */
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: var(--panel-gutter);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.panel-composer-wrap {
+  position: relative;
+  flex: none;
+  padding: var(--panel-gutter);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--color-border-subtle);
+  background: var(--color-canvas);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.context-chip-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+/* Task 5.5 chip states (design.md 5b) — bound/pinned reuse the shared
+   .chip/.btn-icon primitives from extension/ui/components.css unchanged;
+   these are the states that primitive has no opinion about. */
+.chip-restricted {
+  border-color: var(--color-status-warning);
+  color: var(--color-status-warning);
+}
+.chip-restricted .chip-icon {
+  background: color-mix(in srgb, var(--color-status-warning) 16%, transparent);
+  color: var(--color-status-warning);
+}
+.chip-add-context {
+  border-style: dashed;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+}
+.chip-add-context:hover {
+  border-color: var(--color-border);
+  color: var(--color-text);
+}
+.context-read-hint {
+  font-size: var(--font-size-small);
+  color: var(--color-accent-text);
+}
+.context-stale-notice {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  width: 100%;
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--color-status-warning) 12%, var(--color-surface));
+  color: var(--color-status-warning);
+  font-size: var(--font-size-small);
+}
+
+.composer {
+  position: relative;
+  display: flex;
+  align-items: flex-end;
+  gap: var(--space-2);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-composer);
+  padding: var(--space-2) var(--space-2) var(--space-2) var(--space-4);
+  transition: border-color var(--motion-duration) var(--motion-easing), box-shadow var(--motion-duration) var(--motion-easing);
+}
+.composer:focus-within {
+  border-color: var(--color-focus-ring);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-focus-ring) 25%, transparent);
+}
+.composer textarea {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  resize: none;
+  max-height: 120px;
+  min-height: 24px;
+  padding: var(--space-2) 0;
+  font: inherit;
+  color: var(--color-text);
+  line-height: var(--line-height-body);
+  overflow: hidden; /* defense in depth: never bleed past the composer's rounded box */
+}
+.composer textarea::placeholder {
+  color: var(--color-text-secondary);
+}
+.composer textarea:focus {
+  outline: none;
+}
+.composer-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  flex: none;
+  padding-bottom: 2px;
+}
+
+.model-select-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-sm);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-small);
+  min-height: 28px;
+  max-width: 120px;
+}
+.model-select-trigger span:first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.model-select-trigger:hover {
+  background: var(--color-surface-sunken);
+  color: var(--color-text);
+}
+#model-menu .menu-item[aria-selected="true"] {
+  background: var(--color-accent-tint);
+  color: var(--color-accent-text);
+}
+
+.empty-state {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-5);
+  text-align: center;
+  padding: var(--space-6) var(--space-4);
+}
+.empty-state-icon {
+  width: 48px;
+  height: 48px;
+  border-radius: var(--radius-md);
+  background: var(--color-accent-tint);
+  color: var(--color-accent-text);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.empty-state h1 {
+  font-family: var(--font-serif);
+  font-size: var(--font-size-h1);
+  font-weight: 600;
+  margin: 0;
+}
+.empty-state p {
+  margin: 0;
+  color: var(--color-text-secondary);
+  max-width: 34ch;
+}
+.suggestion-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  width: 100%;
+  max-width: 320px;
+}
+.suggestion-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  min-height: var(--target-min);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  color: var(--color-text);
+  text-align: left;
+  font-size: var(--font-size-ui);
+  box-shadow: var(--shadow-sm);
+}
+.suggestion-item:hover {
+  border-color: var(--color-border);
+}
+.suggestion-item .ui-icon {
+  color: var(--color-accent-text);
+  flex: none;
+}
+
+.msg-row {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.msg-row.from-user {
+  align-items: flex-end;
+}
+.msg-row.from-assistant {
+  align-items: stretch;
+}
+.msg-user-bubble {
+  max-width: 88%;
+  background: var(--color-accent-tint);
+  color: var(--color-text);
+  border-radius: var(--radius-md);
+  padding: var(--space-2) var(--space-3);
+  overflow-wrap: anywhere;
+}
+.msg-user-bubble.is-placeholder {
+  font-style: italic;
+  color: var(--color-text-secondary);
+}
+.msg-assistant-body {
+  width: 100%;
+  min-width: 0;
+}
+
+.turn-status-note {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+  font-size: var(--font-size-small);
+  color: var(--color-text-secondary);
+}
+.turn-status-note.is-error {
+  color: var(--color-status-danger);
+}
+
+.stream-cursor {
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  background: var(--color-accent);
+  vertical-align: text-bottom;
+  margin-left: 1px;
+}
+:root[data-motion="reduce"] .stream-cursor {
+  display: none;
+}
+
+.jump-latest {
+  position: sticky;
+  bottom: var(--space-3);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-pill);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border-subtle);
+  box-shadow: var(--shadow-md);
+  font-size: var(--font-size-small);
+  color: var(--color-text);
+  align-self: center;
+  margin-top: var(--space-2);
+}
+
+.active-control-banner {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-sunken);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-small);
+  margin-bottom: var(--space-3);
+}
+.active-control-banner .ui-icon {
+  color: var(--color-status-running);
+}
+.active-control-banner .btn-ghost {
+  margin-left: auto;
+  color: var(--color-status-danger);
+}
+
+.section-heading {
+  font-size: var(--font-size-small);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--color-text-secondary);
+  margin: var(--space-2) 0 0;
+}
+
+.list-column {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.list-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border-subtle);
+  box-shadow: var(--shadow-sm);
+}
+.list-item[aria-current="true"] {
+  border-color: var(--color-accent);
+}
+.list-item-icon {
+  flex: none;
+  width: 36px;
+  height: 36px;
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-sunken);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-text-secondary);
+}
+.list-item-main {
+  flex: 1;
+  min-width: 0;
+}
+.list-item-title {
+  display: block;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.list-item-sub {
+  display: block;
+  font-size: var(--font-size-small);
+  color: var(--color-text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.list-item-actions {
+  flex: none;
+  display: flex;
+  gap: var(--space-1);
+}
+
+.error-banner {
+  display: flex;
+  gap: var(--space-3);
+  align-items: flex-start;
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--color-status-danger);
+  background: color-mix(in srgb, var(--color-status-danger) 8%, var(--color-surface));
+}
+.error-banner .ui-icon {
+  color: var(--color-status-danger);
+  flex: none;
+  margin-top: 2px;
+}
+.error-banner-title {
+  font-weight: 700;
+  margin: 0 0 2px;
+}
+.error-banner-detail {
+  margin: 0;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-small);
+}
+
+.setup-banner {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-4);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+}
+.setup-banner p {
+  margin: 0;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-small);
+}
+
+/* Two top-level "screens" sharing the same shell: chat vs history. Toggled
+   by sidepanel.js via [hidden] -- never both visible, and switching never
+   creates a second scroll container fighting the first. */
+#history-view[hidden],
+#chat-view[hidden] {
+  display: none;
+}
+#history-view {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+}
+
+.recorder-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border-subtle);
+}
+.recorder-row-label {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--font-size-ui);
+}
+.recorder-row-sub {
+  display: block;
+  font-size: var(--font-size-small);
+  color: var(--color-text-secondary);
+}
+
+/* aria-live region: visually hidden, present for screen readers/assistive
+   tech only -- the polite streaming announcement (spec: "a polite live
+   region without announcing every token"). */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ========================= Image attachment composer UI ===================== */
+
+.attachment-strip {
+  display: flex;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  padding: var(--space-1) 0 var(--space-2);
+}
+.attachment-strip[hidden] {
+  display: none;
+}
+.attachment-thumb {
+  position: relative;
+  width: 64px;
+  height: 64px;
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  border: 1px solid var(--color-border-subtle);
+  background: var(--color-surface-sunken);
+  flex: none;
+}
+.attachment-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.attachment-thumb-remove {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 20px;
+  height: 20px;
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--color-canvas) 88%, transparent);
+  border: 1px solid var(--color-border-subtle);
+  color: var(--color-text);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  line-height: 1;
+}
+.attachment-thumb-remove:hover {
+  background: var(--color-surface-sunken);
+}
+.attachment-thumb-name {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  font-size: 10px;
+  padding: 2px 4px;
+  color: var(--color-text);
+  background: color-mix(in srgb, var(--color-surface) 86%, transparent);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attachment-error {
+  font-size: var(--font-size-small);
+  color: var(--color-status-danger);
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-status-danger);
+  background: color-mix(in srgb, var(--color-status-danger) 8%, var(--color-surface));
+}
+.attachment-error[hidden] {
+  display: none;
+}
+
+.attachment-picker-overlay {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-4);
+  background: var(--color-overlay-scrim);
+  z-index: 50;
+}
+.attachment-picker-overlay[hidden] {
+  display: none;
+}
+.attachment-picker-modal {
+  width: min(380px, 100%);
+}
+.attachment-picker-actions {
+  display: flex;
+  gap: var(--space-2);
+  justify-content: flex-end;
+  margin-top: var(--space-4);
+}
+
+/* Composer drop highlight */
+.composer.is-drop-target {
+  border-color: var(--color-accent-text);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-accent) 30%, transparent);
+}
+
+/* Slash picker: distinguish a built-in command from a skill (task 7.3 /
+   specs/agent-skills.md "Built-in commands SHALL be distinguished from
+   skills"). Applied by sidepanel.js's tagPickerItemKinds() as a
+   `data-kind` attribute on the shared .slash-picker-item element (see
+   extension/ui/behaviors.js's UiSlashPicker._render()) — a page-local rule
+   rather than an edit to the shared extension/ui/** component/stylesheet.
+   No built-in command exists in this product yet (skills-model.js's
+   BUILTIN_COMMANDS is currently empty — see that file's header), so this
+   rule has nothing to render against today; it is real, wired, and ready
+   the moment one is added. */
+.slash-picker-item[data-kind="builtin"] .slash-picker-item-name {
+  color: var(--color-accent-text);
+}
+
+/* ============================= Question card (task 9.7) ============================= */
+/* Mirrors .permission-card (extension/ui/components.css) with the options
+ * layout unique to the ask-the-user tool's question card. The .question-card
+ * class augments .permission-card rather than replacing it, so every shared
+ * shelter (border, radius, padding) is inherited. */
+
+#question-slot {
+  padding: 0 var(--space-3) var(--space-2);
+}
+
+.question-card {
+  /* Inherits all .permission-card layout from extension/ui/components.css;
+   * only the options-specific styles are added here. */
+}
+
+.question-card-options {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.question-option {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  text-align: left;
+  padding: var(--space-2) var(--space-3);
+  min-height: 44px; /* touch target per design 5a */
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+  cursor: pointer;
+  transition: border-color 120ms ease, background-color 120ms ease;
+}
+.question-option:hover,
+.question-option:focus-visible {
+  border-color: var(--color-accent-text);
+  background: var(--color-surface-sunken);
+  outline: none;
+}
+.question-option[aria-checked="true"] {
+  border-color: var(--color-accent-text);
+  background: var(--color-accent-tint);
+}
+.question-option-label {
+  font-weight: 600;
+  font-size: var(--font-size-body);
+}
+.question-option-desc {
+  font-size: var(--font-size-small);
+  color: var(--color-text-secondary);
+  margin-top: 2px;
+}

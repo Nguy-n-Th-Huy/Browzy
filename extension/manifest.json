@@ -1,0 +1,63 @@
+{
+  "manifest_version": 3,
+  "name": "Browzy",
+  "version": "1.0.0",
+  "description": "Browzy — Claude Agent SDK in your browser. No Claude account needed. Any Anthropic-compatible provider. Any Chromium browser.",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "tabs",
+    "debugger",
+    "activeTab",
+    "scripting",
+    "nativeMessaging",
+    "tabGroups",
+    "windows",
+    "storage",
+    "alarms",
+    "offscreen",
+    "clipboardWrite",
+    "sidePanel"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Browzy — click to open the assistant panel"
+  },
+  "side_panel": {
+    "default_path": "sidepanel/sidepanel.html"
+  },
+  "options_page": "settings/settings.html",
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": false
+    },
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "recorder/capture.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA97m87hfJCsqy+wQ9oWWcWJvNVMC5CD62dQDypW6BAXTpxHXUYmrYOo59glnMeDQzbOp6D/ZQNDOSV5HtxiZrkzGNfFn1uZRUpzH0TBCTcBS5fiBD2rWSJHx0++QHrcRn18tnVUVlK6cbI+2t2dBWtbdKCzp0VuXswhxWqpT13XY7+dwxw1Rz5bM6bUXqRQNqdHuNVUuFcPJZkfEVJfDNygOgqvj5OGvLCaNLdcXBUlSnCxSe0G06MniUdLeHzeBaf9YSCX9PPadZ2B7TeopRGOsAOFW6RkpHSRNbxJd9KKxpyDs7k+xlZQoQzOS7aCmccD65cLBMQQG+oiKBfgqqrQIDAQAB"
+}

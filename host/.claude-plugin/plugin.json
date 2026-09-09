@@ -1,0 +1,17 @@
+{
+  "name": "browzy",
+  "version": "1.0.0",
+  "description": "Browser automation for Claude Code via the Browzy in Chrome extension: 26 MCP tools (click, type, screenshot, read page, navigate, and more) over the same native-messaging bridge the standalone MCP server and the side panel already use.",
+  "author": {
+    "name": "Browzy"
+  },
+  "homepage": "https://github.com/Nguy-n-Th-Huy/Browzy",
+  "repository": "https://github.com/Nguy-n-Th-Huy/Browzy",
+  "keywords": ["browser-automation", "chrome", "mcp", "browzy"],
+  "mcpServers": {
+    "browzy-in-chrome": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/mcp-server.js"]
+    }
+  }
+}

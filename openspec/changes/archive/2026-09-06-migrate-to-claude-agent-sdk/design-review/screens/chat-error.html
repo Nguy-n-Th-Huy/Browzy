@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Reference: error state</title>
+<link rel="stylesheet" href="../../../../../extension/ui/tokens.css" />
+<link rel="stylesheet" href="../../../../../extension/ui/base.css" />
+<link rel="stylesheet" href="../../../../../extension/ui/components.css" />
+<link rel="stylesheet" href="../../../../../extension/ui/prose.css" />
+<link rel="stylesheet" href="../shell.css" />
+<script type="module" src="../../../../../extension/ui/theme.js"></script>
+<script type="module" src="../../../../../extension/ui/behaviors.js"></script>
+</head>
+<body>
+<div class="qa-frame-label">chat-error</div>
+<div class="panel-shell">
+  <header class="panel-header">
+    <span class="panel-header-title">Open Claude in Chrome</span>
+    <div class="panel-header-actions">
+      <span class="connection-state is-error"><span class="connection-dot"></span> Lỗi kết nối</span>
+      <button class="btn-icon" aria-label="Lịch sử trò chuyện" id="btn-history"></button>
+      <button class="btn-icon" aria-label="Cài đặt" id="btn-settings"></button>
+    </div>
+  </header>
+
+  <main class="panel-scroll">
+    <div class="msg-row from-user">
+      <div class="msg-user-bubble">Tóm tắt bài viết này giúp mình.</div>
+    </div>
+
+    <div class="error-banner" role="alert">
+      <span id="ic-warn"></span>
+      <div>
+        <p class="error-banner-title">Không thể kết nối tới mô hình</p>
+        <p class="error-banner-detail">Yêu cầu tới điểm cuối đã hết thời gian chờ (30 giây). Câu trả lời trước đó vẫn còn nguyên trên đây, chưa bị mất.</p>
+      </div>
+    </div>
+
+    <div class="msg-row from-assistant">
+      <div class="msg-assistant-body prose">
+        <p>Bài viết nói về tình hình kinh tế quý III với mức tăng trưởng GDP 6,8%. Nội dung phía sau chưa được tạo ra do lỗi kết nối ở trên<span aria-hidden="true">.</span></p>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:4px">
+      <p class="card-title" style="display:flex;align-items:center;gap:8px"><span id="ic-info"></span>Cần kiểm tra cài đặt?</p>
+      <p class="card-body">Lỗi hết thời gian chờ thường do điểm cuối (Base URL) không phản hồi. Mở Cài đặt để kiểm tra kết nối.</p>
+      <div style="margin-top:10px;display:flex;gap:8px">
+        <button class="btn btn-secondary btn-sm" type="button">Mở cài đặt</button>
+        <button class="btn btn-ghost btn-sm" type="button">Thử lại</button>
+      </div>
+    </div>
+  </main>
+
+  <div class="panel-composer-wrap">
+    <div class="context-chip-row">
+      <span class="chip">
+        <span class="chip-icon" id="chip-favicon"></span>
+        <span class="chip-label">vnexpress.net — Kinh tế Việt Nam quý III</span>
+      </span>
+    </div>
+    <div class="composer">
+      <textarea rows="1" placeholder="Nhắn tin…" aria-label="Soạn tin nhắn"></textarea>
+      <div class="composer-actions">
+        <button class="model-select-trigger" type="button">
+          <span>Claude</span>
+          <span id="icon-chev"></span>
+        </button>
+        <button class="btn-icon" aria-label="Gửi" id="icon-send"></button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+  import { iconMarkup } from "../../../../../extension/ui/icons.js";
+  document.getElementById("ic-warn").innerHTML = iconMarkup("alertTriangle", { size: 20, title: "Lỗi" });
+  document.getElementById("ic-info").innerHTML = iconMarkup("info", { size: 16 });
+  document.getElementById("icon-chev").innerHTML = iconMarkup("chevronDown", { size: 14 });
+  document.getElementById("icon-send").innerHTML = iconMarkup("send", { size: 18, title: "Gửi" });
+  document.getElementById("btn-history").innerHTML = iconMarkup("history", { size: 18, title: "Lịch sử trò chuyện" });
+  document.getElementById("btn-settings").innerHTML = iconMarkup("settings", { size: 18, title: "Cài đặt" });
+  document.getElementById("chip-favicon").innerHTML = iconMarkup("page", { size: 12 });
+</script>
+</body>
+</html>

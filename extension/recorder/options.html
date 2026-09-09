@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Browzy — Recorder</title>
+<link rel="stylesheet" href="../vendor/rrweb-player.min.css">
+<style>
+  :root { --bg:#f7f7f5; --panel:#fff; --ink:#1c1e22; --muted:#5b5f66; --line:#e2e2dd; --accent:#2a5fd8; --rec:#d23b2e; --ok:#0e8a5f; }
+  @media (prefers-color-scheme:dark){ :root{ --bg:#15171b; --panel:#1c1f24; --ink:#e8eaee; --muted:#9aa0a8; --line:#2a2e35; --accent:#7fa3ff; --rec:#e5604f; --ok:#3fbf8f; } }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  .wrap{max-width:1080px;margin:0 auto;padding:32px 28px 64px}
+  .card{max-width:640px}
+  h1{font-size:20px;margin:0 0 4px} .sub{color:var(--muted);margin:0 0 24px;font-size:13px}
+  h2{font-size:14px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:28px 0 10px;font-weight:600}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px}
+  label{display:block;font-weight:600;margin-bottom:6px}
+  input[type=password],input[type=text]{width:100%;padding:9px 11px;border:1px solid var(--line);border-radius:7px;background:var(--bg);color:var(--ink);font:inherit}
+  .row{display:flex;gap:8px;align-items:center;margin-top:10px}
+  button{padding:8px 14px;border:1px solid var(--line);border-radius:7px;background:var(--accent);color:#fff;font:inherit;font-weight:600;cursor:pointer}
+  button.sec{background:transparent;color:var(--ink)}
+  .status{font-size:13px;margin-left:4px}
+  .status.ok{color:var(--ok)} .status.err{color:var(--rec)}
+  .sess{border:1px solid var(--line);border-radius:8px;margin:8px 0;background:var(--panel);overflow:hidden}
+  .sess summary{cursor:pointer;padding:11px 14px;list-style:none;display:flex;gap:12px;align-items:baseline;flex-wrap:wrap}
+  .sess summary::-webkit-details-marker{display:none}
+  .sess .id{font-family:ui-monospace,Menlo,monospace;font-size:12px;color:var(--accent)}
+  .sess .meta{color:var(--muted);font-size:12px}
+  .sess .snip{flex-basis:100%;color:var(--muted);font-size:12px;font-style:italic;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .sess .body{border-top:1px solid var(--line);padding:12px 14px}
+  .pathrow{display:flex;gap:8px;align-items:center;margin:2px 0 10px}
+  .pathrow code{font-family:ui-monospace,Menlo,monospace;font-size:11px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+  .copy-ref{padding:5px 10px;font-size:12px;border:1px solid var(--line);border-radius:6px;background:transparent;color:var(--ink);cursor:pointer;white-space:nowrap}
+  .copy-ref:hover{border-color:var(--accent)}
+  .track{margin:8px 0}
+  .track h4{margin:0 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
+  /* time-aligned two-lane timeline */
+  /* header row — same widths as the lanes below, so they line up exactly */
+  .tl-head{display:flex;align-items:flex-end;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:12px 0 5px}
+  .th-rail{width:48px;flex:none}
+  .th-b{flex:1;color:var(--accent);padding-left:10px}
+  .th-cur{width:124px;flex:none;text-align:center;color:var(--ok)}
+  .th-n{flex:1.2;color:#7a3fd1;padding-left:12px}
+  @media (prefers-color-scheme:dark){ .th-n{color:#b18aeb} }
+  /* height is computed from content, so nothing should ever exceed it; the
+     clip is a hard guarantee that a lane can never paint over the raw JSON */
+  .tl-lanes{display:flex;position:relative;overflow:hidden}
+  /* time rail: labels on the left, dashed gridlines across every lane */
+  .rail{width:48px;flex:none;position:relative}
+  .rail .tk{position:absolute;right:9px;transform:translateY(-50%);font-family:ui-monospace,Menlo,monospace;font-size:10.5px;color:var(--muted);opacity:.7;white-space:nowrap}
+  .gridlines{position:absolute;left:48px;right:0;top:0;bottom:0;pointer-events:none;z-index:0}
+  .gridlines .gl{position:absolute;left:0;right:0;border-top:1px dashed var(--line);opacity:.5}
+  .lane{flex:1;position:relative;z-index:1}
+  .lane.narr{flex:1.2}
+  /* Track C — cursor activity strip; click a block for the gesture path */
+  .curlane{width:124px;flex:none;position:relative;z-index:1;border-left:1px solid var(--line);border-right:1px solid var(--line)}
+  /* gesture thumbnail — the path drawn on a faded frame, fit to it */
+  .curseg{position:absolute;left:5px;right:5px;box-sizing:border-box;border:1px solid var(--line);border-radius:4px;overflow:hidden;cursor:pointer;background:var(--bg)}
+  .curseg:hover{outline:1px solid var(--ok)}
+  .curseg-frame{position:absolute;inset:0;width:100%;height:100%;object-fit:fill;opacity:.4}
+  .curseg-path{position:absolute;inset:0;width:100%;height:100%}
+  .cur{position:absolute;left:8px;right:8px;box-sizing:border-box;background:var(--ok);border-radius:4px;min-height:6px;cursor:pointer}
+  .cur:hover{filter:brightness(1.12);outline:1px solid var(--ok)}
+  .modal canvas{border:1px solid var(--line);border-radius:6px;background:var(--bg);max-width:100%;display:block;margin-top:8px}
+  .modal img.frame{max-width:100%;border:1px solid var(--line);border-radius:6px;display:block;margin-top:8px}
+  .mk{position:absolute;left:8px;right:8px;box-sizing:border-box;font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.3;background:rgba(42,95,216,.08);border:1px solid rgba(42,95,216,.28);border-radius:6px;padding:3px 8px;overflow:hidden;white-space:nowrap;cursor:pointer}
+  .mk:hover,.utt:hover{filter:brightness(1.06);border-color:var(--accent)}
+  .mk .sup{color:var(--rec)}
+  .mk .inf{color:var(--muted)}
+  .mk-inf{border-style:dashed;opacity:.85}
+  .utt{position:absolute;left:10px;right:2px;box-sizing:border-box;font-size:12.5px;line-height:1.4;background:rgba(122,63,209,.08);border:1px solid rgba(122,63,209,.28);border-radius:6px;padding:4px 9px;overflow:hidden;cursor:pointer;display:-webkit-box;-webkit-box-orient:vertical}
+  @media (prefers-color-scheme:dark){ .mk{background:rgba(127,163,255,.12);border-color:rgba(127,163,255,.3)} .utt{background:rgba(177,138,235,.13);border-color:rgba(177,138,235,.3)} }
+  details.raw summary{font-size:12px;color:var(--muted);cursor:pointer;padding:6px 0}
+  /* detail popup — opens over the page so the timeline never shifts */
+  .modal[hidden]{display:none}
+  .modal{position:fixed;inset:0;z-index:50;display:flex;align-items:center;justify-content:center;padding:24px}
+  .modal-backdrop{position:absolute;inset:0;background:rgba(0,0,0,.45)}
+  .modal-card{position:relative;background:var(--panel);border:1px solid var(--line);border-radius:12px;max-width:580px;width:100%;max-height:82vh;overflow:auto;padding:20px 22px;box-shadow:0 16px 48px rgba(0,0,0,.35)}
+  .modal-close{position:absolute;top:8px;right:10px;background:transparent;border:none;color:var(--muted);font-size:24px;line-height:1;cursor:pointer;padding:2px 8px}
+  .modal h3{margin:0 0 12px;font-size:15px}
+  .mrow{display:grid;grid-template-columns:92px 1fr;gap:12px;padding:7px 0;border-bottom:1px solid var(--line)}
+  .mrow:last-of-type{border-bottom:none}
+  .mrow .k{font-family:ui-monospace,Menlo,monospace;font-size:10.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;padding-top:2px}
+  .mrow .v{font-size:13px;word-break:break-word;line-height:1.5}
+  .mrow .v code{font-size:12px}
+  .mrow .v .path{font-family:ui-monospace,Menlo,monospace;font-size:11px;color:var(--muted);white-space:pre-wrap}
+  .modal pre{margin-top:14px;max-height:none}
+  pre{background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:8px;overflow:auto;font-size:11px;margin:4px 0}
+  /* the raw dump scrolls inside its own box instead of running for pages */
+  details.raw pre{max-height:420px}
+  .empty{color:var(--muted);font-size:13px;padding:8px 0}
+  /* a failed/partial transcript is the loudest thing in the session card */
+  .tstatus{margin:0 0 10px;padding:8px 10px;border-radius:7px;font-size:12.5px;
+    background:rgba(210,59,46,.09);border:1px solid rgba(210,59,46,.35);color:var(--rec)}
+
+  /* ---- Audits pane ---------------------------------------------------- */
+  .tabs{display:flex;gap:2px;border-bottom:1px solid var(--line);margin:0 0 22px}
+  .tabs button{appearance:none;border:0;background:transparent;color:var(--muted);font:inherit;font-weight:600;
+    padding:9px 15px;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;border-radius:0}
+  .tabs button[aria-selected="true"]{color:var(--ink);border-bottom-color:var(--accent)}
+  .tabs button:hover{color:var(--ink)}
+  /* Two blocks on top — steps at the left, the replay at the right — and the
+     audit list beneath them, where full width is worth having. */
+  .atop{display:grid;grid-template-columns:300px minmax(0,1fr);gap:18px;align-items:start}
+  @media (max-width:900px){ .atop{grid-template-columns:1fr} }
+  .aright{display:flex;flex-direction:column;gap:10px;min-width:0}
+  .asec{font-size:14px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);
+    margin:26px 0 10px;font-weight:600}
+  /* Audit cards. These lost their rules in an earlier refactor and were
+     rendering as bare buttons. Laid out wide now, so the journey wraps instead
+     of clipping and the identifying facts sit on one line. */
+  .slist{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:10px}
+  .sitem{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px;
+    cursor:pointer;color:var(--ink);font:inherit;text-align:left;display:flex;flex-direction:column;gap:7px}
+  .sitem:hover{border-color:var(--accent)}
+  .sitem[aria-current="true"]{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset}
+  .sitem .top{display:flex;align-items:center;gap:8px}
+  .sitem .id{font-family:ui-monospace,Menlo,monospace;font-size:10.5px;color:var(--muted);
+    border:1px solid var(--line);border-radius:20px;padding:2px 8px;white-space:nowrap}
+  .sitem[aria-current="true"] .id{color:var(--accent);border-color:var(--accent)}
+  .sitem .when{margin-left:auto;font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums;
+    white-space:nowrap}
+  .sitem .ttl{font-weight:600;font-size:13px;line-height:1.4;overflow-wrap:anywhere}
+  .sitem .meta{color:var(--muted);font-size:11.5px;font-variant-numeric:tabular-nums}
+  .phead{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;margin:0 0 10px}
+  .phead .url{color:var(--muted);font-size:12px;font-family:ui-monospace,Menlo,monospace;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}
+  .badge{font-size:11px;font-weight:600;padding:2px 7px;border-radius:20px;border:1px solid var(--line);color:var(--muted)}
+  .badge.live{color:var(--ok);border-color:var(--ok)}
+  .badge.trunc{color:var(--rec);border-color:var(--rec)}
+  /* One box, not three. The steps are the only thing worth a border here —
+     the site line is a label, so it is written out rather than boxed, and the
+     group is a plain run of rows under it. */
+  .tl{display:flex;flex-direction:column;gap:6px;max-height:520px;overflow-y:auto;
+    padding:12px;border:1px solid var(--line);border-radius:9px;background:var(--panel)}
+  .tlgroup{display:flex;flex-direction:column;gap:4px}
+  .tlgroup + .tlgroup{margin-top:10px;padding-top:10px;border-top:1px solid var(--line)}
+  .tlhead{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;padding:0 2px 2px}
+  .tlhead .site{font-weight:600;font-size:12.5px}
+  .tlhead .tabid{font-family:ui-monospace,Menlo,monospace;font-size:10.5px;color:var(--muted)}
+  .tlgroup[data-active="true"] .tlhead .site{color:var(--accent)}
+  .tlacts{display:flex;flex-direction:column;gap:4px}
+  .act{width:100%;text-align:left;border:1px solid var(--line);border-radius:6px;background:var(--bg);
+    color:var(--ink);font:inherit;font-size:12px;padding:6px 10px;cursor:pointer;
+    display:flex;gap:10px;align-items:baseline}
+  .act:hover{border-color:var(--accent)}
+  .act[aria-current="true"]{border-color:var(--accent);background:var(--accent);color:#fff}
+  .act[aria-current="true"] .t{color:#fff;opacity:.85}
+  .act .t{font-family:ui-monospace,Menlo,monospace;font-size:10.5px;color:var(--muted);
+    font-variant-numeric:tabular-nums;flex:none;min-width:30px}
+  .act .tool{font-weight:600}
+  .transport{display:flex;align-items:center;gap:10px;margin:0 0 10px;padding:9px 11px;
+    border:1px solid var(--line);border-radius:8px;background:var(--bg)}
+  .transport .play{width:32px;height:32px;flex:none;border-radius:50%;border:1px solid var(--line);
+    background:var(--accent);color:#fff;font-size:12px;line-height:1;cursor:pointer;padding:0}
+  .transport .tnow{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;color:var(--muted);
+    font-variant-numeric:tabular-nums;flex:none;min-width:34px;text-align:center}
+  .scrub{flex:1;min-width:0;accent-color:var(--accent);height:4px}
+  .nowtab{font-size:11.5px;font-weight:600;color:var(--accent);flex:none;min-width:96px;text-align:right}
+  #player{margin-top:4px}
+  #player .rr-player{max-width:100%}
+  .arow{display:flex;gap:8px;align-items:center;margin:0 0 12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Browzy — Recorder</h1>
+  <p class="sub">Record an expert browser rollout (behavior + narration) and hand it to a live Claude Code session. Click the toolbar icon to start/stop a recording.</p>
+
+  <h2>OpenAI API key</h2>
+  <div class="card">
+    <label for="key">Required before recording (used for speech-to-text)</label>
+    <input id="key" type="password" placeholder="sk-..." autocomplete="off">
+    <div class="row">
+      <button id="save">Save &amp; validate</button>
+      <button id="reveal" class="sec" type="button">Show</button>
+      <span id="keyStatus" class="status"></span>
+    </div>
+  </div>
+
+  <h2>Microphone</h2>
+  <div class="card">
+    <label>Grant mic access once so recordings can capture your narration</label>
+    <p class="sub" style="margin:6px 0 0">The recorder captures audio in a background page that can't show a permission prompt, so enable it here first.</p>
+    <div class="row">
+      <button id="mic" type="button">Enable microphone</button>
+      <span id="micStatus" class="status"></span>
+    </div>
+  </div>
+
+  <div class="tabs" role="tablist">
+    <button role="tab" aria-selected="false" id="tab-audits">Audits</button>
+    <button role="tab" aria-selected="true" id="tab-recordings">Recordings</button>
+  </div>
+
+  <div id="pane-audits" hidden>
+    <p class="sub" style="margin:-6px 0 16px">Passive replays of what an agent did, one timeline per Claude Code session. Turn on with <code>set_config audit_mode=audit</code>.</p>
+    <div class="arow">
+      <button id="auditRefresh" class="sec" type="button">Refresh</button>
+      <button id="auditDelete" class="sec" type="button">Delete selected</button>
+    </div>
+    <div id="auditPanel" hidden>
+      <div class="atop">
+        <div class="tl" id="timeline"></div>
+        <div class="aright">
+          <div class="phead">
+            <strong id="segTitle">No session</strong>
+            <span class="url" id="segUrl"></span>
+            <span class="badge" id="segBadge" hidden></span>
+          </div>
+          <div id="player"></div>
+          <div class="transport" id="transport" hidden>
+            <button id="playBtn" class="play" type="button" aria-label="Play">&#9654;</button>
+            <span class="tnow" id="tNow">0:00</span>
+            <input id="scrub" class="scrub" type="range" min="0" max="1000" value="0" step="1" aria-label="Session timeline">
+            <span class="tnow" id="tTotal">0:00</span>
+            <span class="nowtab" id="nowTab"></span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <h2 class="asec">Audits</h2>
+    <div class="slist" id="auditList"></div>
+  </div>
+
+  <div id="pane-recordings">
+    <h2 style="margin-top:0">Recorded sessions</h2>
+  <div id="sessions"><div class="empty">No recordings yet.</div></div>
+  </div>
+</div>
+
+<div id="modal" class="modal" hidden>
+  <div class="modal-backdrop" data-close></div>
+  <div class="modal-card">
+    <button class="modal-close" data-close aria-label="Close">&times;</button>
+    <div id="modalBody"></div>
+  </div>
+</div>
+<script src="../vendor/rrweb-player.umd.min.js"></script>
+<script type="module" src="options.js"></script>
+</body>
+</html>

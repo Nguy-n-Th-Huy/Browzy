@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Cài đặt — Browzy</title>
+<link rel="stylesheet" href="../ui/tokens.css" />
+<link rel="stylesheet" href="../ui/base.css" />
+<link rel="stylesheet" href="../ui/components.css" />
+<link rel="stylesheet" href="../ui/prose.css" />
+<script type="module" src="../ui/theme.js"></script>
+<script type="module" src="../ui/behaviors.js"></script>
+<style>
+  /* Page-local layout only — no shared-token overrides. See
+     extension/ui/** ownership note in this change's task delegation:
+     shared primitives are not edited here. */
+  .panel-shell {
+    max-width: 640px;
+    margin: 0 auto;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    background: var(--color-canvas);
+  }
+  .panel-scroll {
+    flex: 1;
+    overflow-y: auto;
+    padding: var(--space-4) var(--panel-gutter) var(--space-8);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+  .settings-banner { margin: 0 0 var(--space-2); }
+  .model-row-info { min-width: 0; }
+  .model-row-info .list-item-title,
+  .model-row-info .list-item-sub { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #capability-detail { display: flex; flex-wrap: wrap; gap: var(--space-1); margin-top: var(--space-1); }
+  .test-disclosure { margin: 0; }
+  #model-add-form { display: flex; flex-wrap: wrap; gap: var(--space-2); align-items: flex-end; }
+  #model-add-form .field { flex: 1 1 140px; margin-bottom: 0; }
+
+  /* Defect (found during visual QA screenshot capture, task 4.4/4.5): the
+     shared .btn class sets display:inline-flex (extension/ui/components.css),
+     and an author stylesheet's display declaration always wins over the
+     browser's UA default `[hidden] { display: none }` rule regardless of
+     selector specificity -- so a bare `hidden` attribute silently does
+     nothing on any .btn-classed element. extension/ui/** is the shared,
+     approved layer (reported as a defect there, not edited); this page-local
+     override compensates without touching it. Two of the shared library's
+     OWN components already hit this same issue and self-compensate the same
+     way (see .menu[hidden] / .tool-row-detail[hidden] / .slash-picker[hidden]
+     in components.css) -- this is that same pattern, applied here. */
+  .btn[hidden] { display: none; }
+</style>
+</head>
+<body>
+<div class="panel-shell">
+  <header class="panel-header">
+    <span class="panel-header-title" style="font-size:var(--font-size-h2)">Cài đặt</span>
+    <div class="panel-header-actions">
+      <ui-menu>
+        <button slot="trigger" class="btn-icon" aria-label="Chọn giao diện" aria-haspopup="menu" id="ic-theme-trigger"></button>
+        <div slot="menu" class="menu" role="menu" aria-label="Giao diện">
+          <button class="menu-item" role="menuitem" id="theme-system"><span id="ic-monitor"></span>Theo hệ thống</button>
+          <button class="menu-item" role="menuitem" id="theme-light"><span id="ic-sun"></span>Sáng</button>
+          <button class="menu-item" role="menuitem" id="theme-dark"><span id="ic-moon"></span>Tối</button>
+        </div>
+      </ui-menu>
+    </div>
+  </header>
+
+  <main class="panel-scroll">
+    <div id="banner-area"></div>
+
+    <p class="section-heading">Nhà cung cấp</p>
+    <div class="field-group">
+      <div class="field-group-item">
+        <div class="field" style="margin-bottom:0">
+          <label class="field-label" for="base-url">Base URL</label>
+          <input class="input" id="base-url" type="text" autocomplete="off" spellcheck="false" />
+          <p class="field-hint" id="base-url-hint">Origin có thể kèm tiền tố cổng gateway. Bắt buộc HTTPS trừ điểm cuối loopback dành cho phát triển.</p>
+          <p class="field-hint" id="base-url-error" role="alert" hidden style="color:var(--color-status-danger)"></p>
+        </div>
+      </div>
+      <div class="field-group-item">
+        <div class="field" style="margin-bottom:0">
+          <label class="field-label" for="key-input">API key</label>
+          <input class="input" id="key-input" type="password" autocomplete="off" placeholder="Nhập API key mới…" />
+          <p class="field-hint">Được lưu trong kho bảo mật của hệ điều hành. Không bao giờ hiển thị lại khóa đã lưu; trang chỉ giữ giá trị vừa nhập tạm thời để gửi đi, và xóa ngay sau khi gửi.</p>
+        </div>
+      </div>
+      <div class="field-group-item">
+        <div class="field-row">
+          <span class="connection-state" id="connection-state"><span class="connection-dot"></span> Chưa kiểm tra kết nối</span>
+          <div class="field-row-actions">
+            <button class="btn btn-ghost btn-sm" type="button" id="btn-remove-key" hidden>Xóa key</button>
+            <button class="btn btn-secondary btn-sm" type="button" id="btn-test-connection">Kiểm tra kết nối</button>
+            <button class="btn btn-primary btn-sm" type="button" id="btn-save">Lưu</button>
+          </div>
+        </div>
+        <p class="field-hint test-disclosure">Kiểm tra kết nối gửi một yêu cầu nhỏ tới nhà cung cấp và có thể phát sinh chi phí API.</p>
+        <p class="field-hint" id="key-status-text">Chưa lưu API key</p>
+        <div id="capability-detail"></div>
+      </div>
+    </div>
+
+    <p class="section-heading">Mô hình</p>
+    <div class="field-group">
+      <div id="model-list"></div>
+      <div class="field-group-item">
+        <form id="model-add-form">
+          <div class="field">
+            <label class="field-label" for="model-add-id">Model ID</label>
+            <input class="input" id="model-add-id" type="text" autocomplete="off" spellcheck="false" placeholder="vd: claude-sonnet-5" />
+          </div>
+          <div class="field">
+            <label class="field-label" for="model-add-label">Tên hiển thị</label>
+            <input class="input" id="model-add-label" type="text" autocomplete="off" placeholder="vd: Sonnet (cân bằng)" />
+          </div>
+          <button class="btn btn-ghost btn-sm" type="submit"><span id="ic-plus"></span>Thêm thủ công</button>
+        </form>
+        <p class="field-hint" id="model-list-error" role="alert" hidden style="color:var(--color-status-danger)"></p>
+        <div class="field-row-actions" style="margin-top:var(--space-2)">
+          <button class="btn btn-secondary btn-sm" type="button" id="btn-discover-models"><span id="ic-refresh"></span>Tìm mô hình</button>
+        </div>
+        <p class="field-hint">ID mô hình là chuỗi do nhà cung cấp định nghĩa — trang này không tự đoán hay sửa ID.</p>
+      </div>
+    </div>
+
+    <p class="section-heading">Xuất / Nhập cài đặt</p>
+    <div class="field-group">
+      <div class="field-group-item">
+        <div class="field-row-actions">
+          <button class="btn btn-secondary btn-sm" type="button" id="btn-export">Xuất cài đặt</button>
+          <button class="btn btn-ghost btn-sm" type="button" id="btn-import">Nhập cài đặt</button>
+          <input type="file" id="import-file-input" accept="application/json" hidden />
+        </div>
+        <p class="field-hint">Tệp xuất KHÔNG chứa API key. Sau khi nhập trên máy mới, bạn cần nhập lại API key.</p>
+      </div>
+    </div>
+
+    <p class="section-heading">Khác</p>
+    <div class="field-group">
+      <div class="field-group-item">
+        <button class="list-item" type="button" style="width:100%;border:none;box-shadow:none;text-align:left" id="nav-skills">
+          <span class="list-item-icon" id="ic-skills"></span>
+          <span class="list-item-main">
+            <span class="list-item-title">Skills</span>
+            <span class="list-item-sub">Nhập thư mục skill, bật/tắt, nạp lại, gỡ bỏ</span>
+          </span>
+          <span id="ic-chevr-skills"></span>
+        </button>
+      </div>
+      <div class="field-group-item">
+        <button class="list-item" type="button" style="width:100%;border:none;box-shadow:none;text-align:left" id="nav-recorder">
+          <span class="list-item-icon" id="ic-mic"></span>
+          <span class="list-item-main">
+            <span class="list-item-title">Ghi lại thao tác (Recorder)</span>
+            <span class="list-item-sub">Khóa OpenAI, quyền micro, danh sách bản ghi</span>
+          </span>
+          <span id="ic-chevr"></span>
+        </button>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script type="module" src="./settings-app.js"></script>
+</body>
+</html>

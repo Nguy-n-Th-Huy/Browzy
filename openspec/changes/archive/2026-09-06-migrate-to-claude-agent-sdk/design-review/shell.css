@@ -1,0 +1,332 @@
+/*
+ * Reference-screen page scaffold ONLY (header/scroll/composer layout).
+ * This file is local to design-review/ -- it composes extension/ui/**
+ * primitives into a panel shell for visual QA. It is NOT one of the
+ * shared primitives; extension/sidepanel/ will define its own shell in a
+ * later task, informed by what this file demonstrates.
+ */
+
+html,
+body {
+  height: 100%;
+}
+
+.panel-shell {
+  width: 100%;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--color-canvas);
+  overflow: hidden;
+}
+
+.panel-header {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--panel-gutter);
+  border-bottom: 1px solid var(--color-border-subtle);
+  background: var(--color-canvas);
+}
+.panel-header-title {
+  font-weight: 700;
+  font-size: var(--font-size-ui);
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.panel-header-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  flex: none;
+}
+
+.panel-scroll {
+  position: relative; /* containing block for .jump-latest -- see below */
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--panel-gutter);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.panel-composer-wrap {
+  position: relative;
+  flex: none;
+  padding: var(--panel-gutter);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--color-border-subtle);
+  background: var(--color-canvas);
+}
+
+.context-chip-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
+}
+
+.composer {
+  position: relative;
+  display: flex;
+  align-items: flex-end;
+  gap: var(--space-2);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-composer);
+  padding: var(--space-2) var(--space-2) var(--space-2) var(--space-4);
+  transition: border-color var(--motion-duration) var(--motion-easing), box-shadow var(--motion-duration) var(--motion-easing);
+}
+.composer:focus-within {
+  border-color: var(--color-focus-ring);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-focus-ring) 25%, transparent);
+}
+.composer textarea {
+  flex: 1;
+  border: none;
+  background: transparent;
+  resize: none;
+  max-height: 120px;
+  min-height: 24px;
+  padding: var(--space-2) 0;
+  font: inherit;
+  color: var(--color-text);
+  line-height: var(--line-height-body);
+  /* Defense in depth: a real implementation auto-grows rows as the user
+     types, but the collapsed single-row state (and this static mockup)
+     must never let overflow bleed past the composer's rounded box and
+     get hard-clipped by the panel shell. */
+  overflow: hidden;
+}
+.composer textarea::placeholder {
+  color: var(--color-text-secondary);
+}
+.composer textarea:focus {
+  outline: none;
+}
+.composer-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  flex: none;
+  padding-bottom: 2px;
+}
+
+.model-select-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-sm);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-small);
+  min-height: 28px;
+}
+.model-select-trigger:hover {
+  background: var(--color-surface-sunken);
+  color: var(--color-text);
+}
+
+.empty-state {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-5);
+  text-align: center;
+  padding: var(--space-6) var(--space-4);
+}
+.empty-state-icon {
+  width: 48px;
+  height: 48px;
+  border-radius: var(--radius-md);
+  background: var(--color-accent-tint);
+  color: var(--color-accent-text);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.empty-state h1 {
+  font-family: var(--font-serif);
+  font-size: var(--font-size-h1);
+  font-weight: 600;
+  margin: 0;
+}
+.empty-state p {
+  margin: 0;
+  color: var(--color-text-secondary);
+  max-width: 34ch;
+}
+.suggestion-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  width: 100%;
+  max-width: 320px;
+}
+.suggestion-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  min-height: var(--target-min);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  color: var(--color-text);
+  text-align: left;
+  font-size: var(--font-size-ui);
+  box-shadow: var(--shadow-sm);
+}
+.suggestion-item:hover {
+  border-color: var(--color-border);
+}
+.suggestion-item .ui-icon {
+  color: var(--color-accent-text);
+  flex: none;
+}
+
+.msg-row {
+  display: flex;
+  flex-direction: column;
+}
+.msg-row.from-user {
+  align-items: flex-end;
+}
+.msg-row.from-assistant {
+  align-items: stretch;
+}
+.msg-user-bubble {
+  max-width: 88%;
+  background: var(--color-accent-tint);
+  color: var(--color-text);
+  border-radius: var(--radius-md);
+  padding: var(--space-2) var(--space-3);
+}
+.msg-assistant-body {
+  width: 100%;
+}
+
+/* Anchored to the bottom edge of the SCROLLABLE reading area (its
+   containing block is .panel-scroll, which is sized to stop exactly
+   where the composer begins) -- never the whole panel -- so it floats
+   just above the composer instead of overlapping it. */
+.jump-latest {
+  position: sticky;
+  bottom: var(--space-3);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-pill);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border-subtle);
+  box-shadow: var(--shadow-md);
+  font-size: var(--font-size-small);
+  color: var(--color-text);
+  align-self: center;
+  margin-top: var(--space-2);
+}
+
+.section-heading {
+  font-size: var(--font-size-small);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--color-text-secondary);
+  margin: var(--space-2) 0 0;
+}
+
+.list-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border-subtle);
+  box-shadow: var(--shadow-sm);
+}
+.list-item-icon {
+  flex: none;
+  width: 36px;
+  height: 36px;
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-sunken);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-text-secondary);
+}
+.list-item-main {
+  flex: 1;
+  min-width: 0;
+}
+.list-item-title {
+  display: block; /* both are <span>s -- ellipsis has no effect on inline boxes */
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.list-item-sub {
+  display: block;
+  font-size: var(--font-size-small);
+  color: var(--color-text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.list-item-actions {
+  flex: none;
+  display: flex;
+  gap: var(--space-1);
+}
+
+.error-banner {
+  display: flex;
+  gap: var(--space-3);
+  align-items: flex-start;
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--color-status-danger);
+  background: color-mix(in srgb, var(--color-status-danger) 8%, var(--color-surface));
+}
+.error-banner .ui-icon {
+  color: var(--color-status-danger);
+  flex: none;
+  margin-top: 2px;
+}
+.error-banner-title {
+  font-weight: 700;
+  margin: 0 0 2px;
+}
+.error-banner-detail {
+  margin: 0;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-small);
+}
+
+.qa-frame-label {
+  position: fixed;
+  top: 4px;
+  left: 4px;
+  z-index: 999;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--color-text-secondary);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: 4px;
+  padding: 1px 4px;
+  opacity: 0.6;
+  pointer-events: none;
+}

@@ -1,0 +1,720 @@
+/*
+ * Shared UI primitives: buttons, fields, cards, menus, status pills,
+ * permission cards, the tool-activity timeline and the slash picker.
+ * Depends on: tokens.css, base.css
+ *
+ * Plain classes, no framework. Interactive behavior (menu open/close,
+ * slash-picker keyboard nav, tool-row expand/collapse) lives in
+ * behaviors.js and attaches to these classes/data-attributes.
+ */
+
+/* ============================= Buttons ============================= */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  min-height: var(--target-min);
+  padding: 0 var(--space-4);
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+  font-size: var(--font-size-ui);
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+  transition:
+    background-color var(--motion-duration) var(--motion-easing),
+    border-color var(--motion-duration) var(--motion-easing),
+    color var(--motion-duration) var(--motion-easing);
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-primary {
+  background: var(--color-accent);
+  color: var(--color-accent-fg);
+}
+.btn-primary:hover:not(:disabled) {
+  filter: brightness(1.04);
+}
+
+.btn-secondary {
+  background: var(--color-surface);
+  color: var(--color-text);
+  border-color: var(--color-border);
+}
+.btn-secondary:hover:not(:disabled) {
+  background: var(--color-surface-sunken);
+}
+
+.btn-ghost {
+  background: transparent;
+  color: var(--color-text-secondary);
+}
+.btn-ghost:hover:not(:disabled) {
+  background: var(--color-surface-sunken);
+  color: var(--color-text);
+}
+
+.btn-danger {
+  background: transparent;
+  color: var(--color-status-danger);
+  border-color: var(--color-status-danger);
+}
+.btn-danger:hover:not(:disabled) {
+  background: var(--color-status-danger);
+  color: var(--color-surface);
+}
+
+.btn-sm {
+  min-height: 28px;
+  padding: 0 var(--space-3);
+  font-size: var(--font-size-small);
+}
+
+.btn-primary-touch {
+  min-height: var(--target-primary);
+  padding: 0 var(--space-5);
+}
+
+/* Icon-only button: square, min pointer target, requires aria-label on
+   the element itself (enforced by convention/lint, not CSS). */
+.btn-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--target-min);
+  height: var(--target-min);
+  padding: 0;
+  border-radius: var(--radius-sm);
+  color: var(--color-text-secondary);
+  background: transparent;
+  transition: background-color var(--motion-duration) var(--motion-easing), color var(--motion-duration) var(--motion-easing);
+}
+.btn-icon:hover:not(:disabled) {
+  background: var(--color-surface-sunken);
+  color: var(--color-text);
+}
+.btn-icon[aria-pressed="true"],
+.btn-icon.is-active {
+  background: var(--color-accent-tint);
+  color: var(--color-accent-text);
+}
+
+/* Solid-danger icon button: the composer's Stop control while streaming.
+   --color-surface on --color-status-danger measures 7.82:1 (dark theme)
+   and 6.54:1 (light theme) -- see reports/05-visual-system.md. */
+.btn-icon.is-danger-solid {
+  background: var(--color-status-danger);
+  color: var(--color-surface);
+}
+.btn-icon.is-danger-solid:hover:not(:disabled) {
+  filter: brightness(1.05);
+  background: var(--color-status-danger);
+  color: var(--color-surface);
+}
+
+/* ============================= Fields ============================= */
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-bottom: var(--space-4);
+}
+
+.field-label {
+  font-size: var(--font-size-ui);
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.field-hint {
+  font-size: var(--font-size-small);
+  color: var(--color-text-secondary);
+  margin: 0;
+}
+
+.field-error {
+  font-size: var(--font-size-small);
+  color: var(--color-status-danger);
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.input,
+.select,
+.textarea {
+  width: 100%;
+  min-height: var(--target-min);
+  padding: var(--space-2) var(--space-3);
+  background: var(--color-surface-sunken);
+  color: var(--color-text);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-ui);
+  transition: border-color var(--motion-duration) var(--motion-easing);
+}
+.input::placeholder,
+.textarea::placeholder {
+  color: var(--color-text-secondary);
+}
+.input:focus-visible,
+.select:focus-visible,
+.textarea:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 1px;
+  border-color: var(--color-focus-ring);
+}
+.input[aria-invalid="true"],
+.textarea[aria-invalid="true"] {
+  border-color: var(--color-status-danger);
+}
+
+.textarea {
+  min-height: var(--space-12);
+  resize: vertical;
+  line-height: var(--line-height-body);
+}
+
+/* Grouped field set: a card holding several related fields, each row
+   separated by a hairline instead of individually boxing every field. */
+.field-group {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-sm);
+  /* No overflow:hidden: field-group-item children are transparent (only
+     the parent has a background/border-radius), so clipping bought
+     nothing here -- and combined with border-radius on a container this
+     tall, it reproducibly made content beyond a certain height fail to
+     paint in this environment's Chromium build. */
+}
+.field-group-title {
+  padding: var(--space-3) var(--space-4) 0;
+  font-size: var(--font-size-small);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--color-text-secondary);
+}
+.field-group-item {
+  padding: var(--space-4);
+  border-top: 1px solid var(--color-border-subtle);
+}
+.field-group-item:first-of-type {
+  border-top: none;
+}
+.field-group-item .field {
+  margin-bottom: 0;
+}
+.field-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2) var(--space-3);
+  /* At 320px a label/status plus a run of action buttons rarely fits one
+     line -- wrap onto a second line instead of squeezing or overflowing. */
+  flex-wrap: wrap;
+}
+.field-row > * {
+  min-width: 0;
+}
+.field-row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+/* ============================= Cards ============================= */
+
+.card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-sm);
+  padding: var(--space-4);
+}
+.card-title {
+  font-size: var(--font-size-h3);
+  font-weight: 700;
+  margin: 0 0 var(--space-1);
+}
+.card-body {
+  color: var(--color-text-secondary);
+  margin: 0;
+}
+
+/* ============================= Menu / popover ============================= */
+
+.menu {
+  position: absolute;
+  z-index: 40;
+  min-width: 180px;
+  max-width: 320px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+  padding: var(--space-2);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.menu[hidden] {
+  display: none;
+}
+.menu-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: var(--target-min);
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-sm);
+  color: var(--color-text);
+  font-size: var(--font-size-ui);
+  text-align: left;
+  width: 100%;
+}
+.menu-item:hover,
+.menu-item:focus-visible,
+.menu-item[data-active="true"] {
+  background: var(--color-surface-sunken);
+}
+.menu-item[aria-selected="true"],
+.menu-item.is-selected {
+  background: var(--color-accent-tint);
+  color: var(--color-accent-text);
+}
+.menu-item .menu-item-icon {
+  color: var(--color-text-secondary);
+  flex: none;
+}
+.menu-separator {
+  height: 1px;
+  background: var(--color-border-subtle);
+  margin: var(--space-1) var(--space-2);
+}
+
+/* ============================= Status pill ============================= */
+
+/* Deliberately static (no infinite spin/pulse loop): design 5a bars
+   looping decorative animation. "Running" is communicated by color, an
+   outline icon and the word itself, not by continuous motion. */
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 2px var(--space-2);
+  border-radius: var(--radius-pill);
+  font-size: var(--font-size-small);
+  font-weight: 600;
+  line-height: 1.6;
+  white-space: nowrap;
+}
+.status-pill .ui-icon {
+  width: 14px;
+  height: 14px;
+}
+.status-pill.is-running {
+  color: var(--color-status-running);
+  background: color-mix(in srgb, var(--color-status-running) 12%, transparent);
+}
+.status-pill.is-succeeded {
+  color: var(--color-status-success);
+  background: color-mix(in srgb, var(--color-status-success) 12%, transparent);
+}
+.status-pill.is-failed {
+  color: var(--color-status-danger);
+  background: color-mix(in srgb, var(--color-status-danger) 12%, transparent);
+}
+.status-pill.is-cancelled {
+  color: var(--color-text-secondary);
+  background: var(--color-surface-sunken);
+}
+.status-pill.is-unknown {
+  color: var(--color-status-warning);
+  background: color-mix(in srgb, var(--color-status-warning) 12%, transparent);
+}
+
+/* ============================= Permission card ============================= */
+
+.permission-card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.permission-card-head {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+}
+/* A flex item's default min-width is auto — it will not shrink below its
+   longest unbreakable run. In a panel this narrow that is the difference
+   between a question wrapping and a question running off the edge. */
+.permission-card-head > * {
+  min-width: 0;
+}
+.permission-card-icon {
+  flex: none;
+  width: var(--space-8);
+  height: var(--space-8);
+  border-radius: var(--radius-sm);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--color-accent-tint);
+  color: var(--color-accent-text);
+}
+.permission-card-title {
+  font-weight: 700;
+  margin: 0 0 2px;
+  overflow-wrap: anywhere;
+}
+.permission-card-detail {
+  margin: 0;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-small);
+  overflow-wrap: anywhere;
+}
+.permission-card-target {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-small);
+  background: var(--color-surface-sunken);
+  border-radius: var(--radius-sm);
+  padding: var(--space-1) var(--space-2);
+  overflow-wrap: anywhere;
+}
+.permission-card-actions {
+  display: flex;
+  gap: var(--space-2);
+  justify-content: flex-end;
+}
+
+/* ============================= Tool activity timeline ============================= */
+
+.tool-timeline {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  padding-left: var(--space-8);
+  /* Defense in depth: only the markdown table (.table-wrap) is meant to
+     scroll horizontally. A screenshot thumbnail or an unbroken token in a
+     detail line must clip here, never grow a scrollbar of its own or
+     force the row wider than the panel. */
+  overflow-x: hidden;
+}
+/* Thin vertical guide connecting sequential actions, per design 5c. */
+.tool-timeline::before {
+  content: "";
+  position: absolute;
+  left: 15px;
+  top: 14px;
+  bottom: 14px;
+  width: 1px;
+  background: var(--color-border-subtle);
+}
+
+/* A single flex ROW would put .tool-row-summary and .tool-row-detail
+   side by side (both are direct, in-flow children -- the rail icon is
+   absolutely positioned and out of flow). Column direction stacks the
+   summary above its detail, each stretched to the full row width. */
+.tool-row {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  padding: var(--space-1) 0;
+  min-height: var(--target-min);
+  min-width: 0;
+}
+.tool-row-icon {
+  position: absolute;
+  left: calc(-1 * var(--space-8) + 8px);
+  top: 8px;
+  width: 16px;
+  height: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-pill);
+  background: var(--color-canvas);
+  color: var(--color-text-secondary);
+}
+.tool-row.is-running .tool-row-icon {
+  color: var(--color-status-running);
+}
+.tool-row.is-succeeded .tool-row-icon {
+  color: var(--color-status-success);
+}
+.tool-row.is-failed .tool-row-icon {
+  color: var(--color-status-danger);
+}
+.tool-row.is-unknown .tool-row-icon {
+  color: var(--color-status-warning);
+}
+.tool-row-summary {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  min-width: 0;
+  min-height: var(--target-min);
+  text-align: left;
+  border-radius: var(--radius-sm);
+  padding: var(--space-1) var(--space-2);
+  margin-left: calc(-1 * var(--space-2));
+  color: var(--color-text);
+  transition: background-color var(--motion-duration) var(--motion-easing);
+}
+.tool-row-summary:hover {
+  background: var(--color-surface-sunken);
+}
+.tool-row-label {
+  font-size: var(--font-size-ui);
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tool-row-meta {
+  font-size: var(--font-size-small);
+  color: var(--color-text-secondary);
+  flex: none;
+}
+.tool-row-chevron {
+  flex: none;
+  color: var(--color-text-secondary);
+  transition: transform var(--motion-duration) var(--motion-easing);
+}
+.tool-row[data-expanded="true"] .tool-row-chevron {
+  transform: rotate(90deg);
+}
+.tool-row-detail {
+  padding: var(--space-2) var(--space-2) var(--space-3);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-small);
+}
+.tool-row-detail[hidden] {
+  display: none;
+}
+.tool-row-thumb {
+  /* Explicit width (not shrink-to-fit) so the 100%-wide child below
+     resolves against a definite value -- an inline-block button sized by
+     content would otherwise let a percentage-width child collapse. */
+  width: min(160px, 100%);
+  margin-top: var(--space-2);
+  display: block;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  cursor: pointer;
+  background: var(--color-surface-sunken);
+  min-width: var(--target-min);
+  min-height: var(--target-min);
+}
+.tool-row-thumb img,
+.tool-row-thumb .thumb-placeholder {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+.tool-row-thumb:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 2px;
+}
+
+/* Collapsed run summary shown after completion. */
+.tool-summary-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-sunken);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-small);
+  width: 100%;
+  text-align: left;
+}
+
+/* ============================= Slash picker ============================= */
+
+.slash-picker {
+  position: absolute;
+  z-index: 30;
+  left: 0;
+  right: 0;
+  bottom: calc(100% + var(--space-2));
+  max-height: 220px;
+  overflow-y: auto;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+  padding: var(--space-2);
+}
+.slash-picker[hidden] {
+  display: none;
+}
+.slash-picker-item {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  width: 100%;
+  min-height: var(--target-min);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  text-align: left;
+  color: var(--color-text);
+}
+.slash-picker-item-name {
+  font-weight: 600;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-small);
+  flex: none;
+}
+.slash-picker-item-desc {
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-small);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+.slash-picker-item[data-highlighted="true"] {
+  background: var(--color-accent-tint);
+}
+.slash-picker-item[data-highlighted="true"] .slash-picker-item-name {
+  color: var(--color-accent-text);
+}
+.slash-picker-empty {
+  padding: var(--space-4) var(--space-3);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-small);
+  text-align: center;
+}
+
+/* ============================= Switch (enable/disable) ============================= */
+
+.switch {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  width: 40px;
+  height: var(--target-min);
+  flex: none;
+}
+.switch input {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  margin: 0;
+  cursor: pointer;
+}
+.switch-track {
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 36px;
+  height: 20px;
+  border-radius: var(--radius-pill);
+  background: var(--color-border);
+  transition: background-color var(--motion-duration) var(--motion-easing);
+}
+.switch-thumb {
+  position: absolute;
+  left: 2px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--color-surface);
+  box-shadow: var(--shadow-sm);
+  transition: transform var(--motion-duration) var(--motion-easing);
+}
+.switch input:checked ~ .switch-track {
+  background: var(--color-accent);
+}
+.switch input:checked ~ .switch-thumb {
+  transform: translate(16px, -50%);
+}
+.switch input:focus-visible ~ .switch-track {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 2px;
+}
+
+/* ============================= Misc layout helpers ============================= */
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 2px var(--space-2) 2px 2px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--color-border-subtle);
+  background: var(--color-surface);
+  font-size: var(--font-size-small);
+  color: var(--color-text-secondary);
+  max-width: 100%;
+}
+.chip-icon {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  border-radius: var(--radius-pill);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--color-surface-sunken);
+  overflow: hidden;
+}
+.chip-icon img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.chip-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.connection-state {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-size: var(--font-size-small);
+  color: var(--color-text-secondary);
+}
+.connection-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: var(--radius-pill);
+  background: var(--color-text-secondary);
+  flex: none;
+}
+.connection-state.is-ready .connection-dot {
+  background: var(--color-status-success);
+}
+.connection-state.is-connecting .connection-dot {
+  background: var(--color-status-warning);
+}
+.connection-state.is-error .connection-dot {
+  background: var(--color-status-danger);
+}

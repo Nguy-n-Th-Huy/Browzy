@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Browzy</title>
+<link rel="stylesheet" href="../ui/tokens.css" />
+<link rel="stylesheet" href="../ui/base.css" />
+<link rel="stylesheet" href="../ui/components.css" />
+<link rel="stylesheet" href="../ui/prose.css" />
+<link rel="stylesheet" href="sidepanel.css" />
+<script type="module" src="../ui/theme.js"></script>
+<script type="module" src="../ui/behaviors.js"></script>
+</head>
+<body>
+<div class="panel-shell">
+  <!-- ============================= Chat screen ============================= -->
+  <div id="chat-view" style="display:flex;flex-direction:column;min-height:0;flex:1">
+    <header class="panel-header">
+      <span class="panel-header-title">Browzy</span>
+      <div class="panel-header-actions">
+        <span class="connection-state" id="connection-state" role="status">
+          <span class="connection-dot"></span>
+          <span id="connection-label">Đang kết nối</span>
+        </span>
+        <button class="btn-icon" id="btn-new-chat" aria-label="Trò chuyện mới, không gắn trang nào"></button>
+        <button class="btn-icon" id="btn-history" aria-label="Lịch sử trò chuyện và bản ghi"></button>
+        <button class="btn-icon" id="btn-settings" aria-label="Cài đặt"></button>
+      </div>
+    </header>
+
+    <main class="panel-scroll" id="panel-scroll" aria-label="Cuộc trò chuyện">
+      <div id="transcript"></div>
+      <div id="empty-state-slot"></div>
+      <!-- Polite live region: streaming text updates land here as an
+           attribute change on #transcript itself (aria-live is set on the
+           scroll container's last assistant block, not this hidden node),
+           and this node additionally announces coarse phase changes
+           (queued/streaming/completed/stopped/error) WITHOUT reading every
+           token -- spec: "a polite live region ... without announcing every
+           token". -->
+      <div class="sr-only" id="phase-announcer" aria-live="polite" role="status"></div>
+    </main>
+
+    <div class="panel-composer-wrap" id="composer-wrap">
+      <div id="setup-banner-slot"></div>
+      <div id="permission-slot"></div>
+      <div id="question-slot"></div>
+      <div class="context-chip-row" id="context-chip-row"></div>
+      <div id="attachment-strip" class="attachment-strip" hidden aria-label="Tệp đính kèm"></div>
+      <div id="attachment-error" class="attachment-error" role="alert" hidden></div>
+      <input id="attachment-file-input" type="file" accept=".png,.jpg,.jpeg,.webp,.gif,.pdf,.txt,.md,.markdown,.csv,.json" multiple hidden />
+      <div class="composer" id="composer">
+        <textarea id="composer-input" rows="1" placeholder="Nhắn tin…" aria-label="Soạn tin nhắn"></textarea>
+        <div class="composer-actions">
+          <ui-menu id="add-menu-wrap">
+            <button slot="trigger" class="btn-icon composer-add-trigger" type="button" id="btn-add" aria-haspopup="menu" aria-label="Thêm tệp hoặc ảnh"></button>
+            <div slot="menu" class="menu" role="menu" id="add-menu">
+              <button type="button" class="menu-item" role="menuitem" id="add-menu-files">
+                <span id="icon-add-files"></span>
+                <span>Thêm tệp hoặc ảnh</span>
+                <kbd class="menu-item-kbd">Ctrl U</kbd>
+              </button>
+            </div>
+          </ui-menu>
+          <ui-menu id="effort-menu-wrap">
+            <button slot="trigger" class="model-select-trigger effort-select-trigger" type="button" id="effort-trigger" aria-haspopup="menu" aria-label="Chọn mức suy luận">
+              <span id="effort-trigger-label">Effort</span>
+            </button>
+            <div slot="menu" class="menu" role="menu" id="effort-menu"></div>
+          </ui-menu>
+          <ui-menu id="model-menu-wrap">
+            <button slot="trigger" class="model-select-trigger" type="button" id="model-trigger" aria-haspopup="menu" aria-label="Chọn model">
+              <span id="model-trigger-label">Model</span>
+              <span id="model-chevron"></span>
+            </button>
+            <div slot="menu" class="menu" role="menu" id="model-menu"></div>
+          </ui-menu>
+          <button class="btn-icon" id="btn-enhance" type="button" aria-label="Cải thiện prompt"></button>
+          <button class="btn-icon" id="btn-send" aria-label="Gửi"></button>
+        </div>
+        <ui-slash-picker id="slash-picker">
+          <div class="slash-picker" role="listbox" aria-label="Chọn skill" hidden></div>
+        </ui-slash-picker>
+      </div>
+    </div>
+
+  <!-- Image picker modal (Ctrl+U) — styled via existing .card/.btn primitives -->
+  <div id="attachment-picker-overlay" class="attachment-picker-overlay" hidden>
+    <div id="attachment-picker-modal" class="card attachment-picker-modal" role="dialog" aria-modal="true" aria-labelledby="attachment-picker-title" tabindex="-1">
+      <h2 id="attachment-picker-title" class="card-title">Chọn tệp đính kèm</h2>
+      <p class="card-body">Ảnh (PNG, JPEG, WebP, GIF), PDF, và văn bản (TXT, Markdown, CSV, JSON) — tối đa 10 MB mỗi tệp, 4 tệp / 20 MB mỗi tin nhắn.</p>
+      <div class="attachment-picker-actions">
+        <label class="btn btn-primary" for="attachment-picker-input">Chọn tệp</label>
+        <input id="attachment-picker-input" type="file" accept=".png,.jpg,.jpeg,.webp,.gif,.pdf,.txt,.md,.markdown,.csv,.json" multiple hidden />
+        <button class="btn btn-secondary" type="button" id="attachment-picker-close">Đóng</button>
+      </div>
+    </div>
+  </div>
+  <!-- ======================= Document detail viewer ======================== -->
+  <!-- Opened from a document card in the transcript. Two tabs, Preview and
+       Markdown, for every format. Preview renders inside a sandboxed iframe
+       for any format whose renderer produces HTML — document content is data,
+       never markup the panel executes. -->
+  <div id="document-viewer-overlay" class="document-viewer-overlay" hidden>
+    <div id="document-viewer-modal" class="document-viewer-modal" role="dialog" aria-modal="true" aria-labelledby="document-viewer-title" tabindex="-1">
+      <header class="document-viewer-header">
+        <span class="document-viewer-icon" id="document-viewer-icon"></span>
+        <span class="document-viewer-heading">
+          <span class="document-viewer-title" id="document-viewer-title"></span>
+          <span class="document-viewer-sub" id="document-viewer-sub"></span>
+        </span>
+        <button class="btn-icon" type="button" id="document-viewer-download" aria-label="Tải tài liệu về máy" title="Tải về"></button>
+        <button class="btn-icon" type="button" id="document-viewer-close" aria-label="Đóng trình xem tài liệu" title="Đóng"></button>
+      </header>
+      <div class="document-viewer-tabs" role="tablist" aria-label="Chế độ xem tài liệu">
+        <button class="document-viewer-tab is-active" type="button" role="tab" id="document-tab-preview" aria-selected="true" aria-controls="document-viewer-body">Xem trước</button>
+        <button class="document-viewer-tab" type="button" role="tab" id="document-tab-markdown" aria-selected="false" aria-controls="document-viewer-body">Markdown</button>
+      </div>
+      <div class="document-viewer-note" id="document-viewer-note" hidden></div>
+      <div class="document-viewer-body" id="document-viewer-body" role="tabpanel" tabindex="0"></div>
+    </div>
+  </div>
+  </div>
+
+  <!-- ======================= History / recordings screen ==================== -->
+  <div id="history-view" hidden>
+    <header class="panel-header">
+      <button class="btn-icon" id="btn-history-back" aria-label="Quay lại cuộc trò chuyện"></button>
+      <span class="panel-header-title" style="font-size:var(--font-size-h2)">Lịch sử &amp; bản ghi</span>
+      <div class="panel-header-actions">
+        <button class="btn btn-primary btn-sm" type="button" id="btn-history-new"><span id="icon-new-plus"></span>Mới</button>
+      </div>
+    </header>
+    <main class="panel-scroll" id="history-scroll" aria-label="Lịch sử trò chuyện và bản ghi">
+      <p class="section-heading">Cuộc trò chuyện</p>
+      <div class="list-column" id="conversation-list"></div>
+      <p class="section-heading">Ghi âm thao tác</p>
+      <div class="recorder-row">
+        <span class="list-item-icon" id="icon-mic-row"></span>
+        <span class="recorder-row-label" id="recorder-status-label">Đang kiểm tra…</span>
+        <button class="btn btn-secondary btn-sm" type="button" id="btn-toggle-recording">Bắt đầu ghi</button>
+      </div>
+      <div class="list-column" id="recording-list"></div>
+    </main>
+  </div>
+</div>
+
+<div id="confirm-delete-slot"></div>
+
+<script type="module" src="sidepanel.js"></script>
+</body>
+</html>

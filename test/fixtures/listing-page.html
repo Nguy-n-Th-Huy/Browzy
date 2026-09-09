@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8" />
+<title>Thông báo mời thầu — dauthau.asia</title>
+</head>
+<body>
+  <!--
+    Fixture shaped like the live dauthau.asia listing/index page evidence
+    (design.md section 9): a Vietnamese tender-notice LISTING page, not an
+    article. The page has many repeated <a>-shaped tender notice items
+    outside the small matched container, plus a small .content div with only
+    boilerplate footer/contact text that get_page_text's selector list will
+    match first (design.md 9: "one of the specific selectors matched a small
+    <div>").
+  
+    get_page_text's selector list (extension/content.js, lines 316-325):
+      article, main, [class*="articleBody"], [class*="post-content"],
+      [class*="entry-content"], [role="main"], .content, #content
+  
+    This fixture has a `.content` div containing only boilerplate, so
+    get_page_text should report:
+      - Source: <div>
+      - coverageRatio < 0.5 (the tender listings dominate the page text)
+      - usedBodyFallback = false (.content matched, not body)
+      - Complete: partial (not Complete: yes)
+  -->
+  <div class="content">
+    <p>Thông tin liên hệ: 0904.634.288, 024.8888.4288</p>
+    <p>contact@dauthau.asia</p>
+    <p>Facebook Fanpage: dauthau.asia</p>
+    <p>Messenger: m.me/dauthau</p>
+  </div>
+
+  <div class="listing">
+    <a href="/thongbao/moithau/12345">
+      <span class="notice-title">Thông báo mời thầu: Cung cấp thiết bị y tế 2026</span>
+      <span class="notice-date">06/09/2026</span>
+    </a>
+    <a href="/thongbao/moithau/12346">
+      <span class="notice-title">Thông báo mời thầu: Xây dựng cầu đường huyện X</span>
+      <span class="notice-date">05/09/2026</span>
+    </a>
+    <a href="/thongbao/moithau/12347">
+      <span class="notice-title">Thông báo mời thầu: Mua sắm máy tính văn phòng</span>
+      <span class="notice-date">04/09/2026</span>
+    </a>
+    <a href="/thongbao/moithau/12348">
+      <span class="notice-title">Thông báo mời thầu: Thiết kế hệ thống điện</span>
+      <span class="notice-date">03/09/2026</span>
+    </a>
+    <a href="/thongbao/moithau/12349">
+      <span class="notice-title">Thông báo mời thầu: Cung cấp vật tư xây dựng</span>
+      <span class="notice-date">02/09/2026</span>
+    </a>
+    <a href="/thongbao/moithau/12350">
+      <span class="notice-title">Thông báo mời thầu: Dịch vụ tư vấn giám sát</span>
+      <span class="notice-date">01/09/2026</span>
+    </a>
+    <a href="/thongbao/moithau/12351">
+      <span class="notice-title">Thông báo mời thầu: Cung cấp phần mềm quản lý</span>
+      <span class="notice-date">31/08/2026</span>
+    </a>
+    <a href="/thongbao/moithau/12352">
+      <span class="notice-title">Thông báo mời thầu: Bảo trì hệ thống máy lạnh</span>
+      <span class="notice-date">30/08/2026</span>
+    </a>
+    <a href="/thongbao/moithau/12353">
+      <span class="notice-title">Thông báo mời thầu: Sửa chữa cơ sở hạ tầng</span>
+      <span class="notice-date">29/08/2026</span>
+    </a>
+    <a href="/thongbao/moithau/12354">
+      <span class="notice-title">Thông báo mời thầu: Cung cấp dịch vụ vận tải</span>
+      <span class="notice-date">28/08/2026</span>
+    </a>
+    <a href="/thongbao/moithau/12355">
+      <span class="notice-title">Thông báo mời thầu: Lắp đặt hệ thống an ninh</span>
+      <span class="notice-date">27/08/2026</span>
+    </a>
+    <a href="/thongbao/moithau/12356">
+      <span class="notice-title">Thông báo mời thầu: Thi công công trình thủy lợi</span>
+      <span class="notice-date">26/08/2026</span>
+    </a>
+    <a href="/thongbao/moithau/12357">
+      <span class="notice-title">Thông báo mời thầu: Cung cấp thiết bị văn phòng</span>
+      <span class="notice-date">25/08/2026</span>
+    </a>
+    <a href="/thongbao/moithau/12358">
+      <span class="notice-title">Thông báo mời thầu: Hỗ trợ kỹ thuật CNTT</span>
+      <span class="notice-date">24/08/2026</span>
+    </a>
+    <a href="/thongbao/moithau/12359">
+      <span class="notice-title">Thông báo mời thầu: Dịch vụ vệ sinh công nghiệp</span>
+      <span class="notice-date">23/08/2026</span>
+    </a>
+    <a href="/thongbao/moithau/12360">
+      <span class="notice-title">Thông báo mời thầu: Cho thuê thiết bị xây dựng</span>
+      <span class="notice-date">22/08/2026</span>
+    </a>
+    <a href="/thongbao/moithau/12361">
+      <span class="notice-title">Thông báo mời thầu: Lắp đặt hệ thống phòng cháy</span>
+      <span class="notice-date">21/08/2026</span>
+    </a>
+    <a href="/thongbao/moithau/12362">
+      <span class="notice-title">Thông báo mời thầu: Cung cấp dược phẩm</span>
+      <span class="notice-date">20/08/2026</span>
+    </a>
+    <a href="/thongbao/moithau/12363">
+      <span class="notice-title">Thông báo mời thầu: Khảo sát địa chất</span>
+      <span class="notice-date">19/08/2026</span>
+    </a>
+    <a href="/thongbao/moithau/12364">
+      <span class="notice-title">Thông báo mời thầu: Thiết kế kiến trúc</span>
+      <span class="notice-date">18/08/2026</span>
+    </a>
+  </div>
+</body>
+</html>

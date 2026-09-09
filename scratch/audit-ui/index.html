@@ -1,0 +1,482 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Audit UI — dev harness</title>
+<!--
+  DEV HARNESS ONLY — not part of the shipped extension.
+
+  This exists so the Audits UI can be designed and reviewed without reloading
+  the extension for every change. It renders exactly the markup and tokens the
+  options page will use, against a real audit.json captured from a live run, so
+  porting it over is a copy rather than a rewrite.
+
+  Serve from the REPO ROOT so ../../extension/vendor resolves:
+    python3 -m http.server 8860
+    open http://localhost:8860/scratch/audit-ui/
+-->
+<link rel="stylesheet" href="../../extension/vendor/rrweb-player.min.css">
+<style>
+  :root { --bg:#f7f7f5; --panel:#fff; --ink:#1c1e22; --muted:#5b5f66; --line:#e2e2dd; --accent:#2a5fd8; --rec:#d23b2e; --ok:#0e8a5f; }
+  @media (prefers-color-scheme:dark){ :root{ --bg:#15171b; --panel:#1c1f24; --ink:#e8eaee; --muted:#9aa0a8; --line:#2a2e35; --accent:#7fa3ff; --rec:#e5604f; --ok:#3fbf8f; } }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  .wrap{max-width:1180px;margin:0 auto;padding:28px 28px 64px}
+  h1{font-size:20px;margin:0 0 4px} .sub{color:var(--muted);margin:0 0 20px;font-size:13px}
+
+  /* ---- tab bar: Audits | Recordings ---- */
+  .tabs{display:flex;gap:2px;border-bottom:1px solid var(--line);margin:0 0 20px}
+  .tabs button{appearance:none;border:0;background:transparent;color:var(--muted);font:inherit;font-weight:600;
+    padding:9px 15px;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;border-radius:0}
+  .tabs button[aria-selected="true"]{color:var(--ink);border-bottom-color:var(--accent)}
+  .tabs button:hover{color:var(--ink)}
+
+  /* Two blocks on top — steps at the left, the replay at the right — and the
+     audit list beneath them, where full width is worth having. */
+  .atop{display:grid;grid-template-columns:300px minmax(0,1fr);gap:18px;align-items:start}
+  @media (max-width:900px){ .atop{grid-template-columns:1fr} }
+  .aright{display:flex;flex-direction:column;gap:10px;min-width:0}
+  .asec{font-size:14px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);
+    margin:26px 0 10px;font-weight:600}
+  /* Audit cards. These lost their rules in an earlier refactor and were
+     rendering as bare buttons. Laid out wide now, so the journey wraps instead
+     of clipping and the identifying facts sit on one line. */
+  .slist{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:10px}
+  .sitem{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px;
+    cursor:pointer;color:var(--ink);font:inherit;text-align:left;display:flex;flex-direction:column;gap:7px}
+  .sitem:hover{border-color:var(--accent)}
+  .sitem[aria-current="true"]{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset}
+  .sitem .top{display:flex;align-items:center;gap:8px}
+  .sitem .id{font-family:ui-monospace,Menlo,monospace;font-size:10.5px;color:var(--muted);
+    border:1px solid var(--line);border-radius:20px;padding:2px 8px;white-space:nowrap}
+  .sitem[aria-current="true"] .id{color:var(--accent);border-color:var(--accent)}
+  .sitem .when{margin-left:auto;font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums;
+    white-space:nowrap}
+  .sitem .ttl{font-weight:600;font-size:13px;line-height:1.4;overflow-wrap:anywhere}
+  .sitem .meta{color:var(--muted);font-size:11.5px;font-variant-numeric:tabular-nums}
+
+  /* ---- player panel ---- */
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}
+  .phead{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;margin:0 0 10px}
+  .phead .url{color:var(--muted);font-size:12px;font-family:ui-monospace,Menlo,monospace;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}
+  .badge{font-size:11px;font-weight:600;padding:2px 7px;border-radius:20px;border:1px solid var(--line);color:var(--muted)}
+  .badge.live{color:var(--ok);border-color:var(--ok)}
+  .badge.trunc{color:var(--rec);border-color:var(--rec)}
+
+  /* One box, not three. The steps are the only thing worth a border here —
+     the site line is a label, so it is written out rather than boxed, and the
+     group is a plain run of rows under it. */
+  .tl{display:flex;flex-direction:column;gap:6px;max-height:520px;overflow-y:auto;
+    padding:12px;border:1px solid var(--line);border-radius:9px;background:var(--panel)}
+  .tlgroup{display:flex;flex-direction:column;gap:4px}
+  .tlgroup + .tlgroup{margin-top:10px;padding-top:10px;border-top:1px solid var(--line)}
+  .tlhead{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;padding:0 2px 2px}
+  .tlhead .site{font-weight:600;font-size:12.5px}
+  .tlhead .tabid{font-family:ui-monospace,Menlo,monospace;font-size:10.5px;color:var(--muted)}
+  .tlgroup[data-active="true"] .tlhead .site{color:var(--accent)}
+  .tlacts{display:flex;flex-direction:column;gap:4px}
+  .act{width:100%;text-align:left;border:1px solid var(--line);border-radius:6px;background:var(--bg);
+    color:var(--ink);font:inherit;font-size:12px;padding:6px 10px;cursor:pointer;
+    display:flex;gap:10px;align-items:baseline}
+  .act:hover{border-color:var(--accent)}
+  .act[aria-current="true"]{border-color:var(--accent);background:var(--accent);color:#fff}
+  .act[aria-current="true"] .t{color:#fff;opacity:.85}
+  .act .t{font-family:ui-monospace,Menlo,monospace;font-size:10.5px;color:var(--muted);
+    font-variant-numeric:tabular-nums;flex:none;min-width:30px}
+  .act .tool{font-weight:600}
+
+  /* ---- session transport: ONE scrubber across every tab ---- */
+  .transport{display:flex;align-items:center;gap:10px;margin:0 0 10px;padding:9px 11px;
+    border:1px solid var(--line);border-radius:8px;background:var(--bg)}
+  .transport .play{width:32px;height:32px;flex:none;border-radius:50%;border:1px solid var(--line);
+    background:var(--accent);color:#fff;font-size:12px;line-height:1;cursor:pointer;padding:0}
+  .transport .tnow{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;color:var(--muted);
+    font-variant-numeric:tabular-nums;flex:none;min-width:34px;text-align:center}
+  .scrub{flex:1;min-width:0;accent-color:var(--accent);height:4px}
+  .nowtab{font-size:11.5px;font-weight:600;color:var(--accent);flex:none;min-width:96px;text-align:right}
+  #player{margin-top:4px}
+  #player .rr-player{max-width:100%}
+  .empty{color:var(--muted);font-size:13px;padding:28px 0;text-align:center}
+  .err{color:var(--rec);font-size:13px;font-family:ui-monospace,Menlo,monospace;white-space:pre-wrap}
+  .hintbar{color:var(--muted);font-size:12px;margin:10px 0 0}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Browzy in Chrome</h1>
+  <p class="sub">Dev harness for the Audits pane — same markup and tokens as the options page.</p>
+
+  <div class="tabs" role="tablist">
+    <button role="tab" aria-selected="true" id="tab-audits">Audits</button>
+    <button role="tab" aria-selected="false" id="tab-recordings">Recordings</button>
+  </div>
+
+  <div id="pane-audits">
+    <div class="atop">
+      <div class="tl" id="timeline"></div>
+      <div class="aright">
+        <div class="phead">
+          <strong id="segTitle">No session</strong>
+          <span class="url" id="segUrl"></span>
+          <span class="badge" id="segBadge" hidden></span>
+        </div>
+        <div id="player"></div>
+        <div class="transport" id="transport" hidden>
+          <button id="playBtn" class="play" type="button" aria-label="Play">&#9654;</button>
+          <span class="tnow" id="tNow">0:00</span>
+          <input id="scrub" class="scrub" type="range" min="0" max="1000" value="0" step="1" aria-label="Session timeline">
+          <span class="tnow" id="tTotal">0:00</span>
+          <span class="nowtab" id="nowTab"></span>
+        </div>
+        <p class="err" id="err" hidden></p>
+      </div>
+    </div>
+
+    <h2 class="asec">Audits</h2>
+    <div class="slist" id="slist"></div>
+    <p class="hintbar" id="loadnote"></p>
+  </div>
+
+  <div id="pane-recordings" hidden>
+    <p class="empty">The existing Recordings UI lives here on the options page.</p>
+  </div>
+</div>
+
+<script src="../../extension/vendor/rrweb-player.umd.min.js"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+let DATA = null;      // { sessions: [ {meta, payload} ] }
+let cur = { session: null, segIndex: 0, player: null };
+
+// The dev harness loads whatever fixtures are listed; the options page will
+// read the same shapes out of IndexedDB instead.
+async function load() {
+  try {
+    const idx = await fetch("fixtures/index.json", { cache: "no-store" }).then((r) => r.json());
+    const sessions = [];
+    for (const f of idx.files) {
+      const payload = await fetch("fixtures/" + f, { cache: "no-store" }).then((r) => r.json());
+      sessions.push(payload);
+    }
+    DATA = { sessions };
+    $("loadnote").textContent = `${sessions.length} fixture${sessions.length === 1 ? "" : "s"} loaded`;
+    renderSessions();
+    if (sessions.length) selectSession(0);
+  } catch (e) {
+    $("loadnote").textContent = "";
+    showErr("Could not load fixtures/index.json — " + e.message +
+      "\nCapture a run first, then copy audit.json into scratch/audit-ui/fixtures/.");
+  }
+}
+
+function showErr(m) { const el = $("err"); el.hidden = false; el.textContent = m; }
+
+function fmtClock(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+function fmtWhen(t) {
+  return new Date(t).toLocaleString([], {
+    month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit"
+  });
+}
+
+function siteOf(url) {
+  try { return new URL(url).host; } catch { return ""; }
+}
+
+// The journey IS the identity. "client 1" means nothing on its own, and every
+// capture of the same page shares a title, so the list showed four rows reading
+// "untouched". The sequence of sites a session visited is what a reviewer
+// actually recognises it by.
+function journeyOf(payload) {
+  const hops = [];
+  for (const seg of payload.segments || []) {
+    const st = payload.streams[seg.streamId];
+    const site = siteOf(st && st.url) || `tab ${seg.tabId}`;
+    if (hops[hops.length - 1] !== site) hops.push(site);
+  }
+  return hops;
+}
+
+function renderSessions() {
+  const host = $("slist");
+  host.innerHTML = "";
+  DATA.sessions.forEach((p, i) => {
+    const s = p.session;
+    const segs = p.segments || [];
+    const hops = journeyOf(p);
+    const tabs = new Set(segs.map((x) => x.tabId)).size;
+    const b = document.createElement("button");
+    b.className = "sitem";
+    b.setAttribute("aria-current", String(i === 0));
+    b.innerHTML =
+      `<span class="top"><span class="id">session ${s.clientId}</span>` +
+      `<span class="when"></span></span>` +
+      `<span class="ttl"></span>` +
+      `<span class="meta">${(s.actions || []).length} actions · ` +
+      `${tabs} tab${tabs === 1 ? "" : "s"}</span>`;
+    b.querySelector(".when").textContent = fmtWhen(s.startedAt);
+    b.querySelector(".ttl").textContent = hops.length ? hops.join(" → ") : "(nothing recorded)";
+    b.title = s.sessionId;
+    b.onclick = () => selectSession(i);
+    host.appendChild(b);
+  });
+}
+
+function selectSession(i) {
+  cur.session = DATA.sessions[i];
+  [...$("slist").children].forEach((c, j) => c.setAttribute("aria-current", String(i === j)));
+  buildTimeline();
+}
+
+// ---------------------------------------------------------------------------
+// One timeline across the whole session.
+//
+// The streams cannot be concatenated — rrweb node ids are per-snapshot — so the
+// continuity is built here instead: each segment contributes its own window to
+// a single global clock, and playback swaps the underlying player at the
+// boundaries. The reviewer presses play once and the tab switches happen on
+// their own, which is the entire point of an audit.
+//
+// Dead time between segments is compressed out. Wall-clock gaps are time the
+// agent spent in ANOTHER tab, already shown by that tab's own segment, so
+// replaying them as a frozen screen would be showing nothing twice.
+const LEAD_IN_MS = 1000;   // a beat before the first action, for context
+const LEAD_OUT_MS = 3000;  // and the aftermath of the last one, so it is actually seen
+
+let T = { spans: [], total: 0, t: 0, playing: false, timer: null, mounted: -1, pinned: null };
+
+function buildTimeline() {
+  const { segments, streams } = cur.session;
+  T.spans = [];
+  let acc = 0;
+  segments.forEach((seg, i) => {
+    const st = streams[seg.streamId];
+    if (!st || !st.events || st.events.length < 2) return;
+    const first = st.events[0].timestamp;
+    const last = st.events[st.events.length - 1].timestamp;
+    const winStart = Math.max(first, seg.tStart - LEAD_IN_MS);
+    // Do NOT clamp the window to the stream's last event. rrweb stops emitting
+    // the moment a page goes quiet, so the final event can land milliseconds
+    // after the last action — clamping there cut the action's own aftermath
+    // off, and a scroll snapped away to the next tab just as it began. The
+    // window runs past the events; the SEEK is what gets clamped, below, so the
+    // replay simply holds its final frame for the remainder.
+    const winEnd = Math.max(seg.tEnd + LEAD_OUT_MS, winStart + 1500);
+    const dur = Math.max(900, winEnd - winStart);
+    T.spans.push({
+      segIndex: i, streamId: seg.streamId, tabId: seg.tabId,
+      first, last, streamDur: Math.max(0, last - first), winStart, dur, g0: acc,
+      site: siteOf(st.url) || `tab ${seg.tabId}`,
+      actions: seg.actions
+    });
+    acc += dur;
+  });
+  T.total = acc;
+  T.t = 0;
+  T.mounted = -1;
+  $("transport").hidden = T.spans.length === 0;
+  $("tTotal").textContent = fmtClock(T.total);
+  $("scrub").max = String(Math.max(1, Math.round(T.total)));
+  renderTimeline();
+  renderAt(0);
+}
+
+function spanAt(t) {
+  for (let i = T.spans.length - 1; i >= 0; i--) if (t >= T.spans[i].g0) return i;
+  return 0;
+}
+
+// Move the whole view to global time t: mount the right segment if it changed,
+// seek inside it, and keep the chrome (chips, markers, labels) in step.
+function renderAt(t, { play = false } = {}) {
+  if (!T.spans.length) return;
+  T.t = Math.max(0, Math.min(t, T.total));
+  const i = spanAt(T.t);
+  const sp = T.spans[i];
+  if (T.mounted !== i) {
+    T.mounted = i;
+    selectSegment(sp.segIndex, { fromTimeline: true });
+  }
+  // Clamp into the stream: past its end the player holds the final frame,
+  // which is what makes the lead-out above possible.
+  const localOffset = Math.min(sp.winStart - sp.first + (T.t - sp.g0), sp.streamDur);
+  seekTo(localOffset, play);
+  $("scrub").value = String(Math.round(T.t));
+  $("tNow").textContent = fmtClock(T.t);
+  $("nowTab").textContent = sp.site;
+  highlight(i);
+}
+
+// Global time of an action, so every chip reads on the ONE session clock the
+// scrubber shows rather than an offset into whichever stream it came from.
+function globalTimeOf(sp, a) {
+  return Math.max(sp.g0, Math.min(sp.g0 + sp.dur, sp.g0 + (a.t - sp.winStart)));
+}
+
+function renderTimeline() {
+  const host = $("timeline");
+  host.innerHTML = "";
+  if (!T.spans.length) {
+    host.innerHTML = '<span class="empty">Nothing was recorded in this session.</span>';
+    return;
+  }
+  T.spans.forEach((sp, i) => {
+    const g = document.createElement("div");
+    g.className = "tlgroup";
+    g.dataset.span = String(i);
+    const head = document.createElement("div");
+    head.className = "tlhead";
+    head.innerHTML = `<span class="site"></span><span class="tabid">tab ${sp.tabId}</span>`;
+    head.querySelector(".site").textContent = sp.site;
+    const acts = document.createElement("div");
+    acts.className = "tlacts";
+    sp.actions.forEach((a) => {
+      const gt = globalTimeOf(sp, a);
+      const b = document.createElement("button");
+      b.className = "act";
+      b.dataset.g = String(gt);
+      b.innerHTML = `<span class="t">${fmtClock(gt)}</span><span class="tool"></span>`;
+      b.querySelector(".tool").textContent = a.action ? `${a.tool}.${a.action}` : a.tool;
+      b.title = a.detail || "";
+      // Land a beat before the action, so it is seen in context rather than as
+      // a jump-cut to its aftermath.
+      b.onclick = () => {
+        setPlaying(false);
+        // Pin the clicked action: the seek lands a beat BEFORE it so the moment
+        // is seen in context, and without this the highlight recomputed from
+        // that earlier time and lit the previous action instead.
+        T.pinned = gt;
+        renderAt(Math.max(sp.g0, gt - 1200));
+      };
+      acts.appendChild(b);
+    });
+    g.appendChild(head);
+    g.appendChild(acts);
+    host.appendChild(g);
+  });
+}
+
+// Follow playback: light the group being played and the action last passed.
+function highlight(spanIndex) {
+  const groups = [...$("timeline").querySelectorAll(".tlgroup")];
+  groups.forEach((g, j) => g.setAttribute("data-active", String(j === spanIndex)));
+  const all = [...$("timeline").querySelectorAll(".act")];
+  let active = -1;
+  all.forEach((b, j) => { if (Number(b.dataset.g) <= T.t + 250) active = j; });
+  // A pinned action wins until the clock actually reaches it, then releases.
+  if (T.pinned != null) {
+    if (T.t + 250 < T.pinned) {
+      const idx = all.findIndex((b) => Number(b.dataset.g) === T.pinned);
+      if (idx >= 0) active = idx;
+    } else {
+      T.pinned = null;
+    }
+  }
+  all.forEach((b, j) => b.setAttribute("aria-current", String(j === active)));
+  if (active >= 0 && all[active]) {
+    all[active].scrollIntoView({ block: "nearest" });
+  }
+}
+
+function setPlaying(on) {
+  T.playing = on;
+  $("playBtn").textContent = on ? "❚❚" : "▶";
+  $("playBtn").setAttribute("aria-label", on ? "Pause" : "Play");
+  if (T.timer) clearInterval(T.timer);
+  T.timer = null;
+  if (!on) {
+    if (cur.player) { try { cur.player.pause(); } catch {} }
+    return;
+  }
+  if (T.t >= T.total - 50) T.t = 0; // replay from the top rather than stalling
+  renderAt(T.t, { play: true });
+  // Derive elapsed time from the wall clock rather than accumulating a fixed
+  // step per tick. Chrome throttles timers in a background tab to about 1Hz, so
+  // a `t += 100` clock ran roughly eight times slow the moment the page lost
+  // focus — the audit played in slow motion and never reached the second tab.
+  // Reading the clock makes throttling cost smoothness, never rate.
+  const wall0 = Date.now();
+  const base = T.t;
+  T.timer = setInterval(() => {
+    const next = base + (Date.now() - wall0);
+    if (next >= T.total) { renderAt(T.total); setPlaying(false); return; }
+    const before = spanAt(T.t);
+    const after = spanAt(next);
+    // Only re-seek the underlying player at a boundary; in between it plays on
+    // its own clock, so playback stays smooth instead of stuttering every tick.
+    if (before !== after) renderAt(next, { play: true });
+    else {
+      // Refresh the highlight on EVERY tick, not just at a tab boundary. This
+      // branch used to update the clock alone, so the active action only moved
+      // when the tab changed and stood still through all the actions between.
+      T.t = next;
+      $("scrub").value = String(Math.round(T.t));
+      $("tNow").textContent = fmtClock(T.t);
+      highlight(after);
+    }
+  }, 100);
+}
+
+function selectSegment(i, opts = {}) {
+  const { segments, streams } = cur.session;
+  cur.segIndex = i;
+  const seg = segments[i];
+  if (!seg) return;
+  const st = streams[seg.streamId];
+
+  $("segTitle").textContent = (st && st.title) || `Segment ${i + 1}`;
+  $("segUrl").textContent = (st && st.url) || "";
+  const badge = $("segBadge");
+  if (st && st.truncated) { badge.hidden = false; badge.className = "badge trunc"; badge.textContent = "truncated — size cap"; }
+  else if (st && !st.endedAt) { badge.hidden = false; badge.className = "badge live"; badge.textContent = "still open"; }
+  else badge.hidden = true;
+
+  mountPlayer(st, seg);
+}
+
+function mountPlayer(stream, seg) {
+  const host = $("player");
+  host.innerHTML = "";
+  if (cur.player) cur.player = null;
+  if (!stream || !stream.events || stream.events.length < 2) {
+    host.innerHTML = '<p class="empty">This segment has too few events to replay.</p>';
+    return;
+  }
+  // The UMD build exposes a module namespace, not the constructor itself.
+  const Player = (window.rrwebPlayer && window.rrwebPlayer.default) || window.rrwebPlayer;
+  if (typeof Player !== "function") { showErr("rrweb-player did not load"); return; }
+  try {
+    cur.player = new Player({
+      target: host,
+      props: {
+        events: stream.events,
+        width: Math.min(host.clientWidth || 900, 1000),
+        height: 420,
+        autoPlay: false,
+        showController: false
+      }
+    });
+    // Open on the moment the agent first acted here, not at the page's birth —
+    // the interesting part is the action, and a few seconds around it.
+    const t0 = stream.events[0].timestamp;
+    seekTo(seg.tStart - t0 - 1000);
+  } catch (e) {
+    showErr("Player failed: " + e.message);
+  }
+}
+
+function seekTo(offsetMs, play = false) {
+  if (!cur.player) return;
+  try { cur.player.goto(Math.max(0, offsetMs), play); } catch {}
+}
+
+$("playBtn").onclick = () => setPlaying(!T.playing);
+$("scrub").oninput = (e) => { setPlaying(false); T.pinned = null; renderAt(Number(e.target.value)); };
+
+load();
+</script>
+</body>
+</html>

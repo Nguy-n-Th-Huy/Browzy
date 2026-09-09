@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Skills — Browzy</title>
+<link rel="stylesheet" href="../ui/tokens.css" />
+<link rel="stylesheet" href="../ui/base.css" />
+<link rel="stylesheet" href="../ui/components.css" />
+<link rel="stylesheet" href="../ui/prose.css" />
+<script type="module" src="../ui/theme.js"></script>
+<script type="module" src="../ui/behaviors.js"></script>
+<style>
+  /* Page-local layout only — see settings.html's own note: shared tokens/
+     primitives in extension/ui/** are not edited here, only reused. */
+  .panel-shell {
+    max-width: 640px;
+    margin: 0 auto;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    background: var(--color-canvas);
+  }
+  .panel-scroll {
+    flex: 1;
+    overflow-y: auto;
+    padding: var(--space-4) var(--panel-gutter) var(--space-8);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+  #import-row { display: flex; flex-direction: column; gap: var(--space-2); }
+  #import-row .field-row { align-items: flex-end; gap: var(--space-2); }
+  #import-row .field { flex: 1; margin-bottom: 0; }
+  .skill-card { display: flex; flex-direction: column; gap: var(--space-2); }
+  .skill-card-head { display: flex; align-items: flex-start; gap: var(--space-3); }
+  .skill-card-body { flex: 1; min-width: 0; }
+  .skill-card-source { margin-top: 6px; font-family: var(--font-mono); }
+  .skill-card-actions { display: flex; gap: var(--space-2); justify-content: flex-end; }
+
+  /* Same `.btn[hidden]` specificity defect settings.html already documents
+     and compensates for (extension/ui/components.css's shared .btn class
+     sets display:inline-flex, which beats the UA [hidden] default) — this
+     page renders/hides busy-state buttons the same way, so it needs the
+     same page-local compensation. */
+  .btn[hidden] { display: none; }
+</style>
+</head>
+<body>
+<div class="panel-shell">
+  <header class="panel-header">
+    <button class="btn-icon" aria-label="Quay lại" id="btn-back"></button>
+    <span class="panel-header-title" style="font-size:var(--font-size-h2)">Skills</span>
+    <div class="panel-header-actions"></div>
+  </header>
+
+  <main class="panel-scroll">
+    <div id="banner-area"></div>
+
+    <p class="section-heading">Nhập skill mới</p>
+    <div class="field-group">
+      <div class="field-group-item" id="import-row">
+        <div class="field">
+          <label class="field-label" for="import-path">Đường dẫn thư mục skill</label>
+          <input class="input" id="import-path" type="text" autocomplete="off" spellcheck="false"
+                 placeholder="vd: C:\Users\ban\skills\tom-tat-trang" />
+          <p class="field-hint">Chỉ thư mục bạn chỉ định được đọc — không tự động quét thư mục cấu hình cá nhân hay dự án nào khác. Thư mục phải chứa một tệp SKILL.md ở gốc.</p>
+        </div>
+        <div class="field-row">
+          <button class="btn btn-secondary btn-sm" type="button" id="btn-import"><span id="ic-folder"></span>Nhập thư mục</button>
+        </div>
+      </div>
+    </div>
+
+    <p class="section-heading">Tạo skill mới</p>
+    <div class="field-group">
+      <div class="field-group-item" id="author-row">
+        <div class="field">
+          <label class="field-label" for="author-name">Tên skill</label>
+          <input class="input" id="author-name" type="text" autocomplete="off" spellcheck="false"
+                 placeholder="vd: tom-tat-trang" />
+          <p class="field-hint">Chỉ chữ, số, "_" hoặc "-" (1-64 ký tự), không dùng dấu cách hay đường dẫn.</p>
+        </div>
+        <div class="field">
+          <label class="field-label" for="author-description">Mô tả</label>
+          <input class="input" id="author-description" type="text" autocomplete="off" spellcheck="false"
+                 placeholder="Mô tả ngắn để mô hình biết khi nào nên dùng skill này" />
+        </div>
+        <div class="field">
+          <label class="field-label" for="author-body">Nội dung (Markdown)</label>
+          <textarea class="textarea" id="author-body" rows="8" spellcheck="false"
+                    placeholder="Hướng dẫn chi tiết cho skill này…"></textarea>
+        </div>
+        <div class="field">
+          <label class="field-label" for="author-allowed-tools">Công cụ được phép (tùy chọn)</label>
+          <input class="input" id="author-allowed-tools" type="text" autocomplete="off" spellcheck="false"
+                 placeholder="vd: Read, Skill" />
+          <p class="field-hint">Cách nhau bởi dấu phẩy. Để trống nếu skill chỉ cần đọc tài nguyên của chính nó.</p>
+        </div>
+        <div class="field-row">
+          <span class="field-label">Cho phép gọi thủ công (/tên-skill)</span>
+          <label class="switch">
+            <input type="checkbox" id="author-user-invocable" checked aria-label="Cho phép gọi thủ công">
+            <span class="switch-track"></span>
+            <span class="switch-thumb"></span>
+          </label>
+        </div>
+        <div class="field-row">
+          <span class="field-label">Cho phép mô hình tự động gọi</span>
+          <label class="switch">
+            <input type="checkbox" id="author-model-invocable" checked aria-label="Cho phép mô hình tự động gọi">
+            <span class="switch-track"></span>
+            <span class="switch-thumb"></span>
+          </label>
+        </div>
+        <div class="field-row">
+          <button class="btn btn-secondary btn-sm" type="button" id="btn-author"><span id="ic-plus"></span>Tạo skill</button>
+        </div>
+      </div>
+    </div>
+
+    <p class="section-heading">Đã nhập</p>
+    <div id="skill-list" style="display:flex;flex-direction:column;gap:8px"></div>
+    <p class="field-hint" id="skills-empty" hidden>Chưa có skill nào — nhập một thư mục skill ở trên để bắt đầu.</p>
+  </main>
+</div>
+
+<script type="module" src="./skills-app.js"></script>
+</body>
+</html>

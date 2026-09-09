@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Reference: skills</title>
+<link rel="stylesheet" href="../../../../../extension/ui/tokens.css" />
+<link rel="stylesheet" href="../../../../../extension/ui/base.css" />
+<link rel="stylesheet" href="../../../../../extension/ui/components.css" />
+<link rel="stylesheet" href="../../../../../extension/ui/prose.css" />
+<link rel="stylesheet" href="../shell.css" />
+<script type="module" src="../../../../../extension/ui/theme.js"></script>
+<script type="module" src="../../../../../extension/ui/behaviors.js"></script>
+</head>
+<body>
+<div class="qa-frame-label">skills</div>
+<div class="panel-shell">
+  <header class="panel-header">
+    <button class="btn-icon" aria-label="Quay lại" id="btn-back"></button>
+    <span class="panel-header-title" style="font-size:var(--font-size-h2)">Skills</span>
+    <div class="panel-header-actions">
+      <button class="btn btn-secondary btn-sm" type="button" id="btn-import"><span id="ic-folder"></span>Nhập thư mục</button>
+    </div>
+  </header>
+
+  <main class="panel-scroll">
+
+  <div style="display:flex;flex-direction:column;gap:8px">
+    <div class="card" style="display:flex;flex-direction:column;gap:8px">
+      <div style="display:flex;align-items:flex-start;gap:12px">
+        <span class="list-item-icon" id="ic-s1"></span>
+        <div style="flex:1;min-width:0">
+          <p class="card-title">tom-tat-trang</p>
+          <p class="card-body">Tóm tắt nội dung trang hiện tại thành các gạch đầu dòng ngắn gọn.</p>
+          <p class="field-hint" style="margin-top:6px;font-family:var(--font-mono)">~/.claude-skills/tom-tat-trang · đã nhập 12/08</p>
+        </div>
+        <label class="switch">
+          <input type="checkbox" checked aria-label="Bật/tắt skill tom-tat-trang">
+          <span class="switch-track"></span>
+          <span class="switch-thumb"></span>
+        </label>
+      </div>
+      <div style="display:flex;gap:8px;justify-content:flex-end">
+        <button class="btn btn-ghost btn-sm" type="button"><span id="ic-refresh1"></span>Nạp lại</button>
+        <button class="btn btn-ghost btn-sm" type="button" style="color:var(--color-status-danger)"><span id="ic-trash1"></span>Gỡ bỏ</button>
+      </div>
+    </div>
+
+    <div class="card" style="display:flex;flex-direction:column;gap:8px">
+      <div style="display:flex;align-items:flex-start;gap:12px">
+        <span class="list-item-icon" id="ic-s2"></span>
+        <div style="flex:1;min-width:0">
+          <p class="card-title">dien-bieu-mau</p>
+          <p class="card-body">Điền và gửi biểu mẫu trên trang web hiện tại theo dữ liệu người dùng cung cấp.</p>
+          <p class="field-hint" style="margin-top:6px;font-family:var(--font-mono)">~/skills-shared/dien-bieu-mau · đã nhập 03/07</p>
+        </div>
+        <label class="switch">
+          <input type="checkbox" aria-label="Bật/tắt skill dien-bieu-mau">
+          <span class="switch-track"></span>
+          <span class="switch-thumb"></span>
+        </label>
+      </div>
+      <div style="display:flex;gap:8px;justify-content:flex-end">
+        <button class="btn btn-ghost btn-sm" type="button"><span id="ic-refresh2"></span>Nạp lại</button>
+        <button class="btn btn-ghost btn-sm" type="button" style="color:var(--color-status-danger)"><span id="ic-trash2"></span>Gỡ bỏ</button>
+      </div>
+    </div>
+
+    <div class="card" style="border-color:var(--color-status-danger)">
+      <div style="display:flex;align-items:flex-start;gap:12px">
+        <span class="list-item-icon" style="color:var(--color-status-danger)" id="ic-s3"></span>
+        <div style="flex:1;min-width:0">
+          <p class="card-title">script-tu-dong</p>
+          <p class="card-body">Yêu cầu chạy script hệ thống — chưa được hỗ trợ.</p>
+          <p class="field-error" style="margin-top:6px"><span id="ic-alert"></span>Cần quyền ghi/thực thi mà ứng dụng chưa hỗ trợ; chỉ đọc tài nguyên và duyệt web được bật.</p>
+        </div>
+      </div>
+    </div>
+
+    <button class="suggestion-item" type="button" style="max-width:none">
+      <span id="ic-plus"></span>
+      <span>Chưa có skill nào khác — nhập một thư mục skill để bắt đầu</span>
+    </button>
+  </div>
+  </main>
+</div>
+
+<script type="module">
+  import { iconMarkup } from "../../../../../extension/ui/icons.js";
+  document.getElementById("btn-back").innerHTML = iconMarkup("chevronRight", { size: 18, title: "Quay lại" });
+  document.getElementById("btn-back").style.transform = "scaleX(-1)";
+  document.getElementById("ic-folder").innerHTML = iconMarkup("folder", { size: 15 });
+  document.getElementById("ic-s1").innerHTML = iconMarkup("skills", { size: 18 });
+  document.getElementById("ic-s2").innerHTML = iconMarkup("skills", { size: 18 });
+  document.getElementById("ic-s3").innerHTML = iconMarkup("skills", { size: 18 });
+  document.getElementById("ic-refresh1").innerHTML = iconMarkup("refresh", { size: 14 });
+  document.getElementById("ic-refresh2").innerHTML = iconMarkup("refresh", { size: 14 });
+  document.getElementById("ic-trash1").innerHTML = iconMarkup("trash", { size: 14 });
+  document.getElementById("ic-trash2").innerHTML = iconMarkup("trash", { size: 14 });
+  document.getElementById("ic-alert").innerHTML = iconMarkup("alertTriangle", { size: 14 });
+  document.getElementById("ic-plus").innerHTML = iconMarkup("plus", { size: 18 });
+</script>
+</body>
+</html>

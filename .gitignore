@@ -1,0 +1,45 @@
+node_modules/
+host/native-host-wrapper.sh
+host/native-host-wrapper.bat
+host/com.anthropic.browzy_in_chrome.json
+# The pre-rename registration left behind on a machine that ran an older
+# install.sh. Machine-local like the one above, and equally never committed.
+host/com.anthropic.open_claude_in_chrome.json
+# install.sh backup/rollback artifacts for the two files above (never a
+# committed product file — always a snapshot of this machine's prior
+# native-messaging registration)
+host/*.bak
+host/*.registry-backup.reg
+.env
+*.log
+.DS_Store
+.wrangler/
+
+# signing key + packaged build (never commit the key)
+extension.pem
+extension.crx
+
+# benchmark research data (486MB base64 trajectories, frames, logs) — not extension code
+benchmark/data/
+benchmark/environments/
+benchmark/logs/
+benchmark/throttle_evidence/
+benchmark/__pycache__/
+
+# personal research data — never commit
+DO_NOT_COMMIT/
+
+# Design canvases are built from the .dc.html sources beside them by the
+# design skill's seeder; the built page embeds a ~2 MB editor payload and is
+# regenerated on every edit, so only the sources are worth versioning.
+plans/**/*.html
+!plans/**/*.dc.html
+
+# Web Store upload packages, rebuilt by package-extension.sh
+build/
+
+# Manually exported Web Store package (package-extension.sh writes to build/)
+extension.zip
+
+# Local Claude Code session state (agent memory, local settings, local skills).
+.claude/

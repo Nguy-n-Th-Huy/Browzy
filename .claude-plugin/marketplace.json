@@ -1,0 +1,17 @@
+{
+  "name": "browzy-marketplace",
+  "owner": {
+    "name": "Browzy"
+  },
+  "plugins": [
+    {
+      "name": "browzy",
+      "description": "Browser automation for Claude Code via the Browzy in Chrome extension: 26 MCP tools over the bundled MCP server. Requires the native messaging host to be registered separately — see the plugin's browzy-setup skill or run `browzy install` from @huydepzai2810/browzy-host.",
+      "source": {
+        "source": "npm",
+        "package": "@huydepzai2810/browzy-host",
+        "version": "1.0.0"
+      }
+    }
+  ]
+}

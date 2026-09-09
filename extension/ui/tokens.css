@@ -1,0 +1,238 @@
+/*
+ * Shared design tokens for the Browzy extension UI.
+ *
+ * Consumed by extension/settings/ and extension/sidepanel/. Plain CSS custom
+ * properties, no build step, no framework. Nothing downstream hardcodes a
+ * colour: every surface, text tone, border and accent in the panel and the
+ * settings screens resolves through this file, which is what makes a palette
+ * change a one-file change.
+ *
+ * The palette is Aurora, the direction settled for the remote-control
+ * overlay (extension/overlay/pointer-overlay.js) and carried through to the
+ * rest of the UI so the page a run is driving and the panel driving it read
+ * as one product. It replaces the earlier warm scheme (off-white #F7F5F2 /
+ * charcoal #191918 / terracotta #C4785B) wholesale — hue, ground and text
+ * tone all moved, not just the accent.
+ *
+ * Aurora is built from two hues at equal lightness and chroma, oklch(0.74
+ * 0.19 215) cyan and oklch(0.74 0.19 300) violet. Only cyan becomes a token
+ * here; see the accent block for why violet does not.
+ *
+ * EVERY text/background and accent pairing below was measured against WCAG
+ * 2.1 AA and carries its ratio inline. Three of them constrain the palette
+ * rather than follow from it, and would be easy to break by "tidying" a
+ * value:
+ *
+ *  1. Cyan at its authored lightness is 1.87:1 on the light canvas — far
+ *     below AA for text. The light theme therefore carries THREE cyan steps,
+ *     not one: --color-accent for fills and icons (3.63:1, non-text only),
+ *     --color-accent-text one step darker for anything body-sized (4.63:1),
+ *     and --color-accent-fg as the label colour on an accent fill (4.87:1
+ *     against it). The dark theme needs no such split: there the authored
+ *     cyan already clears 9.62:1 and is used as-is.
+ *  2. --color-accent-fg is DARK, not white. White on the light theme's
+ *     accent fill reaches only 3.89:1; the near-black reaches 4.87:1. This
+ *     inverts the usual instinct and is deliberate.
+ *  3. A single border colour cannot be both quiet and pass 3:1 everywhere.
+ *     Two tokens exist: --color-border-subtle (decorative dividers and card
+ *     edges that are reinforced by a background change or shadow) and
+ *     --color-border (>=3:1 against canvas, surface AND sunken in both
+ *     themes, for functional boundaries — inputs, outlined buttons, and
+ *     anything whose visibility is the only cue of an interactive edge).
+ *     The sunken surface is the binding constraint in both themes; a border
+ *     that passes on canvas can still fail there.
+ */
+
+:root {
+  color-scheme: light;
+
+  /* ---- Color: surfaces ---- */
+  --color-canvas: #f6f7f9;
+  --color-surface: #ffffff; /* slightly raised: cards, composer, menus */
+  --color-surface-sunken: #eceef2; /* inputs, code blocks */
+  /* Paper. Deliberately the same in both themes: it backs a rendered document
+     page (a PDF canvas), which pdf.js draws onto transparently — a themed
+     surface there would put dark glyphs on a dark ground. Not a UI surface;
+     never use it for panel chrome. */
+  --color-paper: #ffffff;
+  --color-overlay-scrim: rgba(11, 11, 17, 0.34);
+
+  /* ---- Color: text ----
+   * Two text tones cover three usage tiers without introducing a third
+   * token: primary text (body, headings) and a quieter secondary tone for
+   * metadata, labels and inactive icon strokes. Where a design calls for a
+   * third, still-quieter tier, it resolves to --color-text-secondary rather
+   * than earning its own token — one fewer value to keep measured, and the
+   * tier below secondary is never the sole carrier of meaning anyway.
+   */
+  --color-text: #16161c; /* 16.81:1 on canvas, 18.02:1 on surface */
+  --color-text-secondary: #5c5e70; /* 5.95:1 on canvas, 6.38:1 on surface */
+  --color-text-on-accent: #04121a; /* --color-accent-fg alias, see below */
+
+  /* ---- Color: borders ---- */
+  --color-border-subtle: #e2e4ea; /* decorative only, ~1.2:1 */
+  --color-border: #83859a; /* functional: 3.39 canvas / 3.63 surface / 3.12 sunken */
+  --color-focus-ring: #00607f; /* 6.57:1 on canvas, always paired with a visible outline */
+
+  /* ---- Color: accent (Aurora cyan) ----
+   * The two Aurora hues are oklch(0.74 0.19 215) cyan and
+   * oklch(0.74 0.19 300) violet: equal lightness and chroma, hue apart.
+   * At that lightness cyan measures only 1.87:1 on the light canvas, so the
+   * light theme steps it down for anything text-sized, while the dark theme
+   * (where it clears 9.62:1) uses it exactly as authored. Violet is the
+   * overlay layer's second hue and does not appear as a token here: nothing
+   * in the panel needs a second accent, and adding one would invite using it
+   * as the sole carrier of meaning. */
+  --color-accent: #008bb9; /* 3.63:1 on canvas -- fills/icons/large elements only */
+  --color-accent-text: #0078a5; /* 4.63:1 on canvas, 4.96:1 on surface -- accent-colored body text/links */
+  --color-accent-fg: #04121a; /* label color on accent-filled surfaces, 4.87:1 on accent */
+  --color-accent-tint: rgba(0, 139, 185, 0.12); /* selected/hover tint, paired with text tokens for contrast */
+
+  /* ---- Color: status ---- */
+  --color-status-running: #1d5fae; /* 5.94:1 */
+  --color-status-success: #1e7a46; /* 4.99:1 */
+  --color-status-danger: #b3261e; /* 6.10:1 */
+  --color-status-warning: #8a5a00; /* 5.53:1 */
+  --color-status-neutral: var(--color-text-secondary);
+
+  /* ---- Spacing: 4px base ---- */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+  --panel-gutter: clamp(12px, 3.5vw, 16px);
+
+  /* ---- Type ---- */
+  --font-sans:
+    system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial,
+    "Noto Sans", "Noto Sans JP", "Noto Sans SC", sans-serif;
+  /* Restrained reading serif for headings only; falls back to the sans
+     stack (which has full Vietnamese coverage) if the serif is missing
+     required Vietnamese glyphs, so diacritics never fall back to tofu. */
+  --font-serif: "Source Serif 4", ui-serif, Georgia, "Noto Serif", var(--font-sans);
+  --font-mono:
+    ui-monospace, "Cascadia Code", "Segoe UI Mono", Consolas, "Liberation Mono",
+    Menlo, monospace;
+
+  --font-size-body: 15px; /* within 14-16px */
+  --font-size-ui: 14px;
+  --font-size-small: 12.5px;
+  --font-size-h3: 15px;
+  --font-size-h2: 17px;
+  --font-size-h1: 20px;
+  --line-height-body: 1.6; /* within 1.5-1.65 */
+  --line-height-tight: 1.3;
+
+  /* ---- Radius ---- */
+  --radius-composer: 16px;
+  --radius-md: 12px; /* cards, menus */
+  --radius-sm: 10px; /* menus/cards lower bound, buttons */
+  --radius-pill: 999px;
+
+  /* ---- Shadow (subtle elevation only, no glass/gradient effects) ---- */
+  --shadow-sm: 0 1px 2px rgba(11, 11, 17, 0.07);
+  --shadow-md: 0 6px 20px rgba(11, 11, 17, 0.13);
+
+  /* ---- Icons ---- */
+  --icon-size-sm: 16px;
+  --icon-size-md: 18px;
+  --icon-size-lg: 20px;
+  --icon-stroke-width: 1.75;
+
+  /* ---- Pointer targets ---- */
+  --target-min: 32px;
+  --target-primary: 44px;
+
+  /* ---- Motion: 120-180ms opacity/color transitions only ---- */
+  --motion-duration: 150ms;
+  --motion-easing: cubic-bezier(0.2, 0, 0, 1);
+}
+
+/* System dark theme, unless the user explicitly forced light. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+
+    --color-canvas: #0b0b11;
+    --color-surface: #12121b;
+    --color-surface-sunken: #08080c;
+    --color-overlay-scrim: rgba(0, 0, 0, 0.55);
+
+    --color-text: #e8e6f2; /* 15.91:1 on canvas, 15.10:1 on surface */
+    --color-text-secondary: #9d9ab0; /* 7.18:1 on canvas, 6.81:1 on surface */
+
+    --color-border-subtle: #232231;
+    --color-border: #63617e; /* 3.31:1 on canvas, 3.14:1 on surface, 3.37:1 on sunken */
+    --color-focus-ring: #5fd8f5; /* 11.80:1 on canvas */
+
+    --color-accent: #00c5f4; /* 9.62:1 on canvas -- the authored Aurora cyan, usable as text here */
+    --color-accent-text: #00c5f4;
+    --color-accent-fg: #04121a; /* 9.30:1 on accent */
+    --color-text-on-accent: #04121a; /* alias of --color-accent-fg, restated so it cannot inherit the light value */
+    --color-accent-tint: rgba(0, 197, 244, 0.16);
+
+    --color-status-running: #7cc4ff; /* 10.46:1 */
+    --color-status-success: #6fdca4; /* 11.63:1 */
+    --color-status-danger: #ff8f84; /* 8.89:1 */
+    --color-status-warning: #f2c16b; /* 11.79:1 */
+
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+    --shadow-md: 0 10px 28px rgba(0, 0, 0, 0.5);
+  }
+}
+
+/* Explicit persisted override wins in both directions. theme.js sets
+   data-theme="light" or data-theme="dark" on the root element after
+   reading the stored preference; absence of the attribute means "follow
+   the system", handled by the media query above. */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --color-canvas: #0b0b11;
+  --color-surface: #12121b;
+  --color-surface-sunken: #08080c;
+  --color-overlay-scrim: rgba(0, 0, 0, 0.55);
+
+  --color-text: #e8e6f2;
+  --color-text-secondary: #9d9ab0;
+
+  --color-border-subtle: #232231;
+  --color-border: #63617e;
+  --color-focus-ring: #5fd8f5;
+
+  --color-accent: #00c5f4;
+  --color-accent-text: #00c5f4;
+  --color-accent-fg: #04121a;
+  --color-text-on-accent: #04121a;
+  --color-accent-tint: rgba(0, 197, 244, 0.16);
+
+  --color-status-running: #7cc4ff;
+  --color-status-success: #6fdca4;
+  --color-status-danger: #ff8f84;
+  --color-status-warning: #f2c16b;
+
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 10px 28px rgba(0, 0, 0, 0.5);
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  /* Re-declares nothing: the bare :root block above already holds every
+     light value, and this selector's presence is what keeps the dark
+     media query from applying via its :not([data-theme="light"]) guard. */
+}
+
+/* Reduced motion: keep state changes, drop the decorative easing/duration. */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --motion-duration: 0.01ms;
+  }
+}
+:root[data-motion="reduce"] {
+  --motion-duration: 0.01ms;
+}

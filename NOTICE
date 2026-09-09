@@ -1,0 +1,42 @@
+Browzy in Chrome
+================
+
+This project began as a fork of "Open Claude in Chrome", started by
+Sebastian Sosa on 2026-07-21 and licensed under the PolyForm Noncommercial
+License 1.0.0 (see LICENSE, which continues to apply).
+
+The current source tree is substantially rewritten. Measured by `git blame`
+over the tracked source files (js, mjs, sh, ps1, css, html; excluding
+vendored, generated and build output) on the pre-squash history:
+
+    Nguyễn Thế Huy    57,880 lines   71.3%
+    Sebastian Sosa    20,965 lines   25.8%
+    Al31415            1,718 lines    2.1%
+    Rocker Zhang         594 lines    0.7%
+                      ------------
+                      81,157 lines
+
+The commit history was squashed into a single initial commit on 2026-09-09.
+That squash removed the individual commits, not the authorship of the code
+those commits contributed — roughly a quarter of the tree above is still the
+work of the upstream authors named here, which is why this file exists.
+
+Later work in this repository, including the Browzy rebrand, file
+attachments, effort control, prompt enhancement, the slash-dispatch and
+session-skills plugin mechanism, provider profile handling and the
+installers, is by Nguyễn Thế Huy.
+
+Bundled third-party fonts
+-------------------------
+
+The host package ships DejaVu Sans (regular and bold) through the
+`dejavu-fonts-ttf` dependency, used to embed a Unicode font in generated PDF
+documents — the PDF standard fonts are WinAnsi-encoded and cannot represent
+Vietnamese at all. DejaVu Fonts are released under the DejaVu Fonts License,
+a free license derived from the Bitstream Vera Fonts Copyright:
+
+    Fonts are (c) Bitstream (see below). DejaVu changes are in public domain.
+    Glyphs imported from Arev fonts are (c) Tavmjong Bah (see below).
+
+The full license text ships with the dependency at
+`node_modules/dejavu-fonts-ttf/LICENSE`.

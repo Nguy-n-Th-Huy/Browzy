@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Reference: history</title>
+<link rel="stylesheet" href="../../../../../extension/ui/tokens.css" />
+<link rel="stylesheet" href="../../../../../extension/ui/base.css" />
+<link rel="stylesheet" href="../../../../../extension/ui/components.css" />
+<link rel="stylesheet" href="../../../../../extension/ui/prose.css" />
+<link rel="stylesheet" href="../shell.css" />
+<script type="module" src="../../../../../extension/ui/theme.js"></script>
+<script type="module" src="../../../../../extension/ui/behaviors.js"></script>
+</head>
+<body>
+<div class="qa-frame-label">history</div>
+<div class="panel-shell">
+  <header class="panel-header">
+    <button class="btn-icon" aria-label="Quay lại" id="btn-back"></button>
+    <span class="panel-header-title" style="font-size:var(--font-size-h2)">Lịch sử &amp; bản ghi</span>
+    <div class="panel-header-actions">
+      <button class="btn btn-primary btn-sm" type="button" id="btn-new"><span id="ic-plus"></span>Mới</button>
+    </div>
+  </header>
+
+  <main class="panel-scroll">
+  <p class="section-heading">Cuộc trò chuyện</p>
+  <div style="display:flex;flex-direction:column;gap:8px">
+    <div class="list-item" aria-current="true" style="border-color:var(--color-accent)">
+      <span class="list-item-icon" style="color:var(--color-accent-text)" id="ic-c1"></span>
+      <span class="list-item-main">
+        <span class="list-item-title">Tóm tắt kinh tế quý III</span>
+        <span class="list-item-sub">Đang mở · vnexpress.net · 3 tin nhắn</span>
+      </span>
+      <span class="status-pill is-running">Đang chạy</span>
+      <button class="btn-icon" aria-label="Xóa cuộc trò chuyện" id="ic-del1"></button>
+    </div>
+    <div class="list-item">
+      <span class="list-item-icon" id="ic-c2"></span>
+      <span class="list-item-main">
+        <span class="list-item-title">Tìm trang liên hệ và điền biểu mẫu</span>
+        <span class="list-item-sub">Hôm qua, 21:14 · shop.example.com</span>
+      </span>
+      <button class="btn-icon" aria-label="Mở lại cuộc trò chuyện" id="ic-open2"></button>
+      <button class="btn-icon" aria-label="Xóa cuộc trò chuyện" id="ic-del2"></button>
+    </div>
+    <div class="list-item">
+      <span class="list-item-icon" id="ic-c3"></span>
+      <span class="list-item-main">
+        <span class="list-item-title">Phân tích nội dung bài blog</span>
+        <span class="list-item-sub">Thứ Hai, 09:02 · dev.to</span>
+      </span>
+      <button class="btn-icon" aria-label="Mở lại cuộc trò chuyện" id="ic-open3"></button>
+      <button class="btn-icon" aria-label="Xóa cuộc trò chuyện" id="ic-del3"></button>
+    </div>
+    <div class="list-item">
+      <span class="list-item-icon" id="ic-c4"></span>
+      <span class="list-item-main">
+        <span class="list-item-title">Câu hỏi bị gián đoạn</span>
+        <span class="list-item-sub">18/08 · interrupted.example.com</span>
+      </span>
+      <span class="status-pill is-unknown">Bị gián đoạn</span>
+      <button class="btn-icon" aria-label="Xóa cuộc trò chuyện" id="ic-del4"></button>
+    </div>
+  </div>
+
+  <p class="section-heading">Bản ghi thao tác</p>
+  <div style="display:flex;flex-direction:column;gap:8px">
+    <div class="list-item">
+      <span class="list-item-icon" id="ic-r1"></span>
+      <span class="list-item-main">
+        <span class="list-item-title">rec_2f9a — đặt hàng mẫu</span>
+        <span class="list-item-sub">4 phút 12 giây · có âm thanh tường thuật</span>
+      </span>
+      <button class="btn btn-secondary btn-sm" type="button">Đính kèm</button>
+    </div>
+    <div class="list-item">
+      <span class="list-item-icon" id="ic-r2"></span>
+      <span class="list-item-main">
+        <span class="list-item-title">rec_1c07 — đăng nhập &amp; kiểm tra hồ sơ</span>
+        <span class="list-item-sub">1 phút 48 giây</span>
+      </span>
+      <button class="btn btn-secondary btn-sm" type="button">Đính kèm</button>
+    </div>
+  </div>
+  </main>
+</div>
+
+<script type="module">
+  import { iconMarkup } from "../../../../../extension/ui/icons.js";
+  document.getElementById("btn-back").innerHTML = iconMarkup("chevronRight", { size: 18, title: "Quay lại" });
+  document.getElementById("btn-back").style.transform = "scaleX(-1)";
+  document.getElementById("ic-plus").innerHTML = iconMarkup("plus", { size: 15 });
+  document.getElementById("ic-c1").innerHTML = iconMarkup("page", { size: 18 });
+  document.getElementById("ic-c2").innerHTML = iconMarkup("page", { size: 18 });
+  document.getElementById("ic-c3").innerHTML = iconMarkup("page", { size: 18 });
+  document.getElementById("ic-c4").innerHTML = iconMarkup("page", { size: 18 });
+  document.getElementById("ic-r1").innerHTML = iconMarkup("mic", { size: 18 });
+  document.getElementById("ic-r2").innerHTML = iconMarkup("mic", { size: 18 });
+  document.getElementById("ic-open2").innerHTML = iconMarkup("externalLink", { size: 16, title: "Mở lại cuộc trò chuyện" });
+  document.getElementById("ic-open3").innerHTML = iconMarkup("externalLink", { size: 16, title: "Mở lại cuộc trò chuyện" });
+  ["ic-del1","ic-del2","ic-del3","ic-del4"].forEach((id) => {
+    document.getElementById(id).innerHTML = iconMarkup("trash", { size: 16, title: "Xóa cuộc trò chuyện" });
+  });
+</script>
+</body>
+</html>

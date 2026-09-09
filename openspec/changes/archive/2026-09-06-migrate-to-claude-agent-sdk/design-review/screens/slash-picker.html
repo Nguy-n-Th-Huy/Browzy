@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Reference: slash picker</title>
+<link rel="stylesheet" href="../../../../../extension/ui/tokens.css" />
+<link rel="stylesheet" href="../../../../../extension/ui/base.css" />
+<link rel="stylesheet" href="../../../../../extension/ui/components.css" />
+<link rel="stylesheet" href="../../../../../extension/ui/prose.css" />
+<link rel="stylesheet" href="../shell.css" />
+<script type="module" src="../../../../../extension/ui/theme.js"></script>
+<script type="module" src="../../../../../extension/ui/behaviors.js"></script>
+</head>
+<body>
+<div class="qa-frame-label">slash-picker</div>
+<div class="panel-shell">
+  <header class="panel-header">
+    <span class="panel-header-title">Open Claude in Chrome</span>
+    <div class="panel-header-actions">
+      <span class="connection-state is-ready"><span class="connection-dot"></span> Sẵn sàng</span>
+      <button class="btn-icon" aria-label="Lịch sử trò chuyện" id="btn-history"></button>
+      <button class="btn-icon" aria-label="Cài đặt" id="btn-settings"></button>
+    </div>
+  </header>
+
+  <main class="panel-scroll">
+    <div class="msg-row from-assistant">
+      <div class="msg-assistant-body prose">
+        <p>Gõ <code>/</code> trong ô soạn tin để dùng nhanh một skill đã bật.</p>
+      </div>
+    </div>
+  </main>
+
+  <div class="panel-composer-wrap">
+    <ui-slash-picker id="picker">
+      <div class="slash-picker ui-scroll" role="listbox" aria-label="Chọn skill" id="picker-list"></div>
+    </ui-slash-picker>
+    <div class="composer">
+      <textarea rows="1" aria-label="Soạn tin nhắn" id="composer-input">/tom</textarea>
+      <div class="composer-actions">
+        <button class="model-select-trigger" type="button">
+          <span>Claude</span>
+          <span id="icon-chev"></span>
+        </button>
+        <button class="btn-icon" aria-label="Gửi" id="icon-send"></button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+  import { iconMarkup } from "../../../../../extension/ui/icons.js";
+  document.getElementById("icon-chev").innerHTML = iconMarkup("chevronDown", { size: 14 });
+  document.getElementById("icon-send").innerHTML = iconMarkup("send", { size: 18, title: "Gửi" });
+  document.getElementById("btn-history").innerHTML = iconMarkup("history", { size: 18, title: "Lịch sử trò chuyện" });
+  document.getElementById("btn-settings").innerHTML = iconMarkup("settings", { size: 18, title: "Cài đặt" });
+
+  const picker = document.getElementById("picker");
+  picker.setItems([
+    { name: "tom-tat-trang", description: "Tóm tắt nội dung trang hiện tại" },
+    { name: "dien-bieu-mau", description: "Điền và gửi biểu mẫu trên trang" },
+    { name: "so-sanh-gia", description: "So sánh giá sản phẩm giữa các tab đang mở" },
+    { name: "tra-cuu-lich-su", description: "Tìm lại một cuộc trò chuyện trước đây" },
+  ]);
+  picker.move(1); // demonstrate keyboard-highlighted selection, not just item 0
+  picker.show();
+</script>
+</body>
+</html>
