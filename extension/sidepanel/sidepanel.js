@@ -95,6 +95,20 @@ const historyStore = new HistoryStore();
 const profileCache = new ProfileCache();
 const recordingsClient = new RecordingsClient();
 const protocolClient = new ProtocolClient();
+
+// scope-conversation-restore-per-tab (design.md "Scope by the tab the panel
+// booted on, captured once"): this panel document's own restore scope, set
+// EXACTLY ONCE by `boot()` after `pageContext.start()` resolves and never
+// reassigned again — see that function's own comment for why the freeze has
+// to happen there rather than here (the panel's tab is not known yet at
+// module-eval time, only after the tracker's first live query). `null` until
+// then, which the resolver below passes straight through: `PanelController`
+// treats a null scope as "no identifiable scope" (spec's own fallback
+// trigger) and starts a fresh conversation rather than restoring one, which
+// is exactly correct for the narrow window between module load and the
+// scope actually resolving.
+let panelScope = null;
+
 const panel = new PanelController({
   protocolClient,
   historyStore,
@@ -103,7 +117,16 @@ const panel = new PanelController({
   // init() for why (background.js's own "ocic-agent" relay already performs
   // the real hello and replays current handshake state to a late-connecting
   // port).
-  identity: async () => ({})
+  identity: async () => ({}),
+  // A RESOLVER, not the value itself (panel-controller.js's constructor doc):
+  // `panel` is constructed here, before `boot()` has had any chance to reach
+  // `pageContext.start()`, so the only thing that can be handed over at this
+  // point is a closure reading the module-level `panelScope` variable boot()
+  // will freeze later. Every call this controller makes reads `panelScope`
+  // fresh, so once boot() assigns it, every subsequent history-store read/
+  // write is correctly scoped — and because boot() never reassigns it again,
+  // "read once, never re-read" holds all the way through.
+  scope: () => panelScope
 });
 
 let pageContext = null;
@@ -2272,17 +2295,38 @@ async function boot() {
     syncAdoptedTabGroup();
   });
   await pageContext.start();
+  // scope-conversation-restore-per-tab (design.md "Scope by the tab the panel
+  // booted on, captured once"): resolve this panel's restore scope from
+  // `pageContext`'s now-settled first query and FREEZE it into `panelScope`
+  // — assigned here, exactly once, and never reassigned anywhere else in this
+  // file. `pageContext.snapshot().tabId` is the tab this panel document is
+  // attached to right now; capturing it into a separate variable rather than
+  // reading `pageContext` again later matters because `PageContextTracker` is
+  // a FOLLOWING tracker when unpinned (page-context.js: `_onActivated`
+  // updates `_current` to whatever tab becomes active in the window) — a
+  // later `pageContext.snapshot().tabId` read would silently drift onto
+  // whatever tab the operator is glancing at, corrupting a scope this panel
+  // document does not belong to (design.md's rejected "read the scope from
+  // PageContextTracker on each access" alternative). A restricted/blank page
+  // where the tracker resolves no usable tab (`snapshot()` returns `null`)
+  // leaves `panelScope` at `null` — "no identifiable scope" — and
+  // `restoreOrStartConversation()` below already starts a fresh conversation
+  // for that case rather than restoring one (spec "No identifiable scope").
+  const scopeSnapshot = pageContext.snapshot();
+  panelScope = scopeSnapshot && scopeSnapshot.tabId != null ? scopeSnapshot.tabId : null;
   loadPickerCatalog(); // fire-and-forget: first "/" press already has this resolved (or the picker's own empty state covers the not-yet-loaded gap)
   await panel.init();
-  // Resumes the conversation the operator was last looking at (persisted via
-  // history-store.js's `setLastActive()`, updated by every one of
-  // panel-controller.js's active-conversation transitions through its
-  // `_setCurrentConversationId()` setter), falling back to a new conversation
-  // when there is nothing restorable — see restoreOrStartConversation()'s own
+  // Resumes the conversation the operator was last looking at IN THIS TAB
+  // (persisted via history-store.js's scoped `setLastActive()`, updated by
+  // every one of panel-controller.js's active-conversation transitions
+  // through its `_setCurrentConversationId()` setter under `panelScope`
+  // above), falling back to a new conversation when there is nothing
+  // restorable for this scope — see restoreOrStartConversation()'s own
   // header comment for the full restorable/fallback contract. Replaces the
   // old unconditional `if (!panel.currentConversationId) startNewConversation()`
   // check, which is what discarded the operator's place on every panel
-  // reopen and browser restart.
+  // reopen; scoping it per tab is what stops a second tab's panel from
+  // adopting the first tab's conversation instead of starting its own.
   await panel.restoreOrStartConversation();
   render();
 }

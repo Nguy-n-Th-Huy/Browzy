@@ -179,13 +179,25 @@ function makeBridgeTransport(core) {
   };
 }
 
-function buildPanel(core) {
+// scope-conversation-restore-per-tab: every PanelController in this suite now
+// takes an explicit scope resolver (panel-controller.js's constructor doc —
+// "so no call site can do an unscoped read or write"). Most blocks below use
+// their own independent HistoryStore instance, so the exact scope value is
+// arbitrary UNLESS two controllers deliberately SHARE one HistoryStore's
+// underlying storage to simulate the same tab's panel being closed and
+// reopened — those blocks define their own local scope constant and pass it
+// to both controllers so the restore can actually find the entry. This
+// default is for the common single-controller case.
+const DEFAULT_SCOPE = "panel-scope-default";
+
+function buildPanel(core, { scope = DEFAULT_SCOPE } = {}) {
   const protocolClient = new ProtocolClient({ createTransport: () => makeBridgeTransport(core) });
   const panel = new PanelController({
     protocolClient,
     historyStore: new HistoryStore({ storage: memStorage() }),
     profileCache: new ProfileCache({ storage: memStorage({ ocic_profile_cache_v1: completeProfile() }) }),
-    identity: async () => ({ installationId: "test-install", connectionId: "test-conn" })
+    identity: async () => ({ installationId: "test-install", connectionId: "test-conn" }),
+    scope
   });
   return panel;
 }
@@ -423,7 +435,8 @@ async function main() {
       protocolClient: protocolClient2,
       historyStore: sharedHistory,
       profileCache: new ProfileCache({ storage: memStorage({ ocic_profile_cache_v1: completeProfile() }) }),
-      identity: async () => ({ installationId: "test-install", connectionId: "test-conn-2" })
+      identity: async () => ({ installationId: "test-install", connectionId: "test-conn-2" }),
+      scope: DEFAULT_SCOPE
     });
     await panel2.init();
     await waitUntil(() => panel2.protocol.handshakeState() === "ok");
@@ -524,12 +537,24 @@ async function main() {
         { type: "result", subtype: "success", result: "xong việc A" }
       ])
     });
+    // Same tab, panel closed and reopened: panelA and panelB share the SAME
+    // scope, matching how sidepanel.js's `boot()` freezes one scope per tab
+    // for the life of that tab's panel document. Both the durable index
+    // storage AND the session-lifetime last-active storage must be shared —
+    // history-store.js's constructor defaults each to its OWN MemoryStorage
+    // when not injected, so leaving `sessionStorage` unshared would silently
+    // put panelA's remembered id and panelB's read of it in two different
+    // in-memory stores that never see each other, exactly the false-negative
+    // this test exists to catch.
+    const RESTORE_SCOPE = "tab-restore-same";
     const sharedStorage = memStorage();
+    const sharedSession = memStorage();
     const panelA = new PanelController({
       protocolClient: new ProtocolClient({ createTransport: () => makeBridgeTransport(core) }),
-      historyStore: new HistoryStore({ storage: sharedStorage }),
+      historyStore: new HistoryStore({ storage: sharedStorage, sessionStorage: sharedSession }),
       profileCache: new ProfileCache({ storage: memStorage({ ocic_profile_cache_v1: completeProfile() }) }),
-      identity: async () => ({ installationId: "test-install", connectionId: "test-conn-a" })
+      identity: async () => ({ installationId: "test-install", connectionId: "test-conn-a" }),
+      scope: RESTORE_SCOPE
     });
     await panelA.init();
     await waitUntil(() => panelA.protocol.handshakeState() === "ok");
@@ -556,9 +581,10 @@ async function main() {
     };
     const panelB = new PanelController({
       protocolClient: protocolClientB,
-      historyStore: new HistoryStore({ storage: sharedStorage }), // same underlying storage as panelA
+      historyStore: new HistoryStore({ storage: sharedStorage, sessionStorage: sharedSession }), // same underlying storage as panelA
       profileCache: new ProfileCache({ storage: memStorage({ ocic_profile_cache_v1: completeProfile() }) }),
-      identity: async () => ({ installationId: "test-install", connectionId: "test-conn-b" })
+      identity: async () => ({ installationId: "test-install", connectionId: "test-conn-b" }),
+      scope: RESTORE_SCOPE
     });
     await panelB.init();
     await waitUntil(() => panelB.protocol.handshakeState() === "ok");
@@ -576,12 +602,19 @@ async function main() {
   console.log("== restoreOrStartConversation() starts new when the remembered conversation was deleted locally ==");
   {
     const core = buildCore({ sdk: fakeSdk([{ type: "result", subtype: "success", result: "" }]) });
+    // Same-tab close/reopen again: shared index AND shared session storage,
+    // same scope — see the previous block's comment for why both stores
+    // (not just the index) must be shared for this to be a faithful
+    // same-tab-reopen simulation.
+    const DELETE_SCOPE = "tab-delete-locally";
     const sharedStorage = memStorage();
+    const sharedSession = memStorage();
     const panelA = new PanelController({
       protocolClient: new ProtocolClient({ createTransport: () => makeBridgeTransport(core) }),
-      historyStore: new HistoryStore({ storage: sharedStorage }),
+      historyStore: new HistoryStore({ storage: sharedStorage, sessionStorage: sharedSession }),
       profileCache: new ProfileCache({ storage: memStorage({ ocic_profile_cache_v1: completeProfile() }) }),
-      identity: async () => ({ installationId: "test-install", connectionId: "test-conn-a2" })
+      identity: async () => ({ installationId: "test-install", connectionId: "test-conn-a2" }),
+      scope: DELETE_SCOPE
     });
     await panelA.init();
     await waitUntil(() => panelA.protocol.handshakeState() === "ok");
@@ -599,9 +632,10 @@ async function main() {
     };
     const panelB = new PanelController({
       protocolClient: protocolClientB,
-      historyStore: new HistoryStore({ storage: sharedStorage }),
+      historyStore: new HistoryStore({ storage: sharedStorage, sessionStorage: sharedSession }),
       profileCache: new ProfileCache({ storage: memStorage({ ocic_profile_cache_v1: completeProfile() }) }),
-      identity: async () => ({ installationId: "test-install", connectionId: "test-conn-b2" })
+      identity: async () => ({ installationId: "test-install", connectionId: "test-conn-b2" }),
+      scope: DELETE_SCOPE
     });
     await panelB.init();
     await waitUntil(() => panelB.protocol.handshakeState() === "ok");
@@ -624,20 +658,22 @@ async function main() {
     // fallback.
     const core = buildCore({ sdk: fakeSdk([{ type: "result", subtype: "success", result: "" }]) });
     const staleConversationId = "conv_never_existed_on_this_companion";
+    const STALE_SCOPE = "tab-stale-unknown";
     const sharedStorage = memStorage();
     const history = new HistoryStore({ storage: sharedStorage });
     // Seed the local index (so `list()` reports it as present, not filtered
-    // out for absence) AND the remembered last-active id, matching what a
-    // real "the companion's data was wiped but this browser profile's local
-    // index survived" scenario looks like.
+    // out for absence) AND the remembered last-active id under this panel's
+    // own scope, matching what a real "the companion's data was wiped but
+    // this browser profile's local index survived" scenario looks like.
     await history.upsert({ conversationId: staleConversationId, title: "cuộc trò chuyện cũ" });
-    await history.setLastActive(staleConversationId);
+    await history.setLastActive(STALE_SCOPE, staleConversationId);
 
     const panel = new PanelController({
       protocolClient: new ProtocolClient({ createTransport: () => makeBridgeTransport(core) }),
       historyStore: history,
       profileCache: new ProfileCache({ storage: memStorage({ ocic_profile_cache_v1: completeProfile() }) }),
-      identity: async () => ({ installationId: "test-install", connectionId: "test-conn-stale" })
+      identity: async () => ({ installationId: "test-install", connectionId: "test-conn-stale" }),
+      scope: STALE_SCOPE
     });
     await panel.init();
     await waitUntil(() => panel.protocol.handshakeState() === "ok");
@@ -648,7 +684,7 @@ async function main() {
     ok(panel.currentConversationId && panel.currentConversationId !== staleConversationId, "the panel ends up on a new, different conversation after the unknown_conversation reply");
     ok(panel.currentPhase() === RUN_PHASE.EMPTY, "the fallback conversation is a normal, usable empty conversation");
     ok(panel._pendingResumes.length === 0, "the pending-resume entry is cleared once the fallback completes");
-    ok((await history.getLastActive()) !== staleConversationId, "the stale remembered id is forgotten, not retried on the next open");
+    ok((await history.getLastActive(STALE_SCOPE)) !== staleConversationId, "the stale remembered id is forgotten, not retried on the next open");
   }
 
   console.log("== explicit reopen of an unknown conversation surfaces the failure on that conversation, not a silent switch ==");
@@ -704,16 +740,18 @@ async function main() {
     const core = buildCore({ sdk: fakeSdk([{ type: "result", subtype: "success", result: "" }]) });
     const staleBootId = "conv_boot_restore_unknown";
     const staleReopenId = "conv_explicit_reopen_unknown_2";
+    const RACE_SCOPE = "tab-race-1";
     const sharedStorage = memStorage();
     const history = new HistoryStore({ storage: sharedStorage });
     await history.upsert({ conversationId: staleBootId, title: "cuộc trò chuyện cũ" });
-    await history.setLastActive(staleBootId);
+    await history.setLastActive(RACE_SCOPE, staleBootId);
 
     const panel = new PanelController({
       protocolClient: new ProtocolClient({ createTransport: () => makeBridgeTransport(core) }),
       historyStore: history,
       profileCache: new ProfileCache({ storage: memStorage({ ocic_profile_cache_v1: completeProfile() }) }),
-      identity: async () => ({ installationId: "test-install", connectionId: "test-conn-race-1" })
+      identity: async () => ({ installationId: "test-install", connectionId: "test-conn-race-1" }),
+      scope: RACE_SCOPE
     });
     await panel.init();
     await waitUntil(() => panel.protocol.handshakeState() === "ok");
@@ -773,10 +811,11 @@ async function main() {
     // though the valid conversation is what's actually showing.
     const core = buildCore({ sdk: fakeSdk([{ type: "result", subtype: "success", result: "" }]) });
     const staleBootId = "conv_boot_restore_unknown_3";
+    const RACE_SCOPE_2 = "tab-race-2";
     const sharedStorage = memStorage();
     const history = new HistoryStore({ storage: sharedStorage });
     await history.upsert({ conversationId: staleBootId, title: "cuộc trò chuyện cũ" });
-    await history.setLastActive(staleBootId);
+    await history.setLastActive(RACE_SCOPE_2, staleBootId);
 
     // Seed a REAL, valid conversation on the companion for the explicit
     // reopen to resume successfully.
@@ -784,7 +823,8 @@ async function main() {
       protocolClient: new ProtocolClient({ createTransport: () => makeBridgeTransport(core) }),
       historyStore: new HistoryStore({ storage: memStorage() }),
       profileCache: new ProfileCache({ storage: memStorage({ ocic_profile_cache_v1: completeProfile() }) }),
-      identity: async () => ({ installationId: "test-install", connectionId: "test-conn-seed" })
+      identity: async () => ({ installationId: "test-install", connectionId: "test-conn-seed" }),
+      scope: "tab-race-2-seed"
     });
     await seedPanel.init();
     await waitUntil(() => seedPanel.protocol.handshakeState() === "ok");
@@ -801,7 +841,8 @@ async function main() {
       protocolClient: new ProtocolClient({ createTransport: () => makeBridgeTransport(core) }),
       historyStore: history,
       profileCache: new ProfileCache({ storage: memStorage({ ocic_profile_cache_v1: completeProfile() }) }),
-      identity: async () => ({ installationId: "test-install", connectionId: "test-conn-race-2" })
+      identity: async () => ({ installationId: "test-install", connectionId: "test-conn-race-2" }),
+      scope: RACE_SCOPE_2
     });
     await panel.init();
     await waitUntil(() => panel.protocol.handshakeState() === "ok");
@@ -827,7 +868,7 @@ async function main() {
       !listAfter.some((c) => c.conversationId !== staleBootId && c.conversationId !== validId),
       "no phantom conversation row was created in HistoryStore"
     );
-    ok((await history.getLastActive()) === validId, "the remembered last-active id reflects what is actually showing, not the failed boot restore");
+    ok((await history.getLastActive(RACE_SCOPE_2)) === validId, "the remembered last-active id reflects what is actually showing, not the failed boot restore");
     panel.protocol.newConversation = realNewConversation;
   }
 
@@ -862,15 +903,17 @@ async function main() {
     // attempt also fails (same dead port for both).
     {
       const staleId = "conv_dead_port_restore";
+      const DEAD_PORT_SCOPE = "tab-dead-port";
       const sharedStorage = memStorage();
       const history = new HistoryStore({ storage: sharedStorage });
       await history.upsert({ conversationId: staleId, title: "cuộc trò chuyện cũ" });
-      await history.setLastActive(staleId);
+      await history.setLastActive(DEAD_PORT_SCOPE, staleId);
       const panel = new PanelController({
         protocolClient: new ProtocolClient({ createTransport: () => makeBridgeTransport(core) }),
         historyStore: history,
         profileCache: new ProfileCache({ storage: memStorage({ ocic_profile_cache_v1: completeProfile() }) }),
-        identity: async () => ({ installationId: "test-install", connectionId: "test-conn-dead-port" })
+        identity: async () => ({ installationId: "test-install", connectionId: "test-conn-dead-port" }),
+        scope: DEAD_PORT_SCOPE
       });
       await panel.init();
       await waitUntil(() => panel.protocol.handshakeState() === "ok");
@@ -905,6 +948,169 @@ async function main() {
       // that real EMPTY state from here rather than merely not throwing.
       ok(panel.currentPhase() === RUN_PHASE.EMPTY, "currentPhase() resolves to EMPTY from the unconfirmed-active-id, dead-port state");
     }
+  }
+
+  console.log("== restoreOrStartConversation() is scoped: two tabs sharing one storage each restore their OWN conversation, a third never-seen scope starts fresh ==");
+  {
+    // This is the core regression scope-conversation-restore-per-tab exists
+    // to fix: the previous (profile-wide) design handed a second tab the
+    // FIRST tab's conversation. Here two panel scopes deliberately share the
+    // exact same HistoryStore storage (index AND session), the way two real
+    // tabs' panel documents share one chrome.storage backend — isolation
+    // must come from the scope key alone, never from separate storage.
+    const core = buildCore({
+      sdk: fakeSdk([
+        { type: "assistant", message: { content: [{ type: "text", text: "xong" }] } },
+        { type: "result", subtype: "success", result: "xong" }
+      ])
+    });
+    const sharedStorage = memStorage();
+    const sharedSession = memStorage();
+    const SCOPE_X = "tab-scope-x";
+    const SCOPE_Y = "tab-scope-y";
+    const SCOPE_Z = "tab-scope-z"; // shares the same storage, but never remembered against either X or Y
+
+    function buildScopedPanel(scope, connId) {
+      return new PanelController({
+        protocolClient: new ProtocolClient({ createTransport: () => makeBridgeTransport(core) }),
+        historyStore: new HistoryStore({ storage: sharedStorage, sessionStorage: sharedSession }),
+        profileCache: new ProfileCache({ storage: memStorage({ ocic_profile_cache_v1: completeProfile() }) }),
+        identity: async () => ({ installationId: "test-install", connectionId: connId }),
+        scope
+      });
+    }
+
+    // Tab X creates and puts real content in its own conversation.
+    const panelX1 = buildScopedPanel(SCOPE_X, "test-conn-scope-x-1");
+    await panelX1.init();
+    await waitUntil(() => panelX1.protocol.handshakeState() === "ok");
+    await panelX1.startNewConversation();
+    await waitUntil(() => panelX1.currentConversationId != null);
+    const conversationX = panelX1.currentConversationId;
+    await panelX1.sendMessage("việc của tab X");
+    await waitUntil(() => panelX1.currentPhase() === RUN_PHASE.COMPLETED);
+
+    // Tab Y independently creates its own, DIFFERENT conversation.
+    const panelY1 = buildScopedPanel(SCOPE_Y, "test-conn-scope-y-1");
+    await panelY1.init();
+    await waitUntil(() => panelY1.protocol.handshakeState() === "ok");
+    await panelY1.startNewConversation();
+    await waitUntil(() => panelY1.currentConversationId != null);
+    const conversationY = panelY1.currentConversationId;
+    await panelY1.sendMessage("việc của tab Y");
+    await waitUntil(() => panelY1.currentPhase() === RUN_PHASE.COMPLETED);
+
+    ok(conversationX !== conversationY, "the two tabs ended up with genuinely different conversations");
+
+    // A fresh controller reopened on tab X's own scope must resume X, never Y.
+    const panelX2 = buildScopedPanel(SCOPE_X, "test-conn-scope-x-2");
+    await panelX2.init();
+    await waitUntil(() => panelX2.protocol.handshakeState() === "ok");
+    await panelX2.restoreOrStartConversation();
+    await waitUntil(() => panelX2.currentConversationId != null);
+    ok(panelX2.currentConversationId === conversationX, "a fresh controller on tab X's own scope restores tab X's conversation");
+
+    // A fresh controller reopened on tab Y's own scope must resume Y, never X
+    // — this is the exact bug report: opening the panel on a second tab must
+    // never hand back the first tab's conversation.
+    const panelY2 = buildScopedPanel(SCOPE_Y, "test-conn-scope-y-2");
+    await panelY2.init();
+    await waitUntil(() => panelY2.protocol.handshakeState() === "ok");
+    await panelY2.restoreOrStartConversation();
+    await waitUntil(() => panelY2.currentConversationId != null);
+    ok(panelY2.currentConversationId === conversationY, "a fresh controller on tab Y's own scope restores tab Y's conversation, not tab X's");
+
+    // A third scope, sharing the exact same storage, but never remembered
+    // against either X or Y, must start a brand-new conversation rather than
+    // adopting either one's.
+    let resumeCallsZ = 0;
+    const protocolClientZ = new ProtocolClient({ createTransport: () => makeBridgeTransport(core) });
+    const realResumeZ = protocolClientZ.resumeConversation.bind(protocolClientZ);
+    protocolClientZ.resumeConversation = (...args) => {
+      resumeCallsZ++;
+      return realResumeZ(...args);
+    };
+    const panelZ = new PanelController({
+      protocolClient: protocolClientZ,
+      historyStore: new HistoryStore({ storage: sharedStorage, sessionStorage: sharedSession }),
+      profileCache: new ProfileCache({ storage: memStorage({ ocic_profile_cache_v1: completeProfile() }) }),
+      identity: async () => ({ installationId: "test-install", connectionId: "test-conn-scope-z" }),
+      scope: SCOPE_Z
+    });
+    await panelZ.init();
+    await waitUntil(() => panelZ.protocol.handshakeState() === "ok");
+    await panelZ.restoreOrStartConversation();
+    await waitUntil(() => panelZ.currentConversationId != null);
+    ok(
+      panelZ.currentConversationId !== conversationX && panelZ.currentConversationId !== conversationY,
+      "a third scope that shares the same storage but has never been remembered starts its own new conversation rather than adopting X's or Y's"
+    );
+    ok(resumeCallsZ === 0, "the never-before-seen scope never sends a resume at all");
+  }
+
+  console.log("== a panel whose scope resolves to nothing starts a new conversation and never reads (or writes) another scope's entry ==");
+  {
+    // spec "No identifiable scope": a panel that cannot determine which tab
+    // it belongs to (page-context.js resolving no usable tab — see
+    // sidepanel.js's boot(), which leaves `panelScope` at `null` for exactly
+    // this case) must start fresh, never fall through to some other scope's
+    // remembered id merely because it shares the same underlying storage.
+    const core = buildCore({ sdk: fakeSdk([{ type: "result", subtype: "success", result: "" }]) });
+    const sharedStorage = memStorage();
+    const sharedSession = memStorage();
+    const KNOWN_SCOPE = "tab-scope-known";
+
+    // Seed a real remembered conversation under a KNOWN scope, sharing the
+    // same underlying storage the unscoped panel below will read from.
+    const seeder = new PanelController({
+      protocolClient: new ProtocolClient({ createTransport: () => makeBridgeTransport(core) }),
+      historyStore: new HistoryStore({ storage: sharedStorage, sessionStorage: sharedSession }),
+      profileCache: new ProfileCache({ storage: memStorage({ ocic_profile_cache_v1: completeProfile() }) }),
+      identity: async () => ({ installationId: "test-install", connectionId: "test-conn-known-seed" }),
+      scope: KNOWN_SCOPE
+    });
+    await seeder.init();
+    await waitUntil(() => seeder.protocol.handshakeState() === "ok");
+    await seeder.startNewConversation();
+    await waitUntil(() => seeder.currentConversationId != null);
+    const knownConversationId = seeder.currentConversationId;
+
+    let resumeCalls = 0;
+    let newCalls = 0;
+    const protocolClientNoScope = new ProtocolClient({ createTransport: () => makeBridgeTransport(core) });
+    const realResumeNoScope = protocolClientNoScope.resumeConversation.bind(protocolClientNoScope);
+    const realNewNoScope = protocolClientNoScope.newConversation.bind(protocolClientNoScope);
+    protocolClientNoScope.resumeConversation = (...args) => {
+      resumeCalls++;
+      return realResumeNoScope(...args);
+    };
+    protocolClientNoScope.newConversation = (...args) => {
+      newCalls++;
+      return realNewNoScope(...args);
+    };
+    const panelNoScope = new PanelController({
+      protocolClient: protocolClientNoScope,
+      historyStore: new HistoryStore({ storage: sharedStorage, sessionStorage: sharedSession }),
+      profileCache: new ProfileCache({ storage: memStorage({ ocic_profile_cache_v1: completeProfile() }) }),
+      identity: async () => ({ installationId: "test-install", connectionId: "test-conn-no-scope" }),
+      scope: () => null
+    });
+    await panelNoScope.init();
+    await waitUntil(() => panelNoScope.protocol.handshakeState() === "ok");
+    await panelNoScope.restoreOrStartConversation();
+    await waitUntil(() => panelNoScope.currentConversationId != null);
+
+    ok(panelNoScope.currentConversationId !== knownConversationId, "an unscoped panel never adopts a different scope's remembered conversation");
+    ok(resumeCalls === 0, "an unscoped panel never sends a resume at all — it has nothing of its own to resume");
+    ok(newCalls === 1, "an unscoped panel starts a brand-new conversation instead");
+
+    // Read the known scope back through a THIRD controller sharing the same
+    // storage, proving the unscoped panel never wrote into it either.
+    const verifier = new HistoryStore({ storage: sharedStorage, sessionStorage: sharedSession });
+    ok(
+      (await verifier.getLastActive(KNOWN_SCOPE)) === knownConversationId,
+      "the known scope's remembered id is exactly what it was before the unscoped panel ever ran"
+    );
   }
 
   console.log(fail === 0 ? "\nALL SIDEPANEL FAKE-COMPANION TESTS PASSED" : `\n${fail} FAILED`);

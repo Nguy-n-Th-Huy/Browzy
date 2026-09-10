@@ -103,19 +103,45 @@ async function main() {
     ok(!threw && Array.isArray(list) && list.length === 0, "a broken storage backend never crashes the panel");
   }
 
-  console.log("== last-active conversation identity (restore-last-active-conversation) ==");
+  console.log("== last-active conversation identity is scoped per panel (scope-conversation-restore-per-tab) ==");
   {
-    const store = new HistoryStore({ storage: fakeChromeStorage() });
-    ok((await store.getLastActive()) === null, "a fresh store has no remembered last-active id");
+    // Last-active now lives in a SEPARATE session-lifetime store from the
+    // conversation index (design.md "Hold the remembered ids in
+    // session-lifetime storage, keyed by scope"), so it is injected via its
+    // own `sessionStorage` dependency rather than the `storage` used for
+    // list()/upsert() above.
+    const store = new HistoryStore({ storage: fakeChromeStorage(), sessionStorage: fakeChromeStorage() });
+    ok((await store.getLastActive("scope-a")) === null, "a fresh store has no remembered last-active id for a scope it has never seen");
 
-    await store.setLastActive("c1");
-    ok((await store.getLastActive()) === "c1", "set/get round-trips the last-active id");
+    await store.setLastActive("scope-a", "c1");
+    ok((await store.getLastActive("scope-a")) === "c1", "set/get round-trips the last-active id for that scope");
 
-    await store.setLastActive(null);
-    ok((await store.getLastActive()) === null, "setLastActive(null) forgets the remembered id");
+    ok((await store.getLastActive("scope-b")) === null, "a different, never-written scope still reads null — one scope's write never leaks into another's");
+
+    await store.setLastActive("scope-b", "c2");
+    ok((await store.getLastActive("scope-a")) === "c1" && (await store.getLastActive("scope-b")) === "c2", "two scopes round-trip independently under the same storage");
+
+    await store.setLastActive("scope-a", null);
+    ok((await store.getLastActive("scope-a")) === null, "setLastActive(scope, null) forgets the remembered id for that scope");
+    ok((await store.getLastActive("scope-b")) === "c2", "clearing one scope leaves the other scope's entry intact");
   }
 
-  console.log("== last-active storage failures never propagate (a broken chrome.storage.local must not block opening the panel) ==");
+  console.log("== an unidentifiable scope never touches storage (spec \"No identifiable scope\") ==");
+  {
+    const store = new HistoryStore({ storage: fakeChromeStorage(), sessionStorage: fakeChromeStorage() });
+    ok((await store.getLastActive(null)) === null, "a null scope reads null without needing any prior write");
+    ok((await store.getLastActive(undefined)) === null, "an undefined scope reads null the same way");
+    let threw = false;
+    try {
+      await store.setLastActive(null, "c1");
+    } catch {
+      threw = true;
+    }
+    ok(!threw, "setLastActive with a null scope is a safe no-op, never a throw");
+    ok((await store.getLastActive("scope-a")) === null, "the no-op write for a null scope never lands under some other scope");
+  }
+
+  console.log("== last-active storage failures never propagate (a broken chrome.storage.session must not block opening the panel) ==");
   {
     const brokenStorage = {
       async get() {
@@ -125,16 +151,31 @@ async function main() {
         throw new Error("storage unavailable");
       }
     };
-    const store = new HistoryStore({ storage: brokenStorage });
+    // Last-active is backed by `sessionStorage`, not `storage` — a broken
+    // `storage` (the conversation index) is exercised separately above; here
+    // the SESSION store is the one that fails.
+    const store = new HistoryStore({ storage: fakeChromeStorage(), sessionStorage: brokenStorage });
     let threw = false;
     let id = "not-yet-read";
     try {
-      id = await store.getLastActive();
-      await store.setLastActive("c1");
+      id = await store.getLastActive("scope-a");
+      await store.setLastActive("scope-a", "c1");
     } catch {
       threw = true;
     }
-    ok(!threw && id === null, "getLastActive() on a broken storage backend resolves to null, never a throw");
+    ok(!threw && id === null, "getLastActive() on a broken session storage backend resolves to null, never a throw");
+  }
+
+  console.log("== last-active degrades to in-memory when chrome.storage.session is entirely absent ==");
+  {
+    // Neither `storage` nor `sessionStorage` is injected, and this test runs
+    // under plain `node` (no `chrome` global) — the constructor's own
+    // `hasChromeSessionStorage()` fallback must produce a working, isolated
+    // in-memory store rather than throwing at construction or on first use.
+    const store = new HistoryStore();
+    ok((await store.getLastActive("scope-a")) === null, "no chrome.storage.session present still resolves to null rather than throwing");
+    await store.setLastActive("scope-a", "c1");
+    ok((await store.getLastActive("scope-a")) === "c1", "the in-memory fallback still round-trips within the life of this store instance");
   }
 
   console.log(fail === 0 ? "\nALL SIDEPANEL HISTORY-STORE TESTS PASSED" : `\n${fail} FAILED`);

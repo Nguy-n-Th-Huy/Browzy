@@ -28,7 +28,40 @@ const STORAGE_KEY = "ocic_conversation_history_v1";
 // `getLastActive()`/`setLastActive()` below for why this cannot be derived
 // from `list()[0]`). A separate key also means reading it at startup is one
 // small get(), not a read-and-sort of the whole index.
-const LAST_ACTIVE_KEY = "ocic_last_active_conversation_v1";
+//
+// scope-conversation-restore-per-tab (design.md "Hold the remembered ids in
+// session-lifetime storage, keyed by scope"): each panel scope (the tab id
+// the panel booted on — see panel-controller.js's constructor and
+// sidepanel.js's `boot()`) gets its OWN remembered-conversation-id entry,
+// held in `chrome.storage.session` rather than `chrome.storage.local`. A tab
+// id is only meaningful within the browser session that assigned it, and the
+// panel's own per-tab enablement set is itself session-scoped (background.js's
+// `PANEL_ENABLED_TABS_SESSION_KEY`) — sharing that lifetime is what makes it
+// impossible for a numeric tab id surviving into a new session to resurrect
+// an unrelated tab's conversation, which would be a worse version of the
+// cross-scope leak this change fixes. The conversation INDEX above
+// (STORAGE_KEY) is unaffected: it stays in local storage, durable across
+// restarts, because which conversations exist is a different fact with a
+// different lifetime than which one auto-opens.
+//
+// Storage shape: ONE STORAGE KEY PER SCOPE (`lastActiveStorageKey(scope)`
+// below), never a single key holding a `{scope: id}` map. A shared map key
+// would force every write through a read-modify-write of the WHOLE map, and
+// two panel documents (two different tabs) genuinely do share one
+// `chrome.storage.session` backend — both could read the same map at
+// nearly the same time, each mutate only its own entry in local memory, and
+// whichever `set()` lands second would silently overwrite the other's write
+// with a stale copy of the map, discarding it (chrome.storage's `set()` has
+// no merge/patch primitive to close that window). Giving each scope its own
+// top-level key makes every write touch only that scope's own key: two tabs
+// writing different scopes' entries touch different keys and can never
+// collide, so `chrome.storage`'s own per-key write handling is already
+// enough — no read-modify-write, and no cross-tab race, is needed at all.
+const LAST_ACTIVE_KEY_PREFIX = "ocic_last_active_conversation_v1:";
+
+function lastActiveStorageKey(scope) {
+  return `${LAST_ACTIVE_KEY_PREFIX}${scope}`;
+}
 
 function hasChromeStorage() {
   try {
@@ -38,14 +71,29 @@ function hasChromeStorage() {
   }
 }
 
+function hasChromeSessionStorage() {
+  try {
+    return typeof chrome !== "undefined" && !!chrome.storage && !!chrome.storage.session;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * @param {object} [deps]
  * @param {{get(keys):Promise<object>, set(obj):Promise<void>}} [deps.storage] -
- *   defaults to chrome.storage.local; injectable for tests.
+ *   defaults to chrome.storage.local; injectable for tests. Backs the
+ *   durable conversation index only.
+ * @param {{get(keys):Promise<object>, set(obj):Promise<void>}} [deps.sessionStorage] -
+ *   defaults to chrome.storage.session; injectable for tests. Backs the
+ *   per-scope last-active entries (see LAST_ACTIVE_KEY_PREFIX's comment) —
+ *   deliberately a SEPARATE store from `storage` above, since the two have
+ *   different lifetimes.
  */
 export class HistoryStore {
-  constructor({ storage } = {}) {
+  constructor({ storage, sessionStorage } = {}) {
     this._storage = storage || (hasChromeStorage() ? chrome.storage.local : new MemoryStorage());
+    this._sessionStorage = sessionStorage || (hasChromeSessionStorage() ? chrome.storage.session : new MemoryStorage());
   }
 
   async _read() {
@@ -122,36 +170,56 @@ export class HistoryStore {
     await this._write(next);
   }
 
-  /** The conversation the operator was last looking at, or `null` if none is
-   * remembered (never had one, or it was deliberately forgotten via
-   * `setLastActive(null)` — both read the same here, which is exactly what
-   * panel-controller.js's startup restore wants: "no remembered id" and
-   * "explicitly cleared" both fall back to starting a new conversation).
+  /** The conversation the operator was last looking at WITHIN `scope`, or
+   * `null` if none is remembered for that scope (never had one, it was
+   * deliberately forgotten via `setLastActive(scope, null)`, or `scope`
+   * itself is falsy — "no identifiable scope", spec's own fallback trigger —
+   * both read the same here, which is exactly what
+   * panel-controller.js's startup restore wants: "no remembered id for this
+   * scope" and "explicitly cleared" both fall back to starting a new
+   * conversation). A falsy `scope` short-circuits before ever touching
+   * storage, so a panel that cannot identify its own tab can never read
+   * (and, in `setLastActive`, never write) another scope's entry.
    * Same swallow-on-failure treatment as `_read`/`_write`: a storage read
-   * that throws resolves to `null`, never a rejection. */
-  async getLastActive() {
+   * that throws resolves to `null`, never a rejection — and an absent
+   * `chrome.storage.session` (this._sessionStorage falls back to its own
+   * MemoryStorage in that case, see the constructor) degrades to the same
+   * "nothing remembered" outcome, never an error. */
+  async getLastActive(scope) {
+    if (!scope) return null;
     try {
-      const result = await this._storage.get(LAST_ACTIVE_KEY);
-      const id = result && result[LAST_ACTIVE_KEY];
+      const key = lastActiveStorageKey(scope);
+      const result = await this._sessionStorage.get(key);
+      const id = result && result[key];
       return typeof id === "string" && id ? id : null;
     } catch {
       return null;
     }
   }
 
-  /** Remember (or, with `id === null`, forget) which conversation is active.
-   * Deliberately NOT derived from `list()[0]` (most-recently-updated) — see
-   * design.md: `_persistHistoryEntry()` bumps `updatedAt` on every
-   * stream_event/token_batch for ANY conversation this controller holds,
-   * including one the operator switched away from while it kept running in
-   * the background. Most-recently-updated therefore answers a different
-   * question than "which conversation was the operator looking at", and a
-   * caller of getLastActive() at startup wants the latter. Best-effort like
-   * every other write here: a storage failure must not block using the
-   * panel. */
-  async setLastActive(id) {
+  /** Remember (or, with `id === null`, forget) which conversation is active
+   * for `scope`. Deliberately NOT derived from `list()[0]`
+   * (most-recently-updated) — see design.md: `_persistHistoryEntry()` bumps
+   * `updatedAt` on every stream_event/token_batch for ANY conversation this
+   * controller holds, including one the operator switched away from while it
+   * kept running in the background. Most-recently-updated therefore answers
+   * a different question than "which conversation was the operator looking
+   * at in THIS scope", and a caller of getLastActive() at startup wants the
+   * latter.
+   *
+   * Writes ONLY this scope's own storage key (see `lastActiveStorageKey()`'s
+   * comment for why this is a per-key write rather than a read-modify-write
+   * of a shared map) — a concurrent write to a DIFFERENT scope's entry (two
+   * panel documents, two tabs, sharing one `chrome.storage.session`) touches
+   * a different key entirely and can therefore never race with or clobber
+   * this one. Best-effort like every other write here: a storage failure
+   * must not block using the panel. A falsy `scope` is a no-op for the same
+   * "no identifiable scope never touches another scope's entry" reason
+   * `getLastActive()` documents. */
+  async setLastActive(scope, id) {
+    if (!scope) return;
     try {
-      await this._storage.set({ [LAST_ACTIVE_KEY]: id });
+      await this._sessionStorage.set({ [lastActiveStorageKey(scope)]: id || null });
     } catch {
       /* best-effort — a persistence failure must not block using the panel */
     }

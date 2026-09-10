@@ -48,12 +48,35 @@ export class PanelController {
    * @param {import("./history-store.js").HistoryStore} deps.historyStore
    * @param {import("./profile-cache.js").ProfileCache} deps.profileCache
    * @param {() => Promise<{installationId:string, connectionId:string}>} [deps.identity]
+   * @param {() => (string|number|null)} [deps.scope] - scope-conversation-restore-per-tab
+   *   (design.md "Keep one setter, give it the scope"): a RESOLVER for this
+   *   panel's own scope — the tab id the panel booted on — supplied ONCE at
+   *   construction rather than threaded through every `getLastActive()`/
+   *   `setLastActive()` call site. Called fresh every time this controller
+   *   needs the scope (`_setCurrentConversationId()`,
+   *   `restoreOrStartConversation()`, `_handleUnknownConversationError()`),
+   *   never cached here — `sidepanel.js`'s `boot()` is what actually freezes
+   *   the value the resolver reads (see that function's own comment for why
+   *   the freeze has to live there: the scope is not known yet at the moment
+   *   this controller is constructed, only after `pageContext.start()`
+   *   resolves). A missing/falsy result is "no identifiable scope" — every
+   *   `historyStore` call below already degrades that to a no-op read/write
+   *   (see history-store.js's `getLastActive`/`setLastActive`), so this
+   *   defaulting to a resolver that always returns `null` is what makes an
+   *   unscoped panel behave exactly like the spec's "No identifiable scope"
+   *   fallback: it starts a new conversation and never touches another
+   *   scope's remembered id. Accepting a plain value here too (not only a
+   *   function) is a convenience for callers — mainly tests — that already
+   *   know their fixed scope at construction time; it is wrapped in a
+   *   trivial resolver so every internal call site can treat `this._scope`
+   *   uniformly as "call it".
    */
-  constructor({ protocolClient, historyStore, profileCache, identity }) {
+  constructor({ protocolClient, historyStore, profileCache, identity, scope }) {
     this.protocol = protocolClient;
     this.historyStore = historyStore;
     this.profileCache = profileCache;
     this._identity = identity || (async () => ({ installationId: null, connectionId: null }));
+    this._scope = typeof scope === "function" ? scope : () => scope ?? null;
     this.models = new Map(); // conversationId -> ConversationModel
     this.currentConversationId = null;
     // Set while a NEW request is outstanding, so the snapshot that answers it
@@ -170,13 +193,21 @@ export class PanelController {
    *
    * Persistence is fire-and-forget with the rejection swallowed, the same
    * treatment `_persistHistoryEntry()` already gives history writes —
-   * `chrome.storage.local` being unavailable must never block using the
+   * `chrome.storage.session` being unavailable must never block using the
    * panel, and this setter runs synchronously so callers can keep treating
    * the assignment itself as instant.
+   *
+   * scope-conversation-restore-per-tab: the write is scoped by `this._scope()`
+   * (read fresh on every call, never cached — see the constructor's `scope`
+   * doc), so this is the ONLY place a conversation id is ever remembered
+   * against a scope, matching the ONLY place it is ever assigned in memory.
+   * A scope that resolves to nothing makes the write a no-op (history-store.js's
+   * own guard), which is correct: an unscoped panel has nothing of its own to
+   * remember.
    */
   _setCurrentConversationId(conversationId) {
     this.currentConversationId = conversationId;
-    this.historyStore.setLastActive(conversationId).catch(() => {});
+    this.historyStore.setLastActive(this._scope(), conversationId).catch(() => {});
   }
 
   async init() {
@@ -421,7 +452,15 @@ export class PanelController {
   async restoreOrStartConversation() {
     if (this.currentConversationId) return;
 
-    const lastActiveId = await this.historyStore.getLastActive();
+    // scope-conversation-restore-per-tab: reads ONLY this panel's own scope
+    // (spec "Last active conversation restored per panel scope" — "SHALL NOT
+    // adopt a conversation remembered for a different scope"). A scope that
+    // resolves to nothing (spec "No identifiable scope") makes
+    // `getLastActive()` resolve to `null` without ever touching the stored
+    // map (see history-store.js), which falls straight into the
+    // `!restorable` branch below exactly like "First ever open" — there is
+    // no separate code path to fall through to another scope's id.
+    const lastActiveId = await this.historyStore.getLastActive(this._scope());
     let restorable = false;
     if (lastActiveId) {
       const list = await this.historyStore.list();
@@ -539,6 +578,14 @@ export class PanelController {
     this._notify();
   }
 
+  // scope-conversation-restore-per-tab: clearing the remembered identity
+  // already routes through `_setCurrentConversationId(null)` below, which
+  // writes under `this._scope()` — so a delete only ever clears THIS
+  // controller's own scope's entry, never another scope's. The guard
+  // (`currentConversationId === conversationId`) is unchanged from before
+  // this task: this scope's remembered id can only ever equal
+  // `currentConversationId`, since the setter is the sole place either is
+  // assigned, so the two can never drift apart.
   async deleteConversationLocally(conversationId) {
     await this.historyStore.removeLocal(conversationId);
     this.models.delete(conversationId);
@@ -618,7 +665,7 @@ export class PanelController {
     // at it right now, but it is there if the operator navigates back.
     if (this._explicitReopenSinceBoot || this.currentConversationId !== pending.conversationId) return;
 
-    this.historyStore.setLastActive(null).catch(() => {});
+    this.historyStore.setLastActive(this._scope(), null).catch(() => {});
     // Fire-and-forget like the rest of this method's error-path writes:
     // `_startNewConversationSafely()` already swallows its own rejection.
     this._startNewConversationSafely();
