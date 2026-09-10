@@ -377,7 +377,7 @@ await test("default mode (host/mcp-server.js): starts, lists the full registry, 
   const server = await connectServer(MCP_SERVER, pipe);
   try {
     const { tools } = await server.client.listTools();
-    assert(tools.length === 26, `expected 26 registry tools, got ${tools.length}`);
+    assert(tools.length === 28, `expected 28 registry tools, got ${tools.length}`);
     assert(tools.some((t) => t.name === "navigate"), "navigate missing from tool list");
     assert(tools.some((t) => t.name === "tabs_context_mcp"), "legacy _mcp-suffixed alias missing from tool list");
 
@@ -520,7 +520,7 @@ await test("codemode mode (server-codemode.js): starts, exposes execute_code + s
   }
 });
 
-await test("hybrid mode (server-hybrid.js): starts, exposes all 26 upstream tools + execute_code + recording_ack, and a direct passthrough call reaches the extension — no ANTHROPIC_*/CLAUDE_* env, no companion", async () => {
+await test("hybrid mode (server-hybrid.js): starts, exposes all 28 upstream tools + execute_code + recording_ack, and a direct passthrough call reaches the extension — no ANTHROPIC_*/CLAUDE_* env, no companion", async () => {
   const pipe = pipeFor(++seq);
   const ext = fakeExtension(pipe);
   ext.autoRespond((m) => ({ result: { echo: m.tool } }));
@@ -533,7 +533,7 @@ await test("hybrid mode (server-hybrid.js): starts, exposes all 26 upstream tool
     assert(names.includes("execute_code"), `execute_code missing: ${names.join(", ")}`);
     assert(names.includes("recording_ack"), `recording_ack missing: ${names.join(", ")}`);
     const upstreamCount = names.filter((n) => n !== "execute_code" && n !== "recording_ack").length;
-    assert(upstreamCount === 26, `expected 26 upstream passthrough tools, got ${upstreamCount}: ${names.join(", ")}`);
+    assert(upstreamCount === 28, `expected 28 upstream passthrough tools, got ${upstreamCount}: ${names.join(", ")}`);
 
     const reply = await server.client.callTool({ name: "tabs_context_mcp", arguments: {} });
     const text = reply.content?.[0]?.text ?? "";
