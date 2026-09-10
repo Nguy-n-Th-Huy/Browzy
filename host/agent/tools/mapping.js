@@ -273,7 +273,7 @@ export function isJavaScriptToolBorrowedTabAuthorized(run, tabId) {
  *  call. Every other registry tool returns "allow" unconditionally from the
  *  classifier — a non-browser route has its own policy (WebFetch URL guard,
  *  tab-scope/lease authorization) and is never send-class-gated here. */
-export const SEND_CLASS_TOOL_NAMES = Object.freeze(["computer", "javascript_tool"]);
+export const SEND_CLASS_TOOL_NAMES = Object.freeze(["computer", "javascript_tool", "webmcp_call_tool"]);
 
 /** The registered `computer` action vocabulary, read off the live zod enum
  *  in host/tool-definitions.js — never a hand-typed copy. Falls back to the
@@ -551,6 +551,23 @@ export function resolveTargetEvidence(legacyToolName, args = {}, targetHint = nu
       resolved: source != null
     };
   }
+  if (legacyToolName === "webmcp_call_tool") {
+    // The target is a tool the VISITED PAGE declared. Its name and its
+    // effect are page-supplied, and the page's own callback body is never
+    // visible from here — so unlike a script we can scan or a click we can
+    // localize, there is nothing to resolve statically. The name is shown so
+    // the decision card can say what is about to run, and `resolved` stays
+    // false because naming a tool is not the same as knowing what it does.
+    const toolName = typeof args?.name === "string" ? args.name : null;
+    return {
+      kind: toolName ? "page-declared-tool" : "page-declared-tool-missing",
+      ref: toolName,
+      coordinate: null,
+      hasHint,
+      hint: hasHint ? targetHint : null,
+      resolved: false
+    };
+  }
   if (legacyToolName === "computer") {
     const action = normalized.action;
     if (action === "key") {
@@ -625,6 +642,25 @@ export function classifySendClassCall(legacyToolName, args = {}, targetHint = nu
       };
     }
     return { verdict: "allow", reason: "in-scope script with no submit evidence", evidence: resolveTargetEvidence(legacyToolName, args, targetHint) };
+  }
+
+  if (legacyToolName === "webmcp_call_tool") {
+    // Always approve-unknown, never approve-known and never a silent allow.
+    // The callback belongs to the page, so no static analysis can bound its
+    // effect the way jsHasStaticSubmit() bounds a script — a tool named
+    // "search" may still submit an order. Treating it as always-unknown is
+    // what makes the decision card the user's actual authorization, which is
+    // exactly what enforceBorrowedTabScope's read-only default waits for.
+    const evidence = resolveTargetEvidence(legacyToolName, args, targetHint);
+    const toolName = typeof args?.name === "string" ? args.name : null;
+    if (!toolName) {
+      return { verdict: "deny", reason: "webmcp_call_tool without a tool name is undispatchable", evidence };
+    }
+    return {
+      verdict: "approve-unknown",
+      reason: "page-declared tool whose effect cannot be bounded from outside the page",
+      evidence: { ...evidence, unknowns: [`effect of page-declared tool "${toolName}" is defined by the page and not inspectable from here`] }
+    };
   }
 
   // --- computer ---
@@ -717,6 +753,29 @@ export function normalizeApprovalArgs(legacyToolName, args = {}) {
       scriptHash: source ? hashString(source) : null
     };
   }
+  if (legacyToolName === "webmcp_call_tool") {
+    // The approval grant is fingerprinted from what this returns, so the
+    // page-declared tool NAME and its arguments must both be in it. Falling
+    // through to the generic branch below would fingerprint every call
+    // identically, and an Allow for a harmless "search_products" would then
+    // satisfy the pre-dispatch check for a later "delete_account" — the
+    // single-use grant would stop binding the thing the user actually saw.
+    let argsHash = null;
+    try {
+      argsHash = a.toolArgs === undefined ? null : hashString(stableStringify(a.toolArgs));
+    } catch {
+      // Unserializable args must not silently collapse to "no arguments",
+      // which would share a fingerprint with a genuinely argument-less call.
+      argsHash = "unserializable";
+    }
+    return {
+      tool: "webmcp_call_tool",
+      action: "",
+      tabId: a.tabId ?? a.tab_id ?? null,
+      name: typeof a.name === "string" ? a.name : null,
+      argsHash
+    };
+  }
   return { tool: String(legacyToolName || ""), action: String(a.action || "") };
 }
 
@@ -750,7 +809,9 @@ export function fingerprintNormalizedArgs(normalized) {
 
 // --- Mutating vs. read-only classification, by legacy tool name -----------
 //
-// A closed, exhaustive classification of all 26 registry tools (`computer`
+// A closed, exhaustive classification of all 28 registry tools — the 26
+// preserved-baseline entries plus the 2 post-baseline WebMCP page-tool
+// additions from openspec/changes/consume-webmcp-page-tools (`computer`
 // is classified per-action instead of as a whole, since a single call can be
 // a screenshot or a click). A registry-baseline-style test asserts this
 // classification's two sets plus "computer" account for every TOOLS entry,
@@ -769,7 +830,10 @@ const READ_ONLY_LEGACY_TOOLS = new Set([
   "shortcuts_list",
   "retranscribe_recording",
   "switch_browser",
-  "update_plan"
+  "update_plan",
+  // Reads the passively-maintained per-tab page-tool table
+  // (extension/background.js) only — no page or browser side effect.
+  "webmcp_list_tools"
 ]);
 
 const MUTATING_LEGACY_TOOLS = new Set([
@@ -784,7 +848,11 @@ const MUTATING_LEGACY_TOOLS = new Set([
   "shortcuts_execute",
   "resize_window",
   "set_tab_focus",
-  "set_config"
+  "set_config",
+  // Invokes a PAGE-DEFINED callback with arbitrary, unknowable-in-advance
+  // side effects — the same risk class as javascript_tool, and classified
+  // the same conservative way for the same reason.
+  "webmcp_call_tool"
 ]);
 
 // `screenshot`/`zoom` capture pixels without touching the page; `scroll`/
@@ -836,7 +904,18 @@ const TAB_TARGET_ARG_KEYS = {
   shortcuts_list: ["tabId"],
   shortcuts_execute: ["tabId"],
   gif_creator: ["tabId"],
-  tabs_close_mcp: ["tabId", "tabIds"]
+  tabs_close_mcp: ["tabId", "tabIds"],
+  // WebMCP page-tool tools (openspec/changes/consume-webmcp-page-tools),
+  // added as a policy-gap fix: without an entry here, this gate was a no-op
+  // for both tools regardless of isMutatingCall's classification below —
+  // webmcp_call_tool executes arbitrary page-defined code (classified
+  // mutating, same as javascript_tool) and could be dispatched against a
+  // borrowed tab with no authorization at all. webmcp_list_tools only reads
+  // the passively-maintained per-tab page-tool table (classified read-only),
+  // so listing it here changes nothing observable for it — the gate below
+  // is a no-op for read-only calls regardless.
+  webmcp_list_tools: ["tabId"],
+  webmcp_call_tool: ["tabId"]
 };
 
 export class BorrowedTabMutationError extends Error {

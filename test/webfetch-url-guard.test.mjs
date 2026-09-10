@@ -185,7 +185,9 @@ function fakeSkills() {
 }
 
 {
-  ok(TOOLS.length === 26, `sanity: expected the known 26-entry registry baseline, got ${TOOLS.length}`);
+  // 26 preserved-baseline + 2 post-baseline WebMCP page-tool additions
+  // (openspec/changes/consume-webmcp-page-tools) = 28.
+  ok(TOOLS.length === 28, `sanity: expected the known 28-entry registry (26 preserved + 2 post-baseline), got ${TOOLS.length}`);
   const { run, toolBridge } = await makeOptionsRun();
   const mcpServer = createBrowserMcpServer({ toolBridge, coerceArgs: (a) => a, run });
   const options = buildIsolatedOptions({ mcpServer, serverName: SDK_MCP_SERVER_NAME, snapshot: fakeSnapshot(), skills: fakeSkills() });

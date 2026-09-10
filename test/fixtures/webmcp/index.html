@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Browzy WebMCP fixture</title>
+</head>
+<body>
+<!--
+  Manual-verification fixture for openspec/changes/consume-webmcp-page-tools
+  (task 4.3). CI has no Chrome, so the document.modelContext interaction
+  cannot be covered by an automated test (test/webmcp-handlers.test.mjs
+  covers the extension/background.js handler logic with a faked table
+  instead). This page is what a human runs it against manually — see the
+  change report for the exact procedure:
+
+    1. Enable chrome://flags/#enable-webmcp-testing and restart Chrome.
+    2. Load this unpacked extension and open this file as a tab.
+    3. Run webmcp_list_tools against that tab and confirm "echo_fixture_tool"
+       (and "counter_fixture_tool") appear, page-supplied, with their schema.
+    4. Run webmcp_call_tool for "echo_fixture_tool" with {"message": "hi"}
+       and confirm the recognizable result below comes back, and note which
+       via: value was observed.
+    5. Navigate away and confirm the tab's tool list empties.
+
+  If document.modelContext is absent (no trial token, flag off), this page
+  still loads and behaves completely normally — it just never registers
+  anything, matching the "silent absence" requirement.
+-->
+<h1>Browzy WebMCP fixture</h1>
+<p id="status">Checking for document.modelContext...</p>
+<p>
+  This page registers two WebMCP tools for manual verification of Browzy's
+  <code>webmcp_list_tools</code> / <code>webmcp_call_tool</code> operations.
+  It has no purpose beyond that.
+</p>
+<ul>
+  <li><code>echo_fixture_tool</code> — returns a recognizable, deterministic value built from its input.</li>
+  <li><code>counter_fixture_tool</code> — increments and returns an in-page counter, so repeated calls are visibly distinguishable.</li>
+</ul>
+<p>Last call seen by this page: <code id="last-call">(none yet)</code></p>
+
+<script>
+  (function () {
+    var statusEl = document.getElementById("status");
+    var lastCallEl = document.getElementById("last-call");
+
+    if (!("modelContext" in document) || !document.modelContext) {
+      statusEl.textContent =
+        "document.modelContext is not available in this browser/build. " +
+        "Enable chrome://flags/#enable-webmcp-testing and reload, or open " +
+        "this page in a Chrome build within the WebMCP origin trial (149-156).";
+      return;
+    }
+
+    statusEl.textContent = "document.modelContext is available — registering fixture tools...";
+
+    var counter = 0;
+
+    document.modelContext
+      .registerTool({
+        name: "echo_fixture_tool",
+        description:
+          "Browzy WebMCP manual-verification fixture: echoes its input back inside a recognizable envelope, " +
+          "so a caller can confirm the call actually reached this page's own execute callback.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            message: { type: "string", description: "Any string to echo back." }
+          },
+          required: ["message"]
+        },
+        execute: function (input) {
+          lastCallEl.textContent = "echo_fixture_tool(" + JSON.stringify(input) + ")";
+          return {
+            browzy_webmcp_fixture: "echo_fixture_tool",
+            echoed: input && input.message,
+            magic: "browzy-webmcp-fixture-ok"
+          };
+        }
+      })
+      .then(
+        function () {
+          statusEl.textContent = "echo_fixture_tool registered.";
+        },
+        function (err) {
+          statusEl.textContent = "echo_fixture_tool registration failed: " + (err && err.message);
+        }
+      );
+
+    document.modelContext
+      .registerTool({
+        name: "counter_fixture_tool",
+        description:
+          "Browzy WebMCP manual-verification fixture: increments and returns an in-page counter, so repeated " +
+          "calls in the same tab are visibly distinguishable from a cached or replayed result.",
+        inputSchema: { type: "object", properties: {} },
+        execute: function () {
+          counter += 1;
+          lastCallEl.textContent = "counter_fixture_tool() -> " + counter;
+          return { browzy_webmcp_fixture: "counter_fixture_tool", count: counter };
+        }
+      })
+      .then(
+        function () {
+          statusEl.textContent = "echo_fixture_tool and counter_fixture_tool registered. Ready for webmcp_list_tools / webmcp_call_tool.";
+        },
+        function (err) {
+          statusEl.textContent = "counter_fixture_tool registration failed: " + (err && err.message);
+        }
+      );
+  })();
+</script>
+</body>
+</html>

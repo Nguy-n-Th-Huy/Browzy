@@ -26,10 +26,10 @@
 //
 // This suite proves, fully offline (constructed `query()` options only, no
 // SDK/network/credential):
-//   1. All 26 registry-backed browser tools, namespaced under this run's mcp
+//   1. All 28 registry-backed browser tools, namespaced under this run's mcp
 //      server name, plus "Skill", are present in the SDK's `tools`
 //      (availability) allowlist.
-//   2. All 26 registry-backed browser tools are ALSO present in `allowedTools`
+//   2. All 28 registry-backed browser tools are ALSO present in `allowedTools`
 //      (auto-approval) — and "Skill" is deliberately NOT, since passing
 //      'Skill' through `allowedTools` is itself deprecated (sdk.d.ts:1447) —
 //      the `skills` option (already wired) covers it instead. `tools` (minus
@@ -112,10 +112,10 @@ function fakeSkills() {
 
 console.log("\nSDK tool preapproval — every browser tool must be in the allowlist alongside Skill\n");
 
-await test("all 26 registry-backed browser tools, namespaced under this run's mcp server, plus Skill, are preapproved — nothing silently missing", async () => {
+await test("all 28 registry-backed browser tools, namespaced under this run's mcp server, plus Skill, are preapproved — nothing silently missing", async () => {
   assert(
-    TOOLS.length === 26,
-    `expected the known 26-entry registry baseline, got ${TOOLS.length} — if the registry grew or shrank on purpose, this assertion must be updated deliberately, not silently`
+    TOOLS.length === 28,
+    `expected the known 28-entry registry baseline, got ${TOOLS.length} — if the registry grew or shrank on purpose, this assertion must be updated deliberately, not silently`
   );
 
   const { run, toolBridge } = await makeRun();
@@ -152,7 +152,7 @@ await test("all 26 registry-backed browser tools, namespaced under this run's mc
   );
 });
 
-await test("all 24 always-automatic browser tools are auto-approved via allowedTools; computer & javascript_tool stay available through tools only (task 9.1)", async () => {
+await test("all 26 always-automatic browser tools are auto-approved via allowedTools; computer & javascript_tool stay available through tools only (task 9.1)", async () => {
   // Task 9.1 (design.md section 8) narrowed `allowedTools`: `computer` and
   // `javascript_tool` are each capable of producing both an always-automatic
   // call AND a send/submit-class call under the identical tool name, so they
@@ -163,10 +163,10 @@ await test("all 24 always-automatic browser tools are auto-approved via allowedT
   // tools stay in `allowedTools` unchanged — zero added latency, no
   // dependency on `canUseTool` being invoked for them. The first-pass
   // regression this suite caught (tools in `tools` only, never in
-  // `allowedTools`) is still caught here for the 24 always-automatic tools.
+  // `allowedTools`) is still caught here for the 26 always-automatic tools.
   assert(
-    TOOLS.length === 26,
-    `expected the known 26-entry registry baseline, got ${TOOLS.length} — if the registry grew or shrank on purpose, this assertion must be updated deliberately, not silently`
+    TOOLS.length === 28,
+    `expected the known 28-entry registry baseline, got ${TOOLS.length} — if the registry grew or shrank on purpose, this assertion must be updated deliberately, not silently`
   );
 
   const { run, toolBridge } = await makeRun();
@@ -183,7 +183,7 @@ await test("all 24 always-automatic browser tools are auto-approved via allowedT
 
   const sendClassToolNames = new Set(["computer", "javascript_tool"]);
   const alwaysAutomatic = TOOLS.filter((t) => !sendClassToolNames.has(t.name));
-  assert(alwaysAutomatic.length === 24, `internal sanity: 24 always-automatic tools expected, got ${alwaysAutomatic.length}`);
+  assert(alwaysAutomatic.length === 26, `internal sanity: 26 always-automatic tools expected, got ${alwaysAutomatic.length}`);
 
   // Every always-automatic tool MUST be in allowedTools (the regression this
   // suite originally caught — any always-automatic tool absent here would
@@ -195,13 +195,13 @@ await test("all 24 always-automatic browser tools are auto-approved via allowedT
       `always-automatic tool "${t.name}" must be auto-approved as "${qualified}" via allowedTools — being present only in \`tools\` still leaves it behind a permission prompt nothing can answer`
     );
   }
-  // WebSearch and Task are auto-approved alongside the 24 always-automatic
+  // WebSearch and Task are auto-approved alongside the 26 always-automatic
   // browser tools (see query-options.js's `allowedTools` comment); WebFetch
   // is deliberately excluded so its calls route through canUseTool's URL
   // guard instead.
   assert(
     options.allowedTools.length === alwaysAutomatic.length + 2,
-    `allowedTools must contain exactly the 24 always-automatic browser tools plus WebSearch and Task (${alwaysAutomatic.length + 2}), no more and no fewer — got ${options.allowedTools.length}: ${JSON.stringify(options.allowedTools)}`
+    `allowedTools must contain exactly the 26 always-automatic browser tools plus WebSearch and Task (${alwaysAutomatic.length + 2}), no more and no fewer — got ${options.allowedTools.length}: ${JSON.stringify(options.allowedTools)}`
   );
   assert(options.allowedTools.includes("WebSearch"), "WebSearch must be auto-approved");
   assert(options.allowedTools.includes("Task"), "Task must be auto-approved");

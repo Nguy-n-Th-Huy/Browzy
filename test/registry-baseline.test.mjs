@@ -5,7 +5,13 @@
 // ONLY. Design section 6 ("Regression and migration boundaries") calls for a
 // "table-driven fixture suite from all 26 current registry entries" recording
 // "baseline before extraction" so post-migration results can be diffed
-// against it. This file IS that baseline capture.
+// against it. This file IS that baseline capture. The "26" above is quoted
+// verbatim from that archived change's own design.md and describes the
+// registry AS IT STOOD FOR THAT MIGRATION — it is not this file's live count
+// today. openspec/changes/consume-webmcp-page-tools later added two more
+// entries on top of that preserved baseline; see DESIGN_DOC_TOOL_LIST and
+// POST_BASELINE_ADDITIONS below for how this suite tracks the two counts
+// separately rather than editing this historical quote to a new number.
 //
 // It deliberately does NOT implement the second half of 6.1 (mapping
 // friendly SDK-facing operations to preserved executor contracts, or the
@@ -133,34 +139,75 @@ const DESIGN_DOC_TOOL_LIST = [
   "file_upload"
 ];
 
+// Tools added to the registry AFTER the archived migrate-to-claude-agent-sdk
+// baseline above, tracked as their own explicitly-enumerated set rather than
+// folded into DESIGN_DOC_TOOL_LIST — that list quotes an ARCHIVED change's
+// design.md verbatim and never named these two; amending it to include them
+// would misrepresent what that archived document actually said (and would
+// make a genuine future regression — a preserved tool quietly dropped —
+// indistinguishable from an intentional addition). Added by
+// openspec/changes/consume-webmcp-page-tools (see that change's design.md
+// decision 5); NOT part of the 26-operation preservation baseline —
+// openspec/specs/agent-browser-runtime's "Preserve the browser capability
+// baseline" requirement is what calls for tracking additions this way.
+const POST_BASELINE_ADDITIONS = ["webmcp_list_tools", "webmcp_call_tool"];
+
 const missingFromLive = DESIGN_DOC_TOOL_LIST.filter((n) => !liveNames.includes(n));
 const extraInLive = liveNames.filter((n) => !DESIGN_DOC_TOOL_LIST.includes(n));
 
-ok(TOOLS.length === 26, `live registry has exactly 26 entries (design.md's claimed count) — actual: ${TOOLS.length}`);
+ok(
+  TOOLS.length === DESIGN_DOC_TOOL_LIST.length + POST_BASELINE_ADDITIONS.length,
+  `live registry has exactly ${DESIGN_DOC_TOOL_LIST.length} preserved-baseline + ${POST_BASELINE_ADDITIONS.length} post-baseline ` +
+    `entries (${DESIGN_DOC_TOOL_LIST.length + POST_BASELINE_ADDITIONS.length} total) — actual: ${TOOLS.length}`
+);
 ok(
   missingFromLive.length === 0,
   missingFromLive.length === 0
     ? "every tool design.md lists is present in the live registry"
     : `DISCREPANCY: design.md lists tools missing from the live registry: ${missingFromLive.join(", ")}`
 );
+// extraInLive must equal POST_BASELINE_ADDITIONS EXACTLY, in both
+// directions — not merely "extras are permitted". An unaccounted-for extra
+// (a tool nobody documented) and a documented addition gone missing (a
+// preserved-looking tool quietly dropped by rename or removal) are both
+// real discrepancies, and this must fail loudly on either.
+const extraInLiveSet = new Set(extraInLive);
+const postBaselineSet = new Set(POST_BASELINE_ADDITIONS);
+const unaccountedExtras = extraInLive.filter((n) => !postBaselineSet.has(n));
+const postBaselineMissing = POST_BASELINE_ADDITIONS.filter((n) => !extraInLiveSet.has(n));
 ok(
-  extraInLive.length === 0,
-  extraInLive.length === 0
-    ? "no live tool is absent from design.md's list"
-    : `DISCREPANCY: live registry has tools design.md's list omits: ${extraInLive.join(", ")}`
+  unaccountedExtras.length === 0 && postBaselineMissing.length === 0,
+  unaccountedExtras.length === 0 && postBaselineMissing.length === 0
+    ? `every tool in the live registry beyond design.md's list is exactly the enumerated post-baseline set: ${POST_BASELINE_ADDITIONS.join(", ")}`
+    : [
+        unaccountedExtras.length
+          ? `DISCREPANCY: live registry has unaccounted-for tool(s) beyond design.md's list and POST_BASELINE_ADDITIONS: ${unaccountedExtras.join(", ")}`
+          : null,
+        postBaselineMissing.length
+          ? `DISCREPANCY: POST_BASELINE_ADDITIONS lists tool(s) missing from the live registry: ${postBaselineMissing.join(", ")}`
+          : null
+      ]
+        .filter(Boolean)
+        .join("; ")
 );
 
 const namesSet = new Set(liveNames);
 ok(namesSet.size === liveNames.length, "no duplicate tool names in the live registry");
 
-// The registry file's own top-of-file comment ("The 25 browzy-in-chrome
-// tool definitions...") is stale relative to the actual 26-entry array below
-// it. host/tool-definitions.js is out of scope for this task to edit (it is
-// explicitly off-limits and owned by other in-flight work), so this is
-// reported here — and in reports/06-registry-baseline.md — rather than fixed.
-console.log(
-  "  NOTE: host/tool-definitions.js line 1 says \"The 25 ... tool definitions\"" +
-  " but the TOOLS array has 26 entries. Stale comment, out of scope to edit here."
+// Previously (migrate-to-claude-agent-sdk): host/tool-definitions.js's own
+// top-of-file comment said "The 25 browzy-in-chrome tool definitions..."
+// while the array actually held 26 — a discrepancy that change reported
+// here (and in reports/06-registry-baseline.md) rather than fixed, since
+// that file was out of scope for it. openspec/changes/consume-webmcp-
+// page-tools owns host/tool-definitions.js (it appends the two entries
+// POST_BASELINE_ADDITIONS names above) and corrected that header comment in
+// the same pass — it now names both the 26-preserved and 2-added counts, so
+// this is a resolved-history note, not a live discrepancy: verified below.
+ok(
+  TOOLS.length === DESIGN_DOC_TOOL_LIST.length + POST_BASELINE_ADDITIONS.length,
+  TOOLS.length === DESIGN_DOC_TOOL_LIST.length + POST_BASELINE_ADDITIONS.length
+    ? `host/tool-definitions.js's header count (${DESIGN_DOC_TOOL_LIST.length} preserved + ${POST_BASELINE_ADDITIONS.length} post-baseline) now matches the live array`
+    : `DISCREPANCY: host/tool-definitions.js's header claims ${DESIGN_DOC_TOOL_LIST.length} preserved + ${POST_BASELINE_ADDITIONS.length} post-baseline entries but the live array has ${TOOLS.length}`
 );
 
 // =============================================================================
@@ -228,8 +275,12 @@ for (const name of allNames) {
 console.log("\n== Preservation properties (design.md section 6) ==");
 
 // Legacy names containing "mcp" remain present as internal compatibility
-// aliases.
-const legacyMcpNames = liveNames.filter((n) => n.includes("mcp"));
+// aliases. Filtered from the PRESERVED-baseline names only (DESIGN_DOC_TOOL_
+// LIST), not raw liveNames — POST_BASELINE_ADDITIONS' "webmcp_*" names also
+// contain the substring "mcp" (they are named after the WebMCP protocol, not
+// after this legacy alias convention) and are not compatibility aliases, so
+// counting them here would misreport what this check actually found.
+const legacyMcpNames = DESIGN_DOC_TOOL_LIST.filter((n) => liveNames.includes(n) && n.includes("mcp"));
 ok(
   legacyMcpNames.length > 0,
   `at least one legacy 'mcp'-suffixed compatibility alias is present: ${legacyMcpNames.join(", ")}`

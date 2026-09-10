@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Task 6.1 (MAPPING half) — proves every one of the 26 entries recorded in
+// Task 6.1 (MAPPING half) — proves every one of the entries recorded in
 // the committed baseline (test/fixtures/registry-baseline.json,
 // test/registry-baseline.test.mjs) remains reachable through the SDK path
 // via host/agent/tools/mapping.js + host/agent/tools/adapter.js, that legacy
@@ -7,7 +7,9 @@
 // compatibility aliases (design.md decision 6), that the borrowed-tab scope
 // primitives (design.md 5b) behave correctly in isolation, and the two
 // non-negotiable assertions this task calls out explicitly:
-//   - no dropped operation (all 26 reachable)
+//   - no dropped operation (all entries reachable — originally 26; see
+//     TOTAL_REGISTRY_COUNT below for openspec/changes/consume-webmcp-
+//     page-tools' 2 post-baseline additions on top of that)
 //   - no model access to provider credentials via get_config/set_config
 //   - screenshots survive the SDK path as real image content, not text
 //
@@ -38,6 +40,8 @@ import {
   enforceBorrowedTabScope,
   BorrowedTabMutationError,
   extractCreatedTabId,
+  normalizeApprovalArgs,
+  fingerprintNormalizedArgs,
   _mutationClassificationCoverage
 } from "../host/agent/tools/mapping.js";
 import { buildSdkTools, adapterToolNames, KNOWN_TOOL_NAMES, createBrowserMcpServer } from "../host/agent/tools/adapter.js";
@@ -49,6 +53,20 @@ import { Run } from "../host/agent/session/run.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SNAPSHOT_PATH = path.join(__dirname, "fixtures", "registry-baseline.json");
 const BASELINE = JSON.parse(fs.readFileSync(SNAPSHOT_PATH, "utf8"));
+
+// openspec/changes/consume-webmcp-page-tools appended 2 post-baseline
+// entries (webmcp_list_tools, webmcp_call_tool) to the same registry this
+// suite's BASELINE snapshot now includes — see
+// test/registry-baseline.test.mjs's DESIGN_DOC_TOOL_LIST/
+// POST_BASELINE_ADDITIONS split, which is this repo's canonical source for
+// the two counts. This file cannot import that constant directly (that
+// script calls process.exit() at module scope, so importing it would run
+// the whole other suite and exit this process), so the count is mirrored
+// here instead — every bare "26" this suite asserted before that change is
+// replaced with LEGACY_BASELINE_COUNT + POST_BASELINE_ADDITIONS_COUNT below.
+const LEGACY_BASELINE_COUNT = 26;
+const POST_BASELINE_ADDITIONS_COUNT = 2;
+const TOTAL_REGISTRY_COUNT = LEGACY_BASELINE_COUNT + POST_BASELINE_ADDITIONS_COUNT;
 
 const results = [];
 async function test(name, fn) {
@@ -76,12 +94,19 @@ async function makeRun({ tabScope = "any" } = {}) {
 console.log("\nFriendly-name mapping (design.md decision 6)\n");
 
 await test("exactly the three '_mcp'-suffixed legacy names have a friendly alias; every other tool is its own identity", () => {
-  const mcpNames = TOOLS.map((t) => t.name).filter((n) => n.includes("mcp"));
-  assert(mcpNames.length === 3, `expected exactly 3 mcp-suffixed names in the live registry, got ${mcpNames.length}: ${mcpNames.join(", ")}`);
+  // `.endsWith("_mcp")`, not `.includes("mcp")`: openspec/changes/
+  // consume-webmcp-page-tools added "webmcp_list_tools"/"webmcp_call_tool",
+  // which contain the substring "mcp" (they are named after the WebMCP
+  // protocol) but do not END in "_mcp" and are not legacy compatibility
+  // aliases — a substring check would misclassify them. This is a
+  // tightening of what the assertion's own message already claimed to
+  // check, not a weakening.
+  const mcpNames = TOOLS.map((t) => t.name).filter((n) => n.endsWith("_mcp"));
+  assert(mcpNames.length === 3, `expected exactly 3 '_mcp'-suffixed legacy names in the live registry, got ${mcpNames.length}: ${mcpNames.join(", ")}`);
   for (const n of mcpNames) assert(FRIENDLY_TO_LEGACY[LEGACY_TO_FRIENDLY[n]] === n, `${n} must round-trip legacy -> friendly -> legacy`);
   for (const t of TOOLS) {
-    if (!t.name.includes("mcp")) {
-      assert(sdkFacingName(t.name) === t.name, `${t.name} has no mcp substring and must be its own SDK-facing name`);
+    if (!t.name.endsWith("_mcp")) {
+      assert(sdkFacingName(t.name) === t.name, `${t.name} does not end in _mcp and must be its own SDK-facing name`);
     }
   }
 });
@@ -95,12 +120,12 @@ await test("legacyNameFor() resolves BOTH a friendly alias and an already-legacy
   assert(legacyNameFor("totally_unknown_tool") === "totally_unknown_tool", "an unrecognized name passes through — unknown-tool rejection is authorization.js's job, not mapping.js's");
 });
 
-console.log("\nAll 26 registry entries remain reachable through the SDK mapping (no dropped operation)\n");
+console.log(`\nAll ${TOTAL_REGISTRY_COUNT} registry entries remain reachable through the SDK mapping (no dropped operation)\n`);
 
-await test("every one of the 26 baseline entries has a legacy executor contract reachable via sdkFacingToolDefs()", () => {
-  assert(BASELINE.length === 26, `sanity: committed baseline must have 26 entries, has ${BASELINE.length}`);
+await test(`every one of the ${TOTAL_REGISTRY_COUNT} registry entries has a legacy executor contract reachable via sdkFacingToolDefs()`, () => {
+  assert(BASELINE.length === TOTAL_REGISTRY_COUNT, `sanity: committed baseline must have ${TOTAL_REGISTRY_COUNT} entries, has ${BASELINE.length}`);
   const defs = sdkFacingToolDefs();
-  assert(defs.length === 26, `sdkFacingToolDefs() must produce exactly 26 entries, got ${defs.length}`);
+  assert(defs.length === TOTAL_REGISTRY_COUNT, `sdkFacingToolDefs() must produce exactly ${TOTAL_REGISTRY_COUNT} entries, got ${defs.length}`);
   const byLegacyName = new Map(defs.map((d) => [d.legacyName, d]));
   for (const entry of BASELINE) {
     const def = byLegacyName.get(entry.name);
@@ -109,16 +134,16 @@ await test("every one of the 26 baseline entries has a legacy executor contract 
   }
 });
 
-await test("every one of the 26 baseline entries is registered on the real SDK server via adapterToolNames()/KNOWN_TOOL_NAMES", () => {
+await test(`every one of the ${TOTAL_REGISTRY_COUNT} registry entries is registered on the real SDK server via adapterToolNames()/KNOWN_TOOL_NAMES`, () => {
   const registered = new Set(adapterToolNames());
-  assert(registered.size === 26, `adapter must expose exactly 26 tool names, got ${registered.size}`);
+  assert(registered.size === TOTAL_REGISTRY_COUNT, `adapter must expose exactly ${TOTAL_REGISTRY_COUNT} tool names, got ${registered.size}`);
   for (const entry of BASELINE) {
     assert(registered.has(entry.name), `baseline entry "${entry.name}" is not registered on the SDK adapter — DROPPED OPERATION`);
     assert(KNOWN_TOOL_NAMES.has(entry.name), `"${entry.name}" missing from KNOWN_TOOL_NAMES (authorization.js's unknown-tool gate would wrongly reject it)`);
   }
 });
 
-await test("a real SDK tool call for every one of the 26 entries reaches the underlying legacy executor by its ORIGINAL name (not a friendly alias that would break the shared registry contract)", async () => {
+await test(`a real SDK tool call for every one of the ${TOTAL_REGISTRY_COUNT} entries reaches the underlying legacy executor by its ORIGINAL name (not a friendly alias that would break the shared registry contract)`, async () => {
   const run = await makeRun();
   const seenNames = [];
   const toolBridge = new ToolBridge({
@@ -127,7 +152,7 @@ await test("a real SDK tool call for every one of the 26 entries reaches the und
     shutdown: () => {}
   });
   const sdkTools = buildSdkTools({ toolBridge, coerceArgs: (a) => a, run });
-  assert(sdkTools.length === 26, `expected 26 SDK tool objects, got ${sdkTools.length}`);
+  assert(sdkTools.length === TOTAL_REGISTRY_COUNT, `expected ${TOTAL_REGISTRY_COUNT} SDK tool objects, got ${sdkTools.length}`);
   for (const entry of BASELINE) {
     const sdkTool = sdkTools.find((t) => t.name === entry.name);
     assert(sdkTool, `no SDK tool object for "${entry.name}"`);
@@ -152,9 +177,36 @@ await test("a real SDK tool call for every one of the 26 entries reaches the und
     }
     if (entry.name === "retranscribe_recording") args.recording_id = "rec_1";
     if (entry.name === "set_config") { args.key = "humanize"; args.value = true; }
+    if (entry.name === "webmcp_list_tools") args.tabId = 1;
+    if (entry.name === "webmcp_call_tool") {
+      // Policy-gap fix: webmcp_call_tool is now correctly gated by
+      // enforceBorrowedTabScope (mutating call, TAB_TARGET_ARG_KEYS) — under
+      // this test's "any" tabScope, tab 1 is borrowed and unauthorized by
+      // default. Authorize it explicitly, the same way file_upload above
+      // allowlists its path, so this reachability test still measures
+      // reachability rather than tripping the (correct) new authorization
+      // requirement. The dedicated borrowed-tab rejection/authorization
+      // behavior itself is covered separately below.
+      // webmcp_call_tool is send-class (a page-declared tool's effect cannot
+      // be bounded from outside the page), so a real dispatch needs the
+      // single-use approval grant the Allow path records — and that grant
+      // also lifts the borrowed-tab read-only default, exactly as it does
+      // for an approved send-class `computer` call. Record one here the same
+      // way file_upload above allowlists its path, so this test still
+      // measures reachability rather than tripping the (correct) new
+      // authorization requirement. The binding and single-use behavior of
+      // that grant is covered by its own test below.
+      args.tabId = 1;
+      args.name = "fixture_tool";
+      args.toolArgs = {};
+      run.recordApprovalGrant(
+        fingerprintNormalizedArgs(normalizeApprovalArgs("webmcp_call_tool", args)),
+        { requestId: "registry-sdk-mapping-reachability" }
+      );
+    }
     await sdkTool.handler(args);
   }
-  assert(seenNames.length === 26, `expected 26 real dispatches (one per registry entry), got ${seenNames.length}`);
+  assert(seenNames.length === TOTAL_REGISTRY_COUNT, `expected ${TOTAL_REGISTRY_COUNT} real dispatches (one per registry entry), got ${seenNames.length}`);
   for (const entry of BASELINE) {
     assert(seenNames.includes(entry.name), `"${entry.name}" was never actually dispatched to the executor by its real legacy name`);
   }
@@ -215,7 +267,7 @@ await test("borrowed-tab classification is per-run — two different runs never 
   assert(isBorrowedTab(runB, 1) === true, "the same tabId is still borrowed for runB");
 });
 
-await test("isMutatingCall(): computer is classified per-action; every other one of the 26 tools falls in exactly one of read-only/mutating", () => {
+await test(`isMutatingCall(): computer is classified per-action; every other one of the ${TOTAL_REGISTRY_COUNT} tools falls in exactly one of read-only/mutating`, () => {
   assert(isMutatingCall("computer", { action: "screenshot" }) === false, "screenshot must be read-only");
   assert(isMutatingCall("computer", { action: "zoom" }) === false, "zoom must be read-only");
   assert(isMutatingCall("computer", { action: "scroll" }) === false, "scroll must be read-only (needed to read content beyond the viewport, design.md 5b)");
@@ -225,11 +277,20 @@ await test("isMutatingCall(): computer is classified per-action; every other one
   assert(isMutatingCall("navigate") === true, "navigate must be mutating");
   assert(isMutatingCall("javascript_tool") === true, "javascript_tool (arbitrary code) must always be treated as mutating");
   assert(isMutatingCall("tabs_close_mcp") === true, "tabs_close_mcp must be mutating");
+  // openspec/changes/consume-webmcp-page-tools's two additions: list_tools
+  // only reads a passively-maintained table (read-only); call_tool invokes
+  // an arbitrary PAGE-DEFINED callback with unknowable-in-advance side
+  // effects, classified the same conservative way as javascript_tool.
+  assert(isMutatingCall("webmcp_list_tools") === false, "webmcp_list_tools (reads a passive table) must be read-only");
+  assert(isMutatingCall("webmcp_call_tool") === true, "webmcp_call_tool (arbitrary page-defined effects) must always be treated as mutating");
 
   const { readOnly, mutating } = _mutationClassificationCoverage();
   const covered = new Set([...readOnly, ...mutating, "computer"]);
   const liveNames = new Set(TOOLS.map((t) => t.name));
-  assert(covered.size === 26, `classification must cover exactly 26 tools (25 explicit + computer), covers ${covered.size}`);
+  assert(
+    covered.size === TOTAL_REGISTRY_COUNT,
+    `classification must cover exactly ${TOTAL_REGISTRY_COUNT} tools (${TOTAL_REGISTRY_COUNT - 1} explicit + computer), covers ${covered.size}`
+  );
   for (const name of liveNames) {
     assert(covered.has(name), `"${name}" is not classified as read-only, mutating, or computer — a future registry addition must not silently fall through`);
   }
@@ -278,6 +339,109 @@ await test("enforceBorrowedTabScope(): mutation without task authorization is re
     enforceBorrowedTabScope({ run, legacyToolName: "form_input", args: { tabId: 10, ref: "ref_1", value: "x" } });
   } catch (err) { threw2 = err; }
   assert(threw2 instanceof BorrowedTabMutationError, "authorizing tab 9 must not silently authorize tab 10 too");
+});
+
+await test("enforceBorrowedTabScope(): webmcp_call_tool (arbitrary page-defined execution) on a borrowed tab is rejected without authorization; explicit authorization lifts it", async () => {
+  // Policy-gap fix: webmcp_call_tool invokes a PAGE-DEFINED callback with
+  // unknowable-in-advance side effects and is classified mutating (same
+  // conservative treatment as javascript_tool). Before this fix, neither
+  // authorization.js's TAB_ARG_KEYS nor mapping.js's TAB_TARGET_ARG_KEYS
+  // listed webmcp_call_tool, so this gate was a silent no-op for it — a
+  // page-defined tool could be invoked against a borrowed tab with no
+  // authorization at all.
+  const run = await makeRun({ tabScope: [21] });
+  let threw = null;
+  try {
+    enforceBorrowedTabScope({ run, legacyToolName: "webmcp_call_tool", args: { tabId: 21, name: "fixture_tool", toolArgs: {} } });
+  } catch (err) { threw = err; }
+  assert(threw instanceof BorrowedTabMutationError, "webmcp_call_tool against a borrowed tab must be rejected without authorization");
+  assert(threw.tabId === 21, "the error must name the exact tab it rejected");
+
+  authorizeBorrowedTabMutation(run, 21);
+  enforceBorrowedTabScope({ run, legacyToolName: "webmcp_call_tool", args: { tabId: 21, name: "fixture_tool", toolArgs: {} } }); // must NOT throw now
+});
+
+await test("enforceBorrowedTabScope(): webmcp_list_tools (read-only) on a borrowed tab is allowed with no authorization required", async () => {
+  // webmcp_list_tools only reads the passively-maintained per-tab page-tool
+  // table — no page or browser side effect — so it must behave exactly like
+  // every other read-only tool (get_page_text, read_page) against a borrowed
+  // tab: allowed unconditionally.
+  const run = await makeRun({ tabScope: [22] });
+  enforceBorrowedTabScope({ run, legacyToolName: "webmcp_list_tools", args: { tabId: 22 } }); // must not throw
+  assert(isBorrowedTabMutationAuthorized(run, 22) === false, "a read-only call must not implicitly authorize the tab for mutation");
+});
+
+await test("the SDK adapter itself rejects an UNAPPROVED webmcp_call_tool dispatch on a borrowed tab (integration, not just the standalone gate)", async () => {
+  let dispatched = false;
+  const run = await makeRun({ tabScope: [23] });
+  const toolBridge = new ToolBridge({
+    init: async () => {},
+    callTool: async () => { dispatched = true; return { content: [{ type: "text", text: "should never run" }] }; },
+    shutdown: () => {}
+  });
+  const sdkTools = buildSdkTools({ toolBridge, coerceArgs: (a) => a, run });
+  const webmcpCallTool = sdkTools.find((t) => t.name === "webmcp_call_tool");
+  const result = await webmcpCallTool.handler({ tabId: 23, name: "fixture_tool", toolArgs: {} });
+  assert(result.isError === true, "an unapproved webmcp_call_tool dispatch must be reported as an error result");
+  // webmcp_call_tool is send-class, so the approval check runs BEFORE
+  // enforceBorrowedTabScope and is what rejects here. The borrowed-tab
+  // default is still enforced — it is simply no longer the first gate this
+  // call can fail, because a page-declared tool cannot dispatch at all
+  // without a grant for these exact arguments.
+  assert(/approval/i.test(result.content[0].text), `the rejection must explain the missing approval, got: ${result.content[0].text}`);
+  assert(!dispatched, "the underlying tool bridge must NEVER be reached for a rejected webmcp_call_tool dispatch");
+});
+
+await test("an approved webmcp_call_tool grant is bound to the exact page-declared tool it named, and is single-use", async () => {
+  let dispatched = 0;
+  const run = await makeRun({ tabScope: [23] });
+  const toolBridge = new ToolBridge({
+    init: async () => {},
+    callTool: async () => { dispatched += 1; return { content: [{ type: "text", text: "ran" }] }; },
+    shutdown: () => {}
+  });
+  const sdkTools = buildSdkTools({ toolBridge, coerceArgs: (a) => a, run });
+  const webmcpCallTool = sdkTools.find((t) => t.name === "webmcp_call_tool");
+
+  const approved = { tabId: 23, name: "add_to_cart", toolArgs: { productId: "p3" } };
+  const grantFor = (args) => fingerprintNormalizedArgs(normalizeApprovalArgs("webmcp_call_tool", args));
+
+  // A grant for add_to_cart must NOT satisfy a call to a different tool —
+  // otherwise one Allow would authorize every page-declared tool on the page.
+  run.recordApprovalGrant(grantFor(approved), { requestId: "r1" });
+  const otherTool = await webmcpCallTool.handler({ tabId: 23, name: "delete_account", toolArgs: { productId: "p3" } });
+  assert(otherTool.isError === true, "a grant for one page-declared tool must not authorize a different one");
+  assert(dispatched === 0, "a differently-named page tool must never reach the bridge on someone else's grant");
+
+  // Nor a different argument set for the same tool.
+  const otherArgs = await webmcpCallTool.handler({ tabId: 23, name: "add_to_cart", toolArgs: { productId: "p9" } });
+  assert(otherArgs.isError === true, "a grant must not authorize the same tool with different arguments");
+  assert(dispatched === 0, "different arguments must never reach the bridge on someone else's grant");
+
+  // The exact approved call goes through, and lifts the borrowed-tab default.
+  const ok = await webmcpCallTool.handler({ ...approved, toolArgs: { productId: "p3" } });
+  assert(!ok.isError, `the exact approved call must dispatch, got: ${ok.content?.[0]?.text}`);
+  assert(dispatched === 1, "the approved call must reach the bridge exactly once");
+
+  // Single-use: replaying it must not dispatch again.
+  const replay = await webmcpCallTool.handler({ ...approved, toolArgs: { productId: "p3" } });
+  assert(replay.isError === true, "an approval grant must be single-use, not replayable");
+  assert(dispatched === 1, "a replayed grant must not produce a second dispatch");
+});
+
+await test("the SDK adapter allows webmcp_list_tools on the same borrowed tab (read-only default access works)", async () => {
+  let dispatched = false;
+  const run = await makeRun({ tabScope: [23] });
+  const toolBridge = new ToolBridge({
+    init: async () => {},
+    callTool: async (name) => { dispatched = true; return { content: [{ type: "text", text: `page tools for ${name}` }] }; },
+    shutdown: () => {}
+  });
+  const sdkTools = buildSdkTools({ toolBridge, coerceArgs: (a) => a, run });
+  const webmcpListTools = sdkTools.find((t) => t.name === "webmcp_list_tools");
+  const result = await webmcpListTools.handler({ tabId: 23 });
+  assert(dispatched === true, "webmcp_list_tools on a borrowed tab must reach the executor");
+  assert(!result.isError, "webmcp_list_tools on a borrowed tab must not be an error");
 });
 
 await test("the SDK adapter itself rejects a mutation on a borrowed tab (integration, not just the standalone gate)", async () => {

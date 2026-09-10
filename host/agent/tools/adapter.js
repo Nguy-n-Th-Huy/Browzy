@@ -253,13 +253,22 @@ export function buildSdkTools({ toolBridge, coerceArgs, run }) {
         // here, AFTER the run-state/lease/scope checks above and BEFORE
         // enforceBorrowedTabScope below, so the lift and the restriction
         // compose in the right order.
-        if (t.name === "computer" || t.name === "javascript_tool") {
+        if (t.name === "computer" || t.name === "javascript_tool" || t.name === "webmcp_call_tool") {
           const preDispatch = verifyPreDispatchApproval({ run, legacyToolName: t.name, args: coerced });
           if (!preDispatch.ok) {
             run.recordRejectedDispatch?.(t.name, coerced, { reason: "stale_approval", detail: { dispatchReason: preDispatch.reason } });
             return staleApprovalErrorResult(preDispatch.reason);
           }
-          if (preDispatch.granted && t.name === "computer") {
+          // `webmcp_call_tool` joins `computer` in lifting the borrowed-tab
+          // read-only default, and for the same reason: the grant consumed
+          // just above IS the user's explicit Allow for this exact call, so
+          // it is the "explicit authorization from the actual user task"
+          // that default waits for. `javascript_tool` stays excluded — its
+          // restriction is deliberate (design 9d/10.4) and no approval text
+          // lifts it. Without this, every page-declared tool call against
+          // the bound current page would fail, which is the primary way the
+          // side panel is used.
+          if (preDispatch.granted && (t.name === "computer" || t.name === "webmcp_call_tool")) {
             for (const tabId of _tabIdsForArgs(t.name, coerced)) {
               if (isBorrowedTab(run, tabId) && !isBorrowedTabMutationAuthorized(run, tabId)) {
                 authorizeBorrowedTabMutation(run, tabId);

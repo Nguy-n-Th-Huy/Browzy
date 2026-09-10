@@ -6,9 +6,11 @@
 //
 // Kept as pure functions (name/args in, string out) so they are trivially
 // unit-testable without any DOM or chrome.* dependency. The 26-tool
-// inventory mirrors host/tool-definitions.js's TOOLS (design.md's
-// "authoritative preservation inventory"); this file does not change or
-// duplicate their schemas, only how a call is DESCRIBED to a human.
+// preserved-baseline inventory mirrors host/tool-definitions.js's TOOLS
+// (design.md's "authoritative preservation inventory"), plus the 2
+// post-baseline WebMCP page-tool additions from openspec/changes/
+// consume-webmcp-page-tools; this file does not change or duplicate their
+// schemas, only how a call is DESCRIBED to a human.
 
 const STATIC_LABELS_VI = {
   tabs_context_mcp: "Đã kiểm tra các tab đang mở",
@@ -37,6 +39,10 @@ const STATIC_LABELS_VI = {
   upload_image: "Đã tải ảnh lên",
   retranscribe_recording: "Đã chuyển lại bản ghi thành văn bản",
   file_upload: "Đã tải tệp lên",
+  // openspec/changes/consume-webmcp-page-tools: post-baseline additions,
+  // not part of the 26-tool preserved inventory above.
+  webmcp_list_tools: "Đã kiểm tra công cụ do trang khai báo",
+  webmcp_call_tool: "Đã thực thi công cụ do trang khai báo",
   // Application-owned tools, registered alongside the browser tools on the
   // same in-process MCP server (host/agent/tools/**). They are not browser
   // actions, but they arrive on the same tool-call path and would otherwise

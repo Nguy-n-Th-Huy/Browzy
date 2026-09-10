@@ -40,7 +40,15 @@ const TAB_ARG_KEYS = {
   set_tab_focus: ["tabId"],
   upload_image: ["tabId"],
   file_upload: ["tabId"],
-  tabs_close_mcp: ["tabId", "tabIds"]
+  tabs_close_mcp: ["tabId", "tabIds"],
+  // WebMCP page-tool tools (openspec/changes/consume-webmcp-page-tools):
+  // both take a tabId arg and must be scope-checked like every other
+  // tab-targeting tool. webmcp_call_tool executes arbitrary page-defined
+  // code and is additionally gated by the borrowed-tab mutation check in
+  // host/agent/tools/mapping.js's enforceBorrowedTabScope (see that file's
+  // TAB_TARGET_ARG_KEYS/isMutatingCall classification).
+  webmcp_list_tools: ["tabId"],
+  webmcp_call_tool: ["tabId"]
 };
 
 /**
