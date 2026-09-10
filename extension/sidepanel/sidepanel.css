@@ -508,69 +508,13 @@ body {
   color: var(--color-status-danger);
 }
 
-.section-heading {
-  font-size: var(--font-size-small);
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  color: var(--color-text-secondary);
-  margin: var(--space-2) 0 0;
-}
-
-.list-column {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-}
-
-.list-item {
-  display: flex;
-  align-items: center;
-  gap: var(--space-3);
-  padding: var(--space-3);
-  border-radius: var(--radius-md);
-  background: var(--color-surface);
-  border: 1px solid var(--color-border-subtle);
-  box-shadow: var(--shadow-sm);
-}
-.list-item[aria-current="true"] {
-  border-color: var(--color-accent);
-}
-.list-item-icon {
-  flex: none;
-  width: 36px;
-  height: 36px;
-  border-radius: var(--radius-sm);
-  background: var(--color-surface-sunken);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--color-text-secondary);
-}
-.list-item-main {
-  flex: 1;
-  min-width: 0;
-}
-.list-item-title {
-  display: block;
-  font-weight: 600;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.list-item-sub {
-  display: block;
-  font-size: var(--font-size-small);
-  color: var(--color-text-secondary);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.list-item-actions {
-  flex: none;
-  display: flex;
-  gap: var(--space-1);
-}
+/* Moved to extension/ui/components.css: .section-heading, .list-column,
+   .list-item and its children are consumed by extension/settings/** too
+   (settings.html and skills.html both use them), and this file is never
+   loaded there — so on those pages the classes resolved to nothing at all:
+   headings rendered as plain body text and every list row collapsed into
+   stacked, unstyled spans. A primitive used by more than one surface
+   belongs in the shared layer, which is where they now live. */
 
 .error-banner {
   display: flex;
