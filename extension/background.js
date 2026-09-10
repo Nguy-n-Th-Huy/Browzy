@@ -3845,51 +3845,69 @@ const toolHandlers = {
   },
 
   async tabs_create_mcp(args) {
-    await ensureTabGroup(true);
-    // Create the tab INSIDE the MCP group's own window and do NOT select it:
-    // automation must never yank the operator away from what they are looking
-    // at. Without windowId the tab lands in whatever window is currently
-    // focused — i.e. the operator's — which is exactly the interruption we
-    // are avoiding. Use the set_tab_focus tool to surface a tab deliberately.
-    let windowId;
+    // Resolve the anchor — the tab the agent is actually working in — BEFORE
+    // deciding on a group, because when that tab already sits in one of our
+    // own groups the new tab belongs in THAT group, beside it. Grouping it
+    // somewhere else splits one task across two groups, and when no group
+    // exists yet ensureTabGroup(true) would additionally open a whole new
+    // window for it: the operator watches one group while the work appears
+    // outside it. The anchor is whatever tab the last tool_request named
+    // (`lastAgentTabId`); a stale, closed or ungrouped one simply falls back
+    // to the previous behaviour below.
+    // `typeof` guards rather than bare reads: this method's SHIPPED body is
+    // compiled standalone by test/handlers.test.mjs with a fixed dependency
+    // list that declares neither `lastAgentTabId`'s value nor
+    // `isOwnAgentGroupId`, where a bare reference is a ReferenceError rather
+    // than a no-op.
+    let anchor = null;
     try {
-      const groupTabs = await chrome.tabs.query({ groupId: tabGroupId });
-      windowId = groupTabs[0]?.windowId;
-    } catch {}
+      const anchorId = typeof lastAgentTabId === "number" ? lastAgentTabId : null;
+      if (anchorId !== null) anchor = await chrome.tabs.get(anchorId);
+    } catch {
+      anchor = null; // anchor closed mid-run
+    }
+    const anchorGroupId = anchor && typeof anchor.groupId === "number" && anchor.groupId !== -1 ? anchor.groupId : null;
+    const joinAnchorGroup =
+      anchorGroupId !== null && typeof isOwnAgentGroupId === "function" && isOwnAgentGroupId(anchorGroupId);
+
+    // Create the tab INSIDE the target group's own window and do NOT select
+    // it: automation must never yank the operator away from what they are
+    // looking at. Without windowId the tab lands in whatever window is
+    // currently focused — i.e. the operator's — which is exactly the
+    // interruption we are avoiding. Use the set_tab_focus tool to surface a
+    // tab deliberately.
+    let targetGroupId;
+    let windowId;
+    if (joinAnchorGroup) {
+      targetGroupId = anchorGroupId;
+      windowId = anchor.windowId;
+    } else {
+      await ensureTabGroup(true);
+      targetGroupId = tabGroupId;
+      try {
+        const groupTabs = await chrome.tabs.query({ groupId: tabGroupId });
+        windowId = groupTabs[0]?.windowId;
+      } catch {}
+    }
     // Open BESIDE the tab the agent is working on, not at the end of the
     // window. Without an index Chrome appends, and the subsequent
     // chrome.tabs.group() then parks the tab at the far end of the group, so a
     // multi-tab task read back in an order that matched nothing the agent did.
     // `openerTabId` additionally gives Chrome the real parent-child relation it
     // uses for its own tab ordering and close-activation behaviour.
-    // The anchor is whatever tab the last tool_request actually named
-    // (`lastAgentTabId`), re-read here so a stale or closed id, or one that
-    // lives in another window, simply falls back to the previous append.
-    // `typeof` rather than a bare read: this method's SHIPPED body is compiled
-    // standalone by test/handlers.test.mjs, whose sandbox does not declare it.
+    // The anchor resolved above places the tab; an anchor in another window
+    // (or none at all) simply falls back to the previous append.
     const createOpts = { active: false };
     if (windowId) createOpts.windowId = windowId;
-    try {
-      const anchorId = typeof lastAgentTabId === "number" ? lastAgentTabId : null;
-      if (anchorId !== null) {
-        const anchor = await chrome.tabs.get(anchorId);
-        if (
-          anchor &&
-          typeof anchor.index === "number" &&
-          (windowId === undefined || anchor.windowId === windowId)
-        ) {
-          createOpts.index = anchor.index + 1;
-          createOpts.openerTabId = anchor.id;
-        }
-      }
-    } catch {
-      // Anchor gone (closed mid-run) — append, exactly as before.
+    if (anchor && typeof anchor.index === "number" && (windowId === undefined || anchor.windowId === windowId)) {
+      createOpts.index = anchor.index + 1;
+      createOpts.openerTabId = anchor.id;
     }
     const tab = await chrome.tabs.create(createOpts);
     // Claimed before the grouping call for the same reason ensureTabGroup()
     // does: the tabs event this fires must find the tab already ours.
     tabGroupTabs.add(tab.id);
-    await chrome.tabs.group({ tabIds: [tab.id], groupId: tabGroupId });
+    await chrome.tabs.group({ tabIds: [tab.id], groupId: targetGroupId });
     // Record this tab as agent-created for the SDK path (design.md 5b) — a
     // tab this call itself made is never "borrowed", regardless of whether
     // it also lives in the legacy Chrome group above. No-op for legacy
