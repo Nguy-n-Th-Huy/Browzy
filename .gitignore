@@ -43,3 +43,7 @@ extension.zip
 
 # Local Claude Code session state (agent memory, local settings, local skills).
 .claude/
+.codex/config.toml
+opencode.json
+.claude/settings.local.json
+.mcp.json
