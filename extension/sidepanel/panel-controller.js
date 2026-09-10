@@ -21,6 +21,14 @@
 //   ERROR (conversation-scoped, i.e. carries conversationId)
 //                        -> surfaced on that conversation as a connection
 //                          error banner
+//   ERROR "unknown_conversation" (carries NO conversationId — see
+//                          companion.js's _handleResume) -> attributed to
+//                          the oldest outstanding RESUME via
+//                          `_pendingResumes` and surfaced the same way, on
+//                          THAT conversation's model; a startup restore
+//                          additionally falls back to a fresh conversation,
+//                          but only when it is still the one showing (see
+//                          `_handleUnknownConversationError()`)
 //   RECORDING_COMPLETE   -> informational; conversation-model.js already
 //                          renders the underlying recording_complete
 //                          STREAM_EVENT when it lands in that conversation
@@ -54,6 +62,74 @@ export class PanelController {
     // `envelope()`: v/type/payload/ts and nothing else), so the intent has to
     // be remembered here rather than correlated on the reply.
     this._awaitingNewConversation = false;
+    // Every RESUME this controller currently has outstanding, oldest first:
+    // `{ conversationId, isBootRestore }`. Pushed immediately before the
+    // matching `protocol.resumeConversation()` call (see `reopenConversation()`)
+    // and removed either when that conversation's own snapshot arrives (see
+    // `_resolvePendingResume()`) or when an `unknown_conversation` error is
+    // attributed to it (see `_handleUnknownConversationError()`).
+    //
+    // This replaces a single `_restoringConversationId` flag (design.md's
+    // superseded "Correlate the unknown-conversation fallback with an
+    // explicit restoring flag" decision), which only ever tracked ONE
+    // outstanding startup restore and had no way to represent a concurrent
+    // explicit reopen. `sidepanel.js`'s history "open" handler calls
+    // `reopenConversation()` directly and is wired independently of
+    // `bootPromise`, so a user reopen concurrent with an outstanding boot
+    // restore is reachable, not hypothetical — both are RESUMEs, and both
+    // can independently fail with the SAME conversationId-less
+    // `unknown_conversation` envelope.
+    //
+    // ORDERING ASSUMPTION (this is the one thing the wire genuinely cannot
+    // prove, so it is written down rather than implied): an
+    // `unknown_conversation` error carries no conversationId — see
+    // host/agent/companion.js's `_handleResume()`, which catches
+    // `SessionManager#resumeConversation()`'s throw and emits
+    // `{ reason: "unknown_conversation", detail }` with nothing else — so an
+    // incoming error of that shape cannot be looked up by id; it can only be
+    // matched against whichever RESUME is oldest and still unresolved.
+    // `_handleResume()` does no `await` of its own before building that
+    // reply, and the transport carrying envelopes between panel and
+    // companion (a `chrome.runtime.Port` in production, an in-memory queue
+    // in tests) is itself a single ordered channel — so two RESUME sends
+    // provably produce their (non-snapshot) replies in the SAME order the
+    // requests were sent. Treating `_pendingResumes[0]` as "the request this
+    // reply answers" is therefore correct, PROVIDED every push happens
+    // immediately adjacent to its matching send (no `await` between them —
+    // see `reopenConversation()`), so queue order can never drift from wire
+    // send order even when two `reopenConversation()` calls race each other.
+    // A successful RESUME (a `snapshot` reply, which DOES carry the
+    // conversationId) does not need this ordering assumption at all —
+    // `_resolvePendingResume()` removes it by id directly, wherever in the
+    // queue it sits.
+    this._pendingResumes = [];
+    // Flips to true the instant ANY explicit (non-boot) reopenConversation()
+    // call is MADE (set synchronously at the top of that call, before any
+    // `await` — see reopenConversation()), and never resets. Consumed only
+    // by `_handleUnknownConversationError()`'s startup-restore fallback
+    // decision.
+    //
+    // This exists because `currentConversationId` alone is not a reliable
+    // enough signal for "has the operator since navigated away from the
+    // startup restore": `restoreOrStartConversation()` needs THREE awaited
+    // steps before it ever reaches its own `reopenConversation()` call
+    // (`getLastActive()`, `list()`, then `reopenConversation()`'s own
+    // `promptsFor()`), while an explicit reopen needs only ONE
+    // (`promptsFor()`). A boot restore racing a near-simultaneous explicit
+    // reopen therefore systematically tends to reach its send LAST — and,
+    // because `_setCurrentConversationId()` runs immediately before that
+    // send, would then "win" `currentConversationId` back from the
+    // operator's own explicit click even though that click came first in
+    // real operator intent. Comparing `currentConversationId` at
+    // error-arrival time alone would let the automatic startup fallback
+    // fire in exactly that case, overriding an explicit action the operator
+    // already took — which is the "restore attempt the user has since
+    // navigated away from acts on stale state" failure mode this field
+    // closes. `_handleUnknownConversationError()` treats either this flag
+    // OR a `currentConversationId` mismatch as reason enough to skip the
+    // fallback; the flag is the primary guard, `currentConversationId` a
+    // secondary one for any transition this flag does not cover.
+    this._explicitReopenSinceBoot = false;
     this.profile = null;
     // The user's explicit model choice for the NEXT send, from the
     // composer's model menu (sidepanel.js). null means "use the profile's
@@ -81,6 +157,26 @@ export class PanelController {
 
   _notify() {
     for (const fn of this._updateHandlers) fn();
+  }
+
+  /**
+   * The ONLY place `currentConversationId` is assigned (design.md "Funnel all
+   * active-conversation assignment through one setter"). Every one of the
+   * four spots that used to write the field directly — both adopt branches in
+   * `_onEnvelope`'s `snapshot` case, `reopenConversation()`, and the clear in
+   * `deleteConversationLocally()` — now calls this instead, so the persisted
+   * "last active" identity can never drift from the in-memory one: whichever
+   * of the four transitions actually happens, this setter sees it.
+   *
+   * Persistence is fire-and-forget with the rejection swallowed, the same
+   * treatment `_persistHistoryEntry()` already gives history writes —
+   * `chrome.storage.local` being unavailable must never block using the
+   * panel, and this setter runs synchronously so callers can keep treating
+   * the assignment itself as instant.
+   */
+  _setCurrentConversationId(conversationId) {
+    this.currentConversationId = conversationId;
+    this.historyStore.setLastActive(conversationId).catch(() => {});
   }
 
   async init() {
@@ -171,12 +267,181 @@ export class PanelController {
     }
   }
 
-  async reopenConversation(conversationId) {
+  /**
+   * @param {string} conversationId
+   * @param {object} [opts]
+   * @param {boolean} [opts.isBootRestore] - true only when called from
+   *   `restoreOrStartConversation()`'s own startup resume. Never set by a
+   *   caller acting on the operator's explicit request (the history list's
+   *   "open" button) — that distinction is what lets
+   *   `_handleUnknownConversationError()` apply the "forget and start a
+   *   usable new conversation" fallback ONLY to a startup restore, never to
+   *   an explicit reopen (spec "Explicit reopen of an unknown conversation is
+   *   not swapped").
+   */
+  async reopenConversation(conversationId, { isBootRestore = false } = {}) {
+    // Set synchronously, before any `await` in this method — see the
+    // `_explicitReopenSinceBoot` field comment for why timing this to the
+    // CALL, not the eventual send, is what makes it a reliable signal.
+    if (!isBootRestore) this._explicitReopenSinceBoot = true;
     const model = this._getOrCreateModel(conversationId);
     const prompts = await this.historyStore.promptsFor(conversationId);
     model.seedLocalPrompts(prompts);
-    this.currentConversationId = conversationId;
-    this.protocol.resumeConversation(conversationId, 0);
+    // A startup restore must never steal the DISPLAY away from an operator's
+    // own explicit reopen — including one that only started, not
+    // necessarily finished, before this line runs (`_explicitReopenSinceBoot`
+    // is set at the top of an explicit call, before its own `await`, for
+    // exactly this reason). Without this check, `restoreOrStartConversation()`
+    // needing three awaits before it ever reaches this method (vs an explicit
+    // reopen's one) means the boot restore systematically tends to reach
+    // THIS line last and would otherwise optimistically overwrite
+    // `currentConversationId` back onto itself, away from whatever the
+    // operator already explicitly opened — even when that explicit reopen
+    // goes on to succeed. The RESUME below still goes out regardless, so the
+    // restored conversation's own model and history stay in sync and its
+    // eventual reply is still correctly attributed via `_pendingResumes` —
+    // only the "make this the displayed conversation" side effect is
+    // skipped for a superseded startup restore.
+    if (!(isBootRestore && this._explicitReopenSinceBoot)) {
+      this._setCurrentConversationId(conversationId);
+    }
+    // Push the pending-resume entry IMMEDIATELY before the send, with no
+    // `await` in between (see the `_pendingResumes` field comment): that is
+    // what keeps queue order identical to wire send order even when two
+    // `reopenConversation()` calls are racing each other, since each call's
+    // own `await historyStore.promptsFor()` above can resolve in either
+    // order relative to the other's.
+    const pending = { conversationId, isBootRestore };
+    this._pendingResumes.push(pending);
+    try {
+      this.protocol.resumeConversation(conversationId, 0);
+    } catch (err) {
+      // The request never left (port gone) — remove the entry so a later
+      // unrelated error can never be mistaken for this resume having failed,
+      // the same reason startNewConversation() clears `_awaitingNewConversation`
+      // on its own failed send.
+      this._removePendingResume(pending);
+      throw err;
+    }
+  }
+
+  _removePendingResume(entry) {
+    const idx = this._pendingResumes.indexOf(entry);
+    if (idx !== -1) this._pendingResumes.splice(idx, 1);
+  }
+
+  /** Removes (by conversationId, not queue position) the pending resume a
+   * successful `snapshot` reply answers. Unlike the `unknown_conversation`
+   * error path, a snapshot always carries its conversationId, so it never
+   * needs the FIFO ordering assumption — it can be found directly wherever
+   * in the queue it sits. */
+  _resolvePendingResume(conversationId) {
+    const idx = this._pendingResumes.findIndex((p) => p.conversationId === conversationId);
+    if (idx !== -1) this._pendingResumes.splice(idx, 1);
+  }
+
+  /**
+   * startNewConversation() wrapped so it can never reject.
+   * `restoreOrStartConversation()`'s contract is that `boot()` can `await`
+   * it with no catch — `bootPromise` itself has no `.catch()` either, so a
+   * rejection anywhere inside it would abort the rest of startup, including
+   * the very first `render()`, and leave the panel permanently blank. A
+   * `ProtocolClient` throw ("not connected", the port already gone before
+   * the panel finished booting) is a real, reachable failure here, not a
+   * hypothetical one. Swallowing it is safe on both paths that can reach
+   * this method, though not for the same reason: on the `!restorable` path
+   * `currentConversationId` is still null, so `currentPhase()` falls into
+   * its own "no model" branch and renders CONNECTING/ERROR purely from
+   * handshake state (see that method's own header comment); on the
+   * resume-then-fallback-failure path `reopenConversation()` has already
+   * optimistically set `currentConversationId` to the (unconfirmed) id it
+   * tried to resume, so a model exists and `currentPhase()` instead
+   * resolves through `ConversationModel.derivePhase()` — typically EMPTY,
+   * since that model has no turns and no items yet. Either way the panel
+   * renders a real, non-throwing phase, and the next user action — pressing
+   * "+", or reopening from history — retries through its own already-guarded
+   * path.
+   */
+  async _startNewConversationSafely() {
+    try {
+      await this.startNewConversation();
+    } catch {
+      // Swallowed deliberately — see this method's header comment.
+    }
+  }
+
+  /**
+   * Startup entry point (design.md "Restore is a controller method, not
+   * logic in boot()"): resume the conversation the operator was last looking
+   * at, or start a fresh one when there is nothing usable to resume. Kept
+   * DOM-free like every other method here so a test can call it directly —
+   * `sidepanel.js`'s `boot()` only awaits it in place of the old
+   * `if (!panel.currentConversationId) startNewConversation()` block.
+   *
+   * The remembered id is treated as restorable only when it is present in
+   * this panel's own local index (`historyStore.list()`) and not flagged
+   * `deletedLocally` — an id that fails either check is "nothing to restore"
+   * exactly like the spec's "First ever open" scenario, and is never sent to
+   * the companion at all (spec "Remembered conversation was deleted
+   * locally": a locally-deleted conversation is never resurrected by a round
+   * trip). `list()`'s own storage-failure fallback (an empty array) already
+   * makes an unreadable index resolve here to "nothing restorable", which is
+   * exactly the fallback this method wants.
+   *
+   * The actual resume reuses `reopenConversation()` rather than duplicating
+   * its model-creation, local-prompt-seeding and RESUME-sending logic,
+   * passing `{ isBootRestore: true }` so the pending-resume entry it pushes
+   * is distinguishable from an explicit reopen's (see the `_pendingResumes`
+   * field comment and `_handleUnknownConversationError()`).
+   *
+   * Guarded at the top by `if (this.currentConversationId) return;`,
+   * restoring protection the pre-change `boot()` had via
+   * `if (!panel.currentConversationId) startNewConversation()`: `boot()`
+   * awaits `pageContext.start()` and `panel.init()` before calling this
+   * method, and `sidepanel.js`'s history "open" handler is wired
+   * independently of `bootPromise` — so an operator who reopens a
+   * conversation from the history list during either of those earlier awaits
+   * already has a real, deliberately chosen conversation active by the time
+   * this method runs. Restoring or starting a new one here would silently
+   * overwrite that choice with the merely-remembered one, which is exactly
+   * backwards.
+   *
+   * `reopenConversation()` sends the RESUME synchronously inside its own
+   * async body, so a `ProtocolClient` throw (port already gone) surfaces here
+   * as a rejected promise, not a synchronous throw — caught below and
+   * translated into starting a new conversation instead (design.md "Send
+   * failure falls back through the same path"). Both the `!restorable`
+   * branch and this catch branch route through `_startNewConversationSafely()`
+   * rather than `startNewConversation()` directly: `boot()`
+   * awaits this method with no catch, and `bootPromise` has no `.catch()`
+   * either, so a rejection anywhere in here would abort the rest of startup,
+   * including the first `render()`, and leave the panel permanently blank —
+   * a strictly worse outcome than the restore failing.
+   */
+  async restoreOrStartConversation() {
+    if (this.currentConversationId) return;
+
+    const lastActiveId = await this.historyStore.getLastActive();
+    let restorable = false;
+    if (lastActiveId) {
+      const list = await this.historyStore.list();
+      const entry = list.find((c) => c.conversationId === lastActiveId);
+      restorable = !!entry && !entry.deletedLocally;
+    }
+    if (!restorable) {
+      await this._startNewConversationSafely();
+      return;
+    }
+    try {
+      await this.reopenConversation(lastActiveId, { isBootRestore: true });
+    } catch {
+      // The RESUME never left (port gone) or reopenConversation() otherwise
+      // rejected before a reply could ever correlate against the pending
+      // entry it pushed — reopenConversation() already removed that entry
+      // itself on the same throw (see its own catch), so there is nothing
+      // left to clean up here beyond falling back.
+      await this._startNewConversationSafely();
+    }
   }
 
   /**
@@ -277,7 +542,7 @@ export class PanelController {
   async deleteConversationLocally(conversationId) {
     await this.historyStore.removeLocal(conversationId);
     this.models.delete(conversationId);
-    if (this.currentConversationId === conversationId) this.currentConversationId = null;
+    if (this.currentConversationId === conversationId) this._setCurrentConversationId(null);
     this._notify();
   }
 
@@ -289,6 +554,74 @@ export class PanelController {
    */
   fetchDocument(documentId, conversationId = this.currentConversationId) {
     return this.documents.fetch({ conversationId, documentId });
+  }
+
+  /**
+   * Handles an `error` envelope with `reason: "unknown_conversation"` and no
+   * conversationId (host/agent/companion.js's `_handleResume()` — see the
+   * `_pendingResumes` field comment for the full envelope-shape and
+   * correlation reasoning). Called from `_onEnvelope`'s `error` case.
+   */
+  _handleUnknownConversationError(env) {
+    // FIFO shift: the oldest still-outstanding RESUME is provably the one
+    // this reply answers (see the `_pendingResumes` field comment for why).
+    const pending = this._pendingResumes.shift();
+    if (!pending) return; // No RESUME of ours is outstanding — nothing to attribute this to.
+
+    // Surface the failure on the conversation the operator actually asked
+    // about — startup restore or explicit reopen alike —
+    // reusing the SAME `model.connectionError` mechanism a conversation-
+    // scoped error already uses above, rather than inventing a second error
+    // channel the render layer would also have to learn (spec "the panel
+    // surfaces the failure against the conversation the operator asked
+    // for"). `_getOrCreateModel` rather than `models.get`: reopenConversation()
+    // already created this model before sending, but building defensively
+    // here costs nothing and means this method has no hidden dependency on
+    // that ordering.
+    const model = this._getOrCreateModel(pending.conversationId);
+    model.connectionError = { reason: env.reason, detail: env.detail };
+
+    if (!pending.isBootRestore) {
+      // Explicit reopen: the assignment above already satisfies the spec.
+      // Never fall back to starting a new conversation here — that is
+      // exactly the hijack the spec forbids (spec "Explicit reopen of an
+      // unknown conversation is not swapped"): the panel is left exactly on
+      // the conversation the operator asked for, `currentConversationId`
+      // untouched, and no `new` goes on the wire.
+      return;
+    }
+
+    // Startup restore. Only run the "forget the remembered id and start a
+    // usable new conversation" fallback when NEITHER of the following is
+    // true — otherwise the operator has already, one way or another, moved
+    // on from this restore and firing the fallback would silently swap them
+    // onto a THIRD conversation they never asked for (the exact hijack a
+    // concurrent boot-restore-plus-reopen race can otherwise produce: two
+    // conversationId-less unknown_conversation errors are structurally
+    // identical, and the fallback used to fire unconditionally regardless of
+    // what the operator had since done):
+    //
+    //  1. `_explicitReopenSinceBoot` — the operator has made an explicit
+    //     reopen call at ANY point (see that field's comment for why this,
+    //     not `currentConversationId`, is the primary signal: the boot
+    //     restore's own send is structurally slower to fire than an
+    //     explicit reopen's, so comparing only `currentConversationId` at
+    //     this moment can be wrong about which one the operator actually
+    //     asked for last).
+    //  2. `currentConversationId !== pending.conversationId` — a secondary,
+    //     belt-and-suspenders check for any other transition that moved the
+    //     active conversation away from this restore's target without going
+    //     through an explicit reopen (e.g. `deleteConversationLocally()`).
+    //
+    // Leaving the error on `pending.conversationId`'s own model above is
+    // enough even when this guard skips the fallback: nobody may be looking
+    // at it right now, but it is there if the operator navigates back.
+    if (this._explicitReopenSinceBoot || this.currentConversationId !== pending.conversationId) return;
+
+    this.historyStore.setLastActive(null).catch(() => {});
+    // Fire-and-forget like the rest of this method's error-path writes:
+    // `_startNewConversationSafely()` already swallows its own rejection.
+    this._startNewConversationSafely();
   }
 
   _onEnvelope(env) {
@@ -312,10 +645,18 @@ export class PanelController {
         // currentConversationId itself before asking, and never sets the flag.
         if (this._awaitingNewConversation) {
           this._awaitingNewConversation = false;
-          this.currentConversationId = env.conversationId;
+          this._setCurrentConversationId(env.conversationId);
         } else if (this.currentConversationId == null) {
-          this.currentConversationId = env.conversationId;
+          this._setCurrentConversationId(env.conversationId);
         }
+        // Any RESUME reply (a startup restore's or an explicit reopen's)
+        // lands here too — SNAPSHOT is the shared reply shape for
+        // NEW/RESUME/SNAPSHOT_REQUEST. Resolve its pending-resume entry the
+        // instant the conversation it was waiting on actually arrives, so a
+        // later unrelated `unknown_conversation` error can never be
+        // attributed to it (see the "error" case below and the
+        // `_pendingResumes` field comment).
+        this._resolvePendingResume(env.conversationId);
         this._persistHistoryEntry(model);
         this._notify();
         break;
@@ -356,6 +697,8 @@ export class PanelController {
         if (env.conversationId) {
           const model = this.models.get(env.conversationId);
           if (model) model.connectionError = { reason: env.reason, detail: env.detail };
+        } else if (env.reason === "unknown_conversation") {
+          this._handleUnknownConversationError(env);
         }
         this._notify();
         break;

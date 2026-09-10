@@ -2274,9 +2274,16 @@ async function boot() {
   await pageContext.start();
   loadPickerCatalog(); // fire-and-forget: first "/" press already has this resolved (or the picker's own empty state covers the not-yet-loaded gap)
   await panel.init();
-  if (!panel.currentConversationId) {
-    await panel.startNewConversation();
-  }
+  // Resumes the conversation the operator was last looking at (persisted via
+  // history-store.js's `setLastActive()`, updated by every one of
+  // panel-controller.js's active-conversation transitions through its
+  // `_setCurrentConversationId()` setter), falling back to a new conversation
+  // when there is nothing restorable — see restoreOrStartConversation()'s own
+  // header comment for the full restorable/fallback contract. Replaces the
+  // old unconditional `if (!panel.currentConversationId) startNewConversation()`
+  // check, which is what discarded the operator's place on every panel
+  // reopen and browser restart.
+  await panel.restoreOrStartConversation();
   render();
 }
 

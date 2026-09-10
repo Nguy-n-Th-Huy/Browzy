@@ -510,6 +510,403 @@ async function main() {
     ok(missing.found === false && missing.reason === "not_found", `an unknown document reports not_found (${missing.reason})`);
   }
 
+  console.log("== restoreOrStartConversation() resumes the remembered conversation on a fresh controller ==");
+  {
+    // Controller A creates/adopts conversation X and puts real content in it,
+    // then unmounts (nothing here deletes it — mirrors closing the side
+    // panel). A second controller sharing the SAME HistoryStore storage
+    // (chrome.storage.local survives a panel unmount, which is exactly what
+    // makes this restorable) calls restoreOrStartConversation() and must land
+    // on X via a real RESUME, not a NEW.
+    const core = buildCore({
+      sdk: fakeSdk([
+        { type: "assistant", message: { content: [{ type: "text", text: "xong việc A" }] } },
+        { type: "result", subtype: "success", result: "xong việc A" }
+      ])
+    });
+    const sharedStorage = memStorage();
+    const panelA = new PanelController({
+      protocolClient: new ProtocolClient({ createTransport: () => makeBridgeTransport(core) }),
+      historyStore: new HistoryStore({ storage: sharedStorage }),
+      profileCache: new ProfileCache({ storage: memStorage({ ocic_profile_cache_v1: completeProfile() }) }),
+      identity: async () => ({ installationId: "test-install", connectionId: "test-conn-a" })
+    });
+    await panelA.init();
+    await waitUntil(() => panelA.protocol.handshakeState() === "ok");
+    await panelA.startNewConversation();
+    await waitUntil(() => panelA.currentConversationId != null);
+    const conversationId = panelA.currentConversationId;
+    await panelA.sendMessage("việc A");
+    await waitUntil(() => panelA.currentPhase() === RUN_PHASE.COMPLETED);
+
+    // Prove the wire call is really RESUME, not NEW: count NEW envelopes the
+    // fresh controller's ProtocolClient sends before/after the restore call.
+    let newCalls = 0;
+    let resumeCalls = 0;
+    const protocolClientB = new ProtocolClient({ createTransport: () => makeBridgeTransport(core) });
+    const realNewConversation = protocolClientB.newConversation.bind(protocolClientB);
+    const realResumeConversation = protocolClientB.resumeConversation.bind(protocolClientB);
+    protocolClientB.newConversation = (...args) => {
+      newCalls++;
+      return realNewConversation(...args);
+    };
+    protocolClientB.resumeConversation = (...args) => {
+      resumeCalls++;
+      return realResumeConversation(...args);
+    };
+    const panelB = new PanelController({
+      protocolClient: protocolClientB,
+      historyStore: new HistoryStore({ storage: sharedStorage }), // same underlying storage as panelA
+      profileCache: new ProfileCache({ storage: memStorage({ ocic_profile_cache_v1: completeProfile() }) }),
+      identity: async () => ({ installationId: "test-install", connectionId: "test-conn-b" })
+    });
+    await panelB.init();
+    await waitUntil(() => panelB.protocol.handshakeState() === "ok");
+
+    await panelB.restoreOrStartConversation();
+    await waitUntil(() => panelB.currentConversationId === conversationId);
+
+    ok(panelB.currentConversationId === conversationId, "restoreOrStartConversation() lands on the remembered conversation");
+    ok(resumeCalls === 1, "the wire carried exactly one resume for the remembered conversation");
+    ok(newCalls === 0, "restoreOrStartConversation() never sends a new for a restorable conversation");
+    await waitUntil(() => panelB.currentModel() && panelB.currentModel().items.length > 0);
+    ok(panelB.currentModel().items.some((i) => i.kind === "assistant_turn" && i.text === "xong việc A"), "the restored transcript content is the real one from before the unmount");
+  }
+
+  console.log("== restoreOrStartConversation() starts new when the remembered conversation was deleted locally ==");
+  {
+    const core = buildCore({ sdk: fakeSdk([{ type: "result", subtype: "success", result: "" }]) });
+    const sharedStorage = memStorage();
+    const panelA = new PanelController({
+      protocolClient: new ProtocolClient({ createTransport: () => makeBridgeTransport(core) }),
+      historyStore: new HistoryStore({ storage: sharedStorage }),
+      profileCache: new ProfileCache({ storage: memStorage({ ocic_profile_cache_v1: completeProfile() }) }),
+      identity: async () => ({ installationId: "test-install", connectionId: "test-conn-a2" })
+    });
+    await panelA.init();
+    await waitUntil(() => panelA.protocol.handshakeState() === "ok");
+    await panelA.startNewConversation();
+    await waitUntil(() => panelA.currentConversationId != null);
+    const conversationId = panelA.currentConversationId;
+    await panelA.deleteConversationLocally(conversationId);
+
+    let resumeCalls = 0;
+    const protocolClientB = new ProtocolClient({ createTransport: () => makeBridgeTransport(core) });
+    const realResumeConversation = protocolClientB.resumeConversation.bind(protocolClientB);
+    protocolClientB.resumeConversation = (...args) => {
+      resumeCalls++;
+      return realResumeConversation(...args);
+    };
+    const panelB = new PanelController({
+      protocolClient: protocolClientB,
+      historyStore: new HistoryStore({ storage: sharedStorage }),
+      profileCache: new ProfileCache({ storage: memStorage({ ocic_profile_cache_v1: completeProfile() }) }),
+      identity: async () => ({ installationId: "test-install", connectionId: "test-conn-b2" })
+    });
+    await panelB.init();
+    await waitUntil(() => panelB.protocol.handshakeState() === "ok");
+    await panelB.restoreOrStartConversation();
+    await waitUntil(() => panelB.currentConversationId != null);
+
+    ok(panelB.currentConversationId !== conversationId, "a fresh controller never restores a conversation deleted locally");
+    ok(resumeCalls === 0, "the deleted conversation is never sent as a resume at all");
+  }
+
+  console.log("== restoreOrStartConversation() falls back to a usable new conversation when the companion reports unknown_conversation ==");
+  {
+    // Seed the remembered id with a conversation the companion has never
+    // heard of (no matching on-disk transcript meta), so
+    // SessionManager#resumeConversation() throws and companion.js's real
+    // _handleResume() answers with the real `unknown_conversation` error
+    // envelope shape -- no conversationId, exactly as host/agent/companion.js
+    // actually sends it. Driven through the real CompanionCore rather than a
+    // hand-written stub so this proves the real envelope shape triggers the
+    // fallback.
+    const core = buildCore({ sdk: fakeSdk([{ type: "result", subtype: "success", result: "" }]) });
+    const staleConversationId = "conv_never_existed_on_this_companion";
+    const sharedStorage = memStorage();
+    const history = new HistoryStore({ storage: sharedStorage });
+    // Seed the local index (so `list()` reports it as present, not filtered
+    // out for absence) AND the remembered last-active id, matching what a
+    // real "the companion's data was wiped but this browser profile's local
+    // index survived" scenario looks like.
+    await history.upsert({ conversationId: staleConversationId, title: "cuộc trò chuyện cũ" });
+    await history.setLastActive(staleConversationId);
+
+    const panel = new PanelController({
+      protocolClient: new ProtocolClient({ createTransport: () => makeBridgeTransport(core) }),
+      historyStore: history,
+      profileCache: new ProfileCache({ storage: memStorage({ ocic_profile_cache_v1: completeProfile() }) }),
+      identity: async () => ({ installationId: "test-install", connectionId: "test-conn-stale" })
+    });
+    await panel.init();
+    await waitUntil(() => panel.protocol.handshakeState() === "ok");
+
+    await panel.restoreOrStartConversation();
+    await waitUntil(() => panel.currentConversationId != null && panel.currentConversationId !== staleConversationId);
+
+    ok(panel.currentConversationId && panel.currentConversationId !== staleConversationId, "the panel ends up on a new, different conversation after the unknown_conversation reply");
+    ok(panel.currentPhase() === RUN_PHASE.EMPTY, "the fallback conversation is a normal, usable empty conversation");
+    ok(panel._pendingResumes.length === 0, "the pending-resume entry is cleared once the fallback completes");
+    ok((await history.getLastActive()) !== staleConversationId, "the stale remembered id is forgotten, not retried on the next open");
+  }
+
+  console.log("== explicit reopen of an unknown conversation surfaces the failure on that conversation, not a silent switch ==");
+  {
+    // CRITICAL: the pre-fix `_onEnvelope` error case only ever acted on a
+    // startup-restore flag. `reopenConversation()` never set that flag, so
+    // an operator who clicked an unknown conversation in the history list
+    // saw NOTHING: no error, no switch, just an empty conversation. Driven
+    // through the real CompanionCore so the envelope shape (`unknown_conversation`,
+    // no conversationId) is the real one.
+    const core = buildCore({ sdk: fakeSdk([{ type: "result", subtype: "success", result: "" }]) });
+    const panel = buildPanel(core);
+    await panel.init();
+    await waitUntil(() => panel.protocol.handshakeState() === "ok");
+
+    await panel.startNewConversation();
+    await waitUntil(() => panel.currentConversationId != null);
+    const opened = panel.currentConversationId;
+
+    let newCalls = 0;
+    const realNewConversation = panel.protocol.newConversation.bind(panel.protocol);
+    panel.protocol.newConversation = (...args) => {
+      newCalls++;
+      return realNewConversation(...args);
+    };
+
+    const unknownId = "conv_explicit_reopen_unknown";
+    await panel.reopenConversation(unknownId);
+    ok(panel.currentConversationId === unknownId, "reopenConversation() sets the id itself, even before any reply arrives");
+
+    await waitUntil(() => panel.models.get(unknownId) && panel.models.get(unknownId).connectionError != null);
+
+    ok(panel.currentConversationId === unknownId, "the panel is still on the conversation the operator asked for, not silently swapped");
+    ok(
+      panel.models.get(unknownId).connectionError && panel.models.get(unknownId).connectionError.reason === "unknown_conversation",
+      "the unknown_conversation failure is surfaced on that conversation's own model"
+    );
+    // Give any (incorrect) fallback a moment to fire before asserting none did.
+    await new Promise((r) => setTimeout(r, 30));
+    ok(newCalls === 0, "no `new` was ever sent for an explicit reopen's failure");
+    ok(panel.currentConversationId === unknownId, "still on the requested conversation after settling");
+    panel.protocol.newConversation = realNewConversation;
+  }
+
+  console.log("== concurrent boot-restore + explicit reopen, both unknown: no hijack, each failure attributed correctly ==");
+  {
+    // Two independent RESUMEs in flight at once, both destined to fail with
+    // the SAME conversationId-less unknown_conversation envelope. The old
+    // single-flag design could only ever correlate one of them; whichever
+    // error landed first fired the fallback unconditionally and the second
+    // was dropped. `_pendingResumes` must attribute each correctly and must
+    // never hijack the operator onto a conversation neither one asked for.
+    const core = buildCore({ sdk: fakeSdk([{ type: "result", subtype: "success", result: "" }]) });
+    const staleBootId = "conv_boot_restore_unknown";
+    const staleReopenId = "conv_explicit_reopen_unknown_2";
+    const sharedStorage = memStorage();
+    const history = new HistoryStore({ storage: sharedStorage });
+    await history.upsert({ conversationId: staleBootId, title: "cuộc trò chuyện cũ" });
+    await history.setLastActive(staleBootId);
+
+    const panel = new PanelController({
+      protocolClient: new ProtocolClient({ createTransport: () => makeBridgeTransport(core) }),
+      historyStore: history,
+      profileCache: new ProfileCache({ storage: memStorage({ ocic_profile_cache_v1: completeProfile() }) }),
+      identity: async () => ({ installationId: "test-install", connectionId: "test-conn-race-1" })
+    });
+    await panel.init();
+    await waitUntil(() => panel.protocol.handshakeState() === "ok");
+
+    let newCalls = 0;
+    const realNewConversation = panel.protocol.newConversation.bind(panel.protocol);
+    panel.protocol.newConversation = (...args) => {
+      newCalls++;
+      return realNewConversation(...args);
+    };
+
+    // Fire both RESUMEs concurrently, mirroring boot()'s restore racing the
+    // history list's independently-wired "open" handler. Deliberately NOT
+    // awaited individually before the other starts, so both are genuinely
+    // in flight at once (restoreOrStartConversation() needs three awaits
+    // before its own RESUME goes out; reopenConversation() needs only one —
+    // see `_explicitReopenSinceBoot`'s field comment for why that asymmetry
+    // matters here).
+    const restorePromise = panel.restoreOrStartConversation();
+    const reopenPromise = panel.reopenConversation(staleReopenId);
+    await Promise.all([restorePromise, reopenPromise]);
+
+    // Both fail; let both error replies land and any (correct or incorrect)
+    // fallback settle.
+    await waitUntil(() => panel.models.get(staleBootId)?.connectionError != null && panel.models.get(staleReopenId)?.connectionError != null);
+    await new Promise((r) => setTimeout(r, 30));
+
+    ok(newCalls === 0, "the boot restore's fallback never fires once an explicit reopen has happened, so no third/unrequested conversation is ever created");
+    // Deterministic, not merely "one of the two": reopenConversation() never
+    // lets a startup restore's send overwrite `currentConversationId` once
+    // an explicit reopen has already claimed it (see that method's own
+    // comment) — so the operator's own click always wins the display,
+    // regardless of which RESUME's reply happens to land first.
+    ok(
+      panel.currentConversationId === staleReopenId,
+      "the operator's own explicit reopen keeps the display, even though the startup restore's RESUME reaches the wire later"
+    );
+    panel.protocol.newConversation = realNewConversation;
+    ok(
+      panel.models.get(staleBootId).connectionError.reason === "unknown_conversation",
+      "the boot restore's own failure is attributed to the boot restore's conversation"
+    );
+    ok(
+      panel.models.get(staleReopenId).connectionError.reason === "unknown_conversation",
+      "the explicit reopen's own failure is attributed to the explicit reopen's conversation"
+    );
+    ok(panel._pendingResumes.length === 0, "both pending resumes are resolved, none left dangling");
+  }
+
+  console.log("== concurrent boot-restore (unknown) + explicit reopen (valid): operator stays on the valid conversation, no phantom history row ==");
+  {
+    // The other proven ordering: the startup restore fails, but the
+    // operator's own explicit reopen of a REAL conversation succeeds. The
+    // pre-fix fallback fired unconditionally and could create a brand-new
+    // conversation that was never displayed but still persisted into
+    // HistoryStore as a phantom row, while nulling the remembered id even
+    // though the valid conversation is what's actually showing.
+    const core = buildCore({ sdk: fakeSdk([{ type: "result", subtype: "success", result: "" }]) });
+    const staleBootId = "conv_boot_restore_unknown_3";
+    const sharedStorage = memStorage();
+    const history = new HistoryStore({ storage: sharedStorage });
+    await history.upsert({ conversationId: staleBootId, title: "cuộc trò chuyện cũ" });
+    await history.setLastActive(staleBootId);
+
+    // Seed a REAL, valid conversation on the companion for the explicit
+    // reopen to resume successfully.
+    const seedPanel = new PanelController({
+      protocolClient: new ProtocolClient({ createTransport: () => makeBridgeTransport(core) }),
+      historyStore: new HistoryStore({ storage: memStorage() }),
+      profileCache: new ProfileCache({ storage: memStorage({ ocic_profile_cache_v1: completeProfile() }) }),
+      identity: async () => ({ installationId: "test-install", connectionId: "test-conn-seed" })
+    });
+    await seedPanel.init();
+    await waitUntil(() => seedPanel.protocol.handshakeState() === "ok");
+    await seedPanel.startNewConversation();
+    await waitUntil(() => seedPanel.currentConversationId != null);
+    const validId = seedPanel.currentConversationId;
+    // Also index the valid conversation into the SAME storage this test's
+    // panel reads history from, so it is a real, known-to-the-panel entry
+    // (mirroring how it would already be in the operator's history list).
+    await history.upsert({ conversationId: validId, title: "cuộc trò chuyện hợp lệ" });
+
+    let newCalls = 0;
+    const panel = new PanelController({
+      protocolClient: new ProtocolClient({ createTransport: () => makeBridgeTransport(core) }),
+      historyStore: history,
+      profileCache: new ProfileCache({ storage: memStorage({ ocic_profile_cache_v1: completeProfile() }) }),
+      identity: async () => ({ installationId: "test-install", connectionId: "test-conn-race-2" })
+    });
+    await panel.init();
+    await waitUntil(() => panel.protocol.handshakeState() === "ok");
+    const realNewConversation = panel.protocol.newConversation.bind(panel.protocol);
+    panel.protocol.newConversation = (...args) => {
+      newCalls++;
+      return realNewConversation(...args);
+    };
+
+    const restorePromise = panel.restoreOrStartConversation();
+    const reopenPromise = panel.reopenConversation(validId);
+    await Promise.all([restorePromise, reopenPromise]);
+
+    await waitUntil(() => panel.currentModel() && panel.currentModel().items != null);
+    await waitUntil(() => panel.models.get(staleBootId)?.connectionError != null);
+    // Give an incorrect fallback a moment to fire before asserting none did.
+    await new Promise((r) => setTimeout(r, 30));
+
+    ok(panel.currentConversationId === validId, "the operator stays on the conversation they explicitly (and validly) reopened");
+    ok(newCalls === 0, "the boot restore's failure never triggers a fallback once the operator has moved to a different, still-current conversation");
+    const listAfter = await history.list();
+    ok(
+      !listAfter.some((c) => c.conversationId !== staleBootId && c.conversationId !== validId),
+      "no phantom conversation row was created in HistoryStore"
+    );
+    ok((await history.getLastActive()) === validId, "the remembered last-active id reflects what is actually showing, not the failed boot restore");
+    panel.protocol.newConversation = realNewConversation;
+  }
+
+  console.log("== restoreOrStartConversation() never rejects when the port is dead, even for the two unguarded startNewConversation() call sites ==");
+  {
+    // WARNING: the pre-fix version only wrapped the resume attempt in
+    // try/catch. Both the `!restorable` branch and the catch block's own
+    // startNewConversation() call could still reject on a dead port, and
+    // boot() awaits this method with no catch of its own.
+    const core = buildCore({ sdk: fakeSdk([{ type: "result", subtype: "success", result: "" }]) });
+
+    // Case 1: the `!restorable` path (nothing remembered — the common
+    // "first ever open").
+    {
+      const panel = buildPanel(core);
+      await panel.init();
+      await waitUntil(() => panel.protocol.handshakeState() === "ok");
+      panel.protocol.newConversation = () => {
+        throw new Error("ProtocolClient: not connected");
+      };
+      let threw = false;
+      try {
+        await panel.restoreOrStartConversation();
+      } catch {
+        threw = true;
+      }
+      ok(!threw, "restoreOrStartConversation() does not reject on the !restorable path even when the port is dead");
+      ok(panel.currentConversationId == null, "no conversation ends up active when the port never accepted the new conversation");
+    }
+
+    // Case 2: the resume attempt fails AND the fallback new-conversation
+    // attempt also fails (same dead port for both).
+    {
+      const staleId = "conv_dead_port_restore";
+      const sharedStorage = memStorage();
+      const history = new HistoryStore({ storage: sharedStorage });
+      await history.upsert({ conversationId: staleId, title: "cuộc trò chuyện cũ" });
+      await history.setLastActive(staleId);
+      const panel = new PanelController({
+        protocolClient: new ProtocolClient({ createTransport: () => makeBridgeTransport(core) }),
+        historyStore: history,
+        profileCache: new ProfileCache({ storage: memStorage({ ocic_profile_cache_v1: completeProfile() }) }),
+        identity: async () => ({ installationId: "test-install", connectionId: "test-conn-dead-port" })
+      });
+      await panel.init();
+      await waitUntil(() => panel.protocol.handshakeState() === "ok");
+      panel.protocol.resumeConversation = () => {
+        throw new Error("ProtocolClient: not connected");
+      };
+      panel.protocol.newConversation = () => {
+        throw new Error("ProtocolClient: not connected");
+      };
+      let threw = false;
+      try {
+        await panel.restoreOrStartConversation();
+      } catch {
+        threw = true;
+      }
+      ok(!threw, "restoreOrStartConversation() does not reject even when BOTH the resume and the fallback new-conversation attempts fail");
+      // `currentConversationId` is left pointing at the stale remembered id
+      // here, not cleared to null: `reopenConversation()` optimistically
+      // assigns it before attempting the send (by design, for a normal
+      // explicit reopen's UI responsiveness — see that method's own
+      // comment), and a dead port means that assignment happens but the
+      // send that would have confirmed or replaced it never completes
+      // either way. Because an id is active, `currentModel()` returns the
+      // (empty, unseeded-beyond-local-prompts) model `reopenConversation()`
+      // created for it rather than null, so `currentPhase()` does NOT fall
+      // into panel-controller.js's "no model" CONNECTING/ERROR branch — the
+      // handshake in this test is still "ok", there is no turn, and the
+      // model has no items, so `ConversationModel.derivePhase()` resolves
+      // to EMPTY. The requirement this test exists to prove is narrower and
+      // already covered above: the method itself must not reject and abort
+      // `render()`. This assertion proves `currentPhase()` actually reaches
+      // that real EMPTY state from here rather than merely not throwing.
+      ok(panel.currentPhase() === RUN_PHASE.EMPTY, "currentPhase() resolves to EMPTY from the unconfirmed-active-id, dead-port state");
+    }
+  }
+
   console.log(fail === 0 ? "\nALL SIDEPANEL FAKE-COMPANION TESTS PASSED" : `\n${fail} FAILED`);
   fs.rmSync(scratchRoot, { recursive: true, force: true });
   process.exit(fail ? 1 : 0);

@@ -23,6 +23,13 @@
 
 const STORAGE_KEY = "ocic_conversation_history_v1";
 
+// Which conversation was active when the panel last had one open, kept under
+// its own key rather than folded into the STORAGE_KEY index (see
+// `getLastActive()`/`setLastActive()` below for why this cannot be derived
+// from `list()[0]`). A separate key also means reading it at startup is one
+// small get(), not a read-and-sort of the whole index.
+const LAST_ACTIVE_KEY = "ocic_last_active_conversation_v1";
+
 function hasChromeStorage() {
   try {
     return typeof chrome !== "undefined" && !!chrome.storage && !!chrome.storage.local;
@@ -113,6 +120,41 @@ export class HistoryStore {
     const list = await this._read();
     const next = list.filter((c) => c.conversationId !== conversationId);
     await this._write(next);
+  }
+
+  /** The conversation the operator was last looking at, or `null` if none is
+   * remembered (never had one, or it was deliberately forgotten via
+   * `setLastActive(null)` — both read the same here, which is exactly what
+   * panel-controller.js's startup restore wants: "no remembered id" and
+   * "explicitly cleared" both fall back to starting a new conversation).
+   * Same swallow-on-failure treatment as `_read`/`_write`: a storage read
+   * that throws resolves to `null`, never a rejection. */
+  async getLastActive() {
+    try {
+      const result = await this._storage.get(LAST_ACTIVE_KEY);
+      const id = result && result[LAST_ACTIVE_KEY];
+      return typeof id === "string" && id ? id : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Remember (or, with `id === null`, forget) which conversation is active.
+   * Deliberately NOT derived from `list()[0]` (most-recently-updated) — see
+   * design.md: `_persistHistoryEntry()` bumps `updatedAt` on every
+   * stream_event/token_batch for ANY conversation this controller holds,
+   * including one the operator switched away from while it kept running in
+   * the background. Most-recently-updated therefore answers a different
+   * question than "which conversation was the operator looking at", and a
+   * caller of getLastActive() at startup wants the latter. Best-effort like
+   * every other write here: a storage failure must not block using the
+   * panel. */
+  async setLastActive(id) {
+    try {
+      await this._storage.set({ [LAST_ACTIVE_KEY]: id });
+    } catch {
+      /* best-effort — a persistence failure must not block using the panel */
+    }
   }
 }
 

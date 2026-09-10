@@ -103,6 +103,40 @@ async function main() {
     ok(!threw && Array.isArray(list) && list.length === 0, "a broken storage backend never crashes the panel");
   }
 
+  console.log("== last-active conversation identity (restore-last-active-conversation) ==");
+  {
+    const store = new HistoryStore({ storage: fakeChromeStorage() });
+    ok((await store.getLastActive()) === null, "a fresh store has no remembered last-active id");
+
+    await store.setLastActive("c1");
+    ok((await store.getLastActive()) === "c1", "set/get round-trips the last-active id");
+
+    await store.setLastActive(null);
+    ok((await store.getLastActive()) === null, "setLastActive(null) forgets the remembered id");
+  }
+
+  console.log("== last-active storage failures never propagate (a broken chrome.storage.local must not block opening the panel) ==");
+  {
+    const brokenStorage = {
+      async get() {
+        throw new Error("storage unavailable");
+      },
+      async set() {
+        throw new Error("storage unavailable");
+      }
+    };
+    const store = new HistoryStore({ storage: brokenStorage });
+    let threw = false;
+    let id = "not-yet-read";
+    try {
+      id = await store.getLastActive();
+      await store.setLastActive("c1");
+    } catch {
+      threw = true;
+    }
+    ok(!threw && id === null, "getLastActive() on a broken storage backend resolves to null, never a throw");
+  }
+
   console.log(fail === 0 ? "\nALL SIDEPANEL HISTORY-STORE TESTS PASSED" : `\n${fail} FAILED`);
   process.exit(fail ? 1 : 0);
 }
