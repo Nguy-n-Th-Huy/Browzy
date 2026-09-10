@@ -6413,6 +6413,121 @@ async function toggleRecordingIfIdle() {
   }
 }
 
+// --- Design mode / element picker bridge ---------------------------------
+// openspec/changes/add-design-mode-element-picker. An OPERATOR-driven input
+// path (design.md "Design mode is a user action, not an agent action"): it
+// never acquires the browser lease, never passes through the approval gate,
+// and never widens a run's tab scope. Everything below only injects a
+// content script, relays two small messages, and reuses the EXISTING
+// clipped-capture path (takeScreenshot/normalizeCropRegion, both untouched —
+// design.md D6).
+const PICKER_SCRIPT_FILES = ["overlay/element-picker.js"];
+
+function isPickerAck(reply) {
+  return !!reply && reply.ok === true;
+}
+
+/** Same shape as sendOverlayMessage() above (try send, inject-on-failure,
+ * retry once) — deliberately not merged with it: that function's elaborate
+ * per-tab delivery logging exists for the agent's own overlay, which is
+ * mounted on nearly every run: this path is mounted rarely, on operator
+ * demand, and a failure here surfaces directly in activateDesignMode()'s own
+ * return value instead. */
+async function sendPickerMessage(tabId, message) {
+  try {
+    const reply = await chrome.tabs.sendMessage(tabId, message);
+    if (isPickerAck(reply)) return reply;
+  } catch {
+    // No listener yet (never injected, or a fresh document after
+    // navigation) — fall through to inject-and-retry below.
+  }
+  try {
+    await chrome.scripting.executeScript({ target: { tabId }, files: PICKER_SCRIPT_FILES });
+  } catch {
+    return undefined; // chrome://, the Web Store, a closed tab, ... — refused, never claimed as delivered.
+  }
+  try {
+    const reply = await chrome.tabs.sendMessage(tabId, message);
+    return isPickerAck(reply) ? reply : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** design.md D9's second refusal, "a run currently controls that tab": reuses
+ * `overlayRunTabs` (declared above, in the agent-pointer-overlay-bridge
+ * section) — the SAME set the agent's own overlay is shown on, built only
+ * from real action-events' own runId/tabId pairs and emptied by
+ * teardownOverlayForRun() the instant a run ends. Never a second, invented
+ * notion of "is this tab being driven". Widened to the operator's whole tab
+ * group like the overlay itself (addGroupTabsToOverlayRun) — refusing design
+ * mode on any tab in a group a run is actively using is the conservative,
+ * intended reading of D9, not an accident of reuse. */
+function isTabDrivenByRun(tabId) {
+  for (const tabs of overlayRunTabs.values()) {
+    if (tabs.has(tabId)) return true;
+  }
+  return false;
+}
+
+/** design.md D9: both refusals are decided here, BEFORE any injection or
+ * highlight — never after the mode has already appeared to arm. Reuses
+ * background.js's own RESTRICTED_URL_PATTERN (declared below, kept in sync
+ * by hand with page-context.js's identical classifier — see that constant's
+ * own comment), inspecting only the URL string, never page content. */
+async function activateDesignMode(tabId) {
+  if (typeof tabId !== "number") return { ok: false, reason: "no_tab" };
+  let tab;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch {
+    return { ok: false, reason: "tab_unavailable" };
+  }
+  if (tab.url && RESTRICTED_URL_PATTERN.test(tab.url)) {
+    return { ok: false, reason: "restricted_page" };
+  }
+  if (isTabDrivenByRun(tabId)) {
+    return { ok: false, reason: "agent_driving" };
+  }
+  const reply = await sendPickerMessage(tabId, { type: "design_mode_start" });
+  if (!isPickerAck(reply)) {
+    return { ok: false, reason: "injection_failed" };
+  }
+  return { ok: true };
+}
+
+async function cancelDesignMode(tabId, reason) {
+  if (typeof tabId !== "number") return { ok: true };
+  await sendPickerMessage(tabId, { type: "design_mode_stop", reason: reason || "cancelled" }).catch(() => {});
+  return { ok: true };
+}
+
+/** A selection arrived from the content script (design_mode_selection):
+ * serve the clipped capture by passing the picker's OWN region straight into
+ * takeScreenshot() — design.md D6 / task 4.3: nothing about
+ * normalizeCropRegion(), the scroll-offset addition or the DPR handling is
+ * touched or duplicated here. The result (plus the record the content
+ * script already sanitized) is relayed to every extension page via an
+ * ordinary chrome.runtime.sendMessage broadcast — the side panel is the only
+ * listener that acts on `design_mode_picked`. */
+async function handleDesignModeSelection(tabId, record, region) {
+  try {
+    const shot = await takeScreenshot(tabId, { region });
+    chrome.runtime
+      .sendMessage({
+        type: "design_mode_picked",
+        tabId,
+        record,
+        image: { base64: shot.base64, mimeType: "image/jpeg", width: shot.width, height: shot.height, blank: shot.blank }
+      })
+      .catch(() => {});
+  } catch (err) {
+    chrome.runtime
+      .sendMessage({ type: "design_mode_ended", tabId, reason: "capture_failed" })
+      .catch(() => {});
+  }
+}
+
 chrome.action.onClicked.addListener((tab) => {
   if (hasSidePanel) {
     if (tab && tab.windowId != null) {
@@ -6470,6 +6585,32 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // (adoptSoloAgentGroup) and agent-created tabs.
     sendResponse({ ok: true, adopted: false });
     return; // sync response
+  }
+  // --- Design mode / element picker (task 4.2) ----------------------------
+  // Flat snake_case, matching panel_bind_tab/tool_request's own convention.
+  // panel -> background: design_mode_activate / design_mode_cancel.
+  // content -> background: design_mode_selection / design_mode_ended.
+  // background -> panel (broadcast, see handleDesignModeSelection above):
+  // design_mode_picked / design_mode_ended.
+  if (msg.type === "design_mode_activate") {
+    activateDesignMode(msg.tabId).then(sendResponse);
+    return true; // async response
+  }
+  if (msg.type === "design_mode_cancel") {
+    cancelDesignMode(msg.tabId, "operator_cancelled").then(sendResponse);
+    return true; // async response
+  }
+  if (msg.type === "design_mode_selection") {
+    const tabId = sender.tab && typeof sender.tab.id === "number" ? sender.tab.id : msg.tabId;
+    handleDesignModeSelection(tabId, msg.record, msg.region).catch(() => {});
+    sendResponse({ ok: true });
+    return; // sync ack — the async capture is relayed separately, above
+  }
+  if (msg.type === "design_mode_ended") {
+    const tabId = sender.tab && typeof sender.tab.id === "number" ? sender.tab.id : msg.tabId;
+    chrome.runtime.sendMessage({ type: "design_mode_ended", tabId, reason: msg.reason }).catch(() => {});
+    sendResponse({ ok: true });
+    return; // sync ack
   }
   if (msg.type === "agent_settings") {
     // extension/settings/settings-client.js's documented contract — see

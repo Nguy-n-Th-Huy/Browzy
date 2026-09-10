@@ -436,6 +436,59 @@ export function validateStartAttachments(value) {
   return { ok: true, refs };
 }
 
+// --- START envelope's optional `elementRecord` field ------------------------
+// openspec/changes/add-design-mode-element-picker, design.md D7: an
+// operator-picked page element's markup/styles, travelling as its OWN field
+// beside `attachments` — never spliced into `prompt`. Additive under
+// PROTOCOL_VERSION 1: an old peer that has never heard of design mode simply
+// never sends this field, and an old companion ignores it if it somehow
+// arrived. Design.md D5's markup ceiling (32KB) is enforced picker-side
+// (extension/overlay/element-picker.js); this validator allows a little
+// slack over that so a byte-counting difference between UTF-16 code-unit
+// `.length` here and the picker's own UTF-8 byte count never rejects an
+// already-truncated, in-budget record.
+export const ELEMENT_RECORD_MARKUP_SLACK_BYTES = 4 * 1024;
+export const ELEMENT_RECORD_MARKUP_MAX_CHARS = 32 * 1024 + 4 * 1024;
+
+/**
+ * Validate START's optional `elementRecord` field.
+ * @returns {{ok: true, record: object|null} | {ok: false, reason: string}}
+ */
+export function validateStartElementRecord(value) {
+  if (value === undefined || value === null) return { ok: true, record: null };
+  if (typeof value !== "object" || Array.isArray(value)) return { ok: false, reason: "malformed_element_record" };
+  const { pageIdentity, selector, tagName, markup, markupTruncated, styles, rectClipped } = value;
+  if (!pageIdentity || typeof pageIdentity !== "object" || Array.isArray(pageIdentity)) {
+    return { ok: false, reason: "element_record_missing_page_identity" };
+  }
+  if (typeof pageIdentity.tabId !== "number") return { ok: false, reason: "element_record_invalid_page_identity" };
+  if (typeof pageIdentity.url !== "string" || !pageIdentity.url) return { ok: false, reason: "element_record_invalid_page_identity" };
+  if (typeof selector !== "string") return { ok: false, reason: "element_record_invalid_selector" };
+  if (typeof tagName !== "string") return { ok: false, reason: "element_record_invalid_tag_name" };
+  if (typeof markup !== "string") return { ok: false, reason: "element_record_invalid_markup" };
+  if (markup.length > ELEMENT_RECORD_MARKUP_MAX_CHARS) return { ok: false, reason: "element_record_markup_too_large" };
+  if (typeof markupTruncated !== "boolean") return { ok: false, reason: "element_record_invalid_markup_truncated" };
+  if (typeof rectClipped !== "boolean") return { ok: false, reason: "element_record_invalid_rect_clipped" };
+  if (!styles || typeof styles !== "object" || Array.isArray(styles)) return { ok: false, reason: "element_record_invalid_styles" };
+  const normalizedStyles = {};
+  for (const [k, v] of Object.entries(styles)) {
+    if (typeof v !== "string") return { ok: false, reason: "element_record_invalid_styles" };
+    normalizedStyles[k] = v;
+  }
+  return {
+    ok: true,
+    record: {
+      pageIdentity: { tabId: pageIdentity.tabId, url: pageIdentity.url, doc: pageIdentity.doc ?? null },
+      selector,
+      tagName,
+      markup,
+      markupTruncated,
+      styles: normalizedStyles,
+      rectClipped
+    }
+  };
+}
+
 // --- Wire framing over native messaging ---------------------------------
 //
 // Native messaging already frames whole JSON objects (host/native-host.js's

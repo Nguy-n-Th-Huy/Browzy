@@ -230,7 +230,11 @@ await test("a catalog record whose snapshot directory has no SKILL.md on disk is
 
 await test("no operation _handleAgentSettings() accepts takes a filesystem path — enumerated from companion.js's own source", async () => {
   const companionSrc = fs.readFileSync(new URL("../agent/companion.js", import.meta.url), "utf-8");
-  const handlerMatch = /_handleAgentSettings\(envelope\)\s*\{([\s\S]*?)\n  \}\n/.exec(companionSrc);
+  // Line endings are matched tolerantly on purpose: git normalises this
+  // repo's checkout to CRLF on Windows, and a locator that hardcodes a bare
+  // newline stops matching the moment that happens — silently turning this
+  // whole assertion into a no-op instead of a failure anyone would notice.
+  const handlerMatch = /_handleAgentSettings\(envelope\)\s*\{([\s\S]*?)\r?\n {2}\}\r?\n/.exec(companionSrc);
   assert(handlerMatch, "could not locate _handleAgentSettings()'s body in companion.js — has it moved/been renamed?");
   const body = handlerMatch[1];
 

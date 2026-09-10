@@ -10,7 +10,7 @@ import { ProtocolClient, MSG } from "./protocol-client.js";
 import { PanelController } from "./panel-controller.js";
 import { HistoryStore } from "./history-store.js";
 import { ProfileCache, READINESS } from "./profile-cache.js";
-import { PageContextTracker } from "./page-context.js";
+import { PageContextTracker, sameIdentity } from "./page-context.js";
 import { referencesCurrentPage } from "./context-binding.js";
 import { RecordingsClient, listRecordings } from "./recordings-model.js";
 import { toolRowDisplay } from "./conversation-model.js";
@@ -41,6 +41,7 @@ const el = {
   addMenuWrap: $("add-menu-wrap"),
   addMenuFiles: $("add-menu-files"),
   iconAddFiles: $("icon-add-files"),
+  btnDesignMode: $("btn-design-mode"),
   effortTrigger: $("effort-trigger"),
   effortTriggerLabel: $("effort-trigger-label"),
   effortMenu: $("effort-menu"),
@@ -74,6 +75,9 @@ el.btnHistoryBack.style.transform = "scaleX(-1)";
 el.iconNewPlus.innerHTML = iconMarkup("plus", { size: 15 });
 el.btnAdd.innerHTML = iconMarkup("plus", { size: 18, title: "Thêm tệp hoặc ảnh" });
 el.iconAddFiles.innerHTML = iconMarkup("attach", { size: 15 });
+// "click" (not a new icon — extension/ui/** is shared and not edited by this
+// change) is the closest existing glyph to "pick an element by clicking it".
+if (el.btnDesignMode) el.btnDesignMode.innerHTML = iconMarkup("click", { size: 18, title: "Chọn phần tử trên trang" });
 el.btnEnhance.innerHTML = iconMarkup("spark", { size: 18, title: "Cải thiện prompt" });
 el.modelChevron.innerHTML = iconMarkup("chevronDown", { size: 14 });
 el.iconMicRow.innerHTML = iconMarkup("mic", { size: 18 });
@@ -1450,7 +1454,7 @@ function renderAttachments() {
   // Free object URLs for removed entries on next render via previous child tracking.
   // The Blob lives on each entry; URLs are revoked on remove and on clear.
 
-  if (!attachments.length) {
+  if (!attachments.length && !pickedElement) {
     strip.innerHTML = "";
     strip.hidden = true;
     if (!err || !err.textContent) {
@@ -1480,6 +1484,27 @@ function renderAttachments() {
     rm.addEventListener("click", () => removeAttachment(a.id));
     thumb.append(img, name, rm);
     strip.appendChild(thumb);
+  }
+  // The picked-element chip, alongside the attachment thumbnails (task 5.2).
+  if (pickedElement) {
+    const chip = document.createElement("div");
+    chip.className = "attachment-thumb design-mode-chip";
+    const icon = document.createElement("span");
+    icon.className = "design-mode-chip-icon";
+    icon.innerHTML = iconMarkup("click", { size: 14 });
+    const name = document.createElement("span");
+    name.className = "attachment-thumb-name";
+    const label = `<${pickedElement.record.tagName || "el"}>` + (pickedElement.record.selector ? ` ${pickedElement.record.selector}` : "");
+    name.textContent = label;
+    name.title = label;
+    const rm = document.createElement("button");
+    rm.type = "button";
+    rm.className = "attachment-thumb-remove";
+    rm.setAttribute("aria-label", "Bỏ phần tử đã chọn");
+    rm.textContent = "×";
+    rm.addEventListener("click", () => clearPickedElement());
+    chip.append(icon, name, rm);
+    strip.appendChild(chip);
   }
 }
 
@@ -1554,6 +1579,155 @@ function blobToBase64(blob) {
     };
     reader.onerror = () => reject(reader.error || new Error("FileReader failed"));
     reader.readAsDataURL(blob);
+  });
+}
+
+// ---- design mode (element picker) --------------------------------------
+// openspec/changes/add-design-mode-element-picker. An OPERATOR input path —
+// see extension/background.js's own "Design mode / element picker bridge"
+// header for why it never touches the browser lease, the approval gate, or
+// tab scope. This section only: toggles the composer control, relays
+// activate/cancel to background, receives a picked element back, routes its
+// image through the EXISTING attachment path (task 5.3), and renders the
+// removable chip.
+
+// Whether THIS panel currently believes design mode is armed on
+// `designModeTabId`. Reset on every exit route (selection, ended, cancel,
+// bound-page change) — mirrors element-picker.js's own `active` in spirit,
+// but is this panel's OWN belief, corrected by whatever background/the
+// content script actually reports back.
+let designModeActive = false;
+let designModeTabId = null;
+// design.md D8: the page identity recorded at ACTIVATION time (the operator
+// is about to point at THIS exact page) — compared again at Send against
+// pageContext.captureForSend()'s live result, independently of the ordinary
+// page-context chip check (design.md "why reuse rather than add a second
+// mechanism").
+let pendingDesignModeIdentity = null;
+// { record: {selector, tagName, markup, markupTruncated, styles, rectClipped},
+//   attachmentId: string|null, identity: {tabId,url,doc}|null }
+let pickedElement = null;
+
+function renderDesignModeButton() {
+  if (!el.btnDesignMode) return;
+  el.btnDesignMode.setAttribute("aria-pressed", designModeActive ? "true" : "false");
+}
+
+const DESIGN_MODE_REFUSAL_MESSAGES = {
+  restricted_page: "Không thể chọn phần tử trên trang này (trang nội bộ trình duyệt hoặc cửa hàng tiện ích).",
+  agent_driving: "Không thể chọn phần tử khi agent đang điều khiển trang này.",
+  tab_unavailable: "Trang không còn khả dụng.",
+  injection_failed: "Không thể kích hoạt chế độ chọn phần tử trên trang này.",
+  no_tab: "Chưa có trang nào được gắn để chọn phần tử."
+};
+
+/** Ends design mode from THIS side (chip removal, bound-page change, panel
+ * toggled off while active) and tells background/the content script, which
+ * tears down its own listeners/highlight regardless of whether this message
+ * ever arrives (a closed tab, a dead worker) — this call is fire-and-forget
+ * by design, matching every other best-effort chrome.runtime.sendMessage in
+ * this file. */
+function cancelDesignModeIfActive() {
+  if (!designModeActive) return;
+  const tabId = designModeTabId;
+  designModeActive = false;
+  designModeTabId = null;
+  pendingDesignModeIdentity = null;
+  renderDesignModeButton();
+  if (tabId != null && typeof chrome !== "undefined" && chrome.runtime && typeof chrome.runtime.sendMessage === "function") {
+    chrome.runtime.sendMessage({ type: "design_mode_cancel", tabId }).catch(() => {});
+  }
+}
+
+async function toggleDesignMode() {
+  if (!canAcceptAttachments()) return; // gated exactly as Send/attach are
+  if (designModeActive) {
+    cancelDesignModeIfActive();
+    return;
+  }
+  const snap = pageContext ? pageContext.snapshot() : null;
+  if (!snap || snap.tabId == null) {
+    showAttachmentError(DESIGN_MODE_REFUSAL_MESSAGES.no_tab);
+    return;
+  }
+  const tabId = snap.tabId;
+  designModeTabId = tabId;
+  pendingDesignModeIdentity = pageContext.identityForRecord();
+  let res = null;
+  try {
+    res = await chrome.runtime.sendMessage({ type: "design_mode_activate", tabId });
+  } catch {
+    res = null;
+  }
+  if (!res || res.ok !== true) {
+    // design.md D9: both refusals are decided before the mode appears
+    // active — this panel never flips `designModeActive` until background
+    // has actually confirmed activation.
+    designModeTabId = null;
+    pendingDesignModeIdentity = null;
+    showAttachmentError((res && DESIGN_MODE_REFUSAL_MESSAGES[res.reason]) || "Không thể kích hoạt chế độ chọn phần tử.");
+    return;
+  }
+  designModeActive = true;
+  clearAttachmentError();
+  renderDesignModeButton();
+}
+if (el.btnDesignMode) el.btnDesignMode.addEventListener("click", () => { toggleDesignMode().catch(() => {}); });
+
+function clearPickedElement() {
+  if (!pickedElement) return;
+  const attachmentId = pickedElement.attachmentId;
+  pickedElement = null;
+  if (attachmentId && attachments.some((a) => a.id === attachmentId)) removeAttachment(attachmentId); // also re-renders the strip
+  else renderAttachments();
+}
+
+/** A selection arrived from background (design_mode_picked): route the
+ * clipped image through the EXISTING attachment path (task 5.3) — same File
+ * object shape validateAndAppendFiles() already accepts from the OS file
+ * picker, so it inherits the MIME allowlist and 10 MB ceiling (and their
+ * exact over-ceiling message) with no parallel logic of its own. */
+async function onDesignModePicked(msg) {
+  if (designModeTabId !== msg.tabId) return; // stale/foreign — a different activation already superseded this one
+  designModeActive = false;
+  const identity = pendingDesignModeIdentity;
+  designModeTabId = null;
+  pendingDesignModeIdentity = null;
+  renderDesignModeButton();
+
+  let file = null;
+  try {
+    const resp = await fetch(`data:${msg.image.mimeType};base64,${msg.image.base64}`);
+    const blob = await resp.blob();
+    file = new File([blob], `design-mode-element-${Date.now()}.jpg`, { type: msg.image.mimeType });
+  } catch {
+    showAttachmentError("Không thể xử lý ảnh của phần tử đã chọn.");
+    return;
+  }
+  const beforeIds = new Set(attachments.map((a) => a.id));
+  validateAndAppendFiles([file], { from: "design_mode" });
+  const added = attachments.find((a) => !beforeIds.has(a.id));
+  if (!added) return; // rejected by the shared ceiling/allowlist path — its own error is already shown
+  pickedElement = { record: msg.record, attachmentId: added.id, identity };
+  renderAttachments();
+}
+
+if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.onMessage && typeof chrome.runtime.onMessage.addListener === "function") {
+  chrome.runtime.onMessage.addListener((msg) => {
+    if (!msg || typeof msg.type !== "string") return;
+    if (msg.type === "design_mode_picked") {
+      onDesignModePicked(msg).catch(() => {});
+      return;
+    }
+    if (msg.type === "design_mode_ended") {
+      if (designModeTabId !== msg.tabId) return;
+      designModeActive = false;
+      designModeTabId = null;
+      pendingDesignModeIdentity = null;
+      renderDesignModeButton();
+      if (msg.reason === "capture_failed") showAttachmentError("Không thể chụp ảnh của phần tử đã chọn.");
+      return;
+    }
   });
 }
 
@@ -1873,6 +2047,33 @@ async function doSend() {
     }
   }
   contextStaleNotice = null;
+
+  // design.md D8/tasks.md 5.5: a picked element carries its OWN recorded
+  // identity, re-checked against THIS exact send — independently of the
+  // ordinary page-context chip check just above, which can agree (the chip
+  // itself looks unchanged) while the picked element is nonetheless stale
+  // (e.g. the chip was pinned back to the original page after the pick, but
+  // the pick happened on a page that is no longer what `context` reports).
+  let elementRecord = null;
+  if (pickedElement) {
+    const sentIdentity = context ? { tabId: context.tabId, url: context.url, doc: context.doc } : null;
+    if (!sameIdentity(pickedElement.identity, sentIdentity)) {
+      contextStaleNotice = "Phần tử đã chọn thuộc một trang khác — đã bỏ, nhấn Gửi lại để tiếp tục.";
+      clearPickedElement(); // drops both the record and its image attachment (see that function)
+      renderContextChip();
+      return; // never dispatch this activation — a further, explicit Send is required
+    }
+    elementRecord = {
+      pageIdentity: pickedElement.identity,
+      selector: pickedElement.record.selector,
+      tagName: pickedElement.record.tagName,
+      markup: pickedElement.record.markup,
+      markupTruncated: pickedElement.record.markupTruncated,
+      styles: pickedElement.record.styles,
+      rectClipped: pickedElement.record.rectClipped
+    };
+  }
+
   const tabScope = context && context.tabId != null ? [context.tabId] : "any";
   // Exact-message binding (spec "Composer attachment representation and message
   // binding"): snapshot the attachment list at THIS instant. That snapshot
@@ -1950,12 +2151,18 @@ async function doSend() {
   }
   el.composerInput.value = "";
   autoGrow();
+  // task 5.6: clear the picked element BEFORE clearAttachments() re-renders
+  // the strip, so its chip does not draw for the instant between the two —
+  // its underlying image attachment is already part of `attachmentRefs`
+  // above and is cleared along with every other attachment below.
+  pickedElement = null;
   clearAttachments();
   await panel.sendMessage(text, {
     tabScope,
     modelId: panel._selectedModelId,
     pageContext: context,
     attachments: attachmentRefs,
+    elementRecord,
     effort: selectedEffort
   });
   render();
@@ -2293,6 +2500,11 @@ async function boot() {
     contextStaleNotice = null;
     renderContextChip();
     syncAdoptedTabGroup();
+    // tasks.md 3.3/5.6: a bound-page change ends an in-progress picking
+    // session and drops any already-picked element — both would otherwise
+    // describe a page the panel is no longer bound to.
+    cancelDesignModeIfActive();
+    if (pickedElement) clearPickedElement();
   });
   await pageContext.start();
   // scope-conversation-restore-per-tab (design.md "Scope by the tab the panel

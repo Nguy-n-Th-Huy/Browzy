@@ -211,13 +211,17 @@ export class ProtocolClient {
    * `attachments`, when present, is an additive optional field of artifact
    * references (never raw bytes) — ignored by older companions.
    */
-  start({ conversationId, profileId, modelId, tabScope, prompt, context, attachments, effort }) {
+  start({ conversationId, profileId, modelId, tabScope, prompt, context, attachments, effort, elementRecord }) {
     const payload = { conversationId, profileId, modelId, tabScope, prompt, context };
     if (attachments && attachments.length) payload.attachments = attachments;
     // Absent, not null: the companion reads an absent field as "send no effort
     // parameter", and writing an explicit null would say the same thing in a
     // shape older peers have no reason to expect.
     if (effort) payload.effort = effort;
+    // openspec/changes/add-design-mode-element-picker, design.md D7: a
+    // design-mode picked element's own field, beside `attachments` — never
+    // spliced into `prompt`. Additive optional: an old companion ignores it.
+    if (elementRecord) payload.elementRecord = elementRecord;
     this._send(envelope(MSG.START, payload));
   }
 

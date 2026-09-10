@@ -786,6 +786,59 @@ body {
   white-space: nowrap;
 }
 
+/* ==================== Design mode (element picker) ===================== */
+/* openspec/changes/add-design-mode-element-picker. The toggle's active state
+   is carried by border + background + a small dot, never by icon colour
+   alone (spec: "an active/inactive visual state carried by something besides
+   colour"). */
+#btn-design-mode {
+  position: relative;
+}
+#btn-design-mode[aria-pressed="true"] {
+  background: var(--color-surface-sunken);
+  border: 1px solid var(--color-border-strong);
+}
+#btn-design-mode[aria-pressed="true"]::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+/* The picked-element chip lives in the SAME strip as attachment thumbnails
+   (task 5.2's "alongside the existing attachment thumbnails"), but reads as
+   a pill label rather than an image thumbnail — it has no picture of its
+   own (the clipped screenshot is its own, separate attachment thumbnail). */
+.design-mode-chip {
+  width: auto;
+  height: 32px;
+  border-radius: var(--radius-pill);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 0 var(--space-2);
+  background: var(--color-surface-sunken);
+  border: 1px solid var(--color-border-subtle);
+}
+.design-mode-chip .attachment-thumb-name {
+  position: static;
+  background: none;
+  padding: 0;
+  max-width: 160px;
+}
+.design-mode-chip .attachment-thumb-remove {
+  position: static;
+}
+.design-mode-chip-icon {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  flex: none;
+}
+
 .attachment-error {
   font-size: var(--font-size-small);
   color: var(--color-status-danger);

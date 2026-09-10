@@ -502,8 +502,15 @@ export class PanelController {
    *   - snapshot of the composer attachment refs at Send time (exact-message
    *   binding, mirror of pageContext). Additive optional field: old peers
    *   ignore it.
+   * @param {object|null} [opts.elementRecord] - openspec/changes/
+   *   add-design-mode-element-picker, design.md D7: a design-mode picked
+   *   element's `{selector, tagName, markup, markupTruncated, styles,
+   *   rectClipped}`, travelling as its OWN field beside `attachments` —
+   *   never spliced into `text`. The caller (sidepanel.js) has already
+   *   re-validated its recorded page identity against this exact send via
+   *   page-context.js's sameIdentity() (design.md D8) before calling this.
    */
-  async sendMessage(text, { tabScope = "any", profileId, modelId, pageContext = null, attachments = null, effort = null } = {}) {
+  async sendMessage(text, { tabScope = "any", profileId, modelId, pageContext = null, attachments = null, effort = null, elementRecord = null } = {}) {
     const model = this.currentModel();
     if (!model) throw new Error("PanelController.sendMessage: no active conversation");
     model.addLocalUserMessage(text, { attachments: attachments || [] });
@@ -524,6 +531,7 @@ export class PanelController {
       prompt: text,
       context: buildContextMetadata({ text, context: pageContext }),
       ...(attachments && attachments.length ? { attachments } : {}),
+      ...(elementRecord ? { elementRecord } : {}),
       // Only sent when the composer actually chose a level. Omitted means the
       // run sends no effort parameter and the model's own default applies —
       // deliberately not the same as pinning it to today's default.

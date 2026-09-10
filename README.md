@@ -890,6 +890,51 @@ early, experimental bet:
   `test/fixtures/webmcp/index.html`, in a Chrome build within the trial (or
   with the testing flag enabled).
 
+## Design mode (element picker)
+
+A composer control (next to Add and Enhance prompt) lets the **operator** —
+never the agent — point at one element on the bound page and hand the
+assistant its picture, markup and resolved styling in a single gesture,
+instead of describing it in prose. Toggling it arms a hover highlight over
+the bound tab; clicking an element selects it, `Escape` or a second toggle
+cancels, and the mode always ends without capturing anything on those two
+routes.
+
+- **A selection produces a composer image plus a separate structured
+  record.** The image is a screenshot clipped to the element's bounding
+  rectangle, carried by the exact same attachment path (and the same MIME
+  allowlist / 10 MB ceiling) as any other composer image. The markup and a
+  filtered set of computed styles (`display`, `color`, `border`, and roughly
+  two dozen others named once in `extension/overlay/element-picker.js` — not
+  the browser's full ~340-property dump) travel as their own field on the
+  outgoing message, never spliced into the operator's typed text.
+- **Values are stripped in the page, before anything crosses the extension
+  boundary.** The picker clones the selected element, then strips the
+  current `value` of every input, the content of every textarea, and the
+  selected/checked state of every option/checkbox — on the element and every
+  descendant, not only the outermost node — and only THEN serializes the
+  clone. A password field's containing control is stripped more
+  aggressively still: nothing beside the (already-value-stripped) input
+  itself survives serialization, closing the leak a value-only strip would
+  miss (a mirrored "show password" character display, say).
+  `data-*` attributes are kept by default (they usually carry a framework's
+  own test/component hooks) — the one deliberate trade-off in this design,
+  stated rather than hidden: the operator sees exactly what they picked
+  before it is sent.
+- **Markup is bounded and truncation is never silent.** Over 32 KB, markup is
+  cut at the nearest complete tag and the outgoing record says so, with the
+  ceiling that applied.
+- **A picked element is bound to the page it came from.** If the bound tab or
+  URL changes between picking and sending, the send is refused for that
+  attempt and the operator must explicitly send again — the same posture the
+  page-context chip itself already takes.
+- **This is an operator input path, not a new agent capability.** Activating
+  it never takes the browser lease, never passes through the send-class
+  approval gate, and never widens a run's tab scope — and it is refused
+  outright, before anything is injected, on a page a content script can
+  never reach (`chrome://`, the extension gallery, ...) or while a run is
+  actively driving that same tab.
+
 ## Humanized input
 
 Browser automation normally dispatches input the shortest way possible: the

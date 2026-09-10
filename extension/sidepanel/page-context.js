@@ -88,7 +88,14 @@ function sameTarget(a, b) {
 //     (never fail a send merely because the doc channel is unavailable —
 //     unavailability is reported in the snapshot's `doc` field so the host
 //     can apply its own fail-closed read/mutation guards instead).
-function sameIdentity(a, b) {
+// design.md D8 / tasks.md 5.5: exported so a picked design-mode element can
+// be compared against captureForSend()'s live result with the SAME identity
+// semantics the chip itself uses — deliberately NOT the display `_revision`
+// (a title/favicon update bumps that without being a real retarget; see this
+// function's own comment above its declaration below) and deliberately NOT
+// a second, independently-invented notion of "same page" (design.md D8's
+// "why reuse rather than add a second mechanism").
+export function sameIdentity(a, b) {
   if (!a || !b) return a === b;
   if (a.tabId !== b.tabId || a.url !== b.url) return false;
   const da = a.doc && a.doc.confirmed ? a.doc : null;
@@ -294,6 +301,21 @@ export class PageContextTracker {
     this._explicitlyRemoved = true;
     this._revision++;
     this._emit();
+  }
+
+  /**
+   * design.md D8 / tasks.md 5.5: the identity to record when an element is
+   * PICKED (not sent) — the same three fields sameIdentity() above compares.
+   * Deliberately the doc-aware snapshot, not the bare tabId/url the picker's
+   * own record otherwise carries, and deliberately NOT `revision` (a
+   * title/favicon update bumps that without being a real retarget). Null
+   * when there is no bound page at all — a pick can never happen with
+   * nothing bound, but this stays honest rather than fabricating an
+   * identity.
+   */
+  identityForRecord() {
+    if (!this._current) return null;
+    return { tabId: this._current.tabId, url: this._current.url, doc: this._docSnapshot(this._current.tabId) };
   }
 
   /**
