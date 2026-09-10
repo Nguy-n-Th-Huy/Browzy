@@ -63,6 +63,7 @@ import {
   hashString
 } from "../tools/mapping.js";
 import { classifyWebFetchUrl, readWebFetchUrl } from "./webfetch-url-guard.js";
+import { legacyToolNameFromSdkName } from "../tools/adapter.js";
 
 /**
  * Mint a single-execution nonce for one approval (3.3). Bound into the
@@ -139,10 +140,18 @@ export function createCanUseTool({ run, approvals, requestIdTracker, now = Date.
     // correlation still has something to echo.
     const sdkRequestId = toolContext?.toolUseID || toolContext?.tool_use_id || toolContext?.requestId || `local_${now()}_${Math.random().toString(36).slice(2, 8)}`;
 
-    // Resolve the legacy tool name (the SDK-facing server registers tools
-    // under their legacy names: "computer", "javascript_tool", etc.) — the
-    // tool's `name` here is the SDK-facing registered name.
-    const toolName = toolContext?.toolName || "";
+    // Resolve the legacy tool name. The SDK-facing identifier for an
+    // MCP-served tool is the fully-qualified `mcp__<server>__<tool>` form,
+    // NOT the legacy name the classifiers below key on — and every one of
+    // them compares by exact string equality, so a qualified name silently
+    // takes their "not a gated tool" branch and auto-allows the call. The
+    // tool handler (host/agent/tools/adapter.js) classifies the same call
+    // under its registered legacy name, so without this normalization the
+    // gate and the dispatch check disagree about identical bytes: the gate
+    // never prompts and never records a grant, and the handler then refuses
+    // to dispatch for want of one. A name that is already legacy, or a
+    // builtin like "WebFetch", passes through untouched.
+    const toolName = legacyToolNameFromSdkName(toolContext?.toolName || "");
     // Build args/input snapshot. The SDK passes the call's input here.
     const args = toolContext?.input ?? {};
 
@@ -175,7 +184,21 @@ export function createCanUseTool({ run, approvals, requestIdTracker, now = Date.
     // prompt; a deny-verdict call is denied locally with no panel card)
     const targetHint = await resolveHintFor(toolName, args);
     const classification = classifySendClassCall(toolName, args, targetHint);
+    const normalized = normalizeApprovalArgs(toolName, args);
+    const normalizedArgs = fingerprintNormalizedArgs(normalized);
     if (classification.verdict === "allow") {
+      // Record the verdict even though nothing is being approved. This gate
+      // classifies WITH a resolved target hint (resolveHintFor above, which
+      // dereferences a `ref` against the live page); the pre-dispatch check
+      // in host/agent/tools/adapter.js has no page access and classifies
+      // hintless. When the hint is what downgrades a call to non-send, the
+      // two verdicts differ, and the handler would refuse to dispatch for
+      // want of a grant this branch is precisely deciding it does not need.
+      // The gate holds strictly more evidence, so its verdict is the one
+      // that binds; recording it here is what lets the handler honour it
+      // instead of re-deciding on less. Single-use, exactly like a grant:
+      // one gate decision authorizes one dispatch, never a replay.
+      run.recordGateVerdict?.(normalizedArgs, "allow");
       return { behavior: "allow" };
     }
     if (classification.verdict === "deny") {
@@ -191,8 +214,6 @@ export function createCanUseTool({ run, approvals, requestIdTracker, now = Date.
     // credential evidence + a fresh execution nonce + expiry.
     const action = buildActionDescriptor(toolName, args, classification);
     const target = buildTargetDescriptor(toolName, args, targetHint, classification);
-    const normalized = normalizeApprovalArgs(toolName, args);
-    const normalizedArgs = fingerprintNormalizedArgs(normalized);
     const observedState = `st_${hashString(stableStringify({ normalized, evidence: classification.evidence }))}`;
     const execNonce = mintExecNonce();
     const binding = {

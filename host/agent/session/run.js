@@ -229,4 +229,29 @@ export class Run {
     entry.used = true;
     return { ok: true, info: entry };
   }
+
+  // A gate verdict that needed NO approval, recorded for the same reason a
+  // grant is: so the dispatch-time check can tell "the gate decided this
+  // call is not send-class" apart from "this call never passed the gate".
+  //
+  // The gate classifies with a resolved target hint the tool handler cannot
+  // obtain (no page access at dispatch time). When that hint is what makes a
+  // call non-send, the handler's own hintless classification reaches the
+  // opposite verdict and refuses to dispatch for want of a grant the gate
+  // deliberately did not mint. The gate holds strictly more evidence, so its
+  // verdict binds; this records it. Single-use like a grant — one gate
+  // decision authorizes one dispatch, so a replayed handler invocation still
+  // finds nothing and is refused.
+  recordGateVerdict(fingerprint, verdict) {
+    if (!this._gateVerdicts) this._gateVerdicts = new Map();
+    this._gateVerdicts.set(fingerprint, { verdict, used: false });
+  }
+
+  consumeGateVerdict(fingerprint) {
+    const entry = this._gateVerdicts ? this._gateVerdicts.get(fingerprint) : undefined;
+    if (!entry) return { ok: false, reason: "unknown_verdict" };
+    if (entry.used) return { ok: false, reason: "verdict_replayed" };
+    entry.used = true;
+    return { ok: true, verdict: entry.verdict };
+  }
 }

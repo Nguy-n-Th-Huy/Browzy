@@ -139,11 +139,31 @@ function staleApprovalErrorResult(reason) {
  *   calls that need no grant.
  */
 export function verifyPreDispatchApproval({ run, legacyToolName, args }) {
-  // The SAME hint rule as the gate (can-use-tool.js resolveHintFor): an
-  // explicitly provided hint is used as-is, otherwise classification is
-  // hintless. Gate and dispatch must never disagree about what evidence a
-  // call carries — in live traffic the SDK input carries no hint either
-  // way, so both sides are hintless and identical by construction.
+  const fingerprint = fingerprintNormalizedArgs(normalizeApprovalArgs(legacyToolName, args));
+
+  // The gate's own verdict binds when it recorded one. This used to say gate
+  // and dispatch were "hintless and identical by construction" — they are
+  // not. can-use-tool.js's resolveHintFor() dereferences a `ref` against the
+  // live page and classifies WITH that hint; nothing here can (no page
+  // access at dispatch time), so this side is genuinely hintless. When the
+  // hint is what downgrades a call to non-send, the gate allows without
+  // minting a grant and this check, re-deciding on less evidence, would
+  // refuse a call nothing can ever mint a grant for — an unrecoverable
+  // refusal that no retry can clear. The gate holds strictly more evidence,
+  // so its recorded verdict is honoured here rather than second-guessed.
+  //
+  // Absence of a recorded verdict still means "never passed the gate", which
+  // is exactly what the fall-through below is for: a handler invoked without
+  // the gate, or a replayed one, is classified here and refused if it looks
+  // send-class. That is the invariant this check exists to hold, and it is
+  // unchanged.
+  if (typeof run.consumeGateVerdict === "function") {
+    const gateVerdict = run.consumeGateVerdict(fingerprint);
+    if (gateVerdict.ok && gateVerdict.verdict === "allow") {
+      return { ok: true, granted: false };
+    }
+  }
+
   const hint = args?.targetHint && typeof args.targetHint === "object" ? args.targetHint : null;
   const classification = classifySendClassCall(legacyToolName, args, hint);
   if (classification.verdict !== "approve-known" && classification.verdict !== "approve-unknown") {
@@ -152,7 +172,6 @@ export function verifyPreDispatchApproval({ run, legacyToolName, args }) {
   if (typeof run.consumeApprovalGrant !== "function") {
     return { ok: false, reason: "approval grants unsupported by this run" };
   }
-  const fingerprint = fingerprintNormalizedArgs(normalizeApprovalArgs(legacyToolName, args));
   const grant = run.consumeApprovalGrant(fingerprint);
   if (!grant.ok) {
     return { ok: false, reason: grant.reason === "grant_replayed" ? "approval grant already used (replay)" : "no approval grant for these exact arguments (stale or bypassed gate)" };
@@ -323,4 +342,39 @@ export function adapterToolNames() {
  */
 export function sdkQualifiedToolNames(serverName = SDK_MCP_SERVER_NAME, toolNames = adapterToolNames()) {
   return toolNames.map((name) => `mcp__${serverName}__${name}`);
+}
+
+/**
+ * The inverse of `sdkQualifiedToolNames()`: map whatever name the SDK hands
+ * a permission callback back to the legacy tool name every classifier in
+ * host/agent/tools/mapping.js keys on ("computer", "javascript_tool", ...).
+ *
+ * This exists because the two sides of the approval boundary see the SAME
+ * call under DIFFERENT names. The tool HANDLER knows its own registered
+ * legacy name (`t.name` in `buildSdkTools()`), but `Options.canUseTool`
+ * receives the SDK-facing identifier, which for an MCP-served tool is the
+ * fully-qualified `mcp__<server>__<tool>` form. Every classifier compares
+ * against the legacy names by exact string equality
+ * (`SEND_CLASS_TOOL_NAMES.includes(...)`, `legacyToolName === "computer"`),
+ * so handing one a qualified name silently takes the "not a gated tool"
+ * branch — the gate then auto-allows a call the handler independently
+ * classifies as send-class, and the two disagree about the same bytes.
+ *
+ * Only a prefix whose suffix is a tool this adapter actually registers is
+ * stripped, so this cannot map some other MCP server's identically-suffixed
+ * tool onto this project's gate, and a name that is already legacy (or is a
+ * builtin like "WebFetch") is returned untouched.
+ *
+ * @param {string} sdkToolName - the name as the SDK presented it.
+ * @param {string[]} [toolNames] - defaults to `adapterToolNames()`, the same
+ *   registry-derived array `sdkQualifiedToolNames()` uses, so the two can
+ *   never disagree about which suffixes are ours.
+ * @returns {string} the legacy tool name, or `sdkToolName` unchanged.
+ */
+export function legacyToolNameFromSdkName(sdkToolName, toolNames = adapterToolNames()) {
+  if (typeof sdkToolName !== "string" || sdkToolName.length === 0) return "";
+  if (toolNames.includes(sdkToolName)) return sdkToolName;
+  if (!sdkToolName.startsWith("mcp__")) return sdkToolName;
+  const suffix = sdkToolName.slice(sdkToolName.lastIndexOf("__") + 2);
+  return toolNames.includes(suffix) ? suffix : sdkToolName;
 }

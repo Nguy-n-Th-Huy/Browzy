@@ -162,7 +162,7 @@
 // (`computer`/`javascript_tool` send-class calls, and now `WebFetch` — see
 // below).
 
-import { sdkQualifiedToolNames, SDK_MCP_SERVER_NAME } from "./adapter.js";
+import { sdkQualifiedToolNames, legacyToolNameFromSdkName, SDK_MCP_SERVER_NAME } from "./adapter.js";
 import { createWebFetchPreToolUseHook } from "../policy/webfetch-url-guard.js";
 
 // Filesystem writes and arbitrary command execution stay disabled by
@@ -702,7 +702,7 @@ export function buildIsolatedOptions({
   // `allowedTools` unchanged, with zero added latency.
   const ALLOWED_TOOL_EXCLUDE = new Set(["computer", "javascript_tool"]);
   const autoApprovedBrowserToolNames = qualifiedBrowserToolNames.filter(
-    (qname) => !ALLOWED_TOOL_EXCLUDE.has(qname.substring(qname.lastIndexOf("__") + 2))
+    (qname) => !ALLOWED_TOOL_EXCLUDE.has(legacyToolNameFromSdkName(qname))
   );
 
   return {

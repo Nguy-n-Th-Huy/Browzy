@@ -19,6 +19,7 @@
 import { ApprovalRegistry } from "../host/agent/policy/approvals.js";
 import { createCanUseTool, RequestIdTracker } from "../host/agent/policy/can-use-tool.js";
 import { isSendClassCall, enforceBorrowedTabScope, BorrowedTabMutationError } from "../host/agent/tools/mapping.js";
+import { verifyPreDispatchApproval } from "../host/agent/tools/adapter.js";
 import { Run } from "../host/agent/session/run.js";
 import { BrowserLease } from "../host/agent/broker/browser-lease.js";
 
@@ -316,6 +317,108 @@ await test("SendClassCall never invoked from tool args: isSendClassCall is compu
   // Only the REAL target hint drives classification:
   const submitHint = { accessibleName: "Pay Now", tagName: "button", attributes: { type: "submit" } };
   assert(isSendClassCall("computer", { action: "click" }, submitHint) === true, "a click on a real submit button is send-class");
+});
+
+// --- 6. Gate and dispatch must classify the SAME call identically ---------
+//
+// Both regressions below were live in stored conversation logs: five separate
+// conversations show `tool_rejected reason=stale_approval` on a click, and
+// across every conversation ever recorded the approval card had been shown
+// exactly zero times. Both trace to the gate and the dispatch check reading
+// the same call under different names / different evidence.
+
+await test("Gate: the SDK-qualified MCP tool name classifies exactly like the legacy name", async () => {
+  const run = await freshRunBegin();
+  const tracker = new RequestIdTracker();
+  const canUseTool = createCanUseTool({ run, approvals: run.approvals, requestIdTracker: tracker });
+
+  // Live traffic hands canUseTool the fully-qualified MCP identifier, never
+  // the bare legacy name every other test in this file uses. Before the fix
+  // this took classifySendClassCall's "not a gated tool" branch and returned
+  // allow with no prompt, so a submit-class click dispatched with no approval
+  // ever requested — the reason zero approval_request events exist in any
+  // recorded conversation.
+  const promise = canUseTool({
+    toolName: "mcp__browzy-in-chrome-browser__computer",
+    toolUseID: "req_qualified",
+    input: { action: "click", description: "submit the form", tabId: 42 }
+  });
+  await new Promise((r) => setTimeout(r, 5));
+  assert(tracker.has("req_qualified"), "a qualified-name send-class call MUST reach the approval gate, not be silently auto-allowed");
+  tracker.take("req_qualified").resolver({ decision: "deny" });
+  const result = await promise;
+  assert(result.behavior === "deny", "the decision on a qualified-name call must be honoured like any other");
+});
+
+await test("Gate: an unrelated MCP server's identically-suffixed tool is NOT pulled onto this gate", async () => {
+  const run = await freshRunBegin();
+  const tracker = new RequestIdTracker();
+  const canUseTool = createCanUseTool({ run, approvals: run.approvals, requestIdTracker: tracker });
+  const result = await canUseTool({
+    toolName: "mcp__some_other_server__definitely_not_a_browzy_tool",
+    toolUseID: "req_foreign",
+    input: { action: "click", description: "submit the form", tabId: 42 }
+  });
+  assert(result.behavior === "allow", "a tool this adapter does not register is not this gate's business");
+  assert(!tracker.has("req_foreign"), "no approval may be requested for a foreign tool");
+});
+
+await test("Dispatch: a call the gate allowed on resolved-hint evidence dispatches instead of failing stale", async () => {
+  const run = await freshRunBegin();
+  const tracker = new RequestIdTracker();
+  // The gate resolves a target hint the dispatch check cannot: here the hint
+  // says the click lands on an ordinary link, so the gate allows with no
+  // approval. The dispatch check, hintless, sees a bare `click` and — before
+  // the fix — classified it send-class and refused for want of a grant the
+  // gate deliberately never minted. Nothing in the loop could ever mint one,
+  // so the model retried forever; the logs show exactly that, and a
+  // coordinate-based click on the same element succeeding right after.
+  const canUseTool = createCanUseTool({
+    run,
+    approvals: run.approvals,
+    requestIdTracker: tracker,
+    resolveHint: async () => ({ accessibleName: "Watch video", tagName: "a", attributes: { href: "/watch" } })
+  });
+  const input = { action: "left_click", ref: "ref_1", tabId: 42 };
+  const gateResult = await canUseTool({ toolName: "mcp__browzy-in-chrome-browser__computer", toolUseID: "req_hinted", input });
+  assert(gateResult.behavior === "allow", `the resolved hint must let the gate allow this click (got ${gateResult.behavior})`);
+  assert(!tracker.has("req_hinted"), "an allowed call must not have requested an approval");
+
+  const preDispatch = verifyPreDispatchApproval({ run, legacyToolName: "computer", args: input });
+  assert(preDispatch.ok === true, `dispatch must honour the gate's verdict, not re-decide on weaker evidence (got: ${preDispatch.reason})`);
+  assert(preDispatch.granted === false, "no approval was granted, so nothing may be reported as granted");
+});
+
+await test("Dispatch: a handler invoked without ever passing the gate is still refused", () => {
+  const run = makeRun({ tabScope: [42] });
+  // No canUseTool call at all — nothing recorded a verdict or a grant. The
+  // fall-through classification must still catch a send-class call, which is
+  // the whole point of the pre-dispatch check.
+  const preDispatch = verifyPreDispatchApproval({
+    run,
+    legacyToolName: "computer",
+    args: { action: "click", description: "submit the form", tabId: 42 }
+  });
+  assert(preDispatch.ok === false, "a send-class dispatch that never passed the gate must be refused");
+});
+
+await test("Dispatch: a gate verdict authorizes exactly one dispatch, never a replay", async () => {
+  const run = await freshRunBegin();
+  const tracker = new RequestIdTracker();
+  const canUseTool = createCanUseTool({
+    run,
+    approvals: run.approvals,
+    requestIdTracker: tracker,
+    resolveHint: async () => ({ accessibleName: "Watch video", tagName: "a", attributes: { href: "/watch" } })
+  });
+  const input = { action: "left_click", ref: "ref_1", tabId: 42 };
+  await canUseTool({ toolName: "mcp__browzy-in-chrome-browser__computer", toolUseID: "req_once", input });
+
+  assert(verifyPreDispatchApproval({ run, legacyToolName: "computer", args: input }).ok === true, "the first dispatch is authorized");
+  assert(
+    verifyPreDispatchApproval({ run, legacyToolName: "computer", args: input }).ok === false,
+    "a second dispatch on the same single gate decision must be refused, not replayed"
+  );
 });
 
 const failed = results.filter((r) => !r.ok);
