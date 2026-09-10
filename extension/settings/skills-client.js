@@ -14,39 +14,32 @@
 // extension/background.js's createAgentSettingsRelay() already speak this
 // exact envelope shape"). Only the `op` names below are new.
 //
-// Operations (1:1 with host/agent/skills/index.js's exported catalog-lifecycle
-// contract — listCatalog/importSkill/refreshSkill/authorSkill/enableSkill/
-// disableSkill/removeSkill/setInvocationFlags — see that file and
-// manage.js/import.js/author.js):
+// Operations (1:1 with host/agent/companion.js's `_handleAgentSettings()`
+// skills_* case branches, which delegate to host/agent/skills/index.js's
+// exported catalog-lifecycle contract — listCatalog/authorSkill/enableSkill/
+// disableSkill/removeSkill/setInvocationFlags — plus the read-back
+// composition described below):
 //   op: "skills_list"                  payload: {}
-//   op: "skills_import"                payload: { sourceDir }
-//   op: "skills_refresh"               payload: { name }
+//   op: "skills_read_source"           payload: { name }
 //   op: "skills_author"                payload: { name, description, body, userInvocable?, modelInvocable?, allowedTools? }
 //   op: "skills_enable"                payload: { name }
 //   op: "skills_disable"               payload: { name }
 //   op: "skills_remove"                payload: { name }
 //   op: "skills_set_invocation_flags"  payload: { name, userInvocable?, modelInvocable? }
 //
-// IMPORTANT — scope note (mirrors settings-client.js's own, for the same
-// reason): design.md decision 1 puts the real native-messaging relay in
-// extension/background.js, owned by a parallel session in this same change
-// (`extension/background.js` is listed under this task's "Files you MUST NOT
-// touch"). host/agent/companion.js's `_handleAgentSettings()` also does not
-// yet have case branches for the `skills_*` ops above — see reports/
-// 07-skills-ui-evidence.md's "Wire contract and companion wiring gap"
-// section. Both are host-owned/background-owned follow-up work, not this
-// task's file scope. Until they exist, every call here rejects with a
-// NETWORK_ERROR-shaped SkillsErrorLike — never a false "success" — exactly
-// like settings-client.js's own `send()` already behaves for the same
-// not-yet-wired reason.
+// No operation here takes a filesystem path (openspec/changes/
+// redesign-settings-typed-only-skills, design.md decision D1): composing a
+// skill in the app (`skills_author`) is the only way one enters the catalog.
+// `skills_read_source` takes a catalog `name` and nothing else — it is what
+// makes "Sửa" (edit) and "Nhân bản" (duplicate) possible without ever
+// reading a directory the app does not own: it resolves the skill's own
+// approved snapshot host-side and returns
+// `{ name, description, body, allowedTools, userInvocable, modelInvocable }`.
 //
 // This file's own responsibility is narrow and fully covered by
 // test/settings-ui-skills-*.test.mjs: build the right outgoing message,
 // translate a well-formed response back into a plain JS value or a typed
-// error. It never executes anything from a source folder itself — the
-// `sourceDir` payload is just a string path the user picked/typed; all
-// actual file reads/copies happen host-side in host/agent/skills/import.js,
-// which never executes package scripts (see that file's own header).
+// error.
 
 /** Mirrors host/agent/skills/errors.js's error `.code` values without
  * importing any Node module (this file runs in the browser). */
@@ -90,8 +83,7 @@ export function createSkillsClient(opts = {}) {
 
   return {
     listCatalog: () => call("skills_list"),
-    importSkill: (sourceDir) => call("skills_import", { sourceDir }),
-    refreshSkill: (name) => call("skills_refresh", { name }),
+    readSkillSource: (name) => call("skills_read_source", { name }),
     authorSkill: (fields) => call("skills_author", { ...fields }),
     enableSkill: (name) => call("skills_enable", { name }),
     disableSkill: (name) => call("skills_disable", { name }),

@@ -29,14 +29,65 @@
     flex-direction: column;
     gap: var(--space-2);
   }
-  #import-row { display: flex; flex-direction: column; gap: var(--space-2); }
-  #import-row .field-row { align-items: flex-end; gap: var(--space-2); }
-  #import-row .field { flex: 1; margin-bottom: 0; }
+
+  /* "The app reads no directory on this machine" note (design/Skills.dc.html) */
+  .skills-note {
+    display: flex;
+    gap: var(--space-3);
+    padding: var(--space-3) var(--space-4);
+    border-radius: var(--radius-md);
+    background: var(--color-accent-tint);
+    border: 1px solid var(--color-accent);
+    margin-bottom: var(--space-2);
+  }
+  .skills-note-icon { flex: none; color: var(--color-accent-text); margin-top: 2px; }
+  .skills-note p { font-size: var(--font-size-small); color: var(--color-text); line-height: 1.55; margin: 0; }
+
+  /* Soạn/Xem trước tab pair over the Markdown body field (design.md D4) */
+  .body-field-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--space-2); flex-wrap: wrap; }
+  .skill-body-tabs { display: flex; gap: 4px; padding: 4px; background: var(--color-surface-sunken); border: 1px solid var(--color-border); border-bottom: none; border-radius: var(--radius-sm) var(--radius-sm) 0 0; }
+  .skill-body-tab {
+    display: inline-flex; align-items: center; height: 26px; padding: 0 var(--space-3);
+    border-radius: var(--radius-sm); border: none; background: transparent; color: var(--color-text-secondary);
+    font-size: var(--font-size-small); font-weight: 600; font-family: var(--font-sans); cursor: pointer;
+  }
+  .skill-body-tab[aria-selected="true"] { background: var(--color-surface); color: var(--color-text); }
+  .skill-body-tab:focus-visible { outline: 2px solid var(--color-focus-ring); outline-offset: 2px; }
+  #author-body { border-radius: 0 0 var(--radius-sm) var(--radius-sm); }
+  #author-body-preview {
+    min-height: 150px; padding: var(--space-2) var(--space-3); border: 1px solid var(--color-border);
+    border-radius: 0 0 var(--radius-sm) var(--radius-sm); background: var(--color-surface-sunken);
+    overflow-wrap: anywhere; white-space: pre-wrap;
+  }
+  #author-body-preview:empty::before { content: "Chưa có nội dung để xem trước."; color: var(--color-text-secondary); }
+
+  /* Skill cards */
   .skill-card { display: flex; flex-direction: column; gap: var(--space-2); }
   .skill-card-head { display: flex; align-items: flex-start; gap: var(--space-3); }
   .skill-card-body { flex: 1; min-width: 0; }
-  .skill-card-source { margin-top: 6px; font-family: var(--font-mono); }
-  .skill-card-actions { display: flex; gap: var(--space-2); justify-content: flex-end; }
+  .skill-card-source { margin-top: 6px; }
+  .skill-card-actions { display: flex; flex-wrap: wrap; gap: var(--space-2); justify-content: flex-end; }
+
+  /* In-page removal confirmation card (design.md D5, States.dc.html "C") */
+  .skill-confirm { border-color: var(--color-status-danger) !important; }
+  .skill-confirm-head { display: flex; gap: var(--space-3); align-items: flex-start; }
+  .skill-confirm-icon { flex: none; color: var(--color-status-danger); margin-top: 2px; }
+  .skill-confirm-title { font-size: var(--font-size-h3); font-weight: 700; margin: 0; }
+  .skill-confirm-desc { font-size: var(--font-size-small); color: var(--color-text-secondary); margin: 4px 0 0; line-height: 1.55; }
+  .skill-confirm-actions { display: flex; gap: var(--space-2); justify-content: flex-end; }
+
+  /* Empty state (States.dc.html "A") */
+  .skills-empty {
+    display: flex; flex-direction: column; align-items: center; text-align: center; gap: var(--space-2);
+    padding: var(--space-8) var(--space-6); background: var(--color-surface); border: 1px dashed var(--color-border);
+    border-radius: var(--radius-md);
+  }
+  .skills-empty-icon {
+    width: 44px; height: 44px; border-radius: var(--radius-sm); background: var(--color-surface-sunken);
+    color: var(--color-text-secondary); display: flex; align-items: center; justify-content: center;
+  }
+  .skills-empty-title { font-size: var(--font-size-h3); font-weight: 700; margin: 0; }
+  .skills-empty-desc { font-size: var(--font-size-small); color: var(--color-text-secondary); margin: 0; max-width: 340px; line-height: 1.55; }
 
   /* Same `.btn[hidden]` specificity defect settings.html already documents
      and compensates for (extension/ui/components.css's shared .btn class
@@ -57,39 +108,47 @@
   <main class="panel-scroll">
     <div id="banner-area"></div>
 
-    <p class="section-heading">Nhập skill mới</p>
-    <div class="field-group">
-      <div class="field-group-item" id="import-row">
-        <div class="field">
-          <label class="field-label" for="import-path">Đường dẫn thư mục skill</label>
-          <input class="input" id="import-path" type="text" autocomplete="off" spellcheck="false"
-                 placeholder="vd: C:\Users\ban\skills\tom-tat-trang" />
-          <p class="field-hint">Chỉ thư mục bạn chỉ định được đọc — không tự động quét thư mục cấu hình cá nhân hay dự án nào khác. Thư mục phải chứa một tệp SKILL.md ở gốc.</p>
-        </div>
-        <div class="field-row">
-          <button class="btn btn-secondary btn-sm" type="button" id="btn-import"><span id="ic-folder"></span>Nhập thư mục</button>
-        </div>
-      </div>
+    <div class="skills-note">
+      <span class="skills-note-icon" id="ic-note"></span>
+      <p>Skill được soạn trực tiếp tại đây và lưu vào kho của Browzy. Ứng dụng không đọc bất kỳ thư mục nào trên máy bạn — không có đường dẫn nào để nhập, nên cũng không có tệp lạ nào chạy được.</p>
     </div>
 
-    <p class="section-heading">Tạo skill mới</p>
-    <div class="field-group">
+    <p class="section-heading" id="author-heading">Soạn skill mới</p>
+    <p class="field-hint" id="author-mode-hint" role="status" hidden></p>
+    <div class="field-group" role="group" aria-labelledby="author-heading">
       <div class="field-group-item" id="author-row">
         <div class="field">
           <label class="field-label" for="author-name">Tên skill</label>
           <input class="input" id="author-name" type="text" autocomplete="off" spellcheck="false"
-                 placeholder="vd: tom-tat-trang" />
-          <p class="field-hint">Chỉ chữ, số, "_" hoặc "-" (1-64 ký tự), không dùng dấu cách hay đường dẫn.</p>
+                 placeholder="vd: tom-tat-trang" aria-describedby="author-name-hint author-name-error" />
+          <p class="field-hint" id="author-name-hint">Chỉ chữ, số, "_" hoặc "-" (1-64 ký tự), không dùng dấu cách hay đường dẫn.</p>
+          <p class="field-error" id="author-name-error" role="alert" hidden></p>
         </div>
         <div class="field">
           <label class="field-label" for="author-description">Mô tả</label>
           <input class="input" id="author-description" type="text" autocomplete="off" spellcheck="false"
-                 placeholder="Mô tả ngắn để mô hình biết khi nào nên dùng skill này" />
+                 placeholder="Mô tả ngắn để mô hình biết khi nào nên dùng skill này"
+                 aria-describedby="author-description-error" />
+          <p class="field-error" id="author-description-error" role="alert" hidden></p>
         </div>
         <div class="field">
-          <label class="field-label" for="author-body">Nội dung (Markdown)</label>
-          <textarea class="textarea" id="author-body" rows="8" spellcheck="false"
-                    placeholder="Hướng dẫn chi tiết cho skill này…"></textarea>
+          <div class="body-field-head">
+            <span class="field-label" id="author-body-label">Nội dung (Markdown)</span>
+            <span class="field-hint" id="author-body-counter">0 ký tự</span>
+          </div>
+          <div role="tablist" aria-label="Chế độ soạn nội dung" class="skill-body-tabs">
+            <button type="button" role="tab" id="tab-compose" aria-selected="true" aria-controls="author-body-panel" tabindex="0" class="skill-body-tab">Soạn</button>
+            <button type="button" role="tab" id="tab-preview" aria-selected="false" aria-controls="author-body-panel" tabindex="-1" class="skill-body-tab">Xem trước</button>
+          </div>
+          <div id="author-body-panel" role="tabpanel" aria-labelledby="tab-compose">
+            <textarea class="textarea" id="author-body" rows="8" spellcheck="false"
+                      aria-describedby="author-body-hint author-body-error"
+                      placeholder="## Khi nào dùng&#10;Mô tả tình huống kích hoạt skill.&#10;&#10;## Các bước&#10;1. …&#10;2. …"></textarea>
+            <div id="author-body-preview" class="prose" hidden></div>
+          </div>
+          <p class="field-hint" id="author-body-hint">Đây là phần hướng dẫn mô hình sẽ đọc. Viết như bạn đang dặn một đồng nghiệp mới.</p>
+          <p class="field-error" id="author-body-error" role="alert" hidden></p>
+          <span id="author-body-counter-announce" class="ui-visually-hidden" aria-live="polite"></span>
         </div>
         <div class="field">
           <label class="field-label" for="author-allowed-tools">Công cụ được phép (tùy chọn)</label>
@@ -98,7 +157,10 @@
           <p class="field-hint">Cách nhau bởi dấu phẩy. Để trống nếu skill chỉ cần đọc tài nguyên của chính nó.</p>
         </div>
         <div class="field-row">
-          <span class="field-label">Cho phép gọi thủ công (/tên-skill)</span>
+          <span class="status-main" style="flex:1;min-width:0">
+            <span class="field-label" style="display:block">Cho phép gọi thủ công</span>
+            <span class="field-hint">Gõ /tên-skill trong khung chat</span>
+          </span>
           <label class="switch">
             <input type="checkbox" id="author-user-invocable" checked aria-label="Cho phép gọi thủ công">
             <span class="switch-track"></span>
@@ -106,22 +168,35 @@
           </label>
         </div>
         <div class="field-row">
-          <span class="field-label">Cho phép mô hình tự động gọi</span>
+          <span class="status-main" style="flex:1;min-width:0">
+            <span class="field-label" style="display:block">Cho phép mô hình tự động gọi</span>
+            <span class="field-hint">Mô hình tự chọn khi mô tả khớp ngữ cảnh</span>
+          </span>
           <label class="switch">
             <input type="checkbox" id="author-model-invocable" checked aria-label="Cho phép mô hình tự động gọi">
             <span class="switch-track"></span>
             <span class="switch-thumb"></span>
           </label>
         </div>
-        <div class="field-row">
-          <button class="btn btn-secondary btn-sm" type="button" id="btn-author"><span id="ic-plus"></span>Tạo skill</button>
+        <div class="field-row" id="author-actions-row">
+          <p class="field-hint" style="flex:1;min-width:150px">Có thể sửa lại bất cứ lúc nào sau khi tạo.</p>
+          <div class="field-row-actions">
+            <button class="btn btn-ghost btn-sm" type="button" id="btn-discard-draft">Xóa nháp</button>
+            <button class="btn btn-primary btn-sm" type="button" id="btn-author"><span id="ic-plus"></span>Tạo skill</button>
+          </div>
         </div>
       </div>
+      <div class="field-group-item" id="author-pending-load-confirm" hidden></div>
     </div>
 
-    <p class="section-heading">Đã nhập</p>
-    <div id="skill-list" style="display:flex;flex-direction:column;gap:8px"></div>
-    <p class="field-hint" id="skills-empty" hidden>Chưa có skill nào — nhập một thư mục skill ở trên để bắt đầu.</p>
+    <p class="section-heading" id="list-heading">Skill của bạn</p>
+    <div id="skill-list" role="group" aria-labelledby="list-heading" style="display:flex;flex-direction:column;gap:8px"></div>
+    <div class="skills-empty" id="skills-empty" hidden>
+      <span class="skills-empty-icon" id="ic-empty"></span>
+      <p class="skills-empty-title">Chưa có skill nào</p>
+      <p class="skills-empty-desc">Soạn skill đầu tiên ở khối bên trên. Một cái tên, một câu mô tả và vài dòng hướng dẫn là đủ để bắt đầu.</p>
+      <button class="btn btn-primary btn-sm" type="button" id="btn-empty-cta" style="margin-top:4px"><span id="ic-empty-cta"></span>Soạn skill đầu tiên</button>
+    </div>
   </main>
 </div>
 

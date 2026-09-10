@@ -4,7 +4,7 @@
   <em>Official Claude in Chrome gives you 58 blocked domains and two browsers.<br/>
   <strong>Browzy gives you the whole web.</strong></em>
   <br/>
-  <sub>Clean-room reimplementation of Anthropic's browser extension. No blocklist. Any Chromium browser. A 26-tool registry, with the specified flows tested against a real benchmark — not a guarantee of every proprietary feature (see <a href="#what-this-is-not">What this is not</a>).</sub>
+  <sub>Clean-room reimplementation of Anthropic's browser extension. No blocklist. Any Chromium browser. A 28-tool registry (26 preserved baseline + 2 experimental WebMCP page-tool operations), with the specified flows tested against a real benchmark — not a guarantee of every proprietary feature (see <a href="#what-this-is-not">What this is not</a>).</sub>
   <br/>
   <sub><em>Independent project. Not affiliated with, endorsed by, or sponsored by Anthropic.</em></sub>
 </p>
@@ -20,7 +20,7 @@
 
 ---
 
-The official [Claude in Chrome](https://code.claude.com/docs/en/chrome) extension gives Claude Code full browser automation — as long as you stay within Anthropic's allowlist of "safe" sites. Browzy is a clean-room reimplementation that strips the restrictions, with a 26-tool browser registry (verified programmatically — see [Available Tools](#available-tools)) and turn/latency performance that a benchmark below found statistically indistinguishable from the official extension on the tested task set — not a guarantee of matching every proprietary feature (see [What this is not](#what-this-is-not)).
+The official [Claude in Chrome](https://code.claude.com/docs/en/chrome) extension gives Claude Code full browser automation — as long as you stay within Anthropic's allowlist of "safe" sites. Browzy is a clean-room reimplementation that strips the restrictions, with a 28-tool browser registry (26 preserved baseline + 2 experimental WebMCP page-tool operations; verified programmatically — see [Available Tools](#available-tools)) and turn/latency performance that a benchmark below found statistically indistinguishable from the official extension on the tested task set — not a guarantee of matching every proprietary feature (see [What this is not](#what-this-is-not)).
 
 **Two ways to run it.** A **built-in browser side panel**, driven by the official [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk) through a local native companion — no Claude account, no terminal, no Claude Code client, just your own Anthropic-compatible Base URL/API key/model, configured once in Settings. Or the original **external MCP** entry point, unchanged and fully supported, for driving the same extension from a Claude Code session. Both share the one browser extension and one native companion; see [Quick start](#quick-start-two-ways-to-run-it) below. The side panel is the newer, actively-developing path — some of its screens (see [Side panel status](#side-panel-status) below) are still catching up to the external-MCP path's tool coverage.
 
@@ -31,7 +31,7 @@ The official [Claude in Chrome](https://code.claude.com/docs/en/chrome) extensio
 | **Domain blocklist** | 58 blocked domains across 11 categories | No blocklist. Navigate anywhere. |
 | **Browser support** | Chrome and Edge only | Any Chromium browser (Chrome, Edge, Brave, Arc, Opera, Vivaldi, etc.) |
 | **Source code** | Closed source | Open source (MIT) |
-| **Tools** | ~21 MCP tools (Anthropic's own count; not independently verified here) | 26 registry tools (verified: `test/registry-baseline.test.mjs`) — 19 with a named official equivalent (3 of those are currently unimplemented stubs, see [Available Tools](#available-tools)), 7 with no official equivalent, plus `execute_code` and the recording channel outside the core registry |
+| **Tools** | ~21 MCP tools (Anthropic's own count; not independently verified here) | 28 registry tools (verified: `test/registry-baseline.test.mjs`) — the 26-tool preserved baseline (19 with a named official equivalent, 3 of those currently unimplemented stubs, see [Available Tools](#available-tools); 7 with no official equivalent) plus 2 experimental WebMCP page-tool operations with no official equivalent (`webmcp_list_tools`, `webmcp_call_tool`, see [WebMCP page tools](#webmcp-page-tools-experimental)), plus `execute_code` and the recording channel outside the core registry |
 | **Account required** | Claude account/subscription | Side panel: none — bring your own Anthropic-compatible API key. External MCP: a Claude Code session (its own auth, unrelated to this extension) |
 | **Performance** | Baseline | Statistically indistinguishable on the tested benchmark (external-MCP path, both cold — see below); the side panel has not been separately benchmarked |
 
@@ -129,7 +129,7 @@ you talk to them.
 | Setup, once | Load the extension, run the installer, open Settings and enter your provider credential | Load the extension, run the installer, `claude mcp add ...` |
 | Where to go | [SDK-first: browser side panel](#sdk-first-browser-side-panel-no-claude-account) | [External MCP: Claude Code (legacy)](#external-mcp-claude-code-legacy) |
 
-Both share the same 26-tool browser registry, the same stable extension
+Both share the same 28-tool browser registry (26 preserved + 2 experimental WebMCP page-tool operations), the same stable extension
 identity, and the same one-time installer. Neither disables or removes the
 other — running the installer sets both up, and which one you use day to day
 is just a matter of what you open (the browser's side panel, or a Claude Code
@@ -157,7 +157,7 @@ Side panel <--extension messaging--> background.js <--native messaging--> native
                                                                      Anthropic-compatible endpoint
                                                                                 |
                                                                     in-process SDK MCP server
-                                                                     (the same 26-tool registry)
+                                                                     (the same 28-tool registry)
                                                                                 |
                                                                     native-host.js <--native messaging--> Extension <--> Browser
 ```
@@ -192,7 +192,7 @@ Claude Code <--stdio MCP--> server-{codemode,hybrid}.js
 ```
 
 Components:
-1. **Extension** — Manifest V3 with CDP-based browser automation (26 registry tools), plus a side panel and settings UI
+1. **Extension** — Manifest V3 with CDP-based browser automation (28 registry tools: 26 preserved + 2 experimental WebMCP page-tool operations), plus a side panel and settings UI
 2. **Native Messaging Host** (`host/native-host.js`) — bridges the extension to either the SDK companion or an external MCP server, and arbitrates the one shared browser lease between them
 3. **SDK companion** (`host/agent/`) — runs the Claude Agent SDK against your configured provider, exposing the same browser registry as in-process SDK tools; started automatically, supervised, no user-run MCP server
 4. **MCP Server** (`host/mcp-server.js`, external-MCP path) — Node.js process started by Claude Code, exposes the same tools via MCP
@@ -234,7 +234,7 @@ npm install --prefix host/codemode/worker
 ```
 
 `--legacy-peer-deps` is required: the pinned Claude Agent SDK declares a
-`zod@^4` peer, while this project's existing 26-tool registry depends on
+`zod@^4` peer, while this project's existing 28-tool registry depends on
 `zod@^3` (via `zod-to-json-schema`, which reads zod v3's internal shape) —
 bumping the shared `zod` to v4 would break that registry. The installed
 zod v3 release already implements the interface the SDK actually calls, so
@@ -388,6 +388,12 @@ document never promises more than what's built:
   approved built-in allowlist is deliberately empty, so nothing the SDK
   advertises is currently surfaced there.
 
+**Skills are composed in the app, not imported from a folder.** Settings >
+Skills is typed-only: a skill's name, description and Markdown body are
+written directly into the panel, then edited or duplicated the same way — no
+interface the extension can invoke accepts a filesystem path, and none reads,
+copies or watches a directory the application does not own.
+
 None of the above affects the external-MCP path, which is unrelated code and
 unaffected by any of this.
 
@@ -413,7 +419,7 @@ required before recording, on either path:
 
 ### Add the server to Claude Code
 
-The **hybrid** server exposes everything: all 26 tools directly, `execute_code`
+The **hybrid** server exposes everything: all 28 tools directly (26 preserved + 2 experimental WebMCP page-tool operations), `execute_code`
 alongside (the model picks per call), and the recording channel.
 
 ```bash
@@ -622,7 +628,7 @@ To keep it reliable:
    and then `sandbox prewarmed in <n>ms`. `pgrep -fl wrangler` should show one
    process per registered codemode/hybrid server.
 5. **Expect partial degradation, not failure.** If the sandbox never comes up the
-   26 passthrough tools keep working and only `execute_code` errors, so a broken
+   28 passthrough tools keep working and only `execute_code` errors, so a broken
    sidecar looks like "code mode stopped working", not "the browser stopped
    working".
 
@@ -633,12 +639,12 @@ Code](#add-the-server-to-claude-code) is the superset and the one the install
 steps assume. Two leaner variants exist if you want them, and they can
 coexist — register more than one.
 
-**Default** — the 26 tools, nothing else:
+**Default** — the 28 tools, nothing else:
 ```bash
 claude mcp add browzy-in-chrome -- node /absolute/path/to/host/mcp-server.js
 ```
 
-**Code mode** — three tools: `execute_code`, `screenshot`, `zoom`. The model writes JS that calls `chrome.*` (the typed API for all 26 tools) in a sandboxed Cloudflare Worker, collapsing multi-step flows into one round trip:
+**Code mode** — three tools: `execute_code`, `screenshot`, `zoom`. The model writes JS that calls `chrome.*` (the typed API for all 28 tools) in a sandboxed Cloudflare Worker, collapsing multi-step flows into one round trip:
 ```bash
 claude mcp add browzy-in-chrome-codemode -- node /absolute/path/to/host/codemode/server-codemode.js
 ```
@@ -779,15 +785,20 @@ If the model still uses direct tools on the second submission, that's a signal t
 
 ## Available Tools
 
-The core browser registry (`host/tool-definitions.js`) has **26** entries,
+The core browser registry (`host/tool-definitions.js`) has **28** entries,
 verified programmatically (`test/registry-baseline.test.mjs`,
-`reports/06-registry-baseline.md`) — every table row below through
-`switch_browser` plus `update_plan` through `debug_timings`, 26 in total.
-`execute_code` (codemode/hybrid servers) and `recording_ack` (the recording
-channel) sit outside that core registry and are listed here for completeness.
-Both the side panel and external MCP dispatch against the same 26-tool
-registry; the side panel does not yet expose `execute_code` or
-`recording_ack` (those are external-MCP-only, see [Server
+`reports/06-registry-baseline.md`) — the **26** preserved-baseline entries
+below (every table row through `switch_browser` plus `update_plan` through
+`debug_timings`) plus the **2** experimental WebMCP page-tool operations,
+`webmcp_list_tools` and `webmcp_call_tool` (see [WebMCP page
+tools](#webmcp-page-tools-experimental) below — they are tracked as a
+separate, explicitly-enumerated addition on top of the 26-tool baseline, not
+folded into that count, so a future regression there is never indistinguishable
+from an intentional addition). `execute_code` (codemode/hybrid servers) and
+`recording_ack` (the recording channel) sit outside that core registry and are
+listed here for completeness. Both the side panel and external MCP dispatch
+against the same 28-tool registry; the side panel does not yet expose
+`execute_code` or `recording_ack` (those are external-MCP-only, see [Server
 variants](#server-variants)).
 
 Every tool, its purpose, and how it compares to the official Claude in Chrome
@@ -831,6 +842,8 @@ not](#what-this-is-not)):
 | `retranscribe_recording` | Re-run transcription for a failed recording | |
 | `debug` | Read what the extension actually did — the detail tool results omit | |
 | `debug_timings` | Per-call timing diagnostics | |
+| `webmcp_list_tools` | List tools the visited page publishes via WebMCP (experimental, see below) | |
+| `webmcp_call_tool` | Call a page-published WebMCP tool (experimental, see below) | |
 
 Notes on the divergences (✗):
 
@@ -841,6 +854,41 @@ Notes on the divergences (✗):
   but their handlers return a fixed "not yet implemented"/"not supported"
   text result regardless of arguments (`reports/06-registry-baseline.md`).
 - `switch_browser` releases the shared runtime for ~15s so another browser can take over, in place of Claude in Chrome's `list_connected_browsers` / `select_browser` pair.
+
+### WebMCP page tools (experimental)
+
+`webmcp_list_tools` and `webmcp_call_tool` let the agent discover and call
+tools that the **visited page itself** publishes through the emerging WebMCP
+`document.modelContext` API (W3C WebML CG) — not a Browzy capability, a
+capability a site chooses to expose about itself. This is deliberately an
+early, experimental bet:
+
+- **Origin trial, not general availability.** WebMCP is behind a Chrome
+  origin trial spanning versions **149–156**, expiring **2026-11-16**. On an
+  ordinary visitor's Chrome, `document.modelContext` is simply absent —
+  `webmcp_list_tools` returns an empty list, silently, on essentially every
+  site. It becomes available only when the visited site has enrolled in the
+  trial and served a trial token, or when the browser itself has
+  `chrome://flags/#enable-webmcp-testing` enabled for local testing. Do not
+  read this as generally available; treat it as ready for the day a site
+  enrolls, not as something that works today on the wider web.
+- **Page-supplied, not extension-authored.** Every tool name, description,
+  input schema, and result these two operations surface comes from the
+  visited page, not from this extension. It is labelled as such everywhere it
+  reaches the agent, and its text confers no authorization over anything —
+  the same caution already applied to page text reached through
+  `get_page_text`/`read_page`, not a new class of trust.
+- **Two execution paths, always named.** A call prefers the browser's own
+  `executeTool()` entry point (whatever consent/mediation Chrome attaches to
+  it) when the browser exposes one, and falls back to the page's own
+  registered callback (unmediated) only when it does not. Every result states
+  which path served it (`via: executeTool` or `via: captured-callback`).
+- **No automated coverage for the live API interaction.** CI has no Chrome.
+  The two background handlers are unit-tested (`test/webmcp-handlers.test.mjs`)
+  against a faked per-tab table, but the actual `document.modelContext`
+  round-trip can only be verified manually, against
+  `test/fixtures/webmcp/index.html`, in a Chrome build within the trial (or
+  with the testing flag enabled).
 
 ## Humanized input
 

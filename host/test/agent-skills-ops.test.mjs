@@ -4,18 +4,27 @@
 // extension/settings/skills-client.js and extension/sidepanel/skills-client.js
 // already speak a documented `{type:"agent_settings", op:"skills_*", ...}`
 // wire contract (see each file's own header for the exact op names and
-// payload/result shapes), but host/agent/companion.js's `_handleAgentSettings()`
-// had no `skills_*` case — every real call dead-ended on the
-// `unknown agent_settings op` fallback. This suite proves the new case
-// branches answer every op the two clients actually send, delegating
-// straight to the REAL, already-independently-tested
-// host/agent/skills/{manage,import}.js — not a scripted double — against
-// real temp-directory fixtures on disk (valid, malformed, duplicate-named,
-// traversal-attempting, symlink-escaping, script-requiring). No live SDK,
-// browser, or credential is used anywhere: `sdk` stays a fake/injectable
-// recorder (same pattern as host/test/agent-skills-wiring.test.mjs), and a
-// scratch OCIC_AGENT_HOME/OCIC_AGENT_CONFIG_DIR isolates every case from a
-// developer's or this machine's real catalog/profile store.
+// payload/result shapes), and host/agent/companion.js's `_handleAgentSettings()`
+// answers every op the two clients actually send, delegating straight to the
+// REAL, already-independently-tested host/agent/skills/{manage,import}.js —
+// not a scripted double — against real temp-directory fixtures on disk.
+//
+// redesign-settings-typed-only-skills removed the `skills_import`/
+// `skills_refresh` OPERATIONS from the wire (design.md decision D1) — no
+// operation the extension can invoke may take a filesystem path. The
+// LIBRARY those operations used to expose (host/agent/skills/import.js) is
+// untouched, and this file's own scope is host/agent/companion.js /
+// host/test/**, so every case below that used to set up its fixture through
+// the `skills_import`/`skills_refresh` OPS now does so with a direct call to
+// `importSkill()`/`refreshSkill()` (host/agent/skills/index.js) instead —
+// the assertion under test in each such case is unchanged; only how the
+// fixture gets built changed. Cases whose entire assertion duplicated
+// coverage already in host/test/skills-catalog.test.mjs (invalid metadata,
+// duplicate name, path traversal, symlink escape, no script execution) were
+// dropped rather than rewritten — see task 2.2's mapping in this change's
+// implementation report. Import-pipeline coverage did not drop: every
+// dropped assertion has a named counterpart still running in
+// skills-catalog.test.mjs.
 //
 // Run: node host/test/agent-skills-ops.test.mjs
 
@@ -30,6 +39,7 @@ import { ApprovalRegistry } from "../agent/policy/approvals.js";
 import { SessionManager } from "../agent/session/manager.js";
 import { ToolBridge } from "../agent/broker/tool-bridge.js";
 import { AGENT_MESSAGE_TYPES, PROTOCOL_VERSION, makeEnvelope } from "../agent/protocol.js";
+import { importSkill, refreshSkill, enableSkill as enableSkillDirect } from "../agent/skills/index.js";
 
 const results = [];
 async function test(name, fn) {
@@ -88,15 +98,9 @@ function makeSkillDir(frontmatter, extra = {}, bodyTag = "ops") {
   return root;
 }
 
-// Same NTFS-junction technique host/test/skills-catalog.test.mjs uses to
-// exercise a symlink escape with no elevation needed on Windows.
-function createEscapingDirLink(linkPath, targetDir) {
-  fs.symlinkSync(path.resolve(targetDir), linkPath, "junction");
-}
-
 // Records every query() call's options/prompt; yields immediately unless
-// blockUntilReleased is set (used to keep a run "active" while a
-// skills_refresh op is issued mid-run).
+// blockUntilReleased is set (used to keep a run "active" while a mid-run
+// refresh is exercised).
 function recordingSdk({ blockUntilReleased = false } = {}) {
   const calls = [];
   let release = () => {};
@@ -177,98 +181,16 @@ await test("skills_list reflects the real catalog after a real import", async ()
   freshHome();
   const core = buildCore();
   const src = makeSkillDir(defaultFrontmatter("ops-list-skill"), {}, "list");
-  const importReply = await core.handleEnvelope(agentSettingsEnvelope("skills_import", { sourceDir: src }));
-  assert(importReply.ok === true, `skills_import must succeed: ${JSON.stringify(importReply.error)}`);
+  // Fixture setup uses the LIBRARY directly — skills_import is no longer a
+  // wire op (design.md decision D1); this simulates a skill already present
+  // in the catalog (e.g. one imported before this change) so skills_list's
+  // OWN op-level behavior can still be exercised.
+  await importSkill(src);
 
   const listReply = await core.handleEnvelope(agentSettingsEnvelope("skills_list"));
   assert(listReply.ok === true);
   assert(listReply.result.length === 1 && listReply.result[0].name === "ops-list-skill", "the imported skill must appear in skills_list");
   assert(listReply.result[0].enabled === false, "a freshly imported skill starts disabled");
-});
-
-// --- skills_import: rejections stay specific and actionable ---------------
-
-await test("skills_import rejects malformed metadata with a distinct INVALID_METADATA error", async () => {
-  freshHome();
-  const core = buildCore();
-  const src = fs.mkdtempSync(path.join(os.tmpdir(), "ocic-skills-ops-src-badmeta-"));
-  // No SKILL.md at all.
-  const reply = await core.handleEnvelope(agentSettingsEnvelope("skills_import", { sourceDir: src }));
-  assert(reply.ok === false, "malformed metadata must not succeed");
-  assert(reply.error.code === "INVALID_METADATA", `expected INVALID_METADATA, got ${reply.error.code}`);
-  assert(reply.error.message && reply.error.message.length > 0, "error must carry an actionable message");
-});
-
-await test("skills_import rejects a duplicate name with a distinct DUPLICATE_NAME error", async () => {
-  freshHome();
-  const core = buildCore();
-  const src1 = makeSkillDir(defaultFrontmatter("ops-dup-skill", "First one."), {}, "dup1");
-  const first = await core.handleEnvelope(agentSettingsEnvelope("skills_import", { sourceDir: src1 }));
-  assert(first.ok === true, `first import must succeed: ${JSON.stringify(first.error)}`);
-
-  const src2 = makeSkillDir(defaultFrontmatter("ops-dup-skill", "Second, different, folder."), {}, "dup2");
-  const second = await core.handleEnvelope(agentSettingsEnvelope("skills_import", { sourceDir: src2 }));
-  assert(second.ok === false, "a duplicate-named import must not succeed");
-  assert(second.error.code === "DUPLICATE_NAME", `expected DUPLICATE_NAME, got ${second.error.code}`);
-});
-
-await test("skills_import rejects path traversal via the frontmatter name with a distinct PATH_TRAVERSAL error", async () => {
-  const home = freshHome();
-  const core = buildCore();
-  const src = makeSkillDir(defaultFrontmatter("../../evil", "Traversal attempt."), {}, "traversal");
-
-  const reply = await core.handleEnvelope(agentSettingsEnvelope("skills_import", { sourceDir: src }));
-  assert(reply.ok === false, "a traversal attempt must not succeed");
-  assert(reply.error.code === "PATH_TRAVERSAL", `expected PATH_TRAVERSAL, got ${reply.error.code}`);
-
-  const listReply = await core.handleEnvelope(agentSettingsEnvelope("skills_list"));
-  assert(listReply.result.length === 0, "the catalog must remain unchanged after a rejected traversal import");
-  const escapeTarget = path.resolve(home, "skills", "..", "..", "evil");
-  assert(!fs.existsSync(escapeTarget), "path traversal must never write outside the skills root");
-});
-
-await test("skills_import rejects a symlink escaping the package root with a distinct SYMLINK_ESCAPE error (Windows junction)", async () => {
-  freshHome();
-  const core = buildCore();
-  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "ocic-skills-ops-outside-"));
-  fs.writeFileSync(path.join(outside, "secret.txt"), "SECRET_OUTSIDE_CONTENT");
-
-  const src = makeSkillDir(defaultFrontmatter("ops-escape-skill", "Contains an escaping link."), {}, "escape");
-  createEscapingDirLink(path.join(src, "escape"), outside);
-
-  const reply = await core.handleEnvelope(agentSettingsEnvelope("skills_import", { sourceDir: src }));
-  assert(reply.ok === false, "a symlink-escape import must not succeed");
-  assert(reply.error.code === "SYMLINK_ESCAPE", `expected SYMLINK_ESCAPE, got ${reply.error.code}`);
-
-  const listReply = await core.handleEnvelope(agentSettingsEnvelope("skills_list"));
-  assert(listReply.result.length === 0, "the catalog must remain unchanged after a rejected symlink-escape import");
-});
-
-await test("skills_import never executes a script shipped in the package, and a script-requiring skill is rejected only at enable time (never silent shell access)", async () => {
-  freshHome();
-  const core = buildCore();
-  const canaryDir = fs.mkdtempSync(path.join(os.tmpdir(), "ocic-skills-ops-canary-"));
-  const canaryFile = path.join(canaryDir, "executed.txt");
-  const scriptContent =
-    process.platform === "win32"
-      ? `@echo off\r\necho executed> "${canaryFile.replace(/\\/g, "\\\\")}"\r\n`
-      : `#!/bin/sh\necho executed > "${canaryFile}"\n`;
-
-  const src = makeSkillDir(defaultFrontmatter("ops-script-skill", "Ships a script that must never run."), {
-    "hooks/setup.sh": scriptContent
-  }, "script");
-
-  const importReply = await core.handleEnvelope(agentSettingsEnvelope("skills_import", { sourceDir: src }));
-  assert(importReply.ok === true, `import of a script-bearing but otherwise valid package must succeed: ${JSON.stringify(importReply.error)}`);
-  assert(!fs.existsSync(canaryFile), "skills_import must never execute a script found in the package");
-  assert(importReply.result.unsupportedCapabilities.length > 0, "content-based capability detection must flag the shipped script");
-
-  const enableReply = await core.handleEnvelope(agentSettingsEnvelope("skills_enable", { name: "ops-script-skill" }));
-  assert(enableReply.ok === false, "a script-requiring skill must never silently enable");
-  assert(enableReply.error.code === "UNSUPPORTED_CAPABILITY", `expected UNSUPPORTED_CAPABILITY, got ${enableReply.error.code}`);
-
-  const listReply = await core.handleEnvelope(agentSettingsEnvelope("skills_list"));
-  assert(listReply.result[0].enabled === false, "the rejected enable must never flip the catalog's enabled flag");
 });
 
 // --- skills_enable / skills_disable / skills_set_invocation_flags ---------
@@ -277,7 +199,7 @@ await test("skills_enable and skills_disable round-trip through the real catalog
   freshHome();
   const core = buildCore();
   const src = makeSkillDir(defaultFrontmatter("ops-toggle-skill"), {}, "toggle");
-  await core.handleEnvelope(agentSettingsEnvelope("skills_import", { sourceDir: src }));
+  await importSkill(src);
 
   const enableReply = await core.handleEnvelope(agentSettingsEnvelope("skills_enable", { name: "ops-toggle-skill" }));
   assert(enableReply.ok === true, `skills_enable must succeed: ${JSON.stringify(enableReply.error)}`);
@@ -300,7 +222,7 @@ await test("skills_set_invocation_flags updates userInvocable/modelInvocable via
   freshHome();
   const core = buildCore();
   const src = makeSkillDir(defaultFrontmatter("ops-flags-skill"), {}, "flags");
-  await core.handleEnvelope(agentSettingsEnvelope("skills_import", { sourceDir: src }));
+  await importSkill(src);
 
   const reply = await core.handleEnvelope(
     agentSettingsEnvelope("skills_set_invocation_flags", { name: "ops-flags-skill", userInvocable: false, modelInvocable: true })
@@ -312,27 +234,26 @@ await test("skills_set_invocation_flags updates userInvocable/modelInvocable via
   assert(listReply.result[0].userInvocable === false, "the flag change must persist and be visible to skills_list");
 });
 
-// --- skills_refresh / skills_remove ---------------------------------------
+// --- Import-pipeline library behavior, exercised directly (skills_refresh
+// is no longer a wire op — design.md decision D1) --------------------------
 
-await test("skills_refresh re-reads the source folder and updates the catalog, never touching enabled state", async () => {
+await test("refreshSkill() re-reads the source folder and updates the catalog, never touching enabled state (library call — refresh preserving enabled state)", async () => {
   freshHome();
-  const core = buildCore();
   const src = makeSkillDir(defaultFrontmatter("ops-refresh-skill", "v1 description."), { "resource.txt": "v1" }, "refresh");
-  await core.handleEnvelope(agentSettingsEnvelope("skills_import", { sourceDir: src }));
-  await core.handleEnvelope(agentSettingsEnvelope("skills_enable", { name: "ops-refresh-skill" }));
+  await importSkill(src);
+  await enableSkillDirect("ops-refresh-skill");
 
   writeFixture(src, { "SKILL.md": defaultFrontmatter("ops-refresh-skill", "v2 description.") + "\n# Body\n", "resource.txt": "v2" });
-  const refreshReply = await core.handleEnvelope(agentSettingsEnvelope("skills_refresh", { name: "ops-refresh-skill" }));
-  assert(refreshReply.ok === true, `skills_refresh must succeed: ${JSON.stringify(refreshReply.error)}`);
-  assert(refreshReply.result.description === "v2 description.", "refresh must pick up the updated description");
-  assert(refreshReply.result.enabled === true, "refresh must never flip enabled state on its own");
+  const refreshed = await refreshSkill("ops-refresh-skill");
+  assert(refreshed.description === "v2 description.", "refresh must pick up the updated description");
+  assert(refreshed.enabled === true, "refresh must never flip enabled state on its own");
 });
 
 await test("skills_remove leaves the original source directory completely intact and untouched", async () => {
   freshHome();
   const core = buildCore();
   const src = makeSkillDir(defaultFrontmatter("ops-remove-skill"), { "resource.txt": "keep-me" }, "remove");
-  await core.handleEnvelope(agentSettingsEnvelope("skills_import", { sourceDir: src }));
+  await importSkill(src);
 
   const removeReply = await core.handleEnvelope(agentSettingsEnvelope("skills_remove", { name: "ops-remove-skill" }));
   assert(removeReply.ok === true, `skills_remove must succeed: ${JSON.stringify(removeReply.error)}`);
@@ -362,7 +283,7 @@ await test("disabling a skill via skills_disable makes the SAME conversation's n
   const core = buildCore({ sdk });
 
   const src = makeSkillDir(defaultFrontmatter("ops-disable-effect-skill"), {}, "disable-effect");
-  await core.handleEnvelope(agentSettingsEnvelope("skills_import", { sourceDir: src }));
+  await importSkill(src);
   await core.handleEnvelope(agentSettingsEnvelope("skills_enable", { name: "ops-disable-effect-skill" }));
 
   await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.HELLO, {}));
@@ -390,13 +311,15 @@ await test("disabling a skill via skills_disable makes the SAME conversation's n
 });
 
 // --- A running conversation's bound snapshot is unaffected by refresh ----
+// (library calls — skills_refresh is no longer a wire op; the assertions
+// below — mid-run refresh isolation and snapshot immutability across a run
+// — are the exact ones design.md decision D9 requires be preserved.)
 
-await test("skills_refresh issued mid-run does not change that run's already-materialized snapshot; the same conversation's next run is refused; a new conversation gets the refresh", async () => {
+await test("refreshSkill() issued mid-run does not change that run's already-materialized snapshot; the same conversation's next run is refused; a new conversation gets the refresh", async () => {
   freshHome();
   const src = makeSkillDir(defaultFrontmatter("ops-midrun-skill", "v1."), { "resource.txt": "v1" }, "midrun");
-  const setupCore = buildCore();
-  await setupCore.handleEnvelope(agentSettingsEnvelope("skills_import", { sourceDir: src }));
-  await setupCore.handleEnvelope(agentSettingsEnvelope("skills_enable", { name: "ops-midrun-skill" }));
+  await importSkill(src);
+  await enableSkillDirect("ops-midrun-skill");
 
   const { sdk, calls, release } = recordingSdk({ blockUntilReleased: true });
   const core = buildCore({ sdk });
@@ -411,11 +334,11 @@ await test("skills_refresh issued mid-run does not change that run's already-mat
   const materializedResource = path.join(run1Options.plugins[0].path, "skills", "ops-midrun-skill", "resource.txt");
   assert(fs.readFileSync(materializedResource, "utf-8") === "v1", "the active run's materialized snapshot must start at v1");
 
-  // Refresh through the exact same companion op the Settings > Skills UI
-  // sends, WHILE the run above is still active (blocked on the gate).
+  // Refresh via the SAME library function the (now-removed) skills_refresh
+  // op used to call, WHILE the run above is still active (blocked on the
+  // gate).
   writeFixture(src, { "resource.txt": "v2" });
-  const refreshReply = await core.handleEnvelope(agentSettingsEnvelope("skills_refresh", { name: "ops-midrun-skill" }));
-  assert(refreshReply.ok === true, `skills_refresh must succeed: ${JSON.stringify(refreshReply.error)}`);
+  await refreshSkill("ops-midrun-skill");
 
   assert(
     fs.readFileSync(materializedResource, "utf-8") === "v1",

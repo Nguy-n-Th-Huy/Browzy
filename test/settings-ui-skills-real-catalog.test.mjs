@@ -1,19 +1,27 @@
-// Task 7.4: extension/settings/skills-controller.js against the REAL
-// host/agent/skills/** catalog library (importSkill/refreshSkill/
-// listCatalog/enableSkill/disableSkill/removeSkill), using real temp-
-// directory fixtures on disk — no mocked filesystem. This is the "real
-// companion" half of the pair, mirroring test/settings-ui-real-companion.test.mjs's
-// own convention for host/agent/settings/profile.js: a thin adapter here
-// speaks skills-client.js's exact op contract by calling straight into the
-// real library (never through host/agent/companion.js or
-// extension/background.js — neither has the skills_* wiring yet; see
-// extension/settings/skills-client.js's own header). This proves the
-// controller's behavior end-to-end against real import validation
-// (duplicate names, path traversal, symlink escape, invalid metadata,
-// unsupported-capability content detection) and real persistence, closing
-// the gap host/test/skills-catalog.test.mjs already covers at the library
-// layer by proving THIS product's UI-facing controller composes with it
-// correctly too.
+// Task 7.4 / redesign-settings-typed-only-skills task 3.7:
+// extension/settings/skills-controller.js against the REAL host/agent/
+// skills/** catalog library (listCatalog/authorSkill/enableSkill/
+// disableSkill/removeSkill/setInvocationFlags, plus a read-back adapter
+// composed the SAME way host/agent/companion.js's `skills_read_source`
+// case is — see below), using real temp-directory fixtures on disk — no
+// mocked filesystem. This is the "real companion" half of the pair,
+// mirroring test/settings-ui-real-companion.test.mjs's own convention: a
+// thin adapter here speaks skills-client.js's exact op contract by calling
+// straight into the real library (never through host/agent/companion.js or
+// extension/background.js).
+//
+// redesign-settings-typed-only-skills removed skills_import/skills_refresh
+// from the wire (design.md decision D1) — no operation the controller can
+// reach takes a filesystem path anymore. This file's adapter therefore does
+// NOT expose importSkill/refreshSkill; test fixtures that need a
+// PRE-EXISTING (i.e. "legacy", entered before this change) catalog record
+// call `skillsLib.importSkill()`/`skillsLib.refreshSkill()` directly instead
+// — exactly how such a record would already be sitting in a real operator's
+// catalog. This proves what task 3.7 asks: editing a record that entered
+// the catalog through the removed folder-import path still loads correctly
+// through Sửa, and documents — against the REAL library, not a mock — the
+// known limitation that saving such an edit in place is rejected (author.js
+// is byte-identical; see skills-controller.js's own header on why).
 //
 // Run: node test/settings-ui-skills-real-catalog.test.mjs
 import fs from "node:fs";
@@ -21,6 +29,8 @@ import os from "node:os";
 import path from "node:path";
 import { SkillsController } from "../extension/settings/skills-controller.js";
 import * as skillsLib from "../host/agent/skills/index.js";
+import { snapshotDir, assertSafeSegment } from "../host/agent/skills/paths.js";
+import { parseFrontmatter } from "../host/agent/skills/frontmatter.js";
 
 let fail = 0;
 const ok = (c, m) => {
@@ -54,14 +64,46 @@ function defaultFrontmatter(name, description = "A demo skill for tests.") {
   return `---\nname: ${name}\ndescription: ${description}\n---\n`;
 }
 
-// Same NTFS-junction technique host/test/skills-catalog.test.mjs uses to
-// avoid needing symlink-creation privilege elevation on Windows — see that
-// file's own comment for why a junction exercises the identical code path.
-function createEscapingDirLink(linkPath, targetDir) {
-  fs.symlinkSync(path.resolve(targetDir), linkPath, "junction");
+// Mirrors host/agent/companion.js's `skills_read_source` case exactly (same
+// resolution order, same composition of paths.js/frontmatter.js exports,
+// same body-extraction rule) so this adapter exercises the identical
+// contract the real companion answers — see that file for the authoritative
+// version and design.md decision D2 for the rationale.
+function extractSkillBody(raw) {
+  const text = raw.replace(/^﻿/, "");
+  const lines = text.split(/\r\n|\n/);
+  let i = 0;
+  while (i < lines.length && lines[i].trim() === "") i++;
+  i++;
+  while (i < lines.length && lines[i].trim() !== "---") i++;
+  i++;
+  return lines.slice(i).join("\n").replace(/^\n+/, "");
 }
 
-/** Adapter implementing skills-client.js's op contract by calling straight
+async function realReadSkillSource(name) {
+  const record = skillsLib.getSkill(name);
+  if (!record) throw Object.assign(new Error(`No imported skill named "${name}".`), { code: "NOT_FOUND" });
+  const safeSnapshotId = assertSafeSegment(record.snapshotId);
+  const raw = fs.readFileSync(path.join(snapshotDir(safeSnapshotId), "SKILL.md"), "utf-8");
+  const meta = parseFrontmatter(raw);
+  const rawAllowedTools = meta["allowed-tools"];
+  const allowedTools = Array.isArray(rawAllowedTools)
+    ? rawAllowedTools
+    : typeof rawAllowedTools === "string" && rawAllowedTools
+      ? [rawAllowedTools]
+      : [];
+  return {
+    name: record.name,
+    description: meta.description,
+    body: extractSkillBody(raw),
+    allowedTools,
+    userInvocable: record.userInvocable,
+    modelInvocable: record.modelInvocable
+  };
+}
+
+/** Adapter implementing skills-client.js's CURRENT op contract (no
+ * importSkill/refreshSkill — see this file's header) by calling straight
  * into the real host library. host/agent/skills/catalog-store.js reads
  * OCIC_AGENT_HOME and its catalog.json fresh from disk on every call (no
  * in-module caching — see that file), so a single imported module instance
@@ -70,8 +112,7 @@ function createEscapingDirLink(linkPath, targetDir) {
 async function realLibraryClient() {
   return {
     listCatalog: () => skillsLib.listCatalog(),
-    importSkill: (sourceDir) => skillsLib.importSkill(sourceDir),
-    refreshSkill: (name) => skillsLib.refreshSkill(name),
+    readSkillSource: (name) => realReadSkillSource(name),
     authorSkill: (fields) => skillsLib.authorSkill(fields),
     enableSkill: (name) => Promise.resolve(skillsLib.enableSkill(name)),
     disableSkill: (name) => Promise.resolve(skillsLib.disableSkill(name)),
@@ -80,38 +121,36 @@ async function realLibraryClient() {
   };
 }
 
-console.log("== real import: valid skill appears in the catalog and persists across a fresh listCatalog() call ==");
+console.log("== real list: a legacy (folder-imported) record is listed and persists across a fresh listCatalog() call ==");
 {
   const home = freshHome();
+  const srcDir = makeSkillDir(home, "src-1", { frontmatter: defaultFrontmatter("tom-tat-trang", "Tóm tắt nội dung trang.") });
+  await skillsLib.importSkill(srcDir); // simulates a skill that entered the catalog before this change
+
   const client = await realLibraryClient();
   const controller = new SkillsController(client);
   await controller.init();
-  const srcDir = makeSkillDir(home, "src-1", { frontmatter: defaultFrontmatter("tom-tat-trang", "Tóm tắt nội dung trang.") });
-  controller.setImportDraft(srcDir);
-  const result = await controller.importFromDraft();
-  ok(result.ok === true, "real import succeeds for a valid SKILL.md package");
-  ok(controller.state.skills.length === 1 && controller.state.skills[0].name === "tom-tat-trang", "imported skill appears in controller state");
-  ok(controller.state.skills[0].source === fs.realpathSync(srcDir), "recorded source is the real, canonical source folder");
+  ok(controller.state.skills.length === 1 && controller.state.skills[0].name === "tom-tat-trang", "legacy skill appears in controller state via listCatalog()");
   ok(controller.state.skills[0].enabled === false, "a freshly imported skill starts disabled (must be explicitly enabled)");
 
-  // "remains available after browser restart" (spec "Import and reuse"):
-  // simulate a fresh page load by constructing a brand-new controller
-  // against a brand-new library import over the SAME OCIC_AGENT_HOME.
+  // "remains available after browser restart": simulate a fresh page load
+  // by constructing a brand-new controller against a brand-new library
+  // import over the SAME OCIC_AGENT_HOME.
   const client2 = await realLibraryClient();
   const controller2 = new SkillsController(client2);
   await controller2.init();
-  ok(controller2.state.skills.length === 1 && controller2.state.skills[0].name === "tom-tat-trang", "skill still present after a simulated restart (persisted on disk, one-time import)");
+  ok(controller2.state.skills.length === 1 && controller2.state.skills[0].name === "tom-tat-trang", "skill still present after a simulated restart (persisted on disk)");
 }
 
 console.log("== real enable/disable persists and gates dispatch eligibility ==");
 {
   const home = freshHome();
+  const srcDir = makeSkillDir(home, "src-2", { frontmatter: defaultFrontmatter("dien-bieu-mau") });
+  await skillsLib.importSkill(srcDir);
+
   const client = await realLibraryClient();
   const controller = new SkillsController(client);
   await controller.init();
-  const srcDir = makeSkillDir(home, "src-2", { frontmatter: defaultFrontmatter("dien-bieu-mau") });
-  controller.setImportDraft(srcDir);
-  await controller.importFromDraft();
   const enableResult = await controller.setEnabled("dien-bieu-mau", true);
   ok(enableResult.ok === true, "enable succeeds for a supported skill");
   ok(controller.state.skills[0].enabled === true, "state reflects enabled:true");
@@ -120,81 +159,27 @@ console.log("== real enable/disable persists and gates dispatch eligibility ==")
   ok(controller.state.skills[0].enabled === false, "state reflects enabled:false");
 }
 
-console.log("== real import: invalid metadata (missing SKILL.md) rejected with an actionable error, catalog unchanged ==");
+console.log("== real: no operation the controller can reach accepts a filesystem path ==");
 {
-  const home = freshHome();
   const client = await realLibraryClient();
-  const controller = new SkillsController(client);
-  await controller.init();
-  const badDir = path.join(home, "empty-folder");
-  fs.mkdirSync(badDir, { recursive: true });
-  controller.setImportDraft(badDir);
-  const result = await controller.importFromDraft();
-  ok(result.ok === false && result.code === "INVALID_METADATA", `missing SKILL.md rejected as INVALID_METADATA — got ${result.code}`);
-  ok(controller.state.skills.length === 0, "catalog remains empty after a rejected import");
-  ok(/SKILL\.md|metadata/i.test(controller.state.banner.message), "banner explains what was invalid");
+  ok(
+    typeof client.importSkill !== "function" && typeof client.refreshSkill !== "function",
+    "the client adapter used by the controller exposes no importSkill/refreshSkill"
+  );
 }
 
-console.log("== real import: duplicate name rejected, existing catalog entry untouched ==");
+console.log("== real capability detection: an unsupported script capability surfaces UNSUPPORTED_CAPABILITY on enable, never silently grants shell access ==");
 {
   const home = freshHome();
-  const client = await realLibraryClient();
-  const controller = new SkillsController(client);
-  await controller.init();
-  const src1 = makeSkillDir(home, "dup-1", { frontmatter: defaultFrontmatter("so-sanh-gia", "First version.") });
-  controller.setImportDraft(src1);
-  await controller.importFromDraft();
-
-  const src2 = makeSkillDir(home, "dup-2", { frontmatter: defaultFrontmatter("so-sanh-gia", "A different folder, same declared name.") });
-  controller.setImportDraft(src2);
-  const result = await controller.importFromDraft();
-  ok(result.ok === false && result.code === "DUPLICATE_NAME", `duplicate name rejected as DUPLICATE_NAME — got ${result.code}`);
-  ok(controller.state.skills.length === 1 && controller.state.skills[0].description === "First version.", "the ORIGINAL entry is unchanged by the rejected duplicate import");
-}
-
-console.log("== real import: path traversal via frontmatter name rejected ==");
-{
-  const home = freshHome();
-  const client = await realLibraryClient();
-  const controller = new SkillsController(client);
-  await controller.init();
-  const srcDir = makeSkillDir(home, "traversal-1", { frontmatter: defaultFrontmatter("../escape-attempt") });
-  controller.setImportDraft(srcDir);
-  const result = await controller.importFromDraft();
-  ok(result.ok === false && result.code === "PATH_TRAVERSAL", `a ".." skill name is rejected as PATH_TRAVERSAL — got ${result.code}`);
-  ok(controller.state.skills.length === 0, "catalog unchanged after a rejected traversal import");
-}
-
-console.log("== real import: symlink escaping the package root rejected ==");
-{
-  const home = freshHome();
-  const client = await realLibraryClient();
-  const controller = new SkillsController(client);
-  await controller.init();
-  const outsideDir = path.join(home, "outside-secret");
-  fs.mkdirSync(outsideDir, { recursive: true });
-  fs.writeFileSync(path.join(outsideDir, "secret.txt"), "should never be copied");
-  const srcDir = makeSkillDir(home, "symlink-escape-1", { frontmatter: defaultFrontmatter("script-tu-dong") });
-  createEscapingDirLink(path.join(srcDir, "escape-link"), outsideDir);
-  controller.setImportDraft(srcDir);
-  const result = await controller.importFromDraft();
-  ok(result.ok === false && result.code === "SYMLINK_ESCAPE", `escaping link rejected as SYMLINK_ESCAPE — got ${result.code}`);
-  ok(controller.state.skills.length === 0, "catalog unchanged after a rejected symlink-escape import");
-}
-
-console.log("== real import: unsupported script capability surfaces UNSUPPORTED_CAPABILITY on enable, never silently grants shell access ==");
-{
-  const home = freshHome();
-  const client = await realLibraryClient();
-  const controller = new SkillsController(client);
-  await controller.init();
   const srcDir = makeSkillDir(home, "needs-script", {
     frontmatter: defaultFrontmatter("chay-script"),
     extra: { "helper.sh": "#!/bin/sh\necho hello\n" }
   });
-  controller.setImportDraft(srcDir);
-  const importResult = await controller.importFromDraft();
-  ok(importResult.ok === true, "import itself succeeds (capability detection does not block import, only enable)");
+  await skillsLib.importSkill(srcDir);
+
+  const client = await realLibraryClient();
+  const controller = new SkillsController(client);
+  await controller.init();
   ok(
     controller.state.skills[0].unsupportedCapabilities.some((c) => c.includes("helper.sh")),
     "the shell script resource is flagged in unsupportedCapabilities"
@@ -207,46 +192,25 @@ console.log("== real import: unsupported script capability surfaces UNSUPPORTED_
 console.log("== real remove: deletes the app copy but leaves the original source folder on disk ==");
 {
   const home = freshHome();
+  const srcDir = makeSkillDir(home, "src-remove", { frontmatter: defaultFrontmatter("tra-cuu-lich-su") });
+  await skillsLib.importSkill(srcDir);
+  ok(fs.existsSync(path.join(srcDir, "SKILL.md")), "sanity: source SKILL.md exists before remove");
+
   const client = await realLibraryClient();
   const controller = new SkillsController(client);
   await controller.init();
-  const srcDir = makeSkillDir(home, "src-remove", { frontmatter: defaultFrontmatter("tra-cuu-lich-su") });
-  controller.setImportDraft(srcDir);
-  await controller.importFromDraft();
-  ok(fs.existsSync(path.join(srcDir, "SKILL.md")), "sanity: source SKILL.md exists before remove");
-
   const removeResult = await controller.removeSkill("tra-cuu-lich-su");
   ok(removeResult.ok === true, "remove succeeds");
   ok(controller.state.skills.length === 0, "removed skill no longer listed");
   ok(fs.existsSync(path.join(srcDir, "SKILL.md")), "the ORIGINAL source folder/SKILL.md is untouched by remove");
 }
 
-console.log("== real refresh: content change from the source folder takes effect only after explicit refresh ==");
-{
-  const home = freshHome();
-  const client = await realLibraryClient();
-  const controller = new SkillsController(client);
-  await controller.init();
-  const srcDir = makeSkillDir(home, "src-refresh", { frontmatter: defaultFrontmatter("dien-bieu-mau", "Original description.") });
-  controller.setImportDraft(srcDir);
-  await controller.importFromDraft();
-  ok(controller.state.skills[0].description === "Original description.", "sanity: original description recorded");
-
-  fs.writeFileSync(path.join(srcDir, "SKILL.md"), defaultFrontmatter("dien-bieu-mau", "Updated description after edit."));
-  await controller.refreshList();
-  ok(controller.state.skills[0].description === "Original description.", "editing the source alone does NOT change the catalog before an explicit refresh");
-
-  await controller.refreshSkill("dien-bieu-mau");
-  ok(controller.state.skills[0].description === "Updated description after edit.", "explicit refresh picks up the source change");
-}
-
 console.log("== real author: a typed skill (no folder) appears in the catalog exactly like a folder import, and persists after a simulated restart ==");
 {
-  const home = freshHome();
+  freshHome();
   const client = await realLibraryClient();
   const controller = new SkillsController(client);
   await controller.init();
-  void home;
 
   controller.setAuthorField("name", "goi-y-viet-lai");
   controller.setAuthorField("description", "Gợi ý viết lại đoạn văn được chọn.");
@@ -277,7 +241,24 @@ console.log("== real author: invalid name rejected, catalog untouched ==");
   ok(controller.state.skills.length === 0, "catalog remains empty after a rejected author submit");
 }
 
-console.log("== real author: re-submitting the form for the same authored skill edits it in place, no DUPLICATE_NAME ==");
+console.log("== real author: authoring a name already imported from a folder is rejected as DUPLICATE_NAME, that entry is untouched ==");
+{
+  const home = freshHome();
+  const srcDir = makeSkillDir(home, "author-dup-src", { frontmatter: defaultFrontmatter("ten-trung", "Nhập từ thư mục.") });
+  await skillsLib.importSkill(srcDir);
+
+  const client = await realLibraryClient();
+  const controller = new SkillsController(client);
+  await controller.init();
+  controller.setAuthorField("name", "ten-trung");
+  controller.setAuthorField("description", "Đang cố ghi đè lên skill đã nhập từ thư mục.");
+  controller.setAuthorField("body", "# Không nên được lưu\n");
+  const result = await controller.authorFromDraft();
+  ok(result.ok === false && result.code === "DUPLICATE_NAME", `authoring over a folder-imported name is rejected as DUPLICATE_NAME — got ${result.code}`);
+  ok(controller.state.skills.length === 1 && controller.state.skills[0].description === "Nhập từ thư mục.", "the original folder-imported entry is completely untouched");
+}
+
+console.log("== real Sửa (edit): loading and re-saving an AUTHORED record works fully in place, no DUPLICATE_NAME ==");
 {
   freshHome();
   const client = await realLibraryClient();
@@ -290,7 +271,11 @@ console.log("== real author: re-submitting the form for the same authored skill 
   const first = await controller.authorFromDraft();
   ok(first.ok === true, "first author submit succeeds");
 
-  controller.setAuthorField("name", "tra-loi-nhanh");
+  const loaded = await controller.loadForEdit("tra-loi-nhanh");
+  ok(loaded.ok === true, "loadForEdit succeeds against the real snapshot store");
+  ok(controller.state.authorDraft.body === "# v1\n", "the read-back body matches what was authored");
+  ok(controller.state.editingName === "tra-loi-nhanh", "editingName bound to the loaded skill");
+
   controller.setAuthorField("description", "Phiên bản đã sửa.");
   controller.setAuthorField("body", "# v2\n\nChi tiết hơn.\n");
   const second = await controller.authorFromDraft();
@@ -299,22 +284,99 @@ console.log("== real author: re-submitting the form for the same authored skill 
   ok(controller.state.skills[0].description === "Phiên bản đã sửa.", "the record reflects the edited description");
 }
 
-console.log("== real author: authoring a name already imported from a folder is rejected as DUPLICATE_NAME, that entry is untouched ==");
+console.log("== real Sửa (edit): a legacy folder-imported record loads correctly through the SAME snapshot read-back a session would run ==");
 {
   const home = freshHome();
+  const srcDir = makeSkillDir(home, "legacy-src", {
+    frontmatter: defaultFrontmatter("tom-tat-legacy", "Skill nhập từ thư mục trước khi có tính năng này."),
+    body: "\n# Hướng dẫn cũ\n\nLàm theo các bước.\n"
+  });
+  await skillsLib.importSkill(srcDir); // the removed folder-import path, used only to build the fixture
+
   const client = await realLibraryClient();
   const controller = new SkillsController(client);
   await controller.init();
-  const srcDir = makeSkillDir(home, "author-dup-src", { frontmatter: defaultFrontmatter("ten-trung", "Nhập từ thư mục.") });
-  controller.setImportDraft(srcDir);
-  await controller.importFromDraft();
+  const loaded = await controller.loadForEdit("tom-tat-legacy");
+  ok(loaded.ok === true, "loadForEdit succeeds for a record that entered the catalog through the removed folder-import path");
+  ok(
+    controller.state.authorDraft.description === "Skill nhập từ thư mục trước khi có tính năng này.",
+    "description loaded from the approved SNAPSHOT, not from re-reading the original folder"
+  );
+  ok(/Hướng dẫn cũ/.test(controller.state.authorDraft.body), "body loaded from the approved snapshot too");
 
-  controller.setAuthorField("name", "ten-trung");
-  controller.setAuthorField("description", "Đang cố ghi đè lên skill đã nhập từ thư mục.");
-  controller.setAuthorField("body", "# Không nên được lưu\n");
+  // Saving that edit must actually save — the spec's "a skill stored before
+  // this behavior existed ... can still be edited" scenario. Editing adopts
+  // the record: its source moves into the application's own storage, so the
+  // app stops depending on a folder outside itself it no longer reads.
+  // Proven here against the REAL library, not a mock.
+  controller.setAuthorField("description", "Đã sửa trực tiếp.");
+  const saveResult = await controller.authorFromDraft();
+  ok(saveResult.ok === true, `saving an in-place edit of a legacy record succeeds — got ${JSON.stringify(saveResult)}`);
+
+  const catalogAfter = await skillsLib.listCatalog();
+  const edited = catalogAfter.find((s) => s.name === "tom-tat-legacy");
+  ok(catalogAfter.length === 1, "editing updates the one record in place — it never creates a second entry");
+  ok(edited && edited.description === "Đã sửa trực tiếp.", "the edit reached the real catalog record");
+  ok(
+    path.resolve(edited.source).startsWith(path.resolve(skillsLib.authoredSkillsRoot())),
+    `the adopted record's source now lives in the app's own storage, not the original folder — got ${edited.source}`
+  );
+  ok(!fs.existsSync(path.join(srcDir, "MARKER-DELETED")), "the operator's original folder is never written to");
+  ok(fs.existsSync(path.join(srcDir, "SKILL.md")), "the operator's original folder is left on disk untouched");
+
+}
+
+console.log("== real Sửa (edit): only a deliberate edit adopts a foreign-sourced record; composing a new skill under its name is still refused ==");
+{
+  const home = freshHome();
+  const srcDir = makeSkillDir(home, "guard-src", {
+    frontmatter: defaultFrontmatter("guard-legacy", "Bản gốc nhập từ thư mục.")
+  });
+  await skillsLib.importSkill(srcDir); // fixture only — the removed folder-import path
+
+  // No loadForEdit() first: this is someone composing a BRAND NEW skill who
+  // happens to pick a name already held by a folder-imported record. The
+  // name alone must never be read as intent to overwrite it.
+  const controller = new SkillsController(await realLibraryClient());
+  await controller.init();
+  controller.setAuthorField("name", "guard-legacy");
+  controller.setAuthorField("description", "Một skill hoàn toàn khác.");
+  controller.setAuthorField("body", "# Khác hẳn\n");
+  const collision = await controller.authorFromDraft();
+  ok(collision.ok === false && collision.code === "DUPLICATE_NAME", `creating under a taken foreign-sourced name is refused — got ${JSON.stringify(collision)}`);
+
+  const after = await skillsLib.listCatalog();
+  ok(after.length === 1, "the refused creation added no entry");
+  ok(after[0].description === "Bản gốc nhập từ thư mục.", "the refused creation left the existing record untouched");
+  ok(path.resolve(after[0].source) === path.resolve(srcDir), "and did not adopt it — source is still the original folder");
+}
+
+console.log("== real Nhân bản (duplicate): a legacy folder-imported record can be duplicated into a fully editable, owned copy ==");
+{
+  const home = freshHome();
+  const srcDir = makeSkillDir(home, "legacy-dup-src", { frontmatter: defaultFrontmatter("legacy-dup", "Bản gốc nhập từ thư mục.") });
+  await skillsLib.importSkill(srcDir);
+
+  const client = await realLibraryClient();
+  const controller = new SkillsController(client);
+  await controller.init();
+  const loaded = await controller.loadForDuplicate("legacy-dup");
+  ok(loaded.ok === true, "loadForDuplicate succeeds for a legacy record");
+  ok(controller.state.authorDraft.name === "legacy-dup-copy", "seeded under an unused name");
+  ok(controller.state.editingName === null, "editingName stays null — this submit creates a new record");
+
   const result = await controller.authorFromDraft();
-  ok(result.ok === false && result.code === "DUPLICATE_NAME", `authoring over a folder-imported name is rejected as DUPLICATE_NAME — got ${result.code}`);
-  ok(controller.state.skills.length === 1 && controller.state.skills[0].description === "Nhập từ thư mục.", "the original folder-imported entry is completely untouched");
+  ok(result.ok === true, `duplicating a legacy record into a new authored one succeeds: ${JSON.stringify(result)}`);
+  ok(controller.state.skills.length === 2, "both the original legacy record and the new duplicate now exist");
+  const dup = controller.state.skills.find((s) => s.name === "legacy-dup-copy");
+  ok(dup, "the duplicate is present in the catalog");
+
+  // The duplicate is now a fully OWNED, authored record: editing it in
+  // place must succeed with no DUPLICATE_NAME, unlike its legacy source.
+  await controller.loadForEdit("legacy-dup-copy");
+  controller.setAuthorField("description", "Bản sao đã sửa được.");
+  const editResult = await controller.authorFromDraft();
+  ok(editResult.ok === true, `the duplicate, unlike the legacy original, can be edited in place: ${JSON.stringify(editResult)}`);
 }
 
 console.log(fail === 0 ? "\nALL SETTINGS-UI SKILLS REAL-CATALOG TESTS PASSED" : `\n${fail} FAILED`);

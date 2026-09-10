@@ -21,16 +21,25 @@
 // exposes — it does NOT hit import.js's DUPLICATE_NAME guard, because that
 // guard exists to stop two DIFFERENT source folders from claiming the same
 // name, not to stop this feature from editing the one folder it owns.
-// Authoring a name that is already imported from any OTHER source (a folder
-// import, or an authored skill under a different on-disk identity) still
-// raises DUPLICATE_NAME, unchanged, before anything is written to disk.
+//
+// A record this module did NOT write — one that entered the catalog through
+// the folder-import path the product no longer exposes — is editable too,
+// but only when the caller passes `editing: true`. That flag carries the
+// operator's intent, which the name alone cannot: someone composing a brand
+// new skill who happens to pick a taken name must still be told the name is
+// taken, never silently overwrite the skill holding it. Editing such a
+// record ADOPTS it: its `source` is re-pointed at this module's own
+// authored folder before the refresh, so the app stops depending on a
+// directory outside itself that it no longer reads and that may be gone.
+// Without the flag, the DUPLICATE_NAME rejection is unchanged, and it still
+// fires before anything is written to disk.
 
 import fs from "node:fs";
 import path from "node:path";
 import { validateSkillName, validateDescription } from "./frontmatter.js";
 import { importSkill, refreshSkill } from "./import.js";
 import { setInvocationFlags } from "./manage.js";
-import { getSkillRecord } from "./catalog-store.js";
+import { getSkillRecord, upsertSkillRecord } from "./catalog-store.js";
 import { skillsRoot, ensureSkillsRoot, assertSafeSegment } from "./paths.js";
 import { SkillValidationError } from "./errors.js";
 
@@ -110,10 +119,11 @@ function composeSkillMd({ name, description, body, allowedTools }) {
  * @param {boolean} [input.userInvocable] - product-owned catalog flag, applied via manage.js's setInvocationFlags() (see import.js's own header on why this is never a frontmatter field).
  * @param {boolean} [input.modelInvocable] - same as above.
  * @param {string[]|string} [input.allowedTools] - optional `allowed-tools` frontmatter hint (array, or a comma-separated string from a plain text field).
+ * @param {boolean} [input.editing] - the caller is deliberately editing the existing record of this name, not creating a new skill. Only this makes a record whose `source` lies outside this module's own authored folder editable (adopting it — see the module header); omitted or false keeps the DUPLICATE_NAME rejection exactly as it was.
  * @returns {Promise<object>} the resulting catalog record, exactly as importSkill()/refreshSkill() already return it.
  */
 export async function authorSkill(input = {}) {
-  const { name, description, body, userInvocable, modelInvocable, allowedTools } = input;
+  const { name, description, body, userInvocable, modelInvocable, allowedTools, editing } = input;
 
   // Validate every field BEFORE touching disk at all — same "reject, don't
   // guess" posture as import.js's own full-validation-before-any-write rule.
@@ -139,7 +149,17 @@ export async function authorSkill(input = {}) {
   const cleanAllowedTools = normalizeAllowedTools(allowedTools);
 
   const existing = getSkillRecord(validName);
-  const editingOwnSkill = existing ? isOwnAuthoredSource(existing.source, validName) : false;
+  const ownAuthoredSource = existing ? isOwnAuthoredSource(existing.source, validName) : false;
+  // A record this module did not write — one that entered the catalog through
+  // the folder-import path this product no longer exposes — can still be
+  // edited, but ONLY when the caller says it is deliberately editing that
+  // record. The name alone cannot carry that intent: an operator composing a
+  // brand-new skill who happens to pick a name already taken must still be
+  // told so, never silently overwrite someone else's skill. So the decision
+  // is the caller's, passed explicitly, and its absence keeps the original
+  // rejection byte-for-byte.
+  const adoptingForeignSource = !!existing && !ownAuthoredSource && editing === true;
+  const editingOwnSkill = ownAuthoredSource || adoptingForeignSource;
   if (existing && !editingOwnSkill) {
     throw new SkillValidationError(
       "DUPLICATE_NAME",
@@ -152,6 +172,18 @@ export async function authorSkill(input = {}) {
   ensureSkillsRoot();
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, SKILL_MANIFEST_NAME), content, "utf-8");
+
+  // Adopting a foreign-sourced record means its `source` still points at the
+  // folder it was imported from — a path outside this application, which may
+  // no longer exist and which this product deliberately no longer reads.
+  // Re-point it at the authored folder just written above BEFORE refreshing,
+  // so refreshSkill() re-reads the operator's edit rather than the old
+  // folder. This is the whole adoption: one field, then the ordinary
+  // in-place update path. Everything else about the record — enabled state,
+  // invocation flags, snapshot identity — is carried forward by refresh.
+  if (adoptingForeignSource) {
+    upsertSkillRecord({ ...existing, source: dir });
+  }
 
   // Same underlying pipeline a folder import uses — no parallel validation,
   // no hand-written catalog record (see this module's header).

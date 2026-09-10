@@ -31,13 +31,108 @@
     gap: var(--space-2);
   }
   .settings-banner { margin: 0 0 var(--space-2); }
-  .model-row-info { min-width: 0; }
+  .model-row-info { min-width: 0; flex: 1; }
   .model-row-info .list-item-title,
   .model-row-info .list-item-sub { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* The provider's exact model ID: mono so l/1/I and 0/O stay
+     distinguishable, since this is the string an operator has to
+     transcribe. Empty when no display name was given (the row would
+     otherwise print the same ID twice). */
+  .model-row-id { font-family: var(--font-mono); font-size: var(--font-size-small); }
+  .model-row-id:empty { display: none; }
+  .model-default-badge {
+    display: inline-flex;
+    align-items: center;
+    height: 22px;
+    padding: 0 var(--space-2);
+    border-radius: var(--radius-pill);
+    background: var(--color-surface-sunken);
+    color: var(--color-text-secondary);
+    font-size: var(--font-size-small);
+    font-weight: 600;
+    white-space: nowrap;
+  }
   #capability-detail { display: flex; flex-wrap: wrap; gap: var(--space-1); margin-top: var(--space-1); }
   .test-disclosure { margin: 0; }
-  #model-add-form { display: flex; flex-wrap: wrap; gap: var(--space-2); align-items: flex-end; }
+  #model-add-form { display: flex; flex-wrap: wrap; gap: var(--space-2); align-items: flex-end; margin-top: var(--space-3); }
+  /* Same shared-.btn/[hidden] specificity defect this file already documents
+     below — the form is a <form>, but its own hidden state is toggled here
+     alongside the button that controls it, so keep the rule explicit. */
+  #model-add-form[hidden] { display: none; }
   #model-add-form .field { flex: 1 1 140px; margin-bottom: 0; }
+
+  /* Sticky chip navigation (design.md D6): real in-page anchors, not tabs —
+     every section stays rendered, the chips only orient. Sticks to the top
+     of .panel-scroll (its nearest scrolling ancestor), horizontally
+     scrollable at narrow widths so four chips never force the PAGE body to
+     scroll horizontally at 320px. */
+  .settings-navbar {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    display: flex;
+    gap: var(--space-1);
+    padding: var(--space-2) 0;
+    margin: calc(var(--space-4) * -1) calc(var(--panel-gutter) * -1) 0;
+    padding-left: var(--panel-gutter);
+    padding-right: var(--panel-gutter);
+    background: var(--color-canvas);
+    border-bottom: 1px solid var(--color-border-subtle);
+    overflow-x: auto;
+  }
+  .settings-chip {
+    display: inline-flex;
+    align-items: center;
+    height: 30px;
+    padding: 0 var(--space-3);
+    border-radius: var(--radius-pill);
+    font-size: var(--font-size-small);
+    font-weight: 600;
+    color: var(--color-text-secondary);
+    white-space: nowrap;
+    flex: none;
+    /* These are anchors so they carry real in-page navigation, but they read
+       as chips, not as body links — base.css's link colour and the UA's
+       underline both have to go, at rest and on hover. */
+    text-decoration: none;
+  }
+  .settings-chip:hover {
+    text-decoration: none;
+    background: var(--color-surface-sunken);
+    color: var(--color-text);
+  }
+  .settings-chip[aria-current="true"]:hover {
+    background: var(--color-accent-tint);
+    color: var(--color-accent-text);
+  }
+  /* The nav sticks to the top, so an anchor jump would otherwise land the
+     heading underneath it. */
+  .section-heading[id] { scroll-margin-top: 64px; }
+  .settings-chip[aria-current="true"] {
+    background: var(--color-accent-tint);
+    color: var(--color-accent-text);
+  }
+  .settings-chip:focus-visible {
+    outline: 2px solid var(--color-focus-ring);
+    outline-offset: 2px;
+  }
+
+  /* Connection-status card (design.md D8) */
+  .status-card { display: flex; align-items: center; gap: var(--space-3); }
+  .status-card-icon {
+    width: 36px; height: 36px; border-radius: var(--radius-sm); flex: none;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .status-card-icon.is-ok { background: rgba(30, 122, 70, 0.1); color: var(--color-status-success); }
+  .status-card-icon.is-warn { background: var(--color-surface-sunken); color: var(--color-text-secondary); }
+  .status-card-icon.is-fail { background: rgba(179, 38, 30, 0.1); color: var(--color-status-danger); }
+  .status-card-main { flex: 1; min-width: 0; }
+  .status-card-title { display: block; font-size: var(--font-size-h3); font-weight: 700; line-height: 1.3; }
+  .status-card-sub { display: block; font-size: var(--font-size-small); color: var(--color-text-secondary); line-height: 1.5; margin-top: 2px; }
+
+  /* Model default radiogroup (design.md D7) */
+  .model-radio-row { display: flex; align-items: center; gap: var(--space-3); }
+  .model-radio-row input[type="radio"] { flex: none; width: 18px; height: 18px; accent-color: var(--color-accent); }
 
   /* Defect (found during visual QA screenshot capture, task 4.4/4.5): the
      shared .btn class sets display:inline-flex (extension/ui/components.css),
@@ -70,9 +165,25 @@
   </header>
 
   <main class="panel-scroll">
+    <nav class="settings-navbar" aria-label="Điều hướng mục cài đặt">
+      <a class="settings-chip" href="#section-provider" data-section="section-provider">Nhà cung cấp</a>
+      <a class="settings-chip" href="#section-models" data-section="section-models">Mô hình</a>
+      <a class="settings-chip" href="#section-other" data-section="section-other">Skills</a>
+      <a class="settings-chip" href="#section-backup" data-section="section-backup">Sao lưu</a>
+    </nav>
+
     <div id="banner-area"></div>
 
-    <p class="section-heading">Nhà cung cấp</p>
+    <div class="card status-card" id="status-card" role="status">
+      <span class="status-card-icon" id="status-card-icon"></span>
+      <span class="status-card-main">
+        <span class="status-card-title" id="status-card-title"></span>
+        <span class="status-card-sub" id="status-card-sub"></span>
+      </span>
+      <button class="btn btn-secondary btn-sm" type="button" id="btn-status-retest">Kiểm tra lại</button>
+    </div>
+
+    <p class="section-heading" id="section-provider">Nhà cung cấp</p>
     <div class="field-group">
       <div class="field-group-item">
         <div class="field" style="margin-bottom:0">
@@ -104,11 +215,18 @@
       </div>
     </div>
 
-    <p class="section-heading">Mô hình</p>
+    <p class="section-heading" id="section-models">Mô hình</p>
     <div class="field-group">
-      <div id="model-list"></div>
+      <div id="model-list" role="radiogroup" aria-label="Mô hình mặc định"></div>
       <div class="field-group-item">
-        <form id="model-add-form">
+        <div class="field-row">
+          <p class="field-hint" style="flex:1;min-width:170px">ID mô hình là chuỗi do nhà cung cấp định nghĩa — trang này không tự đoán hay sửa ID.</p>
+          <div class="field-row-actions">
+            <button class="btn btn-ghost btn-sm" type="button" id="btn-toggle-model-add" aria-expanded="false" aria-controls="model-add-form"><span id="ic-plus"></span>Thêm thủ công</button>
+            <button class="btn btn-secondary btn-sm" type="button" id="btn-discover-models"><span id="ic-refresh"></span>Tìm mô hình</button>
+          </div>
+        </div>
+        <form id="model-add-form" hidden>
           <div class="field">
             <label class="field-label" for="model-add-id">Model ID</label>
             <input class="input" id="model-add-id" type="text" autocomplete="off" spellcheck="false" placeholder="vd: claude-sonnet-5" />
@@ -117,36 +235,20 @@
             <label class="field-label" for="model-add-label">Tên hiển thị</label>
             <input class="input" id="model-add-label" type="text" autocomplete="off" placeholder="vd: Sonnet (cân bằng)" />
           </div>
-          <button class="btn btn-ghost btn-sm" type="submit"><span id="ic-plus"></span>Thêm thủ công</button>
+          <button class="btn btn-secondary btn-sm" type="submit">Thêm mô hình</button>
         </form>
         <p class="field-hint" id="model-list-error" role="alert" hidden style="color:var(--color-status-danger)"></p>
-        <div class="field-row-actions" style="margin-top:var(--space-2)">
-          <button class="btn btn-secondary btn-sm" type="button" id="btn-discover-models"><span id="ic-refresh"></span>Tìm mô hình</button>
-        </div>
-        <p class="field-hint">ID mô hình là chuỗi do nhà cung cấp định nghĩa — trang này không tự đoán hay sửa ID.</p>
       </div>
     </div>
 
-    <p class="section-heading">Xuất / Nhập cài đặt</p>
-    <div class="field-group">
-      <div class="field-group-item">
-        <div class="field-row-actions">
-          <button class="btn btn-secondary btn-sm" type="button" id="btn-export">Xuất cài đặt</button>
-          <button class="btn btn-ghost btn-sm" type="button" id="btn-import">Nhập cài đặt</button>
-          <input type="file" id="import-file-input" accept="application/json" hidden />
-        </div>
-        <p class="field-hint">Tệp xuất KHÔNG chứa API key. Sau khi nhập trên máy mới, bạn cần nhập lại API key.</p>
-      </div>
-    </div>
-
-    <p class="section-heading">Khác</p>
+    <p class="section-heading" id="section-other">Skills &amp; tiện ích</p>
     <div class="field-group">
       <div class="field-group-item">
         <button class="list-item" type="button" style="width:100%;border:none;box-shadow:none;text-align:left" id="nav-skills">
           <span class="list-item-icon" id="ic-skills"></span>
           <span class="list-item-main">
             <span class="list-item-title">Skills</span>
-            <span class="list-item-sub">Nhập thư mục skill, bật/tắt, nạp lại, gỡ bỏ</span>
+            <span class="list-item-sub">Tự soạn nội dung, bật/tắt, sửa, gỡ bỏ</span>
           </span>
           <span id="ic-chevr-skills"></span>
         </button>
@@ -162,6 +264,18 @@
         </button>
       </div>
     </div>
+    <p class="section-heading" id="section-backup">Sao lưu cài đặt</p>
+    <div class="field-group">
+      <div class="field-group-item">
+        <div class="field-row-actions">
+          <button class="btn btn-secondary btn-sm" type="button" id="btn-export">Xuất cài đặt</button>
+          <button class="btn btn-ghost btn-sm" type="button" id="btn-import">Nhập cài đặt</button>
+          <input type="file" id="import-file-input" accept="application/json" hidden />
+        </div>
+        <p class="field-hint">Tệp xuất KHÔNG chứa API key. Sau khi nhập trên máy mới, bạn cần nhập lại API key.</p>
+      </div>
+    </div>
+
   </main>
 </div>
 

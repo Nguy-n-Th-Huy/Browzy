@@ -104,6 +104,118 @@ function renderBanner(state) {
   area.appendChild(box);
 }
 
+// design.md decision D8: reads only existing controller state
+// (connectionStatus/hasCredential/defaultModelId) and never initiates a
+// connection test on load — testing costs API usage and stays an explicit
+// user action.
+function renderStatusCard(state) {
+  const icon = $("status-card-icon");
+  const title = $("status-card-title");
+  const sub = $("status-card-sub");
+  icon.className = "status-card-icon";
+
+  let iconName = "helpCircle";
+  let toneClass = "is-warn";
+  let titleText = "Chưa cấu hình";
+  let subText = "Nhập Base URL, API key và ít nhất một mô hình ở mục Nhà cung cấp bên dưới.";
+
+  if (state.connectionStatus && state.connectionStatus.status === "testing") {
+    iconName = "clock";
+    toneClass = "is-warn";
+    titleText = "Đang kiểm tra kết nối…";
+    subText = "Đang gửi một yêu cầu nhỏ tới nhà cung cấp.";
+  } else if (state.connectionStatus && state.connectionStatus.status === "pass") {
+    iconName = "checkCircle";
+    toneClass = "is-ok";
+    titleText = state.connectionStatus.textOnly ? "Sẵn sàng (chỉ văn bản)" : "Sẵn sàng chạy";
+    subText = "API key đã lưu trong kho bảo mật hệ điều hành · đã kiểm tra kết nối thành công.";
+  } else if (state.connectionStatus && state.connectionStatus.status === "fail") {
+    iconName = "xCircle";
+    toneClass = "is-fail";
+    titleText = "Kiểm tra kết nối thất bại";
+    subText = "Xem chi tiết lỗi ở mục Nhà cung cấp bên dưới.";
+  } else if (state.hasCredential) {
+    iconName = "helpCircle";
+    toneClass = "is-warn";
+    titleText = "Đã lưu API key — chưa kiểm tra";
+    subText = "Bấm Kiểm tra lại để xác nhận kết nối trước khi trò chuyện.";
+  }
+
+  icon.classList.add(toneClass);
+  icon.innerHTML = iconMarkup(iconName, { size: 20 });
+  title.textContent = titleText;
+  sub.textContent = subText;
+
+  const retestBtn = $("btn-status-retest");
+  retestBtn.disabled = state.testing || !state.hasCredential || !state.defaultModelId;
+  retestBtn.textContent = state.testing ? "Đang kiểm tra…" : "Kiểm tra lại";
+}
+
+// design.md decision D6: marks the chip nearest the top of the viewport as
+// aria-current, without hijacking normal anchor activation/keyboard focus.
+// IntersectionObserver over the section headings — never a scroll handler
+// calling preventDefault() on a chip click.
+function wireChipNav() {
+  const chips = [...document.querySelectorAll(".settings-chip")];
+  const sections = chips
+    .map((chip) => document.getElementById(chip.dataset.section))
+    .filter(Boolean);
+  if (!sections.length || typeof IntersectionObserver !== "function") return;
+
+  const setCurrent = (id) => {
+    for (const chip of chips) {
+      if (chip.dataset.section === id) chip.setAttribute("aria-current", "true");
+      else chip.removeAttribute("aria-current");
+    }
+  };
+
+  // Activating a chip marks it immediately. Waiting for the scroll to settle
+  // and letting the observer notice would leave the chip the user just
+  // pressed unmarked for the length of the jump — and if the target section
+  // is the last one, short enough that its heading never wins the scroll
+  // calculation, it would never mark at all. The click is the user stating
+  // where they are; that is not something to re-derive from scroll position.
+  // The anchor's own navigation is untouched — no preventDefault.
+  let lockUntil = 0;
+  for (const chip of chips) {
+    chip.addEventListener("click", () => {
+      setCurrent(chip.dataset.section);
+      // The jump is asynchronous; without this the observer would fire
+      // mid-flight and overwrite the choice with whatever is passing by.
+      lockUntil = Date.now() + 700;
+    });
+  }
+
+  if (typeof IntersectionObserver !== "function") return;
+
+  // root MUST be the viewport (null), not `.panel-scroll`. `.panel-shell` is
+  // min-height:100vh and grows with its content, so `.panel-scroll` never
+  // actually scrolls or clips — the document does. Rooting the observer at a
+  // non-scrolling element made every section report ratio 1 forever, so the
+  // first chip won every comparison and the marker never moved off it.
+  const visible = new Set();
+  const observer = new IntersectionObserver(
+    (entries) => {
+      for (const entry of entries) {
+        if (entry.isIntersecting) visible.add(entry.target.id);
+        else visible.delete(entry.target.id);
+      }
+      if (Date.now() < lockUntil) return;
+      // The band is the top slice of the viewport below the sticky nav; the
+      // LAST section to have entered it is the one being read.
+      for (let i = sections.length - 1; i >= 0; i -= 1) {
+        if (visible.has(sections[i].id)) {
+          setCurrent(sections[i].id);
+          return;
+        }
+      }
+    },
+    { root: null, rootMargin: "-64px 0px -55% 0px", threshold: 0 }
+  );
+  for (const section of sections) observer.observe(section);
+  setCurrent(sections[0].id);
+}
+
 function renderProvider(state) {
   const urlInput = $("base-url");
   if (document.activeElement !== urlInput) urlInput.value = state.baseUrlDraft;
@@ -167,29 +279,50 @@ function renderModels(state) {
     const row = document.createElement("div");
     row.className = "field-group-item";
     const flex = document.createElement("div");
-    flex.className = "field-row";
+    flex.className = "field-row model-radio-row";
 
-    const info = document.createElement("div");
+    // design.md decision D7: the "· Đặt mặc định" ghost-button affordance
+    // becomes one native radio per model in a radiogroup — the platform's
+    // own control for "exactly one of these", with keyboard semantics for
+    // free. A visible "Mặc định" badge rides alongside so the state has a
+    // carrier besides the radio's own checked appearance.
+    const radioId = `model-default-${index}`;
+    const radio = document.createElement("input");
+    radio.type = "radio";
+    radio.name = "default-model";
+    radio.id = radioId;
+    radio.checked = model.id === state.defaultModelId;
+    radio.setAttribute("aria-label", `Đặt "${model.label || model.id}" làm mô hình mặc định`);
+    radio.addEventListener("change", () => {
+      if (radio.checked) controller.setDefaultModel(model.id);
+    });
+
+    const info = document.createElement("label");
     info.className = "model-row-info";
+    info.setAttribute("for", radioId);
+    // The human name leads; the provider's exact model ID sits under it in
+    // mono. The ID is the thing that must be transcribable character for
+    // character, and a proportional face makes l/1/I and 0/O ambiguous.
+    // When no display name was given, `label` falls back to the ID upstream,
+    // so the row degrades to the ID alone rather than repeating it twice.
     const title = document.createElement("div");
     title.className = "list-item-title";
-    title.textContent = model.id;
+    title.textContent = model.label || model.id;
     const sub = document.createElement("div");
-    sub.className = "list-item-sub";
-    sub.textContent = model.id === state.defaultModelId ? `${model.label} · Mặc định` : model.label;
+    sub.className = "list-item-sub model-row-id";
+    sub.textContent = model.label && model.label !== model.id ? model.id : "";
     info.append(title, sub);
 
     const actions = document.createElement("div");
     actions.className = "field-row-actions";
 
-    if (model.id !== state.defaultModelId) {
-      const makeDefaultBtn = document.createElement("button");
-      makeDefaultBtn.className = "btn btn-ghost btn-sm";
-      makeDefaultBtn.type = "button";
-      makeDefaultBtn.textContent = "Đặt mặc định";
-      makeDefaultBtn.addEventListener("click", () => controller.setDefaultModel(model.id));
-      actions.appendChild(makeDefaultBtn);
+    if (model.id === state.defaultModelId) {
+      const badge = document.createElement("span");
+      badge.className = "model-default-badge";
+      badge.textContent = "Mặc định";
+      actions.appendChild(badge);
     }
+
     if (index > 0) {
       const upBtn = document.createElement("button");
       upBtn.className = "btn-icon";
@@ -218,7 +351,7 @@ function renderModels(state) {
     removeBtn.addEventListener("click", () => controller.removeModel(index));
     actions.appendChild(removeBtn);
 
-    flex.append(info, actions);
+    flex.append(radio, info, actions);
     row.appendChild(flex);
     list.appendChild(row);
   });
@@ -231,6 +364,7 @@ function renderModels(state) {
 
 function render(state) {
   renderBanner(state);
+  renderStatusCard(state);
   renderProvider(state);
   renderModels(state);
 }
@@ -245,6 +379,7 @@ function wireEvents() {
   });
 
   $("btn-test-connection").addEventListener("click", () => controller.testConnection());
+  $("btn-status-retest").addEventListener("click", () => controller.testConnection());
   $("btn-save").addEventListener("click", async () => {
     const keyInput = $("key-input");
     // Trimmed, because a key is almost always arriving here from a clipboard
@@ -264,6 +399,19 @@ function wireEvents() {
     await controller.save(secretInput);
   });
   $("btn-discover-models").addEventListener("click", () => controller.discoverModels());
+
+  // Manual entry is the rarer path (discovery covers most providers), so the
+  // two fields stay collapsed until asked for rather than sitting open above
+  // every model list. aria-expanded/aria-controls carry the state for a
+  // screen reader; focus moves into the first field on open so keyboard use
+  // does not require hunting for what just appeared.
+  $("btn-toggle-model-add").addEventListener("click", () => {
+    const form = $("model-add-form");
+    const opening = form.hidden;
+    form.hidden = !opening;
+    $("btn-toggle-model-add").setAttribute("aria-expanded", String(opening));
+    if (opening) $("model-add-id").focus();
+  });
 
   $("model-add-form").addEventListener("submit", (e) => {
     e.preventDefault();
@@ -321,4 +469,5 @@ function wireEvents() {
 }
 
 wireEvents();
+wireChipNav();
 controller.init();

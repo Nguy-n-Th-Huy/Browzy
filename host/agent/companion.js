@@ -86,15 +86,25 @@ import {
   buildSkillDispatchPrompt,
   SkillDispatchError,
   SkillSnapshotMismatchError,
+  SkillNotFoundError,
+  SkillPathError,
   listCatalog as listSkillsCatalog,
-  importSkill,
-  refreshSkill,
+  getSkill,
   authorSkill,
   enableSkill,
   disableSkill,
   removeSkill,
   setInvocationFlags
 } from "./skills/index.js";
+// `skills_read_source` (below) composes these two directly rather than
+// through index.js: paths.js/frontmatter.js are the change's deliberately
+// byte-identical files (openspec/changes/redesign-settings-typed-only-
+// skills/design.md decision D2), and index.js is left untouched too so a
+// `git diff` over host/agent/skills/** stays empty for this change. Both are
+// pure, side-effect-free helpers (a path-segment guard and a frontmatter
+// parser) — no new file-reading primitive is added anywhere.
+import { snapshotDir, assertSafeSegment } from "./skills/paths.js";
+import { parseFrontmatter } from "./skills/frontmatter.js";
 import {
   recordAdvertisedCommands,
   readAdvertisedCommands,
@@ -112,6 +122,28 @@ function extractSlashCommand(prompt) {
   if (typeof prompt !== "string") return null;
   const trimmed = prompt.trim();
   return trimmed.startsWith("/") ? trimmed : null;
+}
+
+// `skills_read_source`'s body half of parseFrontmatter() (host/agent/skills/
+// frontmatter.js). Mirrors that parser's own scan exactly (strip a leading
+// BOM, skip leading blank lines, the first trimmed "---" opens the block,
+// scan to the next trimmed "---" which closes it) so the two agree on
+// exactly where the frontmatter block ends — `raw` here has already been
+// successfully parsed by parseFrontmatter() by the time this runs, so the
+// delimiters are known to exist. `composeSkillMd()` (author.js) always
+// writes body content starting right after a blank line following the
+// closing "---"; stripping a leading run of newlines here is what makes a
+// composed skill's body round-trip byte-for-byte back into the authoring
+// form's textarea.
+function extractSkillBody(raw) {
+  const text = raw.replace(/^\uFEFF/, "");
+  const lines = text.split(/\r\n|\n/);
+  let i = 0;
+  while (i < lines.length && lines[i].trim() === "") i++;
+  i++; // past the opening "---"
+  while (i < lines.length && lines[i].trim() !== "---") i++;
+  i++; // past the closing "---"
+  return lines.slice(i).join("\n").replace(/^\n+/, "");
 }
 
 // Per-image size ceiling for a user-composer attachment (design.md Decision
@@ -945,34 +977,89 @@ export class CompanionCore {
           const result = await settings.exportProfileRedacted(profileId);
           return ok(result);
         }
-        // Settings > Skills (task 7.3) and the sidepanel slash picker's
-        // read-only catalog fetch. Every op below is a direct, unmodified
-        // delegation to host/agent/skills/index.js's already-built and
-        // independently-tested catalog-lifecycle surface (import.js/
-        // manage.js) — exactly the same "no new business logic here" rule
-        // the provider-profile ops above already follow. None of this is
-        // gated on a prior HELLO or an active conversation (same reasoning
-        // as every op above): skill management is a fact about the
-        // browser-bridge-wide catalog, not about any one conversation.
-        // Op/payload names match extension/settings/skills-client.js and
-        // extension/sidepanel/skills-client.js's documented wire contract
-        // exactly (see each file's own header).
+        // Settings > Skills (redesign-settings-typed-only-skills) and the
+        // sidepanel slash picker's read-only catalog fetch. Every op below
+        // is a direct, unmodified delegation to host/agent/skills/
+        // index.js's already-built and independently-tested
+        // catalog-lifecycle surface (author.js/manage.js) — exactly the
+        // same "no new business logic here" rule the provider-profile ops
+        // above already follow. None of this is gated on a prior HELLO or
+        // an active conversation (same reasoning as every op above): skill
+        // management is a fact about the browser-bridge-wide catalog, not
+        // about any one conversation. Op/payload names match
+        // extension/settings/skills-client.js's and extension/sidepanel/
+        // skills-client.js's documented wire contract exactly (see each
+        // file's own header).
+        //
+        // No `skills_import`/`skills_refresh` op exists here (removed by
+        // redesign-settings-typed-only-skills): no operation this switch
+        // accepts may take a filesystem path from the extension, and none
+        // may read a directory the application does not own. The import
+        // pipeline they used to expose (host/agent/skills/import.js) is
+        // NOT deleted — `authorSkill()` (skills_author, below) still runs
+        // every typed submission through that exact same
+        // importSkill()/refreshSkill() pipeline, just with a directory the
+        // application itself just wrote under its own root, never one
+        // supplied by the extension. See design.md decision D1.
         case "skills_list": {
           const result = await listSkillsCatalog();
           return ok(result);
         }
-        case "skills_import": {
-          const result = await importSkill(envelope.sourceDir);
-          return ok(result);
-        }
-        case "skills_refresh": {
-          const result = await refreshSkill(envelope.name);
-          return ok(result);
+        case "skills_read_source": {
+          // design.md decision D2: takes a catalog `name` and nothing else
+          // — never a path. Resolution order below matches D2 exactly, so a
+          // catalog record with no snapshot on disk, or one tampered to
+          // carry a traversal-shaped snapshotId, is rejected before any
+          // path outside the application's own snapshot store is touched.
+          const record = getSkill(envelope.name);
+          if (!record) throw new SkillNotFoundError(envelope.name);
+
+          let safeSnapshotId;
+          try {
+            safeSnapshotId = assertSafeSegment(record.snapshotId);
+          } catch (err) {
+            // assertSafeSegment() throws a bare Error with no .code — wrap
+            // it as the documented "a live access attempt was blocked"
+            // error (errors.js) rather than let it fall through to the
+            // generic NETWORK_ERROR the catch-all below would assign.
+            throw new SkillPathError("PATH_TRAVERSAL", err.message);
+          }
+
+          let raw;
+          try {
+            raw = fs.readFileSync(path.join(snapshotDir(safeSnapshotId), "SKILL.md"), "utf-8");
+          } catch (err) {
+            throw new SkillPathError(
+              "NOT_FOUND",
+              `Stored skill "${envelope.name}" is missing its approved snapshot: ${err.message}`
+            );
+          }
+
+          const meta = parseFrontmatter(raw);
+          const rawAllowedTools = meta["allowed-tools"];
+          const allowedTools = Array.isArray(rawAllowedTools)
+            ? rawAllowedTools
+            : typeof rawAllowedTools === "string" && rawAllowedTools
+              ? [rawAllowedTools]
+              : [];
+
+          return ok({
+            name: record.name,
+            description: meta.description,
+            body: extractSkillBody(raw),
+            allowedTools,
+            // Invocation flags are product-owned catalog fields, never
+            // sourced from the file itself — see import.js's
+            // readManifestMeta() doc comment and design.md's Context
+            // section ("frontmatter never carried them").
+            userInvocable: record.userInvocable,
+            modelInvocable: record.modelInvocable
+          });
         }
         case "skills_author": {
-          // extension/settings/skills-client.js's typed-form counterpart to
-          // skills_import — see host/agent/skills/author.js's own header
-          // for why this still ends up calling the exact same
+          // extension/settings/skills-client.js's (now sole) authoring
+          // entry point — see host/agent/skills/author.js's own header for
+          // why this still ends up calling the exact same
           // importSkill()/refreshSkill() pipeline underneath, never a
           // parallel one.
           const result = await authorSkill({
@@ -981,7 +1068,12 @@ export class CompanionCore {
             body: envelope.body,
             userInvocable: envelope.userInvocable,
             modelInvocable: envelope.modelInvocable,
-            allowedTools: envelope.allowedTools
+            allowedTools: envelope.allowedTools,
+            // Carries the panel's "this submit is the in-place Sửa flow"
+            // intent, which the name alone cannot express — see
+            // host/agent/skills/author.js's header on why creating a skill
+            // under a taken name must still be refused.
+            editing: envelope.editing === true
           });
           return ok(result);
         }
