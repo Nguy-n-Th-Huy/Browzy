@@ -188,8 +188,11 @@
    * both the live property (what the operator actually typed/checked/
    * selected) and any `value`/`checked`/`selected` attribute the clone
    * inherited from the live element's initial HTML. Structural attributes
-   * (type/name/id/class/placeholder/for/aria-*/role/disabled/required/...)
-   * are never touched here — nothing on this path removes them. */
+   * (type, name, id, class, placeholder, for, aria-anything, role, disabled,
+   * required, and so on) are never touched here — nothing on this path
+   * removes them. NOTE: do not write an `aria-` wildcard with a star and a
+   * slash in a block comment; that sequence closes the comment early and
+   * turns the rest of this file into a syntax error. */
   function stripValueLike(node) {
     var tag = tagNameOf(node);
     if (tag === "INPUT") {

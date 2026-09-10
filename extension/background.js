@@ -6443,13 +6443,25 @@ async function sendPickerMessage(tabId, message) {
   }
   try {
     await chrome.scripting.executeScript({ target: { tabId }, files: PICKER_SCRIPT_FILES });
-  } catch {
-    return undefined; // chrome://, the Web Store, a closed tab, ... — refused, never claimed as delivered.
+  } catch (err) {
+    // Log, don't just swallow. This branch fires for a refused target
+    // (chrome://, the Web Store, a closed tab) AND for a picker script that
+    // cannot load at all — and those need opposite responses. A shipped
+    // syntax error in the picker landed here once and was indistinguishable
+    // from an ordinary refusal all the way up to the panel's generic
+    // "could not activate" message, which is what made it hard to find.
+    console.warn("[browzy] design-mode picker injection failed:", err && err.message ? err.message : err);
+    return undefined;
   }
   try {
     const reply = await chrome.tabs.sendMessage(tabId, message);
-    return isPickerAck(reply) ? reply : undefined;
-  } catch {
+    if (isPickerAck(reply)) return reply;
+    // Injected, but no usable ack: the listener is missing, or the handler
+    // threw before answering. Distinct from the injection failure above.
+    console.warn("[browzy] design-mode picker injected but did not acknowledge", message && message.type);
+    return undefined;
+  } catch (err) {
+    console.warn("[browzy] design-mode picker did not respond after injection:", err && err.message ? err.message : err);
     return undefined;
   }
 }
