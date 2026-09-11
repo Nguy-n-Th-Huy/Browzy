@@ -231,6 +231,12 @@ let lastAgentTabActivityAt = 0;
 // leaves this untouched, and the anchor is re-verified against chrome.tabs.get
 // before it is used at all.
 let lastAgentTabId = null;
+// The run that set `lastAgentTabId`, so a later run can tell that anchor is
+// someone else's. The slot outlives a run, and a stale tab from the previous
+// one is usually still in a group of ours — following it drops the new tab
+// into that older group, which is exactly the split this anchoring exists to
+// prevent. `null` for the legacy MCP path, which has no runs.
+let lastAgentTabRunId = null;
 // Long enough to cover a page opening its popup a beat after the click that
 // triggered it, short enough that a tab the operator opens seconds later is
 // still recognised as theirs.
@@ -3878,11 +3884,17 @@ const toolHandlers = {
       if (meta && meta.runId) {
         const scope = meta.tabScope;
         const scopeIds = Array.isArray(scope) ? scope : [];
+        // In reach means this run can point at the tab: it is in the run's
+        // wire scope, this run opened it, or this run is what put it in the
+        // slot. An unscoped run ("any") reaches every tab in principle, but
+        // that is precisely the case where an anchor left behind by an
+        // earlier run must NOT be inherited — it is only a record of where
+        // someone else was working.
         const withinReach =
           anchorId !== null &&
-          (scope === "any" ||
-            scopeIds.includes(anchorId) ||
-            (typeof sdkAgentCreatedTabs !== "undefined" && sdkAgentCreatedTabs.has(anchorId)));
+          (scopeIds.includes(anchorId) ||
+            (typeof sdkAgentCreatedTabs !== "undefined" && sdkAgentCreatedTabs.has(anchorId)) ||
+            (typeof lastAgentTabRunId !== "undefined" && lastAgentTabRunId === meta.runId));
         if (!withinReach) anchorId = scopeIds.length > 0 ? scopeIds[0] : null;
       }
       if (anchorId !== null) anchor = await chrome.tabs.get(anchorId);
@@ -5679,7 +5691,10 @@ async function handleToolRequest(id, tool, args, meta) {
     // is what makes this race-free across concurrent tool_request dispatch.
     currentToolMeta = meta;
     lastAgentTabActivityAt = Date.now();
-    if (args && typeof args.tabId === "number") lastAgentTabId = args.tabId;
+    if (args && typeof args.tabId === "number") {
+      lastAgentTabId = args.tabId;
+      lastAgentTabRunId = meta && meta.runId ? meta.runId : null;
+    }
     // Action-event `start` (design.md 5c / reports/05-action-event-schema.md):
     // built and emitted here, BEFORE `handler(args)` is ever called below —
     // that ordering (not a timestamp comparison) is what "start precedes

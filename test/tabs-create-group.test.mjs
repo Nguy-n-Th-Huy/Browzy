@@ -40,7 +40,7 @@ const AGENT_GROUP = 7; // the operator's bound tab's own solo group
 const MCP_GROUP = 99; // the standalone group tabs used to always land in
 
 /** @param {{anchor: object|null, ownGroups: number[], tabs?: object[], lastAgentTabId?: number|null, meta?: object, sdkAgentCreatedTabs?: number[]}} opts */
-function harness({ anchor, ownGroups, tabs: extraTabs = [], lastAgentTabId, meta, sdkAgentCreatedTabs = [] }) {
+function harness({ anchor, ownGroups, tabs: extraTabs = [], lastAgentTabId, lastAgentTabRunId = null, meta, sdkAgentCreatedTabs = [] }) {
   const known = new Map();
   if (anchor) known.set(anchor.id, anchor);
   for (const t of extraTabs) known.set(t.id, t);
@@ -81,6 +81,7 @@ function harness({ anchor, ownGroups, tabs: extraTabs = [], lastAgentTabId, meta
     "tabGroupTabs",
     "ensureTabGroup",
     "lastAgentTabId",
+    "lastAgentTabRunId",
     "isOwnAgentGroupId",
     "currentToolMeta",
     "sdkAgentCreatedTabs",
@@ -93,6 +94,7 @@ function harness({ anchor, ownGroups, tabs: extraTabs = [], lastAgentTabId, meta
     new Set(),
     ensureTabGroup,
     lastAgentTabId === undefined ? (anchor ? anchor.id : null) : lastAgentTabId,
+    lastAgentTabRunId,
     (gid) => ownGroups.includes(gid),
     meta,
     new Set(sdkAgentCreatedTabs),
@@ -227,6 +229,41 @@ await test("a tab this run itself opened stays a valid anchor", async () => {
   const create = calls.find((c) => c.api === "create");
   assert(create.opts.openerTabId === 43, `expected the run's own newest tab 43 as the anchor, got ${create.opts.openerTabId}`);
   assert(create.opts.index === 2, "and the next tab sits beside it");
+});
+
+await test("an unscoped run does not inherit the previous run's anchor", async () => {
+  // tabScope "any" reaches every tab, so scope membership cannot rule a stale
+  // anchor out. What rules it out is that another run put it there: an anchor
+  // is a record of where THAT run was working, and following it files this
+  // run's tab under the older group.
+  const stale = { id: 77, index: 5, windowId: 900, groupId: MCP_GROUP };
+  const { H, calls, ensureCalled } = harness({
+    anchor: stale,
+    ownGroups: [AGENT_GROUP, MCP_GROUP],
+    lastAgentTabId: 77,
+    lastAgentTabRunId: "older-run",
+    meta: { runId: "r4", tabScope: "any" }
+  });
+  await H.tabs_create_mcp({});
+  assert(ensureCalled(), "with no anchor of its own the run falls back to the standalone group");
+  const create = calls.find((c) => c.api === "create");
+  assert(create.opts.openerTabId === undefined, "and does not open from a tab it never touched");
+});
+
+await test("an unscoped run keeps the anchor it set itself", async () => {
+  const own = { id: 88, index: 2, windowId: 12, groupId: AGENT_GROUP };
+  const { H, calls, ensureCalled } = harness({
+    anchor: own,
+    ownGroups: [AGENT_GROUP, MCP_GROUP],
+    lastAgentTabId: 88,
+    lastAgentTabRunId: "r5",
+    meta: { runId: "r5", tabScope: "any" }
+  });
+  await H.tabs_create_mcp({});
+  assert(!ensureCalled(), "its own anchor is usable");
+  const grouped = calls.find((c) => c.api === "group");
+  assert(grouped.opts.groupId === AGENT_GROUP, `expected ${AGENT_GROUP}, got ${grouped.opts.groupId}`);
+  assert(calls.find((c) => c.api === "create").opts.openerTabId === 88, "opened from its own working tab");
 });
 
 const failed = results.filter((r) => !r.ok);
