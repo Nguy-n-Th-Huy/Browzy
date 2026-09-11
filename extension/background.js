@@ -3498,6 +3498,25 @@ function hitLandedNote_(p) {
   return ` — landed on <${h.tag}${bits.length ? " " + bits.join(" ") : ""}>${text}`;
 }
 
+/**
+ * Split a hit probe into what the caller is told and the part of that which is
+ * actually a warning.
+ *
+ * These are two different facts and only one of them says anything went wrong.
+ * `hitLandedNote_` documents itself as "not a warning": it reports which
+ * element received a click that landed cleanly. Feeding it to
+ * deriveOutcomeStatus() — which reads any non-empty note as a reason for
+ * doubt — stamped `unknown` on every click that hit exactly what it aimed at,
+ * so a run reading its own timeline saw a page full of maybe-failures and
+ * re-screenshotted, re-clicked and second-guessed work that had in fact
+ * succeeded. The note stays; only the outcome label is now taken from the
+ * warning alone.
+ */
+function probeNotes_(p) {
+  const warning = hitNote_(p);
+  return { note: warning || hitLandedNote_(p), warning };
+}
+
 /** Reports the dropdown a click just opened, so the next move is not a guess.
  *
  * A click that opens a list and a click that closes one return the identical
@@ -4233,6 +4252,10 @@ const toolHandlers = {
     // happens, not where it is released.
     const HIT_PROBED = ["left_click", "right_click", "double_click", "triple_click", "hover", "scroll"];
     let hitNote = "";
+    // Only the subset of `hitNote` that reports a problem. The outcome label
+    // is derived from THIS, never from a note that merely says which element
+    // received the click — see probeNotes_().
+    let hitWarning = "";
     if (args.ref && coordinate) {
       // Resolving the ref already scrolled it into view and hit-tested the
       // result, so there is nothing left to check — only interception is worth
@@ -4242,9 +4265,11 @@ const toolHandlers = {
         // Not a warning: this is what a person's click does too. But the agent
         // named one element and another is being clicked, so it has to be told.
         hitNote = ` — NOTE: ${refProxiedFrom} sits outside the page (a visually hidden control), so this was aimed at the label that operates it, exactly as a click by hand would be.`;
+        hitWarning = hitNote;
         dbg("hit", `${args.ref} unreachable; clicked its label instead @(${coordinate[0]},${coordinate[1]})`, { tab: tabId });
       } else if (refCovering) {
         hitNote = ` — NOTE: <${args.ref}> is covered at that point by ${refCovering}, which received this instead.`;
+        hitWarning = hitNote;
         dbg("hit", `${args.ref} @(${coordinate[0]},${coordinate[1]}) COVERED BY ${refCovering}`, { tab: tabId });
       } else {
         dbg("hit", `${args.ref} @(${coordinate[0]},${coordinate[1]}) reachable`, { tab: tabId });
@@ -4254,11 +4279,12 @@ const toolHandlers = {
       // A warning when there is something to warn about; otherwise still say
       // WHICH element received it, so aiming at the wrong one is visible now
       // rather than inferred from a screenshot two steps later.
-      hitNote = hitNote_(probe) || hitLandedNote_(probe);
+      ({ note: hitNote, warning: hitWarning } = probeNotes_(probe));
       dbg("hit", `@(${coordinate[0]},${coordinate[1]}) ${formatHit(probe)}`, { tab: tabId, x: coordinate[0], y: coordinate[1] });
     } else if (action === "left_click_drag" && startCoordinate) {
       const probe = await probeHit(tabId, startCoordinate[0], startCoordinate[1]);
       hitNote = hitNote_(probe);
+      hitWarning = hitNote;
       dbg("hit", `drag start @(${startCoordinate[0]},${startCoordinate[1]}) ${formatHit(probe)}`,
           { tab: tabId, x: startCoordinate[0], y: startCoordinate[1] });
     }
@@ -4268,7 +4294,7 @@ const toolHandlers = {
     // handler already computed above; see deriveOutcomeStatus()'s comment.
     // Not new verification: `hitNote` is the exact signal the tool response
     // itself already surfaces to the caller.
-    if (actionExtras) actionExtras.outcomeStatus = deriveOutcomeStatus(hitNote);
+    if (actionExtras) actionExtras.outcomeStatus = deriveOutcomeStatus(hitWarning);
     // Real-dispatch progress handler for the visible-cursor overlay
     // (design.md 5c). null for any non-pointer-capable action type, so a
     // case below that never calls it (screenshot, zoom, wait, type, key,
