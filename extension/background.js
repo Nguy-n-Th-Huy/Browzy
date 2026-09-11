@@ -2750,6 +2750,18 @@ function captureScaleForViewport(viewportWidth, viewportHeight) {
   return Math.min(1, MODEL_IMAGE_MAX_EDGE / longEdge);
 }
 
+/** The caller's own shrink factor for a capture, clamped to [0.1, 1].
+ *
+ * Anything absent, unparseable or out of range means "full size" — a bad
+ * number must never silently produce a picture smaller than the caller
+ * expects, because they will read coordinates off it. */
+const MIN_REQUESTED_SCALE = 0.1;
+function requestedScale(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return 1;
+  return Math.min(1, Math.max(MIN_REQUESTED_SCALE, n));
+}
+
 // tabId -> the scale the last screenshot of that tab was captured at. Written
 // only by a real capture, so it always describes an image the model has
 // actually been shown; absent means no image, and coordinates are then already
@@ -2868,6 +2880,14 @@ function zoomScaleForRegion(regionWidth, regionHeight) {
  *   capture scale is deliberately NOT updated, because coordinates read off a
  *   cropped, magnified image are relative to the crop and mean nothing to the
  *   click dispatcher. See the `zoom` action for how that is reported.
+ * @param {number} [opts.scale] - 0.1 to 1: shrink the returned full-viewport
+ *   image by this factor. A picture costs the model tokens by AREA, so half
+ *   the width and height is roughly a quarter of the cost, and a run that
+ *   screenshots after every step spends most of its waiting on exactly that.
+ *   It is the caller's call, not ours: reading a page of body text needs the
+ *   detail, confirming a panel opened does not. Ignored for a `region`
+ *   capture, where shrinking the crop would undo the magnification that is
+ *   the whole point of asking for one.
  */
 async function takeScreenshot(tabId, opts = {}) {
   await ensureAttached(tabId);
@@ -2956,7 +2976,12 @@ async function takeScreenshot(tabId, opts = {}) {
           // the API does not do that resize itself behind our back and shift
           // every coordinate the model reads off the result. See
           // MODEL_IMAGE_MAX_EDGE above.
-          shotScale = captureScaleForViewport(vw, vh);
+          // The cap keeps the image from being resized behind our back on its
+          // way to the model; the caller's factor shrinks it further on
+          // purpose. Both end up in `shotScale`, which is the one number
+          // captureScaleByTab records — so a coordinate read off a half-size
+          // picture maps back to the page with no extra mechanism.
+          shotScale = captureScaleForViewport(vw, vh) * requestedScale(opts.scale);
           clip = { x: scrollX, y: scrollY, width: vw, height: vh, scale: shotScale * inverseDpr };
         }
       }
@@ -4322,7 +4347,8 @@ const toolHandlers = {
 
     switch (action) {
       case "screenshot": {
-        const { base64, imageId, width: shotW, height: shotH, scale: shotScale, blank: shotBlank } = await takeScreenshot(tabId);
+        const { base64, imageId, width: shotW, height: shotH, scale: shotScale, blank: shotBlank } =
+          await takeScreenshot(tabId, { scale: args.scale });
         if (actionExtras) actionExtras.artifactId = imageId;
         // Report the IMAGE's own dimensions, not the CSS viewport's. They are
         // the same whenever the capture was 1:1, but when it was scaled down

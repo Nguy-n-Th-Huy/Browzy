@@ -194,6 +194,14 @@ export const TOOLS = [
         .optional()
         .describe(
           "Optional, for the `screenshot` and `zoom` actions. Set true to write the captured image to disk (under ~/.config/browzy-in-chrome/screenshots/) and return its absolute path in the result so it can be opened or shared. Default false."
+        ),
+      scale: z
+        .number()
+        .min(0.1)
+        .max(1)
+        .optional()
+        .describe(
+          "Optional, for the `screenshot` action. Shrink the returned image by this factor: 1 (default) is full size, 0.5 returns half the width and height and so roughly a quarter of the tokens. An image costs by area, and a run that screenshots after every step spends most of its time waiting on that — so use a smaller scale when you are confirming a state change (a panel opened, a field filled, a page navigated) and full size when you actually need to read fine detail. Coordinates you read off a scaled image are in that image's own pixels and are mapped back to the page for you, exactly as at full size; nothing to convert. Ignored by `zoom`, where shrinking the crop would undo the magnification you asked for."
         )
     }
   },
