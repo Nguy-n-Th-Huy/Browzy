@@ -4210,9 +4210,21 @@ const toolHandlers = {
     // view first: coordinates are viewport-relative, so an element that is off
     // screen has coordinates no dispatch can reach, and the click would land on
     // the document root instead of the thing that was named.
+    //
+    // A ref WINS over a coordinate that arrived with it. The two describe the
+    // same click and only one of them is measured: the ref is resolved against
+    // the live element, the coordinate is read off a picture. They arrive
+    // together often, because the schema calls `coordinate` required for
+    // left_click and `ref` merely an alternative — so a model that located the
+    // control with `find` still fills in a pixel it eyeballed. Preferring that
+    // pixel threw the resolution away silently: no scroll into view, no hit
+    // probe (the branch below assumes the resolve already did one), a clean
+    // `success` outcome, and a log line claiming the ref was "reachable" when
+    // nothing had resolved it. Every miss from a guessed coordinate looked,
+    // from the inside, exactly like a click that worked.
     let refCovering = null;
     let refProxiedFrom = null;
-    if (args.ref && !coordinate) {
+    if (args.ref) {
       const res = await resolveRefToCoordinates(tabId, args.ref);
       if (!res) return { content: [{ type: "text", text: `Could not resolve ref "${args.ref}" to coordinates. The page may have changed — re-run read_page or find for a fresh ref.` }] };
       if (!res.reachable) {
@@ -4229,6 +4241,13 @@ const toolHandlers = {
             }
           ]
         };
+      }
+      if (coordinate && (coordinate[0] !== res.x || coordinate[1] !== res.y)) {
+        dbg(
+          "hit",
+          `${args.ref} resolved to (${res.x},${res.y}); the coordinate sent with it (${coordinate[0]},${coordinate[1]}) was not used`,
+          { tab: tabId }
+        );
       }
       coordinate = [res.x, res.y];
       refCovering = res.covering;
