@@ -5,9 +5,13 @@ This project began as a fork of "Open Claude in Chrome", started by
 Sebastian Sosa on 2026-07-21 and licensed under the PolyForm Noncommercial
 License 1.0.0 (see LICENSE, which continues to apply).
 
-The current source tree is substantially rewritten. Measured by `git blame`
-over the tracked source files (js, mjs, sh, ps1, css, html; excluding
-vendored, generated and build output) on the pre-squash history:
+The current source tree is substantially rewritten.
+
+Authorship, measured at the 2026-09-09 squash
+---------------------------------------------
+
+By `git blame` over the tracked source files (js, mjs, sh, ps1, css, html;
+excluding vendored, generated and build output) on the pre-squash history:
 
     Nguyễn Thế Huy    57,880 lines   71.3%
     Sebastian Sosa    20,965 lines   25.8%
@@ -21,10 +25,38 @@ That squash removed the individual commits, not the authorship of the code
 those commits contributed — roughly a quarter of the tree above is still the
 work of the upstream authors named here, which is why this file exists.
 
-Later work in this repository, including the Browzy rebrand, file
+The split above cannot be recomputed from this repository: the squash left
+one author on every line of the initial commit, and no pre-squash object
+survives here (the root commit is parentless and the reflog begins with it).
+It is recorded as measured, and stands.
+
+Current tree, 2026-09-11
+------------------------
+
+`git blame` over the tracked files matching the same extensions, excluding
+`REAL/` (a vendored benchmark harness), `benchmark/analysis/` (generated
+plots) and `scratch/`:
+
+    from the squashed initial commit    92,909 lines   92.2%
+    written after the squash             7,847 lines    7.8%
+                                       ------------
+                                       100,756 lines
+
+Every line in the second row is by Nguyễn Thế Huy. The first row is what
+survives of the tree the earlier table measured, and the upstream lines are
+all inside it; the exact share cannot be restated, because that table was
+taken over a narrower selection of files than this one. The tree has grown
+by about 8% since the squash, so the upstream share of the whole is now a
+little under the quarter recorded above.
+
+Later work in this repository is by Nguyễn Thế Huy: the Browzy rebrand, file
 attachments, effort control, prompt enhancement, the slash-dispatch and
 session-skills plugin mechanism, provider profile handling and the
-installers, is by Nguyễn Thế Huy.
+installers, and — since the squash — the design-mode element picker,
+consumption of page-declared WebMCP tools, in-app skill composition with the
+settings redesign, approval gating for send-class calls, per-tab restore of
+the last conversation when the side panel reopens, and the tab-group
+anchoring for agent-opened tabs.
 
 Bundled third-party fonts
 -------------------------
