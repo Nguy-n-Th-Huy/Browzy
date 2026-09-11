@@ -3861,7 +3861,30 @@ const toolHandlers = {
     // than a no-op.
     let anchor = null;
     try {
-      const anchorId = typeof lastAgentTabId === "number" ? lastAgentTabId : null;
+      let anchorId = typeof lastAgentTabId === "number" ? lastAgentTabId : null;
+      // On the SDK path the run carries its own reach (`tabScope`), and that
+      // is the better anchor in the two cases `lastAgentTabId` alone gets
+      // wrong:
+      //   - the run has not named a tab yet (its first tool was
+      //     tabs_context_mcp, or tabs_create_mcp itself), so the slot is
+      //     still null even though the run IS bound to the operator's page;
+      //   - the slot is a leftover from an EARLIER run and points at a tab
+      //     this run cannot touch, so following it would open the new tab
+      //     beside unrelated work, in that other group.
+      // Both showed as the same symptom: a task begun on the operator's page
+      // sprouting a second group. Outside a run (legacy path) the slot is
+      // still the only signal there is, and is used unchanged.
+      const meta = typeof currentToolMeta !== "undefined" ? currentToolMeta : null;
+      if (meta && meta.runId) {
+        const scope = meta.tabScope;
+        const scopeIds = Array.isArray(scope) ? scope : [];
+        const withinReach =
+          anchorId !== null &&
+          (scope === "any" ||
+            scopeIds.includes(anchorId) ||
+            (typeof sdkAgentCreatedTabs !== "undefined" && sdkAgentCreatedTabs.has(anchorId)));
+        if (!withinReach) anchorId = scopeIds.length > 0 ? scopeIds[0] : null;
+      }
       if (anchorId !== null) anchor = await chrome.tabs.get(anchorId);
     } catch {
       anchor = null; // anchor closed mid-run
@@ -3923,7 +3946,10 @@ const toolHandlers = {
     if (typeof currentToolMeta !== "undefined" && currentToolMeta && currentToolMeta.runId) {
       sdkAgentCreatedTabs.add(tab.id);
     }
-    const tabs = await chrome.tabs.query({ groupId: tabGroupId });
+    // Read back the group the tab actually landed in, not the standalone one:
+    // once it joins the anchor's group those differ, and listing the other
+    // group's tabs describes a window the agent is not working in.
+    const tabs = await chrome.tabs.query({ groupId: targetGroupId });
     const result = formatTabContext(tabs);
     result.content[0].text = `Created new tab. Tab ID: ${tab.id}\n\n` + result.content[0].text;
     return result;

@@ -39,15 +39,19 @@ console.log("\ntabs_create_mcp groups a new tab with the tab being worked on\n")
 const AGENT_GROUP = 7; // the operator's bound tab's own solo group
 const MCP_GROUP = 99; // the standalone group tabs used to always land in
 
-/** @param {{anchor: object|null, ownGroups: number[]}} opts */
-function harness({ anchor, ownGroups }) {
+/** @param {{anchor: object|null, ownGroups: number[], tabs?: object[], lastAgentTabId?: number|null, meta?: object, sdkAgentCreatedTabs?: number[]}} opts */
+function harness({ anchor, ownGroups, tabs: extraTabs = [], lastAgentTabId, meta, sdkAgentCreatedTabs = [] }) {
+  const known = new Map();
+  if (anchor) known.set(anchor.id, anchor);
+  for (const t of extraTabs) known.set(t.id, t);
   const calls = [];
   let created = 0;
   const chrome = {
     tabs: {
       async get(id) {
-        if (!anchor || anchor.id !== id) throw new Error("no such tab");
-        return anchor;
+        const t = known.get(id);
+        if (!t) throw new Error("no such tab");
+        return t;
       },
       async query() {
         return [{ id: 500, windowId: 900 }]; // the MCP group's own window
@@ -79,7 +83,7 @@ function harness({ anchor, ownGroups }) {
     "lastAgentTabId",
     "isOwnAgentGroupId",
     "currentToolMeta",
-    "agentCreatedTabs",
+    "sdkAgentCreatedTabs",
     "formatTabContext",
     src + "; return H;"
   );
@@ -88,10 +92,10 @@ function harness({ anchor, ownGroups }) {
     MCP_GROUP,
     new Set(),
     ensureTabGroup,
-    anchor ? anchor.id : null,
+    lastAgentTabId === undefined ? (anchor ? anchor.id : null) : lastAgentTabId,
     (gid) => ownGroups.includes(gid),
-    undefined,
-    undefined,
+    meta,
+    new Set(sdkAgentCreatedTabs),
     () => ({ content: [{ type: "text", text: "" }] })
   );
   return { H, calls, ensureCalled: () => ensureCalled };
@@ -161,6 +165,68 @@ await test("a closed anchor does not throw the call away", async () => {
   const mkClosed = () => H.tabs_create_mcp({});
   await mkClosed();
   assert(calls.some((c) => c.api === "create"), "a stale anchor must degrade to an append, never fail the call");
+});
+
+await test("a run bound to the operator's tab anchors there even before it names a tabId", async () => {
+  // The reported case: the run's first tools were tabs_context_mcp and then
+  // tabs_create_mcp, neither of which carries a tabId, so `lastAgentTabId` was
+  // still null and the new tab was provisioned its own group. The run's own
+  // wire scope already names the bound tab; that is the anchor.
+  const bound = { id: 42, index: 3, windowId: 12, groupId: AGENT_GROUP };
+  const { H, calls, ensureCalled } = harness({
+    anchor: bound,
+    ownGroups: [AGENT_GROUP, MCP_GROUP],
+    lastAgentTabId: null,
+    meta: { runId: "r1", tabScope: [42] }
+  });
+  await H.tabs_create_mcp({});
+  assert(!ensureCalled(), "the bound tab's group is usable — nothing new may be provisioned");
+  const grouped = calls.find((c) => c.api === "group");
+  assert(grouped.opts.groupId === AGENT_GROUP, `expected the bound tab's group ${AGENT_GROUP}, got ${grouped.opts.groupId}`);
+  const create = calls.find((c) => c.api === "create");
+  assert(create.opts.windowId === 12, "and in the bound tab's own window");
+  assert(create.opts.index === 4, "beside it");
+});
+
+await test("an anchor left over from an earlier run is ignored in favour of this run's scope", async () => {
+  // `lastAgentTabId` is module-level and outlives a run. Left alone it points
+  // at a tab this run cannot touch, and — because that tab is in a group of
+  // ours too — the new tab would join THAT group: a second group again, just
+  // reached by a different route.
+  const bound = { id: 42, index: 0, windowId: 12, groupId: AGENT_GROUP };
+  const stale = { id: 77, index: 5, windowId: 900, groupId: MCP_GROUP };
+  const { H, calls } = harness({
+    anchor: bound,
+    tabs: [stale],
+    ownGroups: [AGENT_GROUP, MCP_GROUP],
+    lastAgentTabId: 77,
+    meta: { runId: "r2", tabScope: [42] }
+  });
+  await H.tabs_create_mcp({});
+  const grouped = calls.find((c) => c.api === "group");
+  assert(grouped.opts.groupId === AGENT_GROUP, `expected this run's group ${AGENT_GROUP}, got ${grouped.opts.groupId}`);
+  const create = calls.find((c) => c.api === "create");
+  assert(create.opts.openerTabId === 42, "and opened from the tab this run is actually bound to");
+});
+
+await test("a tab this run itself opened stays a valid anchor", async () => {
+  // Not in `tabScope` — the wire scope names only the bound tab — but opened
+  // by this very run, so it is in reach: a third tab belongs beside the
+  // second, not back beside the first.
+  const bound = { id: 42, index: 0, windowId: 12, groupId: AGENT_GROUP };
+  const ownNew = { id: 43, index: 1, windowId: 12, groupId: AGENT_GROUP };
+  const { H, calls } = harness({
+    anchor: bound,
+    tabs: [ownNew],
+    ownGroups: [AGENT_GROUP, MCP_GROUP],
+    lastAgentTabId: 43,
+    meta: { runId: "r3", tabScope: [42] },
+    sdkAgentCreatedTabs: [43]
+  });
+  await H.tabs_create_mcp({});
+  const create = calls.find((c) => c.api === "create");
+  assert(create.opts.openerTabId === 43, `expected the run's own newest tab 43 as the anchor, got ${create.opts.openerTabId}`);
+  assert(create.opts.index === 2, "and the next tab sits beside it");
 });
 
 const failed = results.filter((r) => !r.ok);
