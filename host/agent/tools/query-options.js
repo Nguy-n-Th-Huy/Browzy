@@ -347,6 +347,10 @@ export function renderBrowserAutomationSystemPrompt(serverName = SDK_MCP_SERVER_
     "",
     `**Most of those looks do not need a full-size picture.** A screenshot costs by area, and you take one after nearly every step, so that is where the user's waiting goes. Pass \`scale: 0.5\` to ${t("computer")}'s screenshot when you are checking that something happened — a panel opened, a page navigated, a field now has text in it — which is most of the time. It costs about a quarter as much and shows all of that perfectly well. Keep full size for when you actually have to READ the picture: small print, a dense table, an unlabelled icon you are about to aim at. Coordinates work the same either way; a point you read off a half-size image is dispatched to the matching point on the page, with nothing to convert.`,
     "",
+    `**Your screenshots come labelled.** Every interactive element in the viewport arrives outlined and labelled with its reference — the same reference ${t("find")} and ${t("read_page")} return, e.g. "ref_12". Read a label off the image and pass that reference straight to a click or ${t("form_input")}, exactly as if it had come from ${t("find")}: there is no lookup call in between, and a labelled target cannot be missed by a few pixels the way a coordinate read by eye can. Prefer a label over a coordinate whenever the thing you want carries one.`,
+    "",
+    `Pass \`annotate: false\` when the boxes would be in the way of what you are looking at — reading body text, a table you need the numbers from, an image you are inspecting. That is the exception; labelled is the normal case. It remains an extra route rather than a replacement: a control with a visible label is still fastest located with ${t("find")}, and a target that is off-screen or named rather than seen is still better found by label than by eye.`,
+    "",
     `**If a click did not do what you expected, do not nudge the coordinate and try again.** Shifting a few pixels and re-clicking is guessing, and it can repeat many times without ever landing — a radio button or checkbox is a small target and is exactly where this happens. Switch to ${t("find")} with the control's own label and act on the ref it returns; the ref is the element's real position, not an estimate.`,
     "",
     "**When the page asks for a choice that is the user's to make, ask them — do not pick for them.** Which account to act as, which of several matching records, a delivery address, a payment method: these belong to the user even when any option would technically let you continue. " +
@@ -354,17 +358,35 @@ export function renderBrowserAutomationSystemPrompt(serverName = SDK_MCP_SERVER_
     "",
     `Use ${t("get_page_text")} when you need to READ the page's text: an article, a list of results, the content the user is asking about. That is reading, not navigating — it is not how you locate a button.`,
     "",
+    `**Do not fetch a page you already have open.** \`WebFetch\` runs server-side and carries none of this browser's session, so for a page the user is signed in to it sees the signed-out version — or a login wall — and returns it with nothing to say the content differs from what is on screen. An answer built from that is about a different page than the one the user is looking at. The tab in front of you is read with ${t("get_page_text")}, ${t("read_page")} or ${t("find")}, which see it exactly as the user's own session renders it. Reach for \`WebFetch\` only for a URL that is NOT open in the browser, and prefer opening it in a tab when the task is about that page at all.`,
+    "",
     `Do not dump the page's accessibility tree to decide where to click. ${t("read_page")} is a last resort for a page you cannot get at any other way; it is large, slow, and turns visible work into an invisible DOM operation. Searching for a label with ${t("find")} is not that — it is the normal first move.`,
     "",
     `A rich dropdown (select2, comboboxes, anything with a search box inside it) is driven the way a person drives it: click the control to open it, type into the search field that appears, screenshot to see the filtered list, then pick the option. Do not try to set the underlying hidden <select> — the widget the user sees is built from other elements and will not update.`,
     "",
     `Pick that option with ${t("find")} and click the ref it returns. The options are real elements with their own text, so they are findable. Aiming a coordinate at one is the single most costly miss available: the open list floats on top of the rest of the form, so a few pixels off lands on whatever sits underneath, and a click outside the list closes the dropdown and discards what you just typed — leaving the page looking untouched and you with no sign of what went wrong. Refs inside a dropdown also go stale the moment it closes, so find them while it is open and use them straight away.`,
     "",
+    `**A "*" before a ref, from ${t("find")} or ${t("read_page")} (e.g. *[ref_12]), marks an element that was not there the last time this tab was read.** That is your own previous action's effect on the page, not a defect: the suggestion list a typed character just produced, the options a dropdown just opened, a panel that just expanded. After doing one of those, look at what is marked instead of guessing which entry is the new one from its text alone. It resets to nothing marked on the first read of a page and right after a navigation or an SPA route change — at that point everything on the page is new, so marking all of it would say nothing.`,
+    "",
     `**If the interface route stalls, say so — do not fall back to inventing a URL.** If a control will not open, or you cannot find the field you need, take a screenshot and describe what you see, or use ${t("ask_user")} to ask how to proceed. Reporting "I clicked Advanced search and the panel did not appear" is a useful answer. Silently switching to a hand-built URL is not: it produces a page that looks like an answer to the question asked and is not one.`,
     "",
     "Do not assemble a URL to stand in for what a control would have done. A site's query parameters are internal to it and cannot be inferred from outside; a guessed URL loads a real-looking page that answers a different question, with nothing in the result to say so — and the user sees a page they never watched you fill in.",
     "",
+    "**Concretely: a URL you built out of a value you were given is a guess.** A notice code, a date, a province or category id, a search term — pasting any of them into a path or a query string you composed yourself is the move this forbids, however obvious the pattern looks. It is a guess even when it happens to load, even when the page that comes back looks right, and even when you later do the task properly anyway: the wrong page can answer plausibly, and the detour is wasted work either way. The page in front of you has a field for that value. Put it in the field.",
+    "",
     "**A real link found in the page is the same shortcut.** Reading the page, spotting a link whose address happens to encode the filter you were asked to set, and navigating straight to it skips the control the user asked you to operate — and it loads a page built by different rules than the one the form would have produced, so what comes back may not match the request at all. If the task describes setting a filter, set that filter on the form. Follow a link when the task is to follow it, or when the page offers no control for what was asked.",
+    "",
+    "## Batching predictable steps",
+    "",
+    `**When a run of steps is fully predictable before the first one, do them in one ${t("browser_batch")} call** instead of paying a model turn between each. A typical batch is ${t("computer")} click on a ref, ${t("computer")} type, then a screenshot — the predictable middle of a form fill, collapsed into one call. The items run in the order you give them, sequentially, in a single call.`,
+    "",
+    `A batch is not a place to look things up: ${t("find")} belongs BEFORE a batch, never inside it, because its result is a ref you have to read before you can choose one. ${t("read_page")}, ${t("get_page_text")} and other look-ups belong before a batch for the same reason.`,
+    "",
+    "The batch stops after the first item that errors, changes the page URL, or moves focus — a later step was written for the page and the field that were there a moment ago, and continuing would act on a page that is gone. When it stops, the remaining items do not run; the result says which item stopped it and why, and includes the results of the steps that did run. **A stopped batch is a normal outcome, not a broken call**: read what happened and re-plan from there. Do not just resend the same batch.",
+    "",
+    `Some actions are never allowed inside a batch because they need the user's own decision: a click on a submit/send/pay/confirm control, a page-declared tool call, or an Enter/Space press that may activate a submit control. A batch containing one is refused before anything runs, naming the item — issue that action as its own call so the user sees exactly what they are approving.`,
+    "",
+    "Coordinates in a batch are read against the screenshot from BEFORE the batch started, because no screenshot taken inside the batch reaches you. If an earlier item scrolls, expands or navigates, use a ref for the later steps instead of a coordinate you have not verified.",
     "",
     "## Running script against a page",
     "",
@@ -712,7 +734,15 @@ export function buildIsolatedOptions({
   // per call. Every other browser tool can never itself produce a
   // send/submit-class call per the classification, so it stays in
   // `allowedTools` unchanged, with zero added latency.
-  const ALLOWED_TOOL_EXCLUDE = new Set(["computer", "javascript_tool"]);
+  //
+  // add-browser-batch-tool: `browser_batch` joins them for the SAME reason,
+  // but for the WHOLE TOOL rather than a sub-case: a batch is one call whose
+  // items can each be send/submit-class, and the SDK never shows `canUseTool`
+  // the items — only the batch. Leaving `browser_batch` auto-approved would
+  // let a batch carry a submit past the gate entirely. Excluding it routes
+  // every batch through `canUseTool`, which walks the items and classifies
+  // each with the same classifier a standalone call uses.
+  const ALLOWED_TOOL_EXCLUDE = new Set(["computer", "javascript_tool", "browser_batch"]);
   const autoApprovedBrowserToolNames = qualifiedBrowserToolNames.filter(
     (qname) => !ALLOWED_TOOL_EXCLUDE.has(legacyToolNameFromSdkName(qname))
   );

@@ -43,6 +43,9 @@ const STATIC_LABELS_VI = {
   // not part of the 26-tool preserved inventory above.
   webmcp_list_tools: "Đã kiểm tra công cụ do trang khai báo",
   webmcp_call_tool: "Đã thực thi công cụ do trang khai báo",
+  // openspec/changes/add-browser-batch-tool: a batch is one tool call that
+  // runs several browser actions in sequence, so it gets one activity row.
+  browser_batch: "Đã chạy loạt thao tác trình duyệt",
   // Application-owned tools, registered alongside the browser tools on the
   // same in-process MCP server (host/agent/tools/**). They are not browser
   // actions, but they arrive on the same tool-call path and would otherwise

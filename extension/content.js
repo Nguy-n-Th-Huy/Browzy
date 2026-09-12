@@ -51,6 +51,18 @@
   const elementMap = {}; // refId -> WeakRef<Element>
   const reverseMap = new WeakMap(); // Element -> refId
 
+  // High-water mark on refCounter, recorded once a read_page/find call
+  // finishes reading this document. "First seen since the previous read" is
+  // then just "this element's ref number is above where the counter stood
+  // when that read ended" — no second copy of the tree needs to be kept and
+  // diffed against the live DOM to answer that question.
+  //
+  // null means "no read has completed yet for this document" (see
+  // bumpDocumentEpoch below, which resets it on navigation/SPA route
+  // change), and is what makes the first read of a document mark nothing:
+  // there is no previous read for anything to be new relative to.
+  let readWatermark = null;
+
   // --- Document/SPA identity tracking ---
   //
   // A full page reload/navigation resets this content script for free (the
@@ -90,6 +102,22 @@
   function bumpDocumentEpoch() {
     documentEpoch++;
     for (const k of Object.keys(elementMap)) delete elementMap[k];
+    // Every element on the new document is new by definition, so marking all
+    // of them would carry no information — clear the watermark rather than
+    // leaving it pointing at a ref count that belonged to a document that no
+    // longer exists. This is the one and only place that decides "this is a
+    // different document" (both for a real navigation and for an SPA route
+    // change), so resetting the watermark here — instead of a second,
+    // independent URL comparison inside generateAccessibilityTree/
+    // findElements — keeps that decision owned in one place.
+    readWatermark = null;
+    // The labels on screen name refs that were just deleted above, so leaving
+    // them up would point the operator — and the assistant reading its own
+    // screenshot — at identifiers nothing resolves any more, positioned for a
+    // layout that is gone. They outlive a capture, not a document.
+    try {
+      clearAnnotation();
+    } catch {}
   }
 
   /** Wrap history.pushState/replaceState and listen for popstate/hashchange
@@ -140,6 +168,15 @@
       return null;
     }
     return el;
+  }
+
+  /** Parse the numeric suffix off a "ref_N" id, for comparing against
+   * readWatermark. Returns -1 for anything not in that shape (should never
+   * happen — every ref this script hands out is minted by getOrAssignRef
+   * above) so a malformed id can never be mistaken for "new". */
+  function refNumber(refId) {
+    const m = /^ref_(\d+)$/.exec(refId);
+    return m ? Number(m[1]) : -1;
   }
 
   // --- ARIA role mapping ---
@@ -276,12 +313,238 @@
     return true;
   }
 
+  // --- Screenshot annotation layer ---
+  //
+  // Draws an outline plus a label over every interactive element in the
+  // viewport, so a screenshot the assistant is already looking at carries the
+  // same `ref_N` identifiers find/read_page return. The label IS the existing
+  // reference — no second identity is invented — so a ref read off the picture
+  // resolves, scrolls into view and hit-tests through exactly the same
+  // resolveRefToCoordinates path a ref from a page read does.
+  //
+  // Everything drawn lives in ONE container with a fixed id, pinned at the
+  // maximum z-index and `pointer-events: none`. That container is excluded
+  // from every walk this script performs (generateAccessibilityTree,
+  // findElements, and the annotation walk itself) so its nodes can never be
+  // mistaken for page content, be annotated in turn, or be handed a ref of
+  // their own. Outlines and labels are SEPARATE positioned overlay nodes drawn
+  // over the element's rect; the page's own elements are never mutated, so
+  // removing the container restores the page exactly as it was.
+  const ANNOTATION_CONTAINER_ID = "browzy-annotation-layer";
+  // A capture scaled down by `scale` shrinks the label with everything else.
+  // Rendering the label at `floor / scale` on the page means it comes back at
+  // no less than `floor` image pixels, so the number stays readable. Capped so
+  // a 0.1x capture cannot ask for an absurdly large label.
+  const ANNOTATION_LABEL_FLOOR_PX = 12;
+  const ANNOTATION_LABEL_MAX_PX = 120;
+  // The live container, so a teardown can remove it even if a lookup by id is
+  // unavailable; getElementById remains the fallback for a re-injected script
+  // whose closure lost the reference but whose container is still in the DOM.
+  let annotationContainer = null;
+
+  /** The on-page font size for an annotation label, given the capture's
+   * effective scale, so the label survives downscaling at the legibility
+   * floor. Pure, so it is directly assertable. */
+  function annotationLabelFontPx(scale) {
+    const s = Number(scale);
+    const effective = Number.isFinite(s) && s > 0 && s < 1 ? s : 1;
+    return Math.min(
+      ANNOTATION_LABEL_MAX_PX,
+      Math.max(ANNOTATION_LABEL_FLOOR_PX, Math.ceil(ANNOTATION_LABEL_FLOOR_PX / effective))
+    );
+  }
+
+  /** True for the annotation container and anything inside it. Walks
+   * parentNode rather than relying on closest(), so the tree walk, the find
+   * path and the annotation walk all agree on what counts as annotation. */
+  function isAnnotationNode(el) {
+    if (!el) return false;
+    if (el.id === ANNOTATION_CONTAINER_ID) return true;
+    for (let n = el.parentNode || el.parentElement; n; n = n.parentNode || n.parentElement) {
+      if (n.id === ANNOTATION_CONTAINER_ID) return true;
+    }
+    return false;
+  }
+
+  /** Remove the annotation container. Safe to call when nothing was drawn. */
+  function clearAnnotation() {
+    const container =
+      (annotationContainer && annotationContainer.parentNode && annotationContainer) ||
+      (typeof document.getElementById === "function" && document.getElementById(ANNOTATION_CONTAINER_ID)) ||
+      null;
+    const removed = !!(container && container.parentNode);
+    if (removed) container.parentNode.removeChild(container);
+    annotationContainer = null;
+    return { cleared: removed };
+  }
+
+  /** Draw the annotation layer. `options.scale` is the capture's effective
+   * scale, folded into label sizing. Returns a small report, never throws for
+   * a page-level reason (the caller wraps it so a failure can never fail a
+   * capture). */
+  function drawAnnotation(options = {}) {
+    // Built detached and swapped in at the end — see the swap below. Clearing
+    // first, as this used to, left the page with no layer at all while the
+    // walk ran, and appending the container before the walk made the boxes
+    // pop in one at a time on top of that. Every capture therefore flashed:
+    // gone, then redrawn piece by piece. Now the page holds the previous
+    // layer until the replacement is complete, so a redraw is invisible.
+    const fontPx = annotationLabelFontPx(options.scale);
+    const vw = window.innerWidth || 0;
+    const vh = window.innerHeight || 0;
+
+    const container = document.createElement("div");
+    container.id = ANNOTATION_CONTAINER_ID;
+    container.setAttribute("data-browzy-annotation", "1");
+    Object.assign(container.style, {
+      position: "fixed",
+      left: "0",
+      top: "0",
+      width: "0",
+      height: "0",
+      margin: "0",
+      padding: "0",
+      border: "0",
+      background: "transparent",
+      zIndex: "2147483647",
+      pointerEvents: "none"
+    });
+
+    let drawn = 0;
+
+    function drawOne(el, rect) {
+      // The SAME ref the element already has (or would be given by a page
+      // read): labels are existing references, never a second identity.
+      const ref = getOrAssignRef(el);
+
+      const outline = document.createElement("div");
+      outline.className = "browzy-annotation-outline";
+      Object.assign(outline.style, {
+        position: "absolute",
+        left: `${Math.round(rect.left)}px`,
+        top: `${Math.round(rect.top)}px`,
+        width: `${Math.round(rect.width)}px`,
+        height: `${Math.round(rect.height)}px`,
+        boxSizing: "border-box",
+        border: "2px solid #e11d48",
+        borderRadius: "2px",
+        background: "transparent",
+        pointerEvents: "none"
+      });
+      container.appendChild(outline);
+
+      const label = document.createElement("div");
+      label.className = "browzy-annotation-label";
+      label.textContent = ref;
+      // Keep the label attached to its element and readable: sit it at the
+      // element's top-left (above it when there is room), never off-viewport.
+      // A target smaller than its own label still gets a readable label at the
+      // same corner, so the number is identifiably its own.
+      // INSIDE its own box, top-right — never floating above it.
+      //
+      // Placing the label above the element put it visually on top of whatever
+      // sat higher up the page: the number for a text input landed on the
+      // field's caption, and the number for a nav item landed on the logo
+      // above it. A reader — and a model reading the picture — attaches a
+      // label to the thing it overlaps, so it picked the ref of the element
+      // ABOVE the one it meant, and the click went there. The label has to be
+      // visibly part of the box it names, which means inside it.
+      //
+      // Outside is the fallback only for a target smaller than its own label,
+      // where inside would cover the control entirely.
+      const approxWidth = Math.ceil(ref.length * fontPx * 0.62) + 10;
+      const approxHeight = fontPx + 4;
+      const fitsInside = rect.width >= approxWidth + 4 && rect.height >= approxHeight + 4;
+      let labelLeft;
+      let labelTop;
+      if (fitsInside) {
+        labelLeft = Math.round(rect.right) - approxWidth - 2;
+        labelTop = Math.round(rect.top) + 2;
+      } else {
+        // Too small to hold the label: sit it just above, and accept the
+        // ambiguity for a target this size rather than hide the control.
+        labelLeft = Math.round(rect.left);
+        labelTop = Math.round(rect.top) - approxHeight - 2;
+        if (labelTop < 0) labelTop = Math.round(rect.bottom) + 2;
+      }
+      if (labelLeft + approxWidth > vw) labelLeft = vw - approxWidth;
+      if (labelLeft < 0) labelLeft = 0;
+      if (labelTop < 0) labelTop = 0;
+      Object.assign(label.style, {
+        position: "absolute",
+        left: `${labelLeft}px`,
+        top: `${labelTop}px`,
+        fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+        fontSize: `${fontPx}px`,
+        lineHeight: "1",
+        color: "#ffffff",
+        background: "#e11d48",
+        padding: "2px 5px",
+        borderRadius: "3px",
+        whiteSpace: "nowrap",
+        pointerEvents: "none"
+      });
+      container.appendChild(label);
+      drawn++;
+    }
+
+    function visit(el) {
+      if (!el || el.nodeType !== 1) return;
+      // Never walk into the container's own nodes — that is how a second
+      // capture would draw boxes around the boxes.
+      if (isAnnotationNode(el)) return;
+      const tag = el.tagName.toLowerCase();
+      if (["script", "style", "noscript", "template"].includes(tag)) return;
+
+      if (isInteractive(el) && isVisible(el)) {
+        const rect = el.getBoundingClientRect();
+        if (
+          rect.width >= 1 &&
+          rect.height >= 1 &&
+          rect.right > 0 &&
+          rect.bottom > 0 &&
+          rect.left < vw &&
+          rect.top < vh
+        ) {
+          drawOne(el, rect);
+        }
+      }
+
+      // Same shadow-DOM traversal generateAccessibilityTree uses, so a
+      // control inside a shadow root is annotated too.
+      if (el.shadowRoot) {
+        for (const child of el.shadowRoot.children) visit(child);
+      }
+      for (const child of el.children) visit(child);
+    }
+
+    // Walk the page while the NEW container is still detached: nothing the
+    // walk can reach belongs to it, so it cannot annotate itself, and the
+    // previous layer — still in the document and still excluded by id — keeps
+    // the page looking unchanged meanwhile.
+    const root = document.documentElement || document.body;
+    if (root) visit(root);
+
+    // The swap, in one synchronous step so the browser paints the old layer or
+    // the new one and never the gap between them.
+    clearAnnotation();
+    if (root) root.appendChild(container);
+    annotationContainer = container;
+
+    return { drawn, containerId: ANNOTATION_CONTAINER_ID, labelFontPx: fontPx };
+  }
+
   // --- Accessibility tree generation ---
   function generateAccessibilityTree(options = {}) {
     const filter = options.filter || "all";
     const maxDepth = options.depth || 15;
     const maxChars = options.max_chars || 50000;
     const startRefId = options.ref_id || null;
+    // Snapshot once, before any ref in this call is assigned — getOrAssignRef
+    // below can advance refCounter mid-walk, and comparing against a moving
+    // target would make an element marked "new" only because an earlier
+    // sibling in the same walk happened to be serialized first.
+    const watermarkAtStart = readWatermark;
 
     let output = "";
     let charCount = 0;
@@ -304,6 +567,10 @@
       if (truncated) return;
       if (depth > maxDepth) return;
       if (!el || el.nodeType !== 1) return;
+      // The screenshot-annotation container and everything in it is not page
+      // content: a read_page taken straight after an annotated capture must
+      // contain no trace of the labels.
+      if (isAnnotationNode(el)) return;
 
       const tag = el.tagName.toLowerCase();
       // Skip invisible, script, style, svg internals
@@ -328,7 +595,18 @@
 
         if (role) line += `${role}`;
         if (name) line += ` "${name.substring(0, 100)}"`;
-        line += ` [${ref}]`;
+        // A "*" directly before the bracket says this element's ref did not
+        // exist as of the previous read of this document — refs are handed
+        // out from one monotonic counter, so "new since last read" is
+        // exactly "this ref's number is above the watermark recorded when
+        // that read finished" (see readWatermark's definition above). The
+        // ref string itself is untouched either way: still plain `ref_N`,
+        // because the marker is state ABOUT the element for this rendering,
+        // not part of the element's identity — it gets passed back into
+        // computer/form_input verbatim and must resolve the same regardless
+        // of whether it was marked.
+        const isNew = watermarkAtStart !== null && refNumber(ref) > watermarkAtStart;
+        line += isNew ? ` *[${ref}]` : ` [${ref}]`;
 
         // Extra info for specific elements
         if (tag === "a" && el.href) line += ` href="${el.href}"`;
@@ -371,6 +649,13 @@
     }
 
     walk(root, 0, "");
+    // Recorded after the walk, not before: getOrAssignRef above assigns refs
+    // LAZILY, only to elements actually serialized during this call. An
+    // element that existed but had never been walked gets its first ref
+    // right here, and if the watermark were set before the walk that element
+    // would look new — recording it after is what keeps "new" meaning the
+    // same thing between one read and the next.
+    readWatermark = refCounter;
     return output;
   }
 
@@ -398,7 +683,7 @@
       // belt-and-suspenders for the fallback case where it does not
       // (createOverlayHost()'s own `doc.documentElement || doc.body`) and
       // for any future light-DOM sibling it grows.
-      c.querySelectorAll("script, style, noscript, template, svg, [data-browzy-overlay]").forEach((e) => e.remove());
+      c.querySelectorAll("script, style, noscript, template, svg, [data-browzy-overlay], [data-browzy-annotation]").forEach((e) => e.remove());
       return c.textContent.replace(/\s+/g, " ").trim();
     }
 
@@ -625,12 +910,21 @@
 
   function findElements(query) {
     const tokens = findQueryTokens(query);
+    // Same snapshot-before-assigning-any-ref reasoning as
+    // generateAccessibilityTree's watermarkAtStart above — find and read_page
+    // deliberately share this one per-document watermark (readWatermark)
+    // rather than each keeping its own, so "new" means the same thing no
+    // matter which tool the caller used last.
+    const watermarkAtStart = readWatermark;
     const scored = [];
 
     // Collect all elements including those inside shadow roots
     function collectAll(root) {
       const elements = [];
       for (const el of root.querySelectorAll("*")) {
+        // Annotation nodes are the assistant's own drawing, not page content;
+        // find() must never report a label as a matchable element.
+        if (isAnnotationNode(el)) continue;
         elements.push(el);
         if (el.shadowRoot) {
           elements.push(...collectAll(el.shadowRoot));
@@ -744,8 +1038,9 @@
       const rect = m.el.getBoundingClientRect();
       const cx = Math.round(rect.x + rect.width / 2);
       const cy = Math.round(rect.y + rect.height / 2);
+      const ref = getOrAssignRef(m.el);
       return {
-        ref: getOrAssignRef(m.el),
+        ref,
         role: m.role,
         name: m.name,
         coordinates: [cx, cy],
@@ -757,8 +1052,17 @@
         // discovering the miss afterwards.
         offViewport:
           cx < 0 || cy < 0 || cx >= window.innerWidth || cy >= window.innerHeight,
+        // Same "first seen since the previous read of this document" signal
+        // generateAccessibilityTree renders as a "*" prefix on the line —
+        // see watermarkAtStart above.
+        isNew: watermarkAtStart !== null && refNumber(ref) > watermarkAtStart,
       };
     });
+    // Recorded after every ref above has been assigned, not before: refs are
+    // handed out lazily, only to elements actually returned in `results`, so
+    // recording the watermark earlier would make this very call's own
+    // results look new again on the very next read.
+    readWatermark = refCounter;
     return { results, total };
   }
 
@@ -1233,8 +1537,69 @@
       return true;
     }
 
+    // Describe a ref as the send/submit classifier's target hint.
+    //
+    // The approval gate runs in the host, which cannot see the page: a `ref` in
+    // a tool call is a NAME, not evidence about what will be clicked. Without
+    // this, every ref-only click classified as "unresolved target" and demanded
+    // the user's approval — while a bare guessed coordinate, which is strictly
+    // LESS evidence, was auto-allowed as an ordinary navigation click. The safe
+    // route was the gated one and the guessing route was the free one, so the
+    // model learned to guess.
+    //
+    // Read-only and side-effect free: no scrolling, no hit-test, no mutation.
+    // Deliberately NOT `getRefCoordinates` — that scrolls, and the gate must not
+    // move the page while merely deciding whether to ask the user.
+    if (msg.type === "describeRef") {
+      const el = resolveRef(msg.ref);
+      if (!el) {
+        sendResponse({ result: null });
+        return true;
+      }
+      const attributes = {};
+      for (const a of ["type", "value", "name", "id", "role", "aria-label"]) {
+        const v = el.getAttribute && el.getAttribute(a);
+        if (v) attributes[a] = v.length > 60 ? v.slice(0, 60) : v;
+      }
+      sendResponse({
+        result: {
+          tagName: el.tagName ? el.tagName.toLowerCase() : null,
+          role: getRole(el),
+          accessibleName: getAccessibleName(el),
+          attributes
+        }
+      });
+      return true;
+    }
+
     if (msg.type === "getRefCoordinates") {
       const result = getRefCoordinates(msg.ref, { scrollIntoView: msg.scrollIntoView });
+      sendResponse({ result });
+      return true;
+    }
+
+    // Screenshot annotation, driven from takeScreenshot()'s capture lease. The
+    // draw is wrapped so no page-level failure can ever fail the capture the
+    // caller actually asked for; takeScreenshot() teardown is unconditional.
+    if (msg.type === "annotateElements") {
+      let result;
+      try {
+        result = drawAnnotation({ scale: msg.scale });
+      } catch (e) {
+        try { clearAnnotation(); } catch {}
+        result = { drawn: 0, error: String((e && e.message) || e) };
+      }
+      sendResponse({ result });
+      return true;
+    }
+
+    if (msg.type === "clearAnnotation") {
+      let result;
+      try {
+        result = clearAnnotation();
+      } catch (e) {
+        result = { cleared: false, error: String((e && e.message) || e) };
+      }
       sendResponse({ result });
       return true;
     }
@@ -1288,5 +1653,7 @@
     getRefCoordinates,
     resolveRef,
     elementMap,
+    annotateElements: drawAnnotation,
+    clearAnnotation,
   };
 })();

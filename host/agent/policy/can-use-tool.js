@@ -56,6 +56,8 @@
 
 import {
   classifySendClassCall,
+  classifyBrowserBatch,
+  legacyNameFor,
   normalizeApprovalArgs,
   fingerprintNormalizedArgs,
   resolveTargetEvidence,
@@ -90,10 +92,12 @@ function mintExecNonce() {
  * @param {object} [deps.now] - injectable Date.now for tests
  * @param {Function} [deps.resolveHint] - 3.2 target-resolution stage:
  *   `async (toolName, args, evidence) => targetHint | null`. Awaits the
- *   browser bridge's element registry (ref -> live metadata) where one is
- *   wired; null/omitted (including all of today's host tests and the
- *   current companion wiring) leaves refs unresolved and classification
- *   takes the conservative approve-unknown path instead of guessing.
+ *   browser bridge's element registry (ref -> live metadata). The companion
+ *   wires this to the `describe_ref` handler; omitting it (host tests) leaves
+ *   refs unresolved and classification takes the conservative approve-unknown
+ *   path instead of guessing. Leaving it unwired in PRODUCTION is what made
+ *   every ref click demand approval while a guessed coordinate — strictly
+ *   less evidence — was auto-allowed, so the resolver is not optional there.
  * @param {object} [deps.approvalContext] - 3.3 run-level evidence bound into
  *   every approval this callback issues: `{ domain, docIdentity,
  *   credentialRevision }`. Each PRESENT field is enforced on consume; absent
@@ -131,7 +135,23 @@ export function createCanUseTool({ run, approvals, requestIdTracker, now = Date.
     return null;
   }
 
-  return async function canUseTool(toolContext) {
+  return async function canUseTool(...sdkArgs) {
+    // The SDK calls this with POSITIONAL arguments — `(toolName, input,
+    // context)` — not the single context object this function was written
+    // against. Reading `.toolName`/`.input` off the first argument therefore
+    // produced `undefined` and `{}` for every call: the classifier saw an
+    // empty tool name (its "not a gated tool" branch, verdict `allow`) and
+    // fingerprinted an empty args object, so ONE fingerprint stood for every
+    // call in the run. The dispatch check, which sees the real name and args,
+    // then computed a fingerprint that could never match the one recorded
+    // here, and refused every ref click as "stale or bypassed gate" — while
+    // the gate itself had waved the call through without ever knowing what it
+    // was. Both shapes are accepted here so neither SDK convention can
+    // silently reintroduce that.
+    const toolContext =
+      typeof sdkArgs[0] === "string"
+        ? { toolName: sdkArgs[0], input: sdkArgs[1] ?? {}, ...(sdkArgs[2] && typeof sdkArgs[2] === "object" ? sdkArgs[2] : {}) }
+        : sdkArgs[0] || {};
     // Per sdk.d.ts:209-262, the second parameter carries `toolName`, `input`,
     // and a `requestId`/`toolUseID`. The exact field name carrying the
     // SDK-side request id is `tool_use_id` or `requestId` depending on the
@@ -176,6 +196,44 @@ export function createCanUseTool({ run, approvals, requestIdTracker, now = Date.
       if (!verdict.allowed) {
         return { behavior: "deny", message: verdict.reason };
       }
+      return { behavior: "allow" };
+    }
+
+    // === browser_batch: the gate must see INSIDE the batch (add-browser-batch-tool) ===
+    // A batch is one SDK call. Left to the generic path below it would be
+    // classified as a whole — and because `browser_batch` is not a send-class
+    // tool name, that whole would be `allow`, silently auto-approving every
+    // item inside it, including the `computer`/`javascript_tool` actions this
+    // gate exists to catch. So each item's own target hint is resolved (the
+    // SAME bridge stage a standalone call uses) and each item is classified
+    // with the SAME classifier. Any item that is not a plain `allow` — or a
+    // nested batch — rejects the WHOLE batch before anything runs.
+    //
+    // A batch never raises a panel approval card. An action that needs the
+    // user's decision was always going to cost its own round trip (the user
+    // has to see a card and answer it), so hoisting it out of the batch costs
+    // nothing batching was going to save; and a card bound to evidence from
+    // BEFORE items 1..n ran would be a decision made on a stale description.
+    if (toolName === "browser_batch") {
+      const actions = Array.isArray(args?.actions) ? args.actions : [];
+      const itemHints = [];
+      for (const item of actions) {
+        const itemLegacyName = legacyNameFor(item?.name);
+        const itemInput = item?.input && typeof item.input === "object" ? item.input : {};
+        itemHints.push(await resolveHintFor(itemLegacyName, itemInput));
+      }
+      const batch = classifyBrowserBatch(actions, itemHints);
+      if (!batch.ok) {
+        return { behavior: "deny", message: `Không thể thực thi batch: ${batch.reason}` };
+      }
+      // A clean batch. Record the gate's allow decision (single-use, keyed by
+      // the batch's item-sensitive fingerprint) so the handler-side
+      // pre-dispatch check honours this gate's per-item evidence — it has no
+      // page access and would otherwise re-classify hintless and could reach
+      // the opposite verdict for an item the gate resolved with a hint. This
+      // is an "allow" verdict, never an approval grant: no send-class action
+      // is authorized by it, because a batch containing one never gets here.
+      run.recordGateVerdict?.(fingerprintNormalizedArgs(normalizeApprovalArgs("browser_batch", args)), "allow");
       return { behavior: "allow" };
     }
 

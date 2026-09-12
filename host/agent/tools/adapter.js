@@ -30,6 +30,7 @@ import {
   isBorrowedTabMutationAuthorized,
   isSendClassCall,
   classifySendClassCall,
+  classifyBrowserBatch,
   normalizeApprovalArgs,
   fingerprintNormalizedArgs
 } from "./mapping.js";
@@ -140,12 +141,20 @@ function staleApprovalErrorResult(reason) {
  */
 export function verifyPreDispatchApproval({ run, legacyToolName, args }) {
   const fingerprint = fingerprintNormalizedArgs(normalizeApprovalArgs(legacyToolName, args));
-
   // The gate's own verdict binds when it recorded one. This used to say gate
   // and dispatch were "hintless and identical by construction" — they are
   // not. can-use-tool.js's resolveHintFor() dereferences a `ref` against the
   // live page and classifies WITH that hint; nothing here can (no page
-  // access at dispatch time), so this side is genuinely hintless. When the
+  // access at dispatch time), so this side is genuinely hintless.
+  //
+  // That was aspirational for a while: `resolveHint` was an optional
+  // constructor argument that production never passed, so the gate WAS
+  // hintless too, never reached its own `allow` branch for a ref click, and
+  // never recorded a verdict — and this check then refused every ref-only
+  // click as "stale or bypassed gate" while waving through the bare
+  // coordinate that carries less evidence. The resolver is wired now
+  // (companion.js), which is what makes the sentence above true and this
+  // handshake reachable. When the
   // hint is what downgrades a call to non-send, the gate allows without
   // minting a grant and this check, re-deciding on less evidence, would
   // refuse a call nothing can ever mint a grant for — an unrecoverable
@@ -198,95 +207,160 @@ export function verifyPreDispatchApproval({ run, legacyToolName, args }) {
 // ownership, asserts byte-identical registration against TOOLS).
 const SDK_DESCRIPTIONS = new Map(sdkFacingToolDefs().map((t) => [t.legacyName, t.description]));
 
+/**
+ * The unconditional host-side checks every SINGLE dispatch must pass, for one
+ * call. Extracted so a standalone call and each item of a browser_batch run
+ * the exact same checks: batching cannot give an item a capability (or less
+ * scrutiny) than its standalone form. Records rejections on the run exactly
+ * as the pre-extraction code did.
+ *
+ * @param {object} opts
+ * @param {string} opts.legacyToolName
+ * @param {object} opts.args
+ * @param {boolean} opts.sendClassTool - true for the tools that can produce a
+ *   send/submit-class call (`computer`, `javascript_tool`, `webmcp_call_tool`).
+ *   For those, the single-use pre-dispatch approval check runs (3.4),
+ *   including the borrowed-tab lift a consumed grant authorizes. Batch items
+ *   pass false: the batch's own pre-flight already adjudicated send-class
+ *   before any item check runs, and a batch never carries a per-item grant.
+ * @returns {{ ok: true } | { ok: false, result: object }}
+ */
+function runHostSideChecks({ run, legacyToolName, args, sendClassTool }) {
+  try {
+    authorizeToolCall({
+      toolName: legacyToolName,
+      args,
+      runState: run.state,
+      leaseHeldByThisRun: run.leaseHeldByThisRun(),
+      tabScope: run.tabScope,
+      uploadAllowlist: run.uploadAllowlist,
+      knownToolNames: KNOWN_TOOL_NAMES
+    });
+    // Second, additive gate (design.md 5b): even a call authorizeToolCall
+    // above already approved (in-scope, run active, lease held) can still be a
+    // mutation against a borrowed tab, which needs its own explicit
+    // authorization — see mapping.js.
+    //
+    // Task 9.3 (design 9d): automatically authorize the borrowed tab for
+    // interaction once it is legitimately in scope — for the automatic action
+    // set ONLY: `computer`'s non-submit-classified actions and `form_input`.
+    // `javascript_tool` is deliberately EXCLUDED (design 9d): the shared
+    // per-tab flag has no notion of which tool asked, so granting it for
+    // typing would silently also authorize a later navigating script.
+    if (_isAutoAuthorizeEligible(legacyToolName, args)) {
+      for (const tabId of _tabIdsForArgs(legacyToolName, args)) {
+        if (isBorrowedTab(run, tabId) && !isBorrowedTabMutationAuthorized(run, tabId)) {
+          authorizeBorrowedTabMutation(run, tabId);
+        }
+      }
+    }
+    // 3.3/3.4: a genuinely approved send-class call carries the user's
+    // explicit Allow for THIS exact call (proven by the grant consumed below)
+    // — that Allow IS the explicit task authorization the borrowed-tab
+    // read-only default waits for, so it lifts the default for this dispatch.
+    // `javascript_tool` is deliberately EXCLUDED: its borrowed-tab scripting
+    // restriction stays rejected regardless of any approval text.
+    if (sendClassTool) {
+      const preDispatch = verifyPreDispatchApproval({ run, legacyToolName, args });
+      if (!preDispatch.ok) {
+        run.recordRejectedDispatch?.(legacyToolName, args, { reason: "stale_approval", detail: { dispatchReason: preDispatch.reason } });
+        return { ok: false, result: staleApprovalErrorResult(preDispatch.reason) };
+      }
+      if (preDispatch.granted && (legacyToolName === "computer" || legacyToolName === "webmcp_call_tool")) {
+        for (const tabId of _tabIdsForArgs(legacyToolName, args)) {
+          if (isBorrowedTab(run, tabId) && !isBorrowedTabMutationAuthorized(run, tabId)) {
+            authorizeBorrowedTabMutation(run, tabId);
+          }
+        }
+      }
+    }
+    enforceBorrowedTabScope({ run, legacyToolName, args });
+    return { ok: true };
+  } catch (err) {
+    if (err instanceof AuthorizationError) {
+      run.recordRejectedDispatch?.(legacyToolName, args, err);
+      return { ok: false, result: authorizationErrorResult(err) };
+    }
+    if (err instanceof BorrowedTabMutationError) {
+      run.recordRejectedDispatch?.(legacyToolName, args, { reason: "borrowed_tab_mutation", detail: { tabId: err.tabId } });
+      return { ok: false, result: borrowedTabMutationErrorResult(err) };
+    }
+    throw err;
+  }
+}
+
+function firstTextOf(result) {
+  if (!result || !Array.isArray(result.content)) return "";
+  const block = result.content.find((b) => b && b.type === "text");
+  return block ? String(block.text || "") : "";
+}
+
+/**
+ * Host-side checks for a browser_batch, run BEFORE the batch reaches the
+ * extension. Order matters:
+ *   1. structure + nesting are always validated;
+ *   2. send-class is adjudicated — a clean-batch gate verdict for THIS exact,
+ *      item-sensitive fingerprint means the gate already classified every
+ *      item with resolved target hints the handler cannot obtain, so that
+ *      verdict binds; with no verdict (a handler invoked without passing the
+ *      gate) the items are classified hintless with the SAME classifier, so a
+ *      batch can never smuggle in an item that needs the user's decision;
+ *   3. every item then runs the same per-call host checks as its standalone
+ *      form.
+ * Any failure refuses the WHOLE batch before anything runs.
+ */
+function checkBrowserBatchHostSide({ run, args }) {
+  const actions = Array.isArray(args?.actions) ? args.actions : [];
+  const fingerprint = fingerprintNormalizedArgs(normalizeApprovalArgs("browser_batch", args));
+
+  let gateAllowed = false;
+  if (typeof run.consumeGateVerdict === "function") {
+    const verdict = run.consumeGateVerdict(fingerprint);
+    gateAllowed = verdict.ok && verdict.verdict === "allow";
+  }
+
+  const classification = classifyBrowserBatch(actions, [], { classify: !gateAllowed });
+  if (!classification.ok) {
+    return { ok: false, result: { content: [{ type: "text", text: `Error: ${classification.reason}` }], isError: true } };
+  }
+
+  for (const item of classification.items) {
+    const check = runHostSideChecks({ run, legacyToolName: item.legacyName, args: item.input, sendClassTool: false });
+    if (!check.ok) {
+      return {
+        ok: false,
+        result: {
+          content: [
+            {
+              type: "text",
+              text:
+                `Error: browser_batch item ${item.index + 1} (${item.legacyName}) was refused exactly as it would be standing alone, ` +
+                `so the whole batch was refused before anything ran. ${firstTextOf(check.result)}`
+            }
+          ],
+          isError: true
+        }
+      };
+    }
+  }
+  return { ok: true };
+}
+
 export function buildSdkTools({ toolBridge, coerceArgs, run }) {
   return TOOLS.map((t) =>
     tool(t.name, SDK_DESCRIPTIONS.get(t.name) ?? t.description, t.paramShape, async (args) => {
       const coerced = coerceArgs({ ...(args ?? {}) });
-      try {
-        authorizeToolCall({
-          toolName: t.name,
+      if (t.name === "browser_batch") {
+        const batchCheck = checkBrowserBatchHostSide({ run, args: coerced });
+        if (!batchCheck.ok) return batchCheck.result;
+      } else {
+        const check = runHostSideChecks({
+          run,
+          legacyToolName: t.name,
           args: coerced,
-          runState: run.state,
-          leaseHeldByThisRun: run.leaseHeldByThisRun(),
-          tabScope: run.tabScope,
-          uploadAllowlist: run.uploadAllowlist,
-          knownToolNames: KNOWN_TOOL_NAMES
+          sendClassTool: t.name === "computer" || t.name === "javascript_tool" || t.name === "webmcp_call_tool"
         });
-        // Second, additive gate (design.md 5b): even a call
-        // authorizeToolCall above already approved (in-scope, run active,
-        // lease held) can still be a mutation against a borrowed tab, which
-        // needs its own explicit authorization — see mapping.js.
-        //
-        // Task 9.3 (design 9d): automatically authorize the borrowed tab
-        // for interaction once it is legitimately in scope — for the
-        // automatic action set ONLY: `computer`'s non-submit-classified
-        // actions and `form_input`. This mirrors how "Live current-page
-        // reading" already authorizes reading a borrowed tab without a
-        // confirmation. `javascript_tool` is deliberately EXCLUDED (design
-        // 9d): the shared per-tab flag has no notion of which tool asked,
-        // so granting it for typing would silently also authorize a later
-        // navigating script. A `javascript_tool` call against a borrowed
-        // tab keeps requiring its own authorization (10.4), which this
-        // change does not add.
-        if (_isAutoAuthorizeEligible(t.name, coerced)) {
-          for (const tabId of _tabIdsForArgs(t.name, coerced)) {
-            if (isBorrowedTab(run, tabId) && !isBorrowedTabMutationAuthorized(run, tabId)) {
-              authorizeBorrowedTabMutation(run, tabId);
-            }
-          }
-        }
-        // 3.3/3.4: a genuinely approved send-class `computer` call carries
-        // the user's explicit Allow for THIS exact call (proven by the grant
-        // consumed below) — that Allow IS the explicit task authorization
-        // the borrowed-tab read-only default waits for, so it lifts the
-        // default for this dispatch. `javascript_tool` is deliberately
-        // EXCLUDED: the borrowed-tab scripting restriction stays rejected
-        // regardless of any approval text (spec "Borrowed-tab JavaScript" —
-        // enforced by enforceBorrowedTabScope below, which still throws for
-        // unscripted-borrowed-tab calls).
-        //
-        // 3.4 pre-dispatch revalidation: for send-class-shaped calls, a
-        // single-use approval grant for THESE EXACT normalized arguments
-        // must have been recorded by the Allow path (canUseTool) — otherwise
-        // the evidence is stale (or the gate was bypassed) and nothing
-        // dispatches. Non-send calls skip this entirely. Verification runs
-        // here, AFTER the run-state/lease/scope checks above and BEFORE
-        // enforceBorrowedTabScope below, so the lift and the restriction
-        // compose in the right order.
-        if (t.name === "computer" || t.name === "javascript_tool" || t.name === "webmcp_call_tool") {
-          const preDispatch = verifyPreDispatchApproval({ run, legacyToolName: t.name, args: coerced });
-          if (!preDispatch.ok) {
-            run.recordRejectedDispatch?.(t.name, coerced, { reason: "stale_approval", detail: { dispatchReason: preDispatch.reason } });
-            return staleApprovalErrorResult(preDispatch.reason);
-          }
-          // `webmcp_call_tool` joins `computer` in lifting the borrowed-tab
-          // read-only default, and for the same reason: the grant consumed
-          // just above IS the user's explicit Allow for this exact call, so
-          // it is the "explicit authorization from the actual user task"
-          // that default waits for. `javascript_tool` stays excluded — its
-          // restriction is deliberate (design 9d/10.4) and no approval text
-          // lifts it. Without this, every page-declared tool call against
-          // the bound current page would fail, which is the primary way the
-          // side panel is used.
-          if (preDispatch.granted && (t.name === "computer" || t.name === "webmcp_call_tool")) {
-            for (const tabId of _tabIdsForArgs(t.name, coerced)) {
-              if (isBorrowedTab(run, tabId) && !isBorrowedTabMutationAuthorized(run, tabId)) {
-                authorizeBorrowedTabMutation(run, tabId);
-              }
-            }
-          }
-        }
-        enforceBorrowedTabScope({ run, legacyToolName: t.name, args: coerced });
-      } catch (err) {
-        if (err instanceof AuthorizationError) {
-          run.recordRejectedDispatch?.(t.name, coerced, err);
-          return authorizationErrorResult(err);
-        }
-        if (err instanceof BorrowedTabMutationError) {
-          run.recordRejectedDispatch?.(t.name, coerced, { reason: "borrowed_tab_mutation", detail: { tabId: err.tabId } });
-          return borrowedTabMutationErrorResult(err);
-        }
-        throw err;
+        if (!check.ok) return check.result;
       }
       const meta = run.describeRequestForWire();
       const { result, resultUnknown } = await toolBridge.call(t.name, coerced, meta);

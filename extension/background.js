@@ -1628,6 +1628,11 @@ function teardownOverlayForRun(runId, reason) {
   overlayRunTabs.delete(runId);
   for (const tabId of tabs) {
     sendOverlayMessage(tabId, { type: "browzyOverlayTeardown", reason: reason || "run_ended" }).catch(() => {});
+    // Belt and braces for the labels: a capture clears its own layer, so there
+    // is normally nothing here to remove — but a worker evicted mid-capture
+    // never reaches that finally, and a run that ends should not leave boxes
+    // behind on the operator's page.
+    requestAnnotationClear(tabId).catch(() => {});
   }
 }
 
@@ -2838,6 +2843,44 @@ function requestOverlayShow(tabId) {
     .catch(() => {});
 }
 
+// Screenshot annotation (openspec/changes/annotate-screenshot-elements).
+//
+// The draw and its teardown are requested from takeScreenshot() INSIDE the
+// same capture lease that already brackets the product overlay's hide/show, so
+// the two cannot race: one bracket decides the order, and both ends of the
+// annotation are bounded by the same finally. Best-effort by construction — a
+// page that cannot be annotated (restricted page, no content script) must never
+// fail the capture the caller actually asked for.
+async function requestAnnotationDraw(tabId, scale) {
+  try {
+    const resp = await sendContentMessage(tabId, { type: "annotateElements", scale });
+    return (resp && resp.result) || null;
+  } catch (e) {
+    dbg("content", `annotateElements failed — ${String((e && e.message) || e).slice(0, 120)}`, { tab: tabId });
+    return null;
+  }
+}
+
+/** Whether the labels should linger on the page after a capture.
+ *
+ * Off by default: the labels are FOR the model, which only ever sees them
+ * through a screenshot, so the page a person is also using does not need to
+ * carry them in between. On, they stay up so that person can watch which
+ * elements the assistant is working with. Neither setting changes what is in
+ * the captured image, so neither changes how accurately it acts. */
+async function keepElementLabels(tabId) {
+  await configHydrated;
+  return !!effectiveConfig(tabId).show_element_labels;
+}
+
+async function requestAnnotationClear(tabId) {
+  try {
+    await sendContentMessage(tabId, { type: "clearAnnotation" });
+  } catch {
+    // The page is gone or unreachable; there is nothing left to clean up.
+  }
+}
+
 /** How much to magnify a zoomed region. The point of a zoom is to resolve
  * something the full-page capture rendered too small to read, so the region is
  * enlarged to fill the image budget instead of being reproduced at its original
@@ -2888,35 +2931,24 @@ function zoomScaleForRegion(regionWidth, regionHeight) {
  *   detail, confirming a panel opened does not. Ignored for a `region`
  *   capture, where shrinking the crop would undo the magnification that is
  *   the whole point of asking for one.
+ * @param {boolean} [opts.annotate] - draw an outline + reference label over
+ *   every interactive element in the viewport before the capture (and remove
+ *   it after). The labels are the SAME refs find/read_page return, so a ref
+ *   read off the picture is a direct click/form_input target. The `screenshot`
+ *   action turns this ON unless the caller opts out; this function itself
+ *   draws only when asked, so an internal capture stays plain. Ignored for a
+ *   `region` (zoom) capture.
  */
 async function takeScreenshot(tabId, opts = {}) {
   await ensureAttached(tabId);
   await requestOverlayHide(tabId);
-  // Wait for the page to actually PAINT before capturing.
-  //
-  // Page.captureScreenshot grabs whatever the compositor has right now, which
-  // after a scroll or a click that expands a panel can still be the blank frame
-  // the renderer is part-way through replacing. That produced a
-  // near-uniform-white JPEG — 9.5KB where a real capture of the same viewport
-  // is 130KB — and the agent, shown a blank picture of a page that was in fact
-  // full of the form it was looking for, concluded there was nothing there and
-  // gave up on the interface entirely.
-  //
-  // Two nested requestAnimationFrame callbacks resolve only after a frame has
-  // been composited, which is the event actually being waited for; the fixed
-  // sleeps this replaces were guesses about how long that takes. Bounded and
-  // best-effort: a page that never paints (background tab, stalled renderer)
-  // must not hold up the capture indefinitely.
-  try {
-    await withTimeout(
-      cdp(tabId, "Runtime.evaluate", {
-        expression: "new Promise(r => requestAnimationFrame(() => requestAnimationFrame(() => r(1))))",
-        awaitPromise: true
-      }),
-      500,
-      "paint settle"
-    );
-  } catch {}
+  // Annotate only a full-viewport capture. A `region` capture is a zoom: a crop
+  // whose pixels are relative to the crop and magnified, so labels drawn on it
+  // would defeat the magnification the caller asked for. The opt-out itself
+  // lives at the `screenshot` action, so an internal capture that passes
+  // nothing stays plain.
+  const shouldAnnotate = opts.annotate === true && !opts.region;
+  let annotation = null;
   try {
     // Capture at EXACTLY CSS-pixel dimensions, because the agent reads click
     // coordinates off this image and clicks are dispatched in CSS pixels. On a
@@ -2989,6 +3021,49 @@ async function takeScreenshot(tabId, opts = {}) {
     // Recorded BEFORE the capture can fail: a screenshot the model never
     // receives must not leave a scale behind that a later click would apply.
     // Written only on success, below.
+
+    // Draw the annotation now the capture scale is known, so label sizing can
+    // compensate for a downscaled image, and BEFORE the paint wait below so the
+    // frame the capture grabs actually includes the boxes. Drawn inside the
+    // same capture lease as requestOverlayHide() above and torn down in the
+    // finally below — per capture, including a capture that throws or times
+    // out, so nothing survives into the next image.
+    if (shouldAnnotate) {
+      annotation = await requestAnnotationDraw(tabId, shotScale);
+      dbg(
+        "cdp",
+        `annotation drawn: ${annotation && annotation.drawn != null ? annotation.drawn : "?"} element(s)` +
+          `${annotation && annotation.labelFontPx ? `, label ${annotation.labelFontPx}px` : ""}`,
+        { tab: tabId }
+      );
+    }
+
+    // Wait for the page to actually PAINT before capturing.
+    //
+    // Page.captureScreenshot grabs whatever the compositor has right now, which
+    // after a scroll or a click that expands a panel can still be the blank frame
+    // the renderer is part-way through replacing. That produced a
+    // near-uniform-white JPEG — 9.5KB where a real capture of the same viewport
+    // is 130KB — and the agent, shown a blank picture of a page that was in fact
+    // full of the form it was looking for, concluded there was nothing there and
+    // gave up on the interface entirely.
+    //
+    // Two nested requestAnimationFrame callbacks resolve only after a frame has
+    // been composited, which is the event actually being waited for; the fixed
+    // sleeps this replaces were guesses about how long that takes. Bounded and
+    // best-effort: a page that never paints (background tab, stalled renderer)
+    // must not hold up the capture indefinitely. It runs AFTER the annotation is
+    // drawn so the frame it waits for is the one carrying the labels.
+    try {
+      await withTimeout(
+        cdp(tabId, "Runtime.evaluate", {
+          expression: "new Promise(r => requestAnimationFrame(() => requestAnimationFrame(() => r(1))))",
+          awaitPromise: true
+        }),
+        500,
+        "paint settle"
+      );
+    } catch {}
 
     const shot = async (quality) => {
       const params = { format: "jpeg", quality, optimizeForSpeed: true, captureBeyondViewport: false };
@@ -3066,9 +3141,37 @@ async function takeScreenshot(tabId, opts = {}) {
       height: clip ? Math.round(clip.height * shotScale) : null,
       // Reported so the caller can say the image may be blank, rather than
       // letting a white picture read as an empty page.
-      blank: blankAfterRetry
+      blank: blankAfterRetry,
+      // True when this capture was annotated, so the caller can tell the model
+      // the labels in the picture are the refs its other tools accept.
+      annotated: !!(shouldAnnotate && annotation)
     };
   } finally {
+    // Drawn and removed inside THIS capture lease, and nowhere else. The
+    // labels are in the frame the camera grabs and absent from the page for
+    // every moment after.
+    //
+    // Keeping them up was tried, so the operator could watch which elements
+    // the assistant was working with. It reads as clutter on a page you are
+    // also using: the labels are FOR the model, which only ever sees them
+    // through a screenshot, so the page does not need to carry them between
+    // captures to get the accuracy they exist for.
+    //
+    // `show_element_labels` opts out of the removal, for an operator who wants
+    // to watch which elements are in play. It changes nothing about the image
+    // the model receives — the labels were already drawn above either way —
+    // so it cannot affect how accurately the assistant acts.
+    //
+    // Best-effort and unconditional otherwise: a capture that threw or timed
+    // out before or after drawing still clears here, and a clear with nothing
+    // to remove is a safe no-op — so a plain `annotate: false` capture is also
+    // guaranteed to contain no boxes left over from an earlier one.
+    //
+    // Cleared BEFORE the overlay returns: the draw/clear and the hide/show are
+    // one bracket deciding the order, not two leases that could race.
+    if (!(await keepElementLabels(tabId).catch(() => false))) {
+      await requestAnnotationClear(tabId);
+    }
     requestOverlayShow(tabId);
   }
 }
@@ -3259,6 +3362,17 @@ const CONFIG_SCHEMA = {
     "movement before the click, real key events and identical outcomes — faster " +
     "tiers use fewer path samples and shorter pauses, never none. Only applies " +
     "while humanize is true.",
+  show_element_labels:
+    "Leave the numbered boxes on the page after a screenshot, so you can see " +
+    "which elements the assistant is working with. Default false: they are " +
+    "drawn for the capture and removed immediately, so the page you are also " +
+    "using stays clean. Turning this on does NOT make the assistant more " +
+    "accurate and turning it off does not make it less — the labels are drawn " +
+    "for every screenshot either way, and the model only ever sees them " +
+    "through the picture. This is purely whether they linger for YOU. Either " +
+    "way they take no clicks, never appear in a page read, and a navigation " +
+    "clears them (the references they name die with the document); the next " +
+    "screenshot draws them again.",
   audit_mode:
     "Passively record what this agent does in the browser, so a person can watch " +
     "it back. \"off\" (default) records nothing and costs nothing. \"audit\" " +
@@ -3273,7 +3387,7 @@ const CONFIG_SCHEMA = {
 
 const AUDIT_MODES = ["off", "audit"];
 let configState = {
-  default: { humanize: false, humanize_speed: "fast", humanize_seed: null, audit_mode: "off" },
+  default: { humanize: false, humanize_speed: "fast", humanize_seed: null, audit_mode: "off", show_element_labels: false },
   byTab: {}
 };
 let configHydrated = null;
@@ -3284,7 +3398,7 @@ async function hydrateConfig() {
     const session = await chrome.storage.session.get(TAB_CONFIG_KEY);
     configState = {
       default: {
-        humanize: false, humanize_speed: "fast", humanize_seed: null, audit_mode: "off",
+        humanize: false, humanize_speed: "fast", humanize_seed: null, audit_mode: "off", show_element_labels: false,
         ...(local[CONFIG_KEY] || {})
       },
       byTab: session[TAB_CONFIG_KEY] || {}
@@ -3881,6 +3995,108 @@ async function callWebmcpTool(tabId, name, toolArgs) {
 }
 
 // --- Tool handlers ---
+
+// --- browser_batch support (openspec/changes/add-browser-batch-tool) -------
+//
+// The batch handler runs each item through the SAME `toolHandlers` entry its
+// standalone call would use — no per-tool logic is duplicated. Between items
+// it samples the page URL and the focused element; a batch stops after an item
+// that errors, changes the URL, or changes focus, because every later item was
+// written against the state that just stopped holding.
+//
+// Focus sampling is background-only: a `Runtime.evaluate` on the attached tab
+// returns an opaque, stable descriptor of `document.activeElement` (tag/id/
+// name/type/label/text). No content-script change is needed. Stale refs need no
+// new machinery either: the existing resolveRefToCoordinates()/hit-test path
+// returns its existing "no longer exists"/"could not bring into view" error,
+// which batchItemResultFailed() recognizes so the batch stops with that error.
+
+/** Sample {url, focus} for one tab. Best-effort: an unqueryable tab yields
+ *  nulls, which compare equal and therefore do not stop a batch. */
+async function sampleBatchTabState(tabId) {
+  if (typeof tabId !== "number") return { url: null, focus: null };
+  let url = null;
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    url = (tab && tab.url) || null;
+  } catch {
+    url = null;
+  }
+  let focus = null;
+  try {
+    // Stable descriptor of the focused control. The main-world evaluate here
+    // is deliberate: the content script's element registry lives in an
+    // isolated world this expression cannot see, and a descriptor over plain
+    // DOM properties is enough to tell "focus moved" from "focus did not".
+    const res = await cdp(tabId, "Runtime.evaluate", {
+      expression: `(() => {
+        const el = document.activeElement;
+        if (!el || el === document.body || el === document.documentElement) return null;
+        const attr = (n) => (el.getAttribute ? (el.getAttribute(n) || "") : "");
+        const label = attr("aria-label") || attr("placeholder") || "";
+        return [el.tagName || "", el.id || "", attr("name"), attr("type"), label, (el.textContent || "").trim().slice(0, 60)].join("|");
+      })()`,
+      returnByValue: true
+    });
+    focus = res && res.result ? res.result.value ?? null : null;
+  } catch {
+    focus = null;
+  }
+  return { url, focus };
+}
+
+/** Whether a batch item's returned result represents an error, so the batch
+ *  stops after it. Handlers in this file signal failure three ways: a thrown
+ *  exception, an `isError` result flag (adapter-side rejects do not reach here,
+ *  but a handler may still set it), or an error-shaped text payload. The
+ *  ref-resolve/hit-test refusals are matched by their EXISTING shipped wording
+ *  — that is the whole of the staleness handling, and no new ref validation is
+ *  added. */
+function batchItemResultFailed(result) {
+  if (result == null) return false;
+  if (result.isError === true) return true;
+  const text = Array.isArray(result.content)
+    ? result.content.filter((b) => b && b.type === "text").map((b) => String(b.text || "")).join("\n")
+    : "";
+  if (!text) return false;
+  if (/^\s*error\b/i.test(text)) return true;
+  if (/^\s*could not (resolve|bring)\b/i.test(text)) return true;
+  if (/^\s*ref\s+".*"\s+no longer exists\b/i.test(text)) return true;
+  if (/^\s*coordinate is required\b/i.test(text)) return true;
+  if (/is not in the mcp group/i.test(text)) return true;
+  return false;
+}
+
+/** One-line, human-readable description of why a batch stopped. */
+function batchStopReasonText(stop) {
+  if (!stop) return "";
+  if (stop.reason === "error") return "that item returned an error";
+  if (stop.reason === "url_changed") return `the page URL changed (${stop.from || "none"} -> ${stop.to || "none"})`;
+  if (stop.reason === "focus_changed") return `the focused element changed (${stop.from || "nothing focused"} -> ${stop.to || "nothing focused"})`;
+  return String(stop.reason);
+}
+
+/** Build the batch's tool result: an explicit status line (complete vs stopped,
+ *  which item, which condition) followed by each executed item's real content
+ *  blocks in order, so image results survive as real images. */
+function formatBatchResult(items, total, stop) {
+  const summary = stop
+    ? `browser_batch stopped after item ${stop.index + 1} (${stop.name}): ${batchStopReasonText(stop)}. ` +
+      `${items.length} of ${total} item(s) ran; the remaining ${total - items.length} did not execute. ` +
+      `This is a normal outcome — read the results and re-plan; do not blindly resend the same batch.`
+    : `browser_batch completed: all ${items.length} item(s) ran in order.`;
+  const content = [{ type: "text", text: summary }];
+  for (const entry of items) {
+    content.push({ type: "text", text: `--- item ${entry.index} (${entry.name}) ---` });
+    if (entry.result && Array.isArray(entry.result.content)) {
+      content.push(...entry.result.content);
+    } else {
+      content.push({ type: "text", text: JSON.stringify(entry.result ?? null) });
+    }
+  }
+  return { content };
+}
+
 const toolHandlers = {
   async tabs_context_mcp(args) {
     if (currentToolMeta && currentToolMeta.runId) return sdkTabsContext(currentToolMeta);
@@ -4195,6 +4411,7 @@ const toolHandlers = {
       await ensureDocumentBinding(tabId).catch(() => null);
     }
 
+
     const tab = await chrome.tabs.get(tabId);
     const tabs = await chrome.tabs.query({ groupId: tabGroupId });
     const loading = tab.status !== "complete" ? " (still loading)" : "";
@@ -4315,6 +4532,22 @@ const toolHandlers = {
         hitNote = ` — NOTE: <${args.ref}> is covered at that point by ${refCovering}, which received this instead.`;
         hitWarning = hitNote;
         dbg("hit", `${args.ref} @(${coordinate[0]},${coordinate[1]}) COVERED BY ${refCovering}`, { tab: tabId });
+      } else if (HIT_PROBED.includes(action)) {
+        // Say WHICH element received it, exactly as the coordinate path does.
+        //
+        // This branch used to return a bare "Clicked at (x, y)": resolving the
+        // ref had already hit-tested, so there was nothing left to CHECK. But
+        // "nothing to check" is not "nothing to report" — a caller that picked
+        // the wrong ref in the first place gets a clean success and no way to
+        // notice, and the mistake only surfaces a screenshot or two later as
+        // an unexplained wrong page. Naming the element that took the click is
+        // what makes aiming at the wrong one visible immediately.
+        //
+        // Costs one probe per ref click. Worth it: every other means of
+        // discovering the same mistake costs at least one model round trip.
+        const probe = await probeHit(tabId, coordinate[0], coordinate[1]);
+        hitNote = hitLandedNote_(probe);
+        dbg("hit", `${args.ref} @(${coordinate[0]},${coordinate[1]}) ${formatHit(probe)}`, { tab: tabId });
       } else {
         dbg("hit", `${args.ref} @(${coordinate[0]},${coordinate[1]}) reachable`, { tab: tabId });
       }
@@ -4347,8 +4580,19 @@ const toolHandlers = {
 
     switch (action) {
       case "screenshot": {
-        const { base64, imageId, width: shotW, height: shotH, scale: shotScale, blank: shotBlank } =
-          await takeScreenshot(tabId, { scale: args.scale });
+        const {
+          base64,
+          imageId,
+          width: shotW,
+          height: shotH,
+          scale: shotScale,
+          blank: shotBlank,
+          annotated: shotAnnotated
+        // Annotation is ON unless the caller opts out. Off-by-default meant the
+        // model simply never asked for it — a screenshot the assistant can act
+        // on directly is the point, and an unlabelled capture leaves it aiming
+        // by eye, which is the failure this whole capability exists to remove.
+        } = await takeScreenshot(tabId, { scale: args.scale, annotate: args.annotate !== false });
         if (actionExtras) actionExtras.artifactId = imageId;
         // Report the IMAGE's own dimensions, not the CSS viewport's. They are
         // the same whenever the capture was 1:1, but when it was scaled down
@@ -4374,6 +4618,12 @@ const toolHandlers = {
           shotScale && shotScale !== 1
             ? " — give click coordinates in this image's own pixels; they are mapped back to the page for you"
             : "";
+        // Only said when the capture actually carries labels, so the note can
+        // never describe a picture the model is not looking at. A labelled
+        // reference off this image is a direct click/form_input target.
+        const annotateNote = shotAnnotated
+          ? " — annotated: every interactive element is outlined and labelled with its reference (the same refs find/read_page return). Read a label off the picture and pass that reference straight to a click, form_input or scroll_to; no lookup call is needed."
+          : "";
         // save_to_disk: write the captured image to disk and report the path so
         // Claude Code can open it. Best-effort — never fails the screenshot.
         let saveNote = "";
@@ -4387,7 +4637,7 @@ const toolHandlers = {
         }
         return {
           content: [
-            { type: "text", text: `Successfully captured screenshot (${dims}, jpeg) - ID: ${imageId}${scaleNote}${blankNote}${saveNote}` },
+            { type: "text", text: `Successfully captured screenshot (${dims}, jpeg) - ID: ${imageId}${scaleNote}${annotateNote}${blankNote}${saveNote}` },
             { type: "image", data: base64, mimeType: "image/jpeg" },
           ],
         };
@@ -4743,6 +4993,30 @@ const toolHandlers = {
     }
   },
 
+  // Internal: describe a ref for the host's approval gate. Deliberately NOT in
+  // TOOLS — the model never sees it and must never call it. The host reaches it
+  // through the same tool bridge, before dispatching a click, so the gate can
+  // classify against what the element IS rather than against the fact that it
+  // was named. See can-use-tool.js's `resolveHint`.
+  //
+  // Returns null rather than an error for an unresolvable ref: to the gate that
+  // is "no evidence", which is exactly the conservative path it already has.
+  async describe_ref(args) {
+    const tabId = args && args.tabId;
+    if (typeof tabId !== "number" || !args || typeof args.ref !== "string") {
+      return { content: [{ type: "text", text: "null" }] };
+    }
+    try {
+      const resp = await sendContentMessage(tabId, { type: "describeRef", ref: args.ref });
+      const hint = resp && resp.result ? resp.result : null;
+      return { content: [{ type: "text", text: JSON.stringify(hint) }] };
+    } catch {
+      // A page that cannot be reached is unresolved evidence, never a failure
+      // that should block the call from reaching the gate's own decision.
+      return { content: [{ type: "text", text: "null" }] };
+    }
+  },
+
   async read_page(args) {
     const { tabId } = args;
     if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
@@ -4760,6 +5034,21 @@ const toolHandlers = {
     });
 
     let tree = resp?.result || "Error: Could not generate accessibility tree";
+    // content.js prefixes a newly-appeared element's ref with "*" (see its
+    // readWatermark comment) rather than sending back a separate structured
+    // flag — this tree is plain text, so the only way to know whether
+    // anything was actually marked is to look for the marker itself. Adding
+    // the explanation only when it is present keeps a read of an unchanged
+    // page exactly as before: no stray line about a notation this read never
+    // used.
+    if (/\*\[ref_\d+\]/.test(tree)) {
+      tree +=
+        `\n\nNote: a "*" before a ref (e.g. *[ref_12]) marks an element that was not present the last time this ` +
+        `tab was read — most likely something your previous action brought into existence, such as a suggestion ` +
+        `list after typing or a dropdown's options. Unmarked elements were already on the page. Nothing is marked ` +
+        `right after a navigation or an SPA route change, since every element on a freshly loaded page is new and ` +
+        `marking all of them would say nothing.`;
+    }
     // Append viewport dimensions so Claude knows the coordinate space
     try {
       await ensureAttached(tabId);
@@ -4859,8 +5148,16 @@ const toolHandlers = {
         ? `Found ${total} element(s) matching "${query}"; showing the ${results.length} best matches. Narrow the query if none of these is the one you want:\n\n`
         : `Found ${results.length} element(s) matching "${query}":\n\n`;
     let anyOff = false;
+    // r.isNew is set by content.js's findElements() — same per-document
+    // watermark generateAccessibilityTree compares against, so a "*" here
+    // means the same thing as a "*" in read_page's output. Absent (undefined,
+    // falsy) on a legacy array-shaped payload from a content-script instance
+    // that predates this field, which is the correct fallback: no signal is
+    // not evidence of "new".
+    let anyNew = false;
     for (const r of results) {
-      text += `[${r.ref}] ${r.role} "${r.name}" at (${r.coordinates[0]}, ${r.coordinates[1]})`;
+      text += `${r.isNew ? "*" : ""}[${r.ref}] ${r.role} "${r.name}" at (${r.coordinates[0]}, ${r.coordinates[1]})`;
+      if (r.isNew) anyNew = true;
       if (r.offViewport) {
         anyOff = true;
         text += ` [OFF-VIEWPORT]`;
@@ -4877,6 +5174,14 @@ const toolHandlers = {
         `into view first, and for a control parked outside the page — as visually hidden ` +
         `radios and checkboxes are — it is redirected to the label that operates it, exactly ` +
         `as a click by hand would be.\n`;
+    }
+    if (anyNew) {
+      text +=
+        `\nNote: entries marked with a leading "*" were not present the last time this tab was read (read_page or ` +
+        `find) — most likely something your previous action brought into existence, such as a suggestion list ` +
+        `after typing or a dropdown's options. Unmarked entries were already on the page. Nothing is marked right ` +
+        `after a navigation or an SPA route change, since every element would be new and marking all of them ` +
+        `would say nothing.\n`;
     }
 
     return { content: [{ type: "text", text }] };
@@ -5696,6 +6001,61 @@ const toolHandlers = {
         }
       ]
     };
+  },
+
+  async browser_batch(args) {
+    const actions = Array.isArray(args && args.actions) ? args.actions : [];
+    if (actions.length === 0) {
+      return {
+        content: [{ type: "text", text: "Error: browser_batch requires a non-empty ordered list of { name, input } items." }],
+        isError: true
+      };
+    }
+    const items = [];
+    let stop = null;
+    for (let i = 0; i < actions.length; i++) {
+      const item = actions[i] || {};
+      const name = typeof item.name === "string" ? item.name : "";
+      const input = item.input && typeof item.input === "object" ? item.input : {};
+      const itemTabId = typeof input.tabId === "number" ? input.tabId : undefined;
+      // Dispatch through the SAME handler a standalone call would use — this
+      // is the only place item execution happens, so no per-tool logic is
+      // duplicated and no tool gains a batch-only path.
+      const handler = Object.prototype.hasOwnProperty.call(toolHandlers, name) ? toolHandlers[name] : null;
+      const before = await sampleBatchTabState(itemTabId);
+      let result;
+      if (name === "browser_batch") {
+        // The host refuses a nested batch before dispatch, but the legacy MCP
+        // path does not pass through that host check — so the invariant "a
+        // batch cannot be nested" is enforced here too, fail-closed.
+        result = { content: [{ type: "text", text: "Error: a browser_batch cannot contain another browser_batch." }], isError: true };
+      } else if (!handler || typeof handler !== "function") {
+        result = { content: [{ type: "text", text: `Error: unknown tool "${name}" in browser_batch.` }], isError: true };
+      } else {
+        try {
+          result = await handler(input);
+        } catch (err) {
+          result = { content: [{ type: "text", text: `Error: ${(err && err.message) || String(err)}` }], isError: true };
+        }
+      }
+      items.push({ index: i, name, result });
+      // Stop conditions are checked in this order and stop AFTER the item that
+      // caused them; later items never run.
+      if (batchItemResultFailed(result)) {
+        stop = { index: i, name, reason: "error" };
+        break;
+      }
+      const after = await sampleBatchTabState(itemTabId);
+      if (before.url !== after.url) {
+        stop = { index: i, name, reason: "url_changed", from: before.url, to: after.url };
+        break;
+      }
+      if (before.focus !== after.focus) {
+        stop = { index: i, name, reason: "focus_changed", from: before.focus, to: after.focus };
+        break;
+      }
+    }
+    return formatBatchResult(items, actions.length, stop);
   },
 };
 

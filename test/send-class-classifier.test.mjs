@@ -171,7 +171,14 @@ await test("query-options.js keeps every other (always-automatic) browser tool i
   const { run, toolBridge } = await makeRun();
   const mcpServer = createBrowserMcpServer({ toolBridge, coerceArgs: (a) => a, run });
   const options = buildIsolatedOptions({ mcpServer, serverName: SDK_MCP_SERVER_NAME, snapshot: fakeSnapshot(), skills: fakeSkills() });
-  const sendClassToolNames = new Set(["computer", "javascript_tool"]);
+  // add-browser-batch-tool adds `browser_batch` to this excluded set for the
+  // SAME reason `computer`/`javascript_tool` are there: a batch is one call
+  // whose items can each be send/submit-class, and the gate must see the
+  // items rather than auto-approving the whole tool. It therefore joins the
+  // excluded set here instead of the always-automatic set this assertion
+  // sweeps — the assertion's contract (every ALWAYS-AUTOMATIC tool stays
+  // auto-approved) is unchanged and still enforced for all the others.
+  const sendClassToolNames = new Set(["computer", "javascript_tool", "browser_batch"]);
   for (const t of TOOLS) {
     if (sendClassToolNames.has(t.name)) continue;
     const qualified = `mcp__${SDK_MCP_SERVER_NAME}__${t.name}`;

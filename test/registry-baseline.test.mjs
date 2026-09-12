@@ -142,15 +142,16 @@ const DESIGN_DOC_TOOL_LIST = [
 // Tools added to the registry AFTER the archived migrate-to-claude-agent-sdk
 // baseline above, tracked as their own explicitly-enumerated set rather than
 // folded into DESIGN_DOC_TOOL_LIST — that list quotes an ARCHIVED change's
-// design.md verbatim and never named these two; amending it to include them
-// would misrepresent what that archived document actually said (and would
-// make a genuine future regression — a preserved tool quietly dropped —
+// design.md verbatim and never named these; amending it to include them would
+// misrepresent what that archived document actually said (and would make a
+// genuine future regression — a preserved tool quietly dropped —
 // indistinguishable from an intentional addition). Added by
 // openspec/changes/consume-webmcp-page-tools (see that change's design.md
-// decision 5); NOT part of the 26-operation preservation baseline —
-// openspec/specs/agent-browser-runtime's "Preserve the browser capability
-// baseline" requirement is what calls for tracking additions this way.
-const POST_BASELINE_ADDITIONS = ["webmcp_list_tools", "webmcp_call_tool"];
+// decision 5) and openspec/changes/add-browser-batch-tool; NOT part of the
+// 26-operation preservation baseline — openspec/specs/agent-browser-runtime's
+// "Preserve the browser capability baseline" requirement is what calls for
+// tracking additions this way.
+const POST_BASELINE_ADDITIONS = ["webmcp_list_tools", "webmcp_call_tool", "browser_batch"];
 
 const missingFromLive = DESIGN_DOC_TOOL_LIST.filter((n) => !liveNames.includes(n));
 const extraInLive = liveNames.filter((n) => !DESIGN_DOC_TOOL_LIST.includes(n));

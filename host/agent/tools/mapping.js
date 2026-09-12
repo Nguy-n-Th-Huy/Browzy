@@ -721,6 +721,79 @@ export function classifySendClassCall(legacyToolName, args = {}, targetHint = nu
   return { verdict: "allow", reason: "no submit signal; navigation-click default", evidence: resolveTargetEvidence(legacyToolName, args, targetHint) };
 }
 
+// --- browser_batch policy pre-flight (add-browser-batch-tool) --------------
+//
+// A browser_batch is ONE SDK tool call, so canUseTool and the handler-side
+// dispatch checks see it once. Without walking its items, every action inside
+// would be invisible to the send/submit gate — including the `computer` and
+// `javascript_tool` actions SEND_CLASS_TOOL_NAMES exists to catch. This is
+// deliberately the SAME classifier a standalone call uses
+// (classifySendClassCall); there is no second classifier here, so the set of
+// actions requiring the user's decision is identical whether or not a batch
+// is involved.
+
+function rejectBatchItem(index, toolName, detail) {
+  const position = index == null ? "browser_batch item" : `browser_batch item ${index + 1}`;
+  const named = toolName ? `${position} (${toolName})` : position;
+  return {
+    ok: false,
+    itemIndex: index == null ? null : index,
+    itemNumber: index == null ? null : index + 1,
+    toolName: toolName || null,
+    reason: `${named}: ${detail}`
+  };
+}
+
+/**
+ * Walk a browser_batch's ordered items and apply the send/submit-class gate to
+ * each, exactly as if that item were issued on its own.
+ *
+ * A nested batch is rejected outright (a batch cannot contain a batch). Any
+ * item whose classification is anything other than `allow` rejects the WHOLE
+ * batch before anything executes: a batch never raises a panel approval card,
+ * so an item that needs the user's decision must be issued as its own call.
+ *
+ * @param {Array} actions - the batch's `{ name, input }` items, in order.
+ * @param {Array} [itemHints] - optional, parallel to `actions`: the resolved
+ *   element hint for each item. canUseTool resolves these through the browser
+ *   bridge; the handler path passes none (hintless, the conservative path).
+ * @param {{ classify?: boolean }} [opts] - `classify: false` validates
+ *   structure and nesting only. The handler uses it when a clean-batch gate
+ *   verdict already classified every item with strictly more evidence
+ *   (resolved target hints it cannot obtain itself).
+ * @returns {{ ok: true, items: Array<{index:number,name:string,legacyName:string,input:object}> }
+ *   | { ok: false, itemIndex:number|null, itemNumber:number|null, toolName:string|null, reason:string }}
+ */
+export function classifyBrowserBatch(actions, itemHints = [], opts = {}) {
+  const classify = opts.classify !== false;
+  if (!Array.isArray(actions)) {
+    // Absent/non-array: nothing to gate. The registry's own schema requires a
+    // non-empty array, so this is only reachable by a direct/legacy
+    // invocation; the executor rejects it fail-closed.
+    return { ok: true, items: [] };
+  }
+  const items = [];
+  for (let i = 0; i < actions.length; i++) {
+    const item = actions[i];
+    if (!item || typeof item !== "object" || typeof item.name !== "string" || !item.name) {
+      return rejectBatchItem(i, null, "is not a { name, input } tool call");
+    }
+    const legacyName = legacyNameFor(item.name);
+    if (legacyName === "browser_batch") {
+      return rejectBatchItem(i, legacyName, "a batch cannot contain another batch");
+    }
+    const input = item.input && typeof item.input === "object" ? item.input : {};
+    if (classify) {
+      const verdict = classifySendClassCall(legacyName, input, itemHints?.[i] ?? null);
+      if (verdict.verdict !== "allow") {
+        return rejectBatchItem(i, legacyName, `${verdict.reason}. It must be issued on its own call.`);
+      }
+    }
+    items.push({ index: i, name: item.name, legacyName, input });
+  }
+  return { ok: true, items };
+}
+
 /**
  * Normalize a call to its canonical binding form: qualified tool name,
  * registered action name (computer actions normalized, javascript_tool's
@@ -776,6 +849,24 @@ export function normalizeApprovalArgs(legacyToolName, args = {}) {
       argsHash
     };
   }
+  if (legacyToolName === "browser_batch") {
+    // The batch's approval/fingerprint binding must be sensitive to the ITEMS,
+    // not just the tool name: falling through to the generic branch below
+    // would fingerprint every batch identically, so a gate verdict or grant
+    // recorded for one batch would satisfy the pre-dispatch check for a
+    // DIFFERENT batch's items. Item names are normalized through the same
+    // friendly-alias resolution dispatch uses, and every item input is hashed.
+    const actions = Array.isArray(a.actions) ? a.actions : [];
+    const items = actions.map((item) => ({
+      name: legacyNameFor(item?.name),
+      input: item?.input && typeof item.input === "object" ? item.input : null
+    }));
+    return {
+      tool: "browser_batch",
+      itemCount: items.length,
+      itemsHash: hashString(stableStringify(items))
+    };
+  }
   return { tool: String(legacyToolName || ""), action: String(a.action || "") };
 }
 
@@ -809,9 +900,10 @@ export function fingerprintNormalizedArgs(normalized) {
 
 // --- Mutating vs. read-only classification, by legacy tool name -----------
 //
-// A closed, exhaustive classification of all 28 registry tools — the 26
-// preserved-baseline entries plus the 2 post-baseline WebMCP page-tool
-// additions from openspec/changes/consume-webmcp-page-tools (`computer`
+// A closed, exhaustive classification of all 29 registry tools — the 26
+// preserved-baseline entries plus the 3 post-baseline additions (the 2 WebMCP
+// page-tool operations from openspec/changes/consume-webmcp-page-tools and
+// browser_batch from openspec/changes/add-browser-batch-tool; `computer`
 // is classified per-action instead of as a whole, since a single call can be
 // a screenshot or a click). A registry-baseline-style test asserts this
 // classification's two sets plus "computer" account for every TOOLS entry,
@@ -852,7 +944,12 @@ const MUTATING_LEGACY_TOOLS = new Set([
   // Invokes a PAGE-DEFINED callback with arbitrary, unknowable-in-advance
   // side effects — the same risk class as javascript_tool, and classified
   // the same conservative way for the same reason.
-  "webmcp_call_tool"
+  "webmcp_call_tool",
+  // A batch dispatches arbitrary member tools in sequence, so it is at least
+  // as capable of mutating page/browser state as any single call. It is never
+  // gated as a whole (its items are classified individually, above), but it
+  // must never be treated as read-only against a borrowed tab — fail safe.
+  "browser_batch"
 ]);
 
 // `screenshot`/`zoom` capture pixels without touching the page; `scroll`/

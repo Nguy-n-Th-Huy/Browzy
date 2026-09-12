@@ -1,8 +1,10 @@
-// The 28 browzy-in-chrome tool definitions (26 preserved-baseline operations
-// plus 2 post-baseline WebMCP page-tool operations — see
-// test/registry-baseline.test.mjs's DESIGN_DOC_TOOL_LIST/
-// POST_BASELINE_ADDITIONS split, and the "Preserve the browser capability
-// baseline" requirement in openspec/specs/agent-browser-runtime), extracted
+// The 29 browzy-in-chrome tool definitions (26 preserved-baseline operations
+// plus 3 post-baseline operations — the 2 WebMCP page tools added by
+// openspec/changes/consume-webmcp-page-tools and browser_batch added by
+// openspec/changes/add-browser-batch-tool; see test/registry-baseline.test.mjs's
+// DESIGN_DOC_TOOL_LIST/POST_BASELINE_ADDITIONS split, and the "Preserve the
+// browser capability baseline" requirement in
+// openspec/specs/agent-browser-runtime), extracted
 // as data so both the standard stdio MCP server (host/mcp-server.js) and the
 // codemode + hybrid servers can register them without duplicating the
 // schemas.
@@ -202,13 +204,19 @@ export const TOOLS = [
         .optional()
         .describe(
           "Optional, for the `screenshot` action. Shrink the returned image by this factor: 1 (default) is full size, 0.5 returns half the width and height and so roughly a quarter of the tokens. An image costs by area, and a run that screenshots after every step spends most of its time waiting on that — so use a smaller scale when you are confirming a state change (a panel opened, a field filled, a page navigated) and full size when you actually need to read fine detail. Coordinates you read off a scaled image are in that image's own pixels and are mapped back to the page for you, exactly as at full size; nothing to convert. Ignored by `zoom`, where shrinking the crop would undo the magnification you asked for."
+        ),
+      annotate: z
+        .boolean()
+        .optional()
+        .describe(
+          "Optional, for the `screenshot` action. Every interactive element in the viewport is outlined and labelled with its reference before the capture, so a reference can be read straight off the picture. The labels ARE the references `find` and `read_page` return (e.g. \"ref_12\") — the same element reference, not a second numbering — so a label read off the image is passed to a click, `form_input` or `scroll_to` exactly as a reference from a page read is, with no lookup call in between. Default TRUE: annotate unless you have a reason not to, because a labelled element is acted on by name while an unlabelled one has to be aimed at by eye. Set false only when the boxes would get in the way of reading the page itself — dense body text, a table you need to read, an image you are inspecting. Ignored by `zoom`."
         )
     }
   },
   {
     name: "find",
     description:
-      'Find elements on the page using natural language. Can search for elements by their purpose (e.g., "search bar", "login button") or by text content (e.g., "organic mango product"). Returns up to 20 matching elements with references that can be used with other tools. If more than 20 matches exist, you\'ll be notified to use a more specific query. If you don\'t have a valid tab ID, use tabs_context_mcp first to get available tabs.',
+      'Find elements on the page using natural language. Can search for elements by their purpose (e.g., "search bar", "login button") or by text content (e.g., "organic mango product"). Returns up to 20 matching elements with references that can be used with other tools. If more than 20 matches exist, you\'ll be notified to use a more specific query. A leading "*" on a result marks an element that was not present the last time this tab was read (by find or read_page) — useful right after typing into a field or opening a dropdown, to see what just appeared; nothing is marked on the first read of a page or right after a navigation. If you don\'t have a valid tab ID, use tabs_context_mcp first to get available tabs.',
     paramShape: {
       query: z
         .string()
@@ -405,7 +413,7 @@ export const TOOLS = [
   {
     name: "read_page",
     description:
-      "Get an accessibility tree representation of elements on the page. By default returns all elements including non-visible ones. Output is limited to 50000 characters by default. If the output exceeds this limit, you will receive an error asking you to specify a smaller depth or focus on a specific element using ref_id. Optionally filter for only interactive elements. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
+      "Get an accessibility tree representation of elements on the page. By default returns all elements including non-visible ones. Output is limited to 50000 characters by default. If the output exceeds this limit, you will receive an error asking you to specify a smaller depth or focus on a specific element using ref_id. Optionally filter for only interactive elements. A \"*\" directly before a ref (e.g. *[ref_12]) marks an element that was not present the last time this tab was read — typically something your previous action just created, such as a suggestion list or an expanded panel; nothing is marked on the first read of a page or right after a navigation. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
     paramShape: {
       tabId: z
         .number()
@@ -703,6 +711,30 @@ export const TOOLS = [
         .describe(
           "Arguments to pass to the page-declared tool's execute callback, matching its inputSchema from webmcp_list_tools. Omit for a tool that takes no arguments."
         )
+    }
+  },
+  {
+    name: "browser_batch",
+    description:
+      "Run an ordered list of browser tool calls in ONE call, sequentially, stopping early. Use it only for a run of actions you can fully predict before the first one runs — typically click(ref) → type → screenshot — so the user does not wait a full model turn between each step. Items execute one after another, never concurrently, and cannot be nested: a browser_batch inside another browser_batch is rejected.\n" +
+      "The batch STOPS after the first item that (a) returns an error, (b) changes the page URL, or (c) changes which element is focused. Later items then do NOT run. A stopped batch is a normal outcome, not a broken call: the result reports which item stopped it and why, and carries the results of the items that did run. Read that and re-plan — do not blindly resend the same batch.\n" +
+      "COORDINATES: no screenshot taken during the batch reaches you, so every coordinate in the batch is interpreted against the screenshot you took BEFORE the batch started. If an earlier item scrolls, expands, or navigates, do not aim at a coordinate you have not verified — use a ref, or stop and take a fresh screenshot on a later turn.\n" +
+      "`find` belongs BEFORE a batch, not inside it: its output is refs YOU must read before you can choose one, so a batch cannot find something and then click its result. Actions that need the user's own decision — a click on a submit/send/pay/confirm control, a page-declared tool call, or an Enter/Space that may activate a submit control — are rejected inside a batch, naming the item; issue those as their own call so the user sees exactly what they are approving. Every item runs with exactly the same tab-scope and restricted-page checks it would have standing alone.",
+    paramShape: {
+      actions: z
+        .array(
+          z.object({
+            name: z.string().describe('The tool name to run (e.g. "computer", "form_input", "navigate").'),
+            input: z
+              .record(z.any())
+              .optional()
+              .describe(
+                "That tool's own arguments, identical to what you would pass if calling it directly. Omit for a tool that takes none."
+              )
+          })
+        )
+        .min(1)
+        .describe("Ordered list of tool calls to run sequentially. At least one item. Batches cannot be nested.")
     }
   }
 ];

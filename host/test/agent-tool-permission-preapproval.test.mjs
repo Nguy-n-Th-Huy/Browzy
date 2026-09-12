@@ -26,15 +26,16 @@
 //
 // This suite proves, fully offline (constructed `query()` options only, no
 // SDK/network/credential):
-//   1. All 28 registry-backed browser tools, namespaced under this run's mcp
+//   1. All 29 registry-backed browser tools, namespaced under this run's mcp
 //      server name, plus "Skill", are present in the SDK's `tools`
 //      (availability) allowlist.
-//   2. All 28 registry-backed browser tools are ALSO present in `allowedTools`
-//      (auto-approval) — and "Skill" is deliberately NOT, since passing
-//      'Skill' through `allowedTools` is itself deprecated (sdk.d.ts:1447) —
-//      the `skills` option (already wired) covers it instead. `tools` (minus
-//      "Skill") and `allowedTools` must name the identical set, so the two
-//      can never drift apart.
+//   2. Every ALWAYS-AUTOMATIC registry-backed browser tool (29 minus the
+//      gated `computer`, `javascript_tool`, and `browser_batch`) is ALSO
+//      present in `allowedTools` (auto-approval) — and "Skill" is deliberately
+//      NOT, since passing 'Skill' through `allowedTools` is itself deprecated
+//      (sdk.d.ts:1447) — the `skills` option (already wired) covers it
+//      instead. `tools` (minus "Skill") and `allowedTools` name the same set
+//      plus the excluded gated tools, so the two can never drift apart.
 //   3. HIGH_RISK_BUILTINS remain disallowed from both `tools` and
 //      `allowedTools`, and every other isolation guarantee (settingSources:
 //      [], strictMcpConfig: true, single application-owned mcp server) is
@@ -112,10 +113,10 @@ function fakeSkills() {
 
 console.log("\nSDK tool preapproval — every browser tool must be in the allowlist alongside Skill\n");
 
-await test("all 28 registry-backed browser tools, namespaced under this run's mcp server, plus Skill, are preapproved — nothing silently missing", async () => {
+await test("all 29 registry-backed browser tools, namespaced under this run's mcp server, plus Skill, are preapproved — nothing silently missing", async () => {
   assert(
-    TOOLS.length === 28,
-    `expected the known 28-entry registry baseline, got ${TOOLS.length} — if the registry grew or shrank on purpose, this assertion must be updated deliberately, not silently`
+    TOOLS.length === 29,
+    `expected the known 29-entry registry baseline, got ${TOOLS.length} — if the registry grew or shrank on purpose, this assertion must be updated deliberately, not silently`
   );
 
   const { run, toolBridge } = await makeRun();
@@ -152,21 +153,24 @@ await test("all 28 registry-backed browser tools, namespaced under this run's mc
   );
 });
 
-await test("all 26 always-automatic browser tools are auto-approved via allowedTools; computer & javascript_tool stay available through tools only (task 9.1)", async () => {
+await test("all 26 always-automatic browser tools are auto-approved via allowedTools; computer, javascript_tool & browser_batch stay available through tools only (task 9.1)", async () => {
   // Task 9.1 (design.md section 8) narrowed `allowedTools`: `computer` and
   // `javascript_tool` are each capable of producing both an always-automatic
   // call AND a send/submit-class call under the identical tool name, so they
   // MUST be removed from `allowedTools` (auto-approval at the grain of a
   // whole tool name would preapprove the submit case alongside everything
   // else). They remain in `tools` for availability and reach `canUseTool`,
-  // where `isSendClassCall()` decides per call. The remaining 24 browser
-  // tools stay in `allowedTools` unchanged — zero added latency, no
-  // dependency on `canUseTool` being invoked for them. The first-pass
+  // where `isSendClassCall()` decides per call. openspec/changes/
+  // add-browser-batch-tool adds `browser_batch` to that excluded set for the
+  // same reason at the whole-tool grain: a batch is one call whose items can
+  // each be send/submit-class, so the gate must see the items. The remaining
+  // 26 browser tools stay in `allowedTools` unchanged — zero added latency,
+  // no dependency on `canUseTool` being invoked for them. The first-pass
   // regression this suite caught (tools in `tools` only, never in
   // `allowedTools`) is still caught here for the 26 always-automatic tools.
   assert(
-    TOOLS.length === 28,
-    `expected the known 28-entry registry baseline, got ${TOOLS.length} — if the registry grew or shrank on purpose, this assertion must be updated deliberately, not silently`
+    TOOLS.length === 29,
+    `expected the known 29-entry registry baseline, got ${TOOLS.length} — if the registry grew or shrank on purpose, this assertion must be updated deliberately, not silently`
   );
 
   const { run, toolBridge } = await makeRun();
@@ -181,7 +185,7 @@ await test("all 26 always-automatic browser tools are auto-approved via allowedT
 
   assert(Array.isArray(options.allowedTools), "options.allowedTools must be an explicit array, never omitted");
 
-  const sendClassToolNames = new Set(["computer", "javascript_tool"]);
+  const sendClassToolNames = new Set(["computer", "javascript_tool", "browser_batch"]);
   const alwaysAutomatic = TOOLS.filter((t) => !sendClassToolNames.has(t.name));
   assert(alwaysAutomatic.length === 26, `internal sanity: 26 always-automatic tools expected, got ${alwaysAutomatic.length}`);
 
@@ -207,11 +211,12 @@ await test("all 26 always-automatic browser tools are auto-approved via allowedT
   assert(options.allowedTools.includes("Task"), "Task must be auto-approved");
   assert(!options.allowedTools.includes("WebFetch"), "WebFetch must NOT be auto-approved — it must route through canUseTool's URL guard");
 
-  // `computer` and `javascript_tool` MUST be in `tools` (availability) but
-  // ABSENT from `allowedTools` — this is the load-bearing consequence of task
-  // 9.1: removing them from `allowedTools` routes every one of their calls
-  // through `canUseTool`, where `isSendClassCall()` decides per call rather
-  // than the SDK preapproving the submit case wholesale.
+  // `computer`, `javascript_tool` and `browser_batch` MUST be in `tools`
+  // (availability) but ABSENT from `allowedTools` — this is the load-bearing
+  // consequence of task 9.1 (extended to batching by add-browser-batch-tool):
+  // removing them from `allowedTools` routes every one of their calls through
+  // `canUseTool`, where `isSendClassCall()` decides per call rather than the
+  // SDK preapproving the submit case wholesale.
   for (const name of sendClassToolNames) {
     const qualified = `mcp__${SDK_MCP_SERVER_NAME}__${name}`;
     assert(options.tools.includes(qualified), `"${name}" must remain AVAILABLE in tools (availability) — design 8: they stay in tools`);

@@ -1707,10 +1707,40 @@ export class CompanionCore {
     //     gate, not claimed by structural tests.
     //   - credentialRevision: the resolved profile snapshot's revision; a
     //     rotation/revocation between Allow and dispatch fails the consume.
+    // Resolve a `ref` into real evidence about the element before classifying.
+    //
+    // Without this the gate is blind: a ref is a name, so every ref-only click
+    // classified as "target unknown" and demanded the user's approval, while a
+    // bare coordinate — strictly less evidence, and never hit-tested — was
+    // auto-allowed as an ordinary navigation click. The precise route was the
+    // gated one and the guessing route was the free one, and the pre-dispatch
+    // check then refused the ref click outright for want of a grant that the
+    // gate's own `allow` branch was never reached to record.
+    //
+    // Read-only, best-effort, and off the page's critical path: `describe_ref`
+    // is an internal handler the model cannot call, and any failure resolves to
+    // null, which is the conservative unknown path the classifier already has.
+    const resolveHint = async (toolName, args) => {
+      if (toolName !== "computer" || !args || typeof args.ref !== "string") return null;
+      if (typeof args.tabId !== "number") return null;
+      const { result } = await this.toolBridge.call(
+        "describe_ref",
+        { tabId: args.tabId, ref: args.ref },
+        run.describeRequestForWire()
+      );
+      const text = result?.content?.[0]?.text;
+      if (typeof text !== "string" || text === "null") return null;
+      try {
+        return JSON.parse(text);
+      } catch {
+        return null;
+      }
+    };
     const canUseTool = createCanUseTool({
       run,
       approvals: run.approvals,
       requestIdTracker: this._pendingApprovals,
+      resolveHint,
       approvalContext: {
         ...(context?.hostname ? { domain: context.hostname } : {}),
         ...((context?.tabId != null || context?.url) ? { docIdentity: { ...(context.tabId != null ? { tabId: context.tabId } : {}), ...(context.url ? { url: context.url } : {}) } } : {}),
