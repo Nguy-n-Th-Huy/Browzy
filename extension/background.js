@@ -7554,3 +7554,34 @@ async function recoverTabGroupState() {
 
 recoverTabGroupState();
 connectNativeHost();
+
+// --- Browzy API-key harness channel (extension/agent/panel.html) ------------
+// Additive only: forwards whitelisted tool calls to the existing
+// toolHandlers registry and returns the handler result verbatim. Module
+// state (currentToolMeta/currentAction) is deliberately left untouched so
+// concurrent native-host traffic keeps its own attribution; handlers run
+// with whatever context they already have (null-safe by construction).
+const HARNESS_BRIDGE_TOOLS = new Set([
+  "computer",
+  "navigate",
+  "read_page",
+  "find",
+  "browser_batch",
+  "tabs_context_mcp",
+  "tabs_create_mcp",
+  "tabs_close_mcp",
+]);
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (!msg || msg.type !== "browzy_agent_tool") return false;
+  if (!sender || sender.id !== chrome.runtime.id) return false;
+  const { tool, args } = msg;
+  if (!HARNESS_BRIDGE_TOOLS.has(tool) || typeof toolHandlers[tool] !== "function") {
+    sendResponse({ ok: false, error: "Unknown or bridged-off tool: " + String(tool) });
+    return false;
+  }
+  Promise.resolve()
+    .then(() => toolHandlers[tool](args || {}))
+    .then((result) => sendResponse({ ok: true, result: result ?? null }))
+    .catch((e) => sendResponse({ ok: false, error: (e && e.message) || String(e) }));
+  return true;
+});

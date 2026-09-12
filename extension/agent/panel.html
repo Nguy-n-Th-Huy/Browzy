@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Browzy Harness — API key agent</title>
+<style>
+  body { max-width: 760px; margin: 0 auto; padding: 20px; font: 14px/1.55 system-ui, sans-serif; background: #141210; color: #ece7df; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  p.hint { color: #a8a29e; font-size: 12px; margin: 0 0 16px; }
+  label { display: block; font-size: 12px; color: #a8a29e; margin: 12px 0 4px; }
+  input, textarea { width: 100%; box-sizing: border-box; background: #26231f; border: 1px solid #44403c; color: #ece7df; border-radius: 8px; padding: 9px; font-size: 13px; }
+  textarea#task { height: 84px; resize: vertical; }
+  .row { display: flex; gap: 8px; margin-top: 12px; }
+  button { border: none; border-radius: 8px; padding: 10px 16px; font-size: 13px; cursor: pointer; }
+  #btn-prep { background: #3a3632; color: #ece7df; }
+  #btn-run { background: #c15f3c; color: #fff; flex: 1; }
+  button:disabled { opacity: .5; cursor: wait; }
+  #log { margin-top: 16px; background: #1c1917; border: 1px solid #333; border-radius: 8px; padding: 12px; min-height: 200px; max-height: 55vh; overflow-y: auto; font-size: 13px; white-space: pre-wrap; }
+  #log .tool { color: #d6a35c; }
+  #log .err { color: #fca5a5; }
+  #log .ok { color: #86efac; }
+  #log img { max-width: 100%; border-radius: 6px; margin: 6px 0; }
+</style>
+</head>
+<body>
+  <h1>Harness — agent chạy bằng API key</h1>
+  <p class="hint">Key chỉ nằm trong bộ nhớ tab này (sessionStorage), reload là mất. Không gửi đi đâu ngoài api.anthropic.com.</p>
+  <label for="key">Anthropic API key</label>
+  <input id="key" type="password" autocomplete="off" placeholder="sk-ant-..." />
+  <label for="model">Model</label>
+  <input id="model" type="text" spellcheck="false" value="claude-sonnet-4-5" />
+  <label for="task">Task</label>
+  <textarea id="task" placeholder="vd: mở example.com và cho biết tiêu đề trang"></textarea>
+  <div class="row">
+    <button id="btn-prep">1. Chuẩn bị tab</button>
+    <button id="btn-run">2. Chạy</button>
+    <button id="btn-dl" style="background:#3a3632;color:#ece7df;flex:0.6">Tải log</button>
+  </div>
+  <div id="log"></div>
+  <script type="module" src="panel.js"></script>
+</body>
+</html>
