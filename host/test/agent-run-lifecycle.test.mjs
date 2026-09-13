@@ -2,9 +2,15 @@
 //
 // Run lifecycle: stop blocks dispatch, lost responses are reported as
 // "result unknown" and never auto-replayed, approval tokens bind to exact
-// action/target/run and expire, and queued runs cannot cross scopes.
+// action/target/run and expire, queued runs cannot cross scopes, and live
+// streaming fragments (openspec/changes/add-live-streaming-and-thinking)
+// share the token batch window while never reaching the durable transcript.
 //
 // Run: node host/test/agent-run-lifecycle.test.mjs
+
+import os from "node:os";
+import path from "node:path";
+import fs from "node:fs";
 
 import { Run, RUN_STATES } from "../agent/session/run.js";
 import { BrowserLease } from "../agent/broker/browser-lease.js";
@@ -12,6 +18,14 @@ import { ApprovalRegistry } from "../agent/policy/approvals.js";
 import { authorizeToolCall, AuthorizationError, RunUploadAllowlist } from "../agent/policy/authorization.js";
 import { ToolBridge, isResultUnknown } from "../agent/broker/tool-bridge.js";
 import { TokenBatcher } from "../agent/session/token-batcher.js";
+import { CompanionCore } from "../agent/companion.js";
+import { SessionManager } from "../agent/session/manager.js";
+import { TranscriptStore } from "../agent/storage/transcript-store.js";
+import { conversationEventsFile } from "../agent/storage/paths.js";
+import { buildIsolatedOptions } from "../agent/tools/query-options.js";
+import { buildEnhanceOptions } from "../agent/enhance-prompt.js";
+import { SDK_MCP_SERVER_NAME } from "../agent/tools/adapter.js";
+import { STREAM_PARTIAL_EVENT_TYPE, isTransientEvent } from "../agent/protocol.js";
 import { HOST_DROPPED_ERROR, NO_BRIDGE_ERROR } from "../tool-runtime.js";
 
 const results = [];
@@ -294,6 +308,196 @@ await test("TokenBatcher.dispose flushes whatever is pending (run completion mus
   batcher.push({ type: "stream_message", message: "final chunk" });
   batcher.dispose();
   assert(sent.length === 1 && sent[0].events.length === 1, "dispose must flush pending tokens instead of dropping them");
+});
+
+// --- Live streaming fragments
+// (openspec/changes/add-live-streaming-and-thinking, task group 1) ---
+//
+// The host half of the change: the panel run's options enable the SDK's
+// partial-message stream, the `_runQuery()` pump gives each raw
+// `SDKPartialAssistantMessage` its own transient identity, the batch
+// predicate covers that identity so fragments share the one bounded window
+// complete messages already use, and the durable sink never lets a fragment
+// reach `events.jsonl`. Storage is isolated under a scratch root — never the
+// operator's real per-user agent home (storage/paths.js).
+process.env.OCIC_AGENT_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "ocic-live-fragments-"));
+
+function fakeSnapshot() {
+  return {
+    model: "claude-fake-model",
+    env: { ANTHROPIC_BASE_URL: "https://example.invalid", ANTHROPIC_API_KEY: "fake-key" }
+  };
+}
+
+function fakeSkills() {
+  return {
+    cwd: process.cwd(),
+    configDir: path.join(process.cwd(), ".fake-claude-config"),
+    pluginDir: path.join(process.cwd(), ".fake-skills-plugin"),
+    allowedSkillNames: [],
+    skillOverrides: {}
+  };
+}
+
+function fragment(uuid, event) {
+  return {
+    type: STREAM_PARTIAL_EVENT_TYPE,
+    message: { type: "stream_event", event, parent_tool_use_id: null, uuid, session_id: "sess_fake" }
+  };
+}
+
+await test("the transient fragment event name and its transient-only classification are the fixed cross-wave contract", () => {
+  // The panel wave pins this exact literal (it cannot import a Node-side
+  // host module — see extension/sidepanel/panel-controller.js's own note on
+  // hand-synced protocol literals), so a rename here must fail loudly rather
+  // than silently orphan the panel's fragment path.
+  assert(STREAM_PARTIAL_EVENT_TYPE === "stream_partial", `the panel pins the literal "stream_partial", got ${JSON.stringify(STREAM_PARTIAL_EVENT_TYPE)}`);
+  assert(isTransientEvent({ type: STREAM_PARTIAL_EVENT_TYPE }), "the fragment type must be classified as transient");
+  assert(
+    !isTransientEvent({ type: "stream_message" }) && !isTransientEvent(null) && !isTransientEvent(undefined),
+    "transient must mean exactly the fragment type — a complete message is durable traffic and must never be skipped by the sink"
+  );
+});
+
+await test("buildIsolatedOptions enables the SDK partial-message stream for panel runs — and no other query builder does", () => {
+  const options = buildIsolatedOptions({
+    mcpServer: { fake: "server" },
+    serverName: SDK_MCP_SERVER_NAME,
+    snapshot: fakeSnapshot(),
+    skills: fakeSkills()
+  });
+  assert(
+    options.includePartialMessages === true,
+    "the panel run's options must set includePartialMessages — without it the SDK emits complete messages only and there is nothing to show live"
+  );
+  // The prompt-enhancement path builds its own options object (design.md
+  // decision 1's scope note) and never routes through buildIsolatedOptions;
+  // enabling partials there would change traffic no consumer reads.
+  const enhance = buildEnhanceOptions({ snapshot: fakeSnapshot(), abortController: new AbortController() });
+  assert(
+    !("includePartialMessages" in enhance),
+    "the prompt-enhancement query must NOT enable partial messages — the flag lives in the panel-run builder only"
+  );
+});
+
+await test("a stream_event SDK message is forwarded as a transient fragment; the complete message stays stream_message and is stored exactly once", async () => {
+  // One realistic partial stream: the answer text arrives as fragments, then
+  // the SDK emits the COMPLETE assistant message that supersedes them.
+  const streamEvents = [
+    { type: "message_start", message: { id: "msg_1", role: "assistant", content: [] } },
+    { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+    { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Xin " } },
+    { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "chào" } },
+    { type: "content_block_stop", index: 0 },
+    { type: "message_stop" }
+  ];
+  const sdkPartials = streamEvents.map((event, i) => ({
+    type: "stream_event",
+    event,
+    parent_tool_use_id: null,
+    uuid: `uuid_${i}`,
+    session_id: "sess_fake"
+  }));
+  const completeMessage = {
+    type: "assistant",
+    message: { id: "msg_1", role: "assistant", content: [{ type: "text", text: "Xin chào" }] },
+    parent_tool_use_id: null,
+    session_id: "sess_fake",
+    uuid: "uuid_complete"
+  };
+  const sdk = {
+    async *query() {
+      for (const m of [...sdkPartials, completeMessage]) yield m;
+    }
+  };
+
+  const store = new TranscriptStore();
+  const lease = new BrowserLease();
+  const approvals = new ApprovalRegistry();
+  const sessionManager = new SessionManager({ store, lease, approvals });
+  const toolBridge = new ToolBridge({ init: async () => {}, callTool: async () => ({ content: [] }), shutdown: () => {} });
+  const core = new CompanionCore({ toolBridge, sessionManager, lease, coerceArgs: (a) => a, sdk });
+
+  const conversationId = sessionManager.newConversation({});
+  const run = sessionManager.startRun(conversationId);
+
+  // Capture exactly what the run emits — the half the forked child forwards
+  // live through its TokenBatcher (companion.js's runAsForkedChild) — while
+  // leaving the real durable sink underneath untouched.
+  const emitted = [];
+  const originalEmit = run.emit.bind(run);
+  run.emit = (event) => {
+    originalEmit(event);
+    emitted.push(event);
+  };
+
+  await core._runQuery(run, "Xin chào", {});
+
+  // The pump's own messages, then the run's terminal lifecycle event
+  // (`_runQuery`'s `finally` -> finishRun() -> markDone() -> run_done): the
+  // fragments and their complete message must all precede it, exactly as the
+  // batcher's flush-before-non-batchable rule preserves on the wire.
+  assert(
+    JSON.stringify(emitted.map((e) => e.type)) ===
+      JSON.stringify([...sdkPartials.map(() => STREAM_PARTIAL_EVENT_TYPE), "stream_message", "run_done"]),
+    `each stream_event SDK message must become a ${STREAM_PARTIAL_EVENT_TYPE} and the complete message must keep stream_message, in SDK order — got ${JSON.stringify(emitted.map((e) => e.type))}`
+  );
+  for (const partial of sdkPartials) {
+    assert(
+      emitted.some((e) => e.type === STREAM_PARTIAL_EVENT_TYPE && e.message === partial),
+      "the SDK partial message must be forwarded verbatim under `message` (the panel reads message.event/message.uuid from it), never rewritten or flattened"
+    );
+  }
+  const liveComplete = emitted.find((e) => e.type === "stream_message");
+  assert(liveComplete && liveComplete.message === completeMessage, "the complete assistant message must be forwarded unchanged as stream_message");
+
+  // Durable half: the append is the only path to a stored record, and the
+  // transient type must never take it.
+  const rawLog = fs.readFileSync(conversationEventsFile(conversationId), "utf-8");
+  assert(!rawLog.includes(STREAM_PARTIAL_EVENT_TYPE), "no fragment may reach events.jsonl — the durable transcript stays the complete-message record replay/snapshot rebuild from");
+  const snapshot = sessionManager.snapshotSince(conversationId, 0);
+  assert(
+    snapshot.events.filter((e) => e.type === STREAM_PARTIAL_EVENT_TYPE).length === 0,
+    "a snapshot must contain no fragment entry"
+  );
+  const storedMessages = snapshot.events.filter((e) => e.type === "stream_message");
+  assert(storedMessages.length === 1, `the complete assistant message must be stored exactly once (found ${storedMessages.length})`);
+  assert(
+    JSON.stringify(storedMessages[0].message) === JSON.stringify(completeMessage),
+    "the stored record must be the SDK's complete message itself, with no fragment merged into it"
+  );
+  assert(
+    snapshot.events.every((e) => Number.isInteger(e.seq)),
+    "only durable events carry a seq — a fragment can never participate in the reconnect watermark because it is never stored"
+  );
+});
+
+await test("fragments share the one bounded batch window with complete messages and still arrive before the tool/lifecycle event that follows them", () => {
+  const sent = [];
+  // The default predicate is the one the forked child's own
+  // `new TokenBatcher({ sendImmediate })` uses, so this is the production
+  // routing decision, not a test-local copy of it.
+  const batcher = new TokenBatcher({ sendImmediate: (p) => sent.push(p), windowMs: 1000 });
+
+  for (let i = 0; i < 3; i++) {
+    batcher.push(fragment(`uuid_${i}`, { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: `t${i}` } }));
+  }
+  batcher.push({ type: "stream_message", message: { type: "assistant", message: { id: "msg_1", content: [{ type: "text", text: "t0t1t2" }] } } });
+  assert(sent.length === 0, "fragments must coalesce into the existing window instead of being forwarded one native message per delta");
+
+  batcher.push({ type: "tool_rejected", toolName: "navigate", reason: "run_not_active" }); // not batchable
+  assert(sent.length === 2, "a following non-batchable event must flush the pending batch first, then go out immediately");
+  assert(sent[0].type === "token_batch" && sent[0].events.length === 4, `the batch must contain the fragments AND the complete message, in order — got ${JSON.stringify(sent[0].events.map((e) => e.type))}`);
+  assert(
+    sent[0].events[0].type === STREAM_PARTIAL_EVENT_TYPE &&
+      sent[0].events[2].type === STREAM_PARTIAL_EVENT_TYPE &&
+      sent[0].events[3].type === "stream_message",
+    "order inside the batch must be the SDK's own order: fragments, then the complete message they belong to"
+  );
+  assert(sent[1].type === "tool_rejected", "the tool event must arrive after the text that preceded it, never before");
+
+  batcher.dispose();
+  assert(sent.length === 2, "dispose with nothing pending must not emit an empty batch");
 });
 
 const failed = results.filter((r) => !r.ok);

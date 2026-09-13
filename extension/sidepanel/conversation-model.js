@@ -47,6 +47,24 @@
 import { RUN_PHASE } from "./run-states.js";
 import { humanToolLabel, humanToolLabelRunning, summarizeArgsForDetail } from "./tool-labels.js";
 
+// The host's transient live-fragment event type (host/agent/protocol.js's
+// STREAM_PARTIAL_EVENT_TYPE), hand-synced here for the same reason
+// panel-controller.js hand-syncs the other protocol literals: the extension
+// cannot import a Node-side host module. Exported so panel-controller.js's
+// history-persistence gate reads the SAME single literal this model does
+// instead of scattering a second copy of the string.
+//
+// The fragment's shape, fixed by Wave 1 (host/agent/protocol.js):
+//   { type: "stream_partial", runId, message: {
+//       type: "stream_event",
+//       event: { type: "message_start" | "content_block_start" |
+//                "content_block_delta" | "content_block_stop" |
+//                "message_delta" | "message_stop", ... } } }
+// The SDK message is carried verbatim, so the assistant message id the
+// complete message is reconciled against is `message.event.message.id`
+// (opened by `message_start`).
+export const STREAM_PARTIAL_EVENT_TYPE = "stream_partial";
+
 function extractResultText(content) {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
@@ -148,6 +166,25 @@ export class ConversationModel {
     this._turnsByRunId = new Map(); // runId -> item (assistant_turn)
     this._pendingUserIndex = null; // index of a just-sent, not-yet-bound user item
     this._localPrompts = new Map(); // runId -> original prompt text (this session's own echo cache)
+    // Per-run, per-SDK-message-id record of the answer/thinking text already
+    // displayed from LIVE fragments, so the complete message(s) that follow
+    // can append only the missing suffix instead of the whole text again
+    // (design decision 4). `runId -> { currentMessageId, byMessage:
+    // Map(messageId -> { text: {streamed, start}, thinking: {streamed, start} }) }`.
+    //
+    // One id can be shared by several complete assistant messages (the SDK
+    // emits one per completed content block), so a message id's entry is kept
+    // until every kind it streamed has been consumed — never retired by the
+    // first complete message that carries the id — and only then released
+    // (`_releaseConsumedBuffer`) so an id with nothing left to reconcile does
+    // not accumulate.
+    //
+    // Lifetime: this is transient display bookkeeping, never history. It is
+    // cleared by every rebuild (`_resetItems()` below, which `_reset()` and
+    // `_rebuildItems()` both call) and dropped when the run ends
+    // (`_dropPartialBuffers`), so a snapshot/reconnect rebuild can never
+    // leave a buffer claiming a prefix the rebuilt turn no longer shows.
+    this._partialBuffers = new Map();
   }
 
   /** Seed locally-cached prompt text for runIds this browser profile has
@@ -435,6 +472,14 @@ export class ConversationModel {
         // warning is not a thing this model models at all.
         warnings: [],
         text: "",
+        // Model reasoning for this turn, accumulated from live
+        // `thinking_delta` fragments and from `thinking` blocks inside
+        // complete messages alike (tasks.md 2.5). `redactedThinking` says a
+        // `redacted_thinking` block arrived — thinking that occurred WITHOUT
+        // disclosable content — so the renderer can report that honestly
+        // instead of inventing or decrypting anything.
+        thinking: "",
+        redactedThinking: false,
         // Mid-turn answers to ask-user questions, in answer order:
         // {text, afterToolCount, ts}. Rendered right after the tool timeline
         // (before the prose), so a pick sits next to the tool call that asked
@@ -473,6 +518,23 @@ export class ConversationModel {
    * applied, exactly as before. */
   applyEvent(event, { trim = true } = {}) {
     if (!event || typeof event !== "object") return;
+    // A live fragment (design decisions 3 and 10): applied to the turn, but
+    // never retained in the window and never allowed to move a watermark. It
+    // carries no `seq` by construction, and returning BEFORE the window push
+    // is what keeps `_windowEvents`/`_highSeq`/`lastSeq` meaning exactly what
+    // they document themselves to mean: the durable record. A rebuild
+    // therefore reconstructs the turn from durable events only, and the
+    // complete message that follows supplies the full text (suffix-only, see
+    // `_applyStreamMessage`), so no replayed prefix can duplicate it.
+    //
+    // Only this literal gets the exemption: an unknown event type keeps the
+    // pre-existing behavior (ignored by `_applyEventToItems()`'s default
+    // branch, still retained in the window), because graceful degradation of
+    // a future/unknown event rests on that.
+    if (event.type === STREAM_PARTIAL_EVENT_TYPE) {
+      this._applyEventToItems(event);
+      return;
+    }
     const seq = this._windowSeq(event);
     if (seq > 0) {
       if (seq <= this._highSeq) return; // already incorporated — replay overlap
@@ -530,6 +592,7 @@ export class ConversationModel {
         for (const row of turn.toolRows) {
           if (row.status === "running") row.status = "cancelled";
         }
+        this._dropPartialBuffers(event.runId);
         this._invalidatePendingDownloadDecisionForRun(event.runId);
         break;
       }
@@ -537,6 +600,7 @@ export class ConversationModel {
         const turn = this._turnFor(event.runId, { createIfMissing: true, ts: event.ts });
         turn.lifecycle = "done";
         turn.complete = true;
+        this._dropPartialBuffers(event.runId);
         this._invalidatePendingDownloadDecisionForRun(event.runId);
         break;
       }
@@ -545,6 +609,7 @@ export class ConversationModel {
         turn.lifecycle = "error";
         turn.complete = false;
         turn.errorInfo = { reason: event.reason || "run_error", detail: event.detail };
+        this._dropPartialBuffers(event.runId);
         this._invalidatePendingDownloadDecisionForRun(event.runId);
         break;
       }
@@ -555,6 +620,7 @@ export class ConversationModel {
         for (const row of turn.toolRows) {
           if (row.status === "running") row.status = "unknown";
         }
+        this._dropPartialBuffers(event.runId);
         this._invalidatePendingDownloadDecisionForRun(event.runId);
         break;
       }
@@ -594,6 +660,12 @@ export class ConversationModel {
       }
       case "stream_message":
         this._applyStreamMessage(event.runId, event.message, event.ts);
+        break;
+      // A live fragment (tasks.md 2.1/2.2): the raw SDK partial-message event
+      // carried verbatim under `message`. Applied to the turn — never a turn
+      // creator, never durable, never a watermark move (see applyEvent()).
+      case STREAM_PARTIAL_EVENT_TYPE:
+        this._applyStreamPartial(event.runId, event.message);
         break;
       // Tasks 7.4/7.5: an injection probe finding — a FACT about content a
       // tool already returned (the content was delivered unchanged; see
@@ -871,10 +943,26 @@ export class ConversationModel {
     if (!message || typeof message !== "object") return;
     const turn = this._turnFor(runId, { createIfMissing: true, ts });
     if (message.type === "assistant" && message.message && Array.isArray(message.message.content)) {
+      // The SDK message id is what the live fragments for this exact message
+      // were keyed by (`message_start` derived it in `_applyStreamPartial`).
+      // When a buffer exists, only the suffix the stream did not already
+      // produce is appended (design decision 4); without one, the message's
+      // text is appended once, in full — the authoritative case for a panel
+      // that missed fragments or talks to a companion that emits none.
+      //
+      // One id can be shared by SEVERAL complete assistant messages: the
+      // pinned SDK documents that a streamed response is emitted "one
+      // assistant message per completed content block, so several consecutive
+      // assistant messages can share message.id and each carries just that
+      // block". The streamed fragments for that id cover ALL of its blocks,
+      // so the buffer must survive each of those messages (see
+      // `_reconcileCompleteBlock` / `_releaseConsumedBuffer`).
+      const messageId = message.message.id != null ? String(message.message.id) : null;
+      const buf = this._bufferEntryFor(runId, messageId);
       for (const block of message.message.content) {
         if (!block) continue;
         if (block.type === "text" && typeof block.text === "string") {
-          turn.text += block.text;
+          this._reconcileCompleteBlock(turn, "text", block.text, buf && buf.text);
           // The busy/working indicator's visibility condition (see isBusy())
           // needs "has answer text been applied since run start / since the
           // most recent tool_use". That is derived from this existing block
@@ -883,6 +971,15 @@ export class ConversationModel {
           // does NOT touch this field: a tool finishing is not answer text
           // resuming.
           turn.lastContentKind = "text";
+        } else if (block.type === "thinking" && typeof block.thinking === "string") {
+          // Thinking that arrives only inside a completed message (no streamed
+          // fragments) must still be shown (tasks.md 2.5), reconciled by the
+          // same message id and suffix rule as the answer.
+          this._reconcileCompleteBlock(turn, "thinking", block.thinking, buf && buf.thinking);
+        } else if (block.type === "redacted_thinking") {
+          // Thinking that occurred, with nothing disclosable: a flag, never
+          // the block's `data` (which this panel must not reveal or invent).
+          turn.redactedThinking = true;
         } else if (block.type === "tool_use") {
           turn.toolRows.push({
             key: block.id || nextKey("tool"),
@@ -896,6 +993,12 @@ export class ConversationModel {
           turn.lastContentKind = "tool_use";
         }
       }
+      // Deliberately NOT retired here: retiring after the first complete
+      // message that carries the id is exactly what made a sibling complete
+      // message (same id, different block) append text the fragments had
+      // already displayed. Only a buffer with nothing left unconsumed is
+      // released, and the run-terminal/rebuild drops are unchanged.
+      this._releaseConsumedBuffer(runId, messageId, buf);
     } else if (message.type === "user" && message.message && Array.isArray(message.message.content)) {
       for (const block of message.message.content) {
         if (!block || block.type !== "tool_result") continue;
@@ -909,6 +1012,175 @@ export class ConversationModel {
     // "system" and "result" SDK messages carry no transcript-visible
     // content this model needs beyond the run-lifecycle events already
     // emitted independently by host/agent/session/run.js.
+  }
+
+  /** One live fragment, verbatim (`message` is the SDK's
+   * `SDKPartialAssistantMessage`: `{type:"stream_event", event, uuid,
+   * session_id, parent_tool_use_id}`). Only `message_start`,
+   * `content_block_start` and `content_block_delta` carry anything this model
+   * displays; `input_json_delta` (live tool-argument streaming) and
+   * `signature_delta` are discarded on purpose (tasks.md 2.1), and
+   * `content_block_stop`/`message_delta`/`message_stop` close state the
+   * complete message already owns.
+   *
+   * A subagent's own frames carry a non-null `parent_tool_use_id` (the pinned
+   * SDK stamps it on every frame a Task's subagent produces). The panel
+   * renders ONE operator turn and its runs do not set `forwardSubagentText`,
+   * so a subagent's text/thinking never arrives as a complete message to
+   * reconcile against — displaying its fragments would leave unreconcilable
+   * text inside the operator's answer. They are dropped here, at the
+   * presentation layer; the host's forwarding is unchanged.
+   *
+   * A fragment never creates a turn (design decision 10): without the run's
+   * own lifecycle already applied there is nothing to stream into, and the
+   * complete message still delivers the text in full. */
+  _applyStreamPartial(runId, sdkMessage) {
+    if (sdkMessage && sdkMessage.parent_tool_use_id != null) return;
+    const streamEvent = sdkMessage && sdkMessage.event;
+    if (!streamEvent || typeof streamEvent !== "object") return;
+    const turn = this._turnsByRunId.get(runId);
+    if (!turn) return;
+    switch (streamEvent.type) {
+      case "message_start": {
+        // Opens the id every following delta of this message is keyed by.
+        const id = streamEvent.message && streamEvent.message.id;
+        if (id != null) this._partialRun(runId, { create: true }).currentMessageId = String(id);
+        break;
+      }
+      case "content_block_start": {
+        const block = streamEvent.content_block || {};
+        if (block.type === "redacted_thinking") {
+          turn.redactedThinking = true;
+        } else if (block.type === "thinking" && typeof block.thinking === "string" && block.thinking) {
+          this._appendPartialRun(runId, "thinking", block.thinking, turn);
+        } else if (block.type === "text" && typeof block.text === "string" && block.text) {
+          this._appendPartialRun(runId, "text", block.text, turn);
+        }
+        break;
+      }
+      case "content_block_delta": {
+        const delta = streamEvent.delta || {};
+        if (delta.type === "text_delta" && typeof delta.text === "string" && delta.text) {
+          this._appendPartialRun(runId, "text", delta.text, turn);
+        } else if (delta.type === "thinking_delta" && typeof delta.thinking === "string" && delta.thinking) {
+          this._appendPartialRun(runId, "thinking", delta.thinking, turn);
+        }
+        break;
+      }
+      case "content_block_stop":
+      case "message_delta":
+      case "message_stop":
+      default:
+        // Closing state the complete message already owns; anything else is
+        // an event kind this panel does not display and ignores without
+        // failing (the same tolerance the old panel had for a fragment it
+        // did not recognize).
+        break;
+    }
+  }
+
+  /** Apply one fragment to the turn AND remember it in the message's buffer,
+   * so the complete message can append only the missing suffix. The buffer's
+   * start offset anchors the fragment text inside the turn's text/thinking,
+   * which is what lets a buffer that is NOT a prefix of the complete text be
+   * superseded at the exact spot it occupied instead of duplicated. Each kind
+   * keeps its own run of streamed text, because one message id can carry a
+   * thinking block and a text block. */
+  _appendPartialRun(runId, kind, text, turn) {
+    const buf = this._bufferFor(runId, null); // current message id, opened by message_start
+    if (!buf) return; // no message_start seen: no id to reconcile against
+    const state = buf[kind];
+    if (state.start == null) state.start = turn[kind].length;
+    state.streamed += text;
+    turn[kind] += text;
+    if (kind === "text") {
+      // Fragments feed the existing derivation exactly as complete text
+      // blocks do: the busy indicator clears when text actually starts
+      // appearing (tasks.md 2.4), without changing isBusy() itself.
+      turn.lastContentKind = "text";
+    }
+  }
+
+  /** Append a complete content block of `kind` ("text" or "thinking"),
+   * subtracting whatever the fragments for this message id already displayed.
+   * A streamed run that is a prefix of the complete block is appended
+   * suffix-only; one the complete block extends from (a longer streamed run
+   * covering several blocks of the same id) is consumed head-first, leaving
+   * the rest anchored for its own block; anything else is superseded by the
+   * complete block at the exact span it occupied (treated as authoritative).
+   * `state` is the kind's buffer slot, or null when this id streamed nothing
+   * of this kind — then the block is the only source and is appended in full. */
+  _reconcileCompleteBlock(turn, kind, text, state) {
+    if (!text) return;
+    const streamed = state && state.streamed;
+    if (!streamed) {
+      turn[kind] += text;
+      return;
+    }
+    if (streamed.startsWith(text)) {
+      state.streamed = streamed.slice(text.length);
+      state.start = state.streamed ? state.start + text.length : null;
+      return;
+    }
+    if (text.startsWith(streamed)) {
+      turn[kind] += text.slice(streamed.length);
+      state.streamed = "";
+      state.start = null;
+      return;
+    }
+    turn[kind] = turn[kind].slice(0, state.start) + text + turn[kind].slice(state.start + streamed.length);
+    state.streamed = "";
+    state.start = null;
+  }
+
+  _partialRun(runId, { create = false } = {}) {
+    let run = this._partialBuffers.get(runId);
+    if (!run && create) {
+      run = { currentMessageId: null, byMessage: new Map() };
+      this._partialBuffers.set(runId, run);
+    }
+    return run || null;
+  }
+
+  /** The open message's buffer, created on first use. `messageId` (a fresh
+   * `message_start`) re-keys the run; passing null uses the id already open. */
+  _bufferFor(runId, messageId) {
+    const run = this._partialRun(runId, { create: true });
+    if (messageId != null) run.currentMessageId = String(messageId);
+    const id = run.currentMessageId;
+    if (id == null) return null;
+    let buf = run.byMessage.get(id);
+    if (!buf) {
+      buf = { text: { streamed: "", start: null }, thinking: { streamed: "", start: null } };
+      run.byMessage.set(id, buf);
+    }
+    return buf;
+  }
+
+  /** The existing buffer for a message id, or null — used by the complete
+   * message so it never creates a buffer of its own. */
+  _bufferEntryFor(runId, messageId) {
+    if (messageId == null) return null;
+    const run = this._partialBuffers.get(runId);
+    return run ? run.byMessage.get(messageId) || null : null;
+  }
+
+  /** Drop a message id's buffer once it has nothing left unconsumed (the
+   * common case after its content blocks have all been reconciled). The id
+   * itself is deliberately left open (`currentMessageId`) so a fragment from
+   * a later block of the same streamed message still re-opens a buffer for
+   * it. */
+  _releaseConsumedBuffer(runId, messageId, buf) {
+    if (!buf || messageId == null) return;
+    if (buf.text.streamed || buf.thinking.streamed) return;
+    const run = this._partialBuffers.get(runId);
+    if (run) run.byMessage.delete(messageId);
+  }
+
+  /** A run reached a terminal state: its fragments can never be confirmed
+   * again, so its buffers are dropped (design decision 10). */
+  _dropPartialBuffers(runId) {
+    this._partialBuffers.delete(runId);
   }
 
   /** The overall panel phase, per spec's 11 named states. `ctx` carries

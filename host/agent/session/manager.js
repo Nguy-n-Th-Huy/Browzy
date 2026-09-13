@@ -15,6 +15,7 @@ import { UsageLedger } from "../storage/usage-ledger.js";
 import { RecordingAttachmentsStore, RECORDING_ATTACHMENT_STATES } from "../storage/recording-attachments.js";
 import { sanitizeActionEvent, PerStreamSeqTracker } from "../storage/action-timeline.js";
 import { migrateConversationMetadata, buildSdkSessionRef, SDK_SESSION_REF_STATUS, validateBudgetPolicy } from "../storage/conversation-metadata.js";
+import { isTransientEvent } from "../protocol.js";
 
 export function newConversationId() {
   return `conv_${crypto.randomBytes(9).toString("hex")}`;
@@ -248,6 +249,16 @@ export class SessionManager {
       // the just-removed on-disk directory.
       onEvent: (event) => {
         if (this._deletedConversations.has(conversationId)) return;
+        // Live stream fragments (protocol.js's STREAM_PARTIAL_EVENT_TYPE)
+        // are transient by contract: they exist to drive the panel's live
+        // display while a message is still being produced, and must never
+        // become part of this conversation's durable record. Dropping them
+        // HERE, at the one call that writes an event through to disk, is
+        // what keeps `store.appendEvent` the only path to a stored record
+        // and replay/snapshot/reconnect exactly the complete-message history
+        // they are today — with no `seq` allocated to a fragment and nothing
+        // for a later reconnect to rebuild from (design.md decisions 2/3).
+        if (isTransientEvent(event)) return;
         this.store.appendEvent(conversationId, event);
       }
     });

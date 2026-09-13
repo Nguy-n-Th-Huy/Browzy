@@ -12,8 +12,12 @@
 //   STREAM_EVENT         -> one event, applied live; runId comes from the
 //                          envelope (the inner event object does not carry
 //                          one for live traffic — see companion.js's
-//                          runAsForkedChild)
-//   TOKEN_BATCH          -> same as STREAM_EVENT, once per batched event
+//                          runAsForkedChild). A transient live fragment is
+//                          applied to the model but skipped by the history
+//                          gate below.
+//   TOKEN_BATCH          -> same as STREAM_EVENT, once per batched event; a
+//                          batch containing only transient fragments is
+//                          display-only traffic and writes no history.
 //   START (reply)        -> binds the just-sent local user message to its
 //                          real runId and persists it to HistoryStore
 //   STOP (reply)         -> no-op beyond logging; run_stopped (a
@@ -33,7 +37,7 @@
 //                          renders the underlying recording_complete
 //                          STREAM_EVENT when it lands in that conversation
 
-import { ConversationModel } from "./conversation-model.js";
+import { ConversationModel, STREAM_PARTIAL_EVENT_TYPE } from "./conversation-model.js";
 import { DocumentsClient } from "./documents-client.js";
 import { buildConversationArtifact, normalizeExportFormat } from "./history-export.js";
 import { RUN_PHASE } from "./run-states.js";
@@ -49,6 +53,16 @@ const RUN_TERMINAL_EVENT_TYPES = new Set(["run_done", "run_stopped", "run_error"
 
 function isRunTerminalEvent(event) {
   return !!event && RUN_TERMINAL_EVENT_TYPES.has(event.type);
+}
+
+// A live fragment (conversation-model.js's STREAM_PARTIAL_EVENT_TYPE, itself
+// hand-synced with host/agent/protocol.js). Fragments are display-only
+// traffic: a `stream_event`/`token_batch` carrying nothing else must not
+// write history metadata, derive a title, or push a presentation update —
+// only the durable events that share the envelope (a complete message, a
+// lifecycle event) may (tasks.md 2.7).
+function isTransientFragmentEvent(event) {
+  return !!event && event.type === STREAM_PARTIAL_EVENT_TYPE;
 }
 
 // Coalescing window for presentation-metadata pushes and the local cache
@@ -1385,8 +1399,11 @@ export class PanelController {
       case "stream_event": {
         const model = this.models.get(env.conversationId);
         if (model) {
-          model.applyEvent(normalizeEvent(env.event, env.runId));
-          this._persistHistoryEntry(model, { immediate: isRunTerminalEvent(env.event) });
+          const event = normalizeEvent(env.event, env.runId);
+          model.applyEvent(event);
+          // A fragment-only envelope changes nothing durable: no history
+          // write, no title derivation, no presentation push.
+          if (!isTransientFragmentEvent(event)) this._persistHistoryEntry(model, { immediate: isRunTerminalEvent(event) });
         }
         this._notify();
         break;
@@ -1395,11 +1412,19 @@ export class PanelController {
         const model = this.models.get(env.conversationId);
         if (model && Array.isArray(env.events)) {
           let terminal = false;
+          let durable = false;
           for (const e of env.events) {
-            model.applyEvent(normalizeEvent(e, env.runId));
-            if (isRunTerminalEvent(e)) terminal = true;
+            const event = normalizeEvent(e, env.runId);
+            model.applyEvent(event);
+            if (isTransientFragmentEvent(event)) continue;
+            durable = true;
+            if (isRunTerminalEvent(event)) terminal = true;
           }
-          this._persistHistoryEntry(model, { immediate: terminal });
+          // A batch of ONLY fragments is display-only traffic: the batcher
+          // coalesces a fragment with the complete message it belongs to when
+          // both are pending, but a lone fragment batch must not touch
+          // history either way.
+          if (durable) this._persistHistoryEntry(model, { immediate: terminal });
         }
         this._notify();
         break;

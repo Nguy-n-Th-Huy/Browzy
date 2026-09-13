@@ -358,6 +358,60 @@ export const THREAT_EVENT_TYPES = Object.freeze({
   TAB_RISK_UPDATE: "tab_risk_update"
 });
 
+// --- Transient live-fragment event type (add-live-streaming-and-thinking) --
+//
+// The inner `event.type` a raw SDK partial-message event carries once the
+// panel run's `query()` is built with `includePartialMessages: true` (see
+// tools/query-options.js's `buildIsolatedOptions()` — the ONLY builder that
+// sets it). Companion.js's `_runQuery()` pump forwards one of these per SDK
+// `SDKPartialAssistantMessage`, and it reaches the panel inside the SAME
+// existing envelope every other live event uses: the token batcher treats a
+// fragment exactly like the `stream_message` it belongs to, so it travels as
+// one entry of a `token_batch` and never as a native message of its own —
+// never a new envelope type, and never a change to either envelope's shape.
+// The SDK message is carried verbatim under `message`, exactly as
+// `stream_message` carries a complete one:
+//
+//   { type: "stream_partial", message: {
+//       type: "stream_event",
+//       event: { type: "message_start" | "content_block_start" |
+//                "content_block_delta" | "content_block_stop" |
+//                "message_delta" | "message_stop", ... },
+//       parent_tool_use_id: string | null,
+//       uuid: string,
+//       session_id: string } }
+//
+// TRANSIENT is the contract, and the only property a consumer may rely on:
+// this is live display traffic. It is never appended to a conversation's
+// durable transcript (SessionManager.startRun()'s onEvent sink drops it
+// before `store.appendEvent` — the append stays the only path to a stored
+// record), it carries no `seq`, and it is absent from replay, snapshot and
+// every paged transcript read by construction. A distinct type rather than a
+// flag on `stream_message` is what makes that separation structural: the
+// sink and the batcher are the two host places that must know about it, and
+// both read this constant instead of a scattered literal.
+//
+// Degradation is intended in both directions (design.md decision 8), not
+// negotiated: a panel that does not know this type ignores it (see
+// extension/sidepanel/conversation-model.js `_applyEventToItems()`, whose
+// default branch ignores an unknown event type rather than failing), and a
+// companion that never emits it simply never exercises the delta path.
+// Additive under PROTOCOL_VERSION 1 — no version bump, because an old peer
+// already tolerates an unknown inner event type, which is exactly the
+// property this relies on.
+export const STREAM_PARTIAL_EVENT_TYPE = "stream_partial";
+
+// Every event type that is live-only: emitted through `Run.emit()` and
+// forwarded to the panel, but never allowed to reach the durable transcript.
+// A set (rather than the sink testing one literal) so a second transient
+// kind can be added in one place instead of hunting every drop site.
+export const TRANSIENT_EVENT_TYPES = Object.freeze([STREAM_PARTIAL_EVENT_TYPE]);
+
+/** True when `event` is live-only traffic that must never be persisted. */
+export function isTransientEvent(event) {
+  return !!event && TRANSIENT_EVENT_TYPES.includes(event.type);
+}
+
 // --- Chunked-transport sequence kinds -------------------------------------
 //
 // The announced purpose carried in a chunk_begin envelope's `kind` field

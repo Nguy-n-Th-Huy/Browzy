@@ -316,7 +316,7 @@ console.log("== a run this model never sent (rebuild path with no cached prompt)
   ok(m.items[0].text.includes("không có sẵn"), "the placeholder text is honest about missing data, not a guess");
 }
 
-console.log("== a leading `thinking` content block (real gateway behavior, per a live capability-test capture) is tolerated, never breaks parsing ==");
+console.log("== a leading `thinking` content block (real gateway behavior, per a live capability-test capture) is tolerated and captured, never breaks parsing ==");
 {
   const m = new ConversationModel("c9");
   m.addLocalUserMessage("giải thích ngắn gọn");
@@ -337,7 +337,8 @@ console.log("== a leading `thinking` content block (real gateway behavior, per a
   });
   m.applyEvent({ type: "run_done", runId: "rthink" });
   const turn = m.items.find((it) => it.kind === "assistant_turn");
-  ok(turn.text === "Đây là câu trả lời.", "the thinking block is skipped and the actual text block still renders correctly");
+  ok(turn.text === "Đây là câu trả lời.", "the text block still renders exactly, independent of the thinking block");
+  ok(turn.thinking === "nội bộ: cân nhắc cách trả lời", "...and the thinking block is accumulated for the turn's thinking display");
   ok(turn.complete === true, "a message with a leading thinking block still completes normally");
 }
 
@@ -385,6 +386,294 @@ console.log("== ask-user answers anchor to the asking turn, not the transcript t
   const m2 = new ConversationModel("c11");
   m2.recordQuestionAnswer("VIP");
   ok(m2.items.some((it) => it.kind === "user" && it.isQuestionAnswer && it.text === "👉 VIP"), "without an asking turn the answer still lands as a trailing user item");
+}
+
+console.log("== live fragments (2.1-2.7): applied to the turn, never durable, reconciled suffix-only ==");
+{
+  const partial = (runId, event) => ({
+    type: "stream_partial",
+    runId,
+    message: { type: "stream_event", event, uuid: "u1", session_id: "s1", parent_tool_use_id: null }
+  });
+  const messageStart = (runId, id) =>
+    partial(runId, { type: "message_start", message: { id, role: "assistant", content: [] } });
+  const textDelta = (runId, text, index = 0) =>
+    partial(runId, { type: "content_block_delta", index, delta: { type: "text_delta", text } });
+  const thinkingDelta = (runId, thinking, index = 0) =>
+    partial(runId, { type: "content_block_delta", index, delta: { type: "thinking_delta", thinking } });
+  const blockStart = (runId, index, contentBlock) => partial(runId, { type: "content_block_start", index, content_block: contentBlock });
+  const completeAssistant = (runId, id, content) => ({
+    type: "stream_message",
+    runId,
+    message: { type: "assistant", message: { id, content } }
+  });
+  const newRun = (id, runId) => {
+    const m = new ConversationModel(id);
+    m.addLocalUserMessage("câu hỏi " + id);
+    m.applyEvent({ type: "run_created", runId });
+    m.applyEvent({ type: "run_started", runId });
+    return m;
+  };
+  const turnOf = (m) => m.items.find((it) => it.kind === "assistant_turn");
+
+  // --- text appears before completion, suffix-only reconciliation, and the
+  //     transient event never enters the window or the watermark ---
+  {
+    const m = newRun("s1", "rs");
+    const windowBefore = m.windowSize();
+    const seqBefore = m.highestSeq();
+    m.applyEvent(messageStart("rs", "msg_1"));
+    m.applyEvent(blockStart("rs", 0, { type: "text", text: "" }));
+    m.applyEvent(textDelta("rs", "Đây là "));
+    m.applyEvent(textDelta("rs", "câu trả lời"));
+    const turn = turnOf(m);
+    ok(turn.text === "Đây là câu trả lời", "answer text is visible from fragments before the message completes");
+    ok(turn.lastContentKind === "text", "fragments feed the busy-indicator derivation exactly as a complete text block does");
+    ok(
+      m.windowSize() === windowBefore && m.highestSeq() === seqBefore && !m._windowEvents.some((e) => e.type === "stream_partial"),
+      "a fragment is not retained in the event window and does not move the watermark"
+    );
+
+    // A fragment stamped with a bogus seq must still be excluded: the
+    // transient TYPE is the rule, not the absence of a seq.
+    const mSeq = newRun("s1b", "rsb");
+    const seqBeforeB = mSeq.highestSeq();
+    const windowBeforeB = mSeq.windowSize();
+    mSeq.applyEvent({ ...messageStart("rsb", "msg_b"), seq: 9001 });
+    mSeq.applyEvent({ ...textDelta("rsb", "x"), seq: 9002 });
+    ok(
+      mSeq.highestSeq() === seqBeforeB && mSeq.windowSize() === windowBeforeB,
+      "even a fragment carrying a seq is excluded from the watermark and the window"
+    );
+
+    m.applyEvent(completeAssistant("rs", "msg_1", [{ type: "text", text: "Đây là câu trả lời đầy đủ." }]));
+    ok(turn.text === "Đây là câu trả lời đầy đủ.", "the complete message appends ONLY the missing suffix — no duplicated text");
+    m.applyEvent({ type: "run_done", runId: "rs" });
+    ok(m._partialBuffers.size === 0, "the run's fragment buffers are dropped at run_done");
+  }
+
+  // --- a complete message whose id has no buffer appends once, in full ---
+  {
+    const m = newRun("s2", "r2");
+    m.applyEvent(completeAssistant("r2", "msg_unseen", [{ type: "text", text: "toàn bộ câu trả lời" }]));
+    ok(turnOf(m).text === "toàn bộ câu trả lời", "a complete message with no matching buffer appends once, in full");
+  }
+
+  // --- a buffer that is not a prefix is superseded by the complete text ---
+  {
+    const m = newRun("s3", "r3");
+    m.applyEvent(messageStart("r3", "msg_3"));
+    m.applyEvent(textDelta("r3", "Sai hoàn toàn"));
+    m.applyEvent(completeAssistant("r3", "msg_3", [{ type: "text", text: "Kết quả đúng" }]));
+    ok(turnOf(m).text === "Kết quả đúng", "a non-prefix buffer is superseded, never concatenated with the completion");
+
+    // Anchored replacement, not a truncation of the whole turn: an earlier
+    // completed message in the same turn must survive.
+    const m2 = newRun("s3b", "r3b");
+    m2.applyEvent(completeAssistant("r3b", "msg_a", [{ type: "text", text: "trước " }]));
+    m2.applyEvent(messageStart("r3b", "msg_b"));
+    m2.applyEvent(textDelta("r3b", "sai"));
+    m2.applyEvent(completeAssistant("r3b", "msg_b", [{ type: "text", text: "đúng" }]));
+    ok(turnOf(m2).text === "trước đúng", "superseding replaces only the fragment's own span inside the turn");
+  }
+
+  // --- thinking accumulates from fragments AND complete messages ---
+  {
+    const m = newRun("s4", "r4");
+    m.applyEvent(messageStart("r4", "msg_4"));
+    m.applyEvent(blockStart("r4", 0, { type: "thinking", thinking: "" }));
+    m.applyEvent(thinkingDelta("r4", "cân nhắc "));
+    m.applyEvent(thinkingDelta("r4", "thứ nhất"));
+    m.applyEvent(blockStart("r4", 1, { type: "text", text: "" }));
+    m.applyEvent(textDelta("r4", "Câu trả lời", 1));
+    const turn = turnOf(m);
+    ok(turn.thinking === "cân nhắc thứ nhất", "thinking_delta fragments accumulate on the turn");
+    ok(turn.text === "Câu trả lời", "the answer and thinking buffers stay independent");
+
+    m.applyEvent(
+      completeAssistant("r4", "msg_4", [
+        { type: "thinking", thinking: "cân nhắc thứ nhất và kỹ hơn" },
+        { type: "text", text: "Câu trả lời" },
+        { type: "redacted_thinking", data: "bí-mật-đã-mã-hoá" }
+      ])
+    );
+    ok(turn.thinking === "cân nhắc thứ nhất và kỹ hơn", "the complete thinking block appends only the missing suffix");
+    ok(turn.text === "Câu trả lời", "the answer is not duplicated when both kinds streamed");
+    ok(
+      turn.redactedThinking === true && !JSON.stringify(turn).includes("bí-mật-đã-mã-hoá"),
+      "a redacted_thinking block becomes a flag only — its data is never stored"
+    );
+    m.applyEvent(messageStart("r4", "msg_4b"));
+    m.applyEvent(thinkingDelta("r4", "còn dở"));
+    ok(m._partialBuffers.size === 1, "a new streamed message opens a fresh buffer");
+    m.applyEvent({ type: "run_error", runId: "r4", reason: "x" });
+    ok(m._partialBuffers.size === 0, "fragment buffers are dropped at run_error too");
+  }
+
+  // --- ONE streamed message id, SEVERAL complete assistant messages. The
+  //     pinned SDK: "While a response streams the CLI emits one assistant
+  //     message per completed content block, so several consecutive assistant
+  //     messages can share message.id and each carries just that block."
+  //     Every one of those messages must reconcile suffix-only against the
+  //     id's whole fragment stream — retiring the buffer at the FIRST one
+  //     duplicated whichever block completed second. ---
+  {
+    const streamBothBlocks = (m, runId, id) => {
+      m.applyEvent(messageStart(runId, id));
+      m.applyEvent(blockStart(runId, 0, { type: "thinking", thinking: "" }));
+      m.applyEvent(thinkingDelta(runId, "cân nhắc"));
+      m.applyEvent(blockStart(runId, 1, { type: "text", text: "" }));
+      m.applyEvent(textDelta(runId, "Xin chào", 1));
+      const t = turnOf(m);
+      ok(t.thinking === "cân nhắc" && t.text === "Xin chào", "one streamed id: the fragments of both blocks are shown before either completes");
+    };
+
+    // The API's own order: the thinking block's message, then the text one.
+    const m = newRun("s11", "r11");
+    streamBothBlocks(m, "r11", "msg_split");
+    m.applyEvent(completeAssistant("r11", "msg_split", [{ type: "thinking", thinking: "cân nhắc" }]));
+    ok(turnOf(m).thinking === "cân nhắc", "the first complete block (thinking) still reconciles, appending nothing new");
+    m.applyEvent(completeAssistant("r11", "msg_split", [{ type: "text", text: "Xin chào" }]));
+    ok(turnOf(m).text === "Xin chào", "the SECOND complete message sharing the id does not duplicate the answer text");
+    ok(turnOf(m).thinking === "cân nhắc", "...and leaves the already-completed thinking exactly once");
+    m.applyEvent({ type: "run_done", runId: "r11" });
+    ok(m._partialBuffers.size === 0, "run-terminal drops still clear the id's buffer after a split completion");
+
+    // Reverse order: the text block's message, then the thinking one — the
+    // same shape the other way round must not duplicate thinking.
+    const m2 = newRun("s12", "r12");
+    streamBothBlocks(m2, "r12", "msg_split2");
+    m2.applyEvent(completeAssistant("r12", "msg_split2", [{ type: "text", text: "Xin chào" }]));
+    ok(turnOf(m2).text === "Xin chào", "with the text message first, the answer is not duplicated either");
+    m2.applyEvent(completeAssistant("r12", "msg_split2", [{ type: "thinking", thinking: "cân nhắc" }]));
+    ok(turnOf(m2).thinking === "cân nhắc", "...and the thinking message that follows still reconciles suffix-only");
+    ok(turnOf(m2).text === "Xin chào", "...without touching the answer");
+  }
+
+  // --- one id whose streamed run is LONGER than a single block (a text
+  //     block, a tool call, then another text block): the earlier block is
+  //     consumed head-first, never allowed to truncate answer text the stream
+  //     already displayed ---
+  {
+    const m = newRun("s13", "r13");
+    m.applyEvent(messageStart("r13", "msg_multi"));
+    m.applyEvent(textDelta("r13", "Để tôi kiểm tra"));
+    m.applyEvent(textDelta("r13", "Kết quả là"));
+    ok(turnOf(m).text === "Để tôi kiểm traKết quả là", "both text blocks of the id stream into the answer in order");
+    m.applyEvent(completeAssistant("r13", "msg_multi", [{ type: "text", text: "Để tôi kiểm tra" }]));
+    ok(
+      turnOf(m).text === "Để tôi kiểm traKết quả là",
+      "the first block completes without truncating the later text the stream already showed for the id"
+    );
+    m.applyEvent(completeAssistant("r13", "msg_multi", [{ type: "tool_use", id: "t1", name: "navigate", input: {} }]));
+    m.applyEvent(completeAssistant("r13", "msg_multi", [{ type: "text", text: "Kết quả là xong" }]));
+    ok(
+      turnOf(m).text === "Để tôi kiểm traKết quả là xong",
+      "the later block of the same id then appends only its missing suffix"
+    );
+  }
+
+  // --- a subagent's own frames are never the operator's turn ---
+  {
+    const m = newRun("s14", "r14");
+    const subagentPartial = (event) => ({
+      type: "stream_partial",
+      runId: "r14",
+      message: { type: "stream_event", event, uuid: "u-sub", session_id: "s1", parent_tool_use_id: "toolu_subagent" }
+    });
+    m.applyEvent(subagentPartial({ type: "message_start", message: { id: "msg_sub", content: [] } }));
+    m.applyEvent(subagentPartial({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "việc của subagent" } }));
+    m.applyEvent(subagentPartial({ type: "content_block_delta", index: 1, delta: { type: "thinking_delta", thinking: "suy nghĩ nội bộ" } }));
+    m.applyEvent(subagentPartial({ type: "content_block_start", index: 2, content_block: { type: "redacted_thinking", data: "cipher" } }));
+    const turn = turnOf(m);
+    ok(turn.text === "" && turn.thinking === "", "a subagent fragment contributes no text or thinking to the operator's turn");
+    ok(turn.redactedThinking === false, "...and not even a redaction flag");
+    ok(m._partialBuffers.size === 0, "...and opens no buffer the operator's own messages would be reconciled against");
+    m.applyEvent(messageStart("r14", "msg_op"));
+    m.applyEvent(textDelta("r14", "câu trả lời"));
+    m.applyEvent(completeAssistant("r14", "msg_op", [{ type: "text", text: "câu trả lời" }]));
+    ok(turnOf(m).text === "câu trả lời", "the operator's own stream still streams and reconciles normally after an ignored subagent frame");
+  }
+  {
+    // Thinking that arrives only in a complete message must still be shown.
+    const m = newRun("s5", "r5");
+    m.applyEvent(
+      completeAssistant("r5", "msg_5", [
+        { type: "thinking", thinking: "chỉ trong tin nhắn hoàn chỉnh" },
+        { type: "text", text: "ok" }
+      ])
+    );
+    const turn = turnOf(m);
+    ok(turn.thinking === "chỉ trong tin nhắn hoàn chỉnh", "thinking inside a completed message is accumulated, not dropped");
+    ok(turn.redactedThinking === false && turn.text === "ok", "...without disturbing the answer or inventing a redaction");
+
+    // A redacted-only message, and a redacted fragment block.
+    m.applyEvent(completeAssistant("r5", "msg_5b", [{ type: "redacted_thinking", data: "cipher" }]));
+    ok(
+      turn.redactedThinking === true && !JSON.stringify(turn).includes("cipher"),
+      "a redacted block is reported as thinking that occurred, never as leaked content"
+    );
+  }
+  {
+    const m = newRun("s5c", "r5c");
+    m.applyEvent(messageStart("r5c", "msg_5c"));
+    m.applyEvent(blockStart("r5c", 0, { type: "redacted_thinking", data: "cipher-live" }));
+    ok(
+      turnOf(m).redactedThinking === true && turnOf(m).thinking === "" && !JSON.stringify(turnOf(m)).includes("cipher-live"),
+      "a redacted_thinking fragment block is a flag only, never content"
+    );
+  }
+
+  // --- a rebuild mid-message leaves no stale buffer ---
+  {
+    const m = newRun("s7", "r7");
+    m.applyEvent(messageStart("r7", "msg_7"));
+    m.applyEvent(textDelta("r7", "dở dang"));
+    ok(turnOf(m).text === "dở dang" && m._partialBuffers.size === 1, "mid-message: the streaming text is shown and its buffer is open");
+    m.seedLocalPrompts(new Map([["r7", "câu hỏi s7"]]));
+    m.applySnapshot({
+      conversationId: "s7",
+      meta: {},
+      lastSeq: 2,
+      events: [
+        { seq: 1, type: "run_created", runId: "r7" },
+        { seq: 2, type: "run_started", runId: "r7" }
+      ]
+    });
+    ok(m._partialBuffers.size === 0, "a snapshot rebuild clears every fragment buffer — no stale prefix survives");
+    const rebuilt = turnOf(m);
+    ok(rebuilt.text === "", "the rebuilt turn shows the durable record only (fragment-only text is not durable)");
+    m.applyEvent(completeAssistant("r7", "msg_7", [{ type: "text", text: "dở dang nhưng đầy đủ" }]));
+    ok(rebuilt.text === "dở dang nhưng đầy đủ", "after a mid-message rebuild the complete message appends its full text exactly once");
+  }
+  {
+    // An eviction rebuild (`_rebuildItems`) clears buffers as well.
+    const m = new ConversationModel("s8", { maxWindowEvents: 2 });
+    m.applyEvent({ type: "run_created", runId: "r8" });
+    m.applyEvent({ type: "run_started", runId: "r8" });
+    m.applyEvent(messageStart("r8", "msg_8"));
+    m.applyEvent(textDelta("r8", "dở"));
+    ok(m._partialBuffers.size === 1, "buffer open before the window is pushed over budget");
+    m.applyEvent({ seq: 1, type: "stream_message", runId: "r8", message: { type: "assistant", message: { id: "msg_x", content: [{ type: "text", text: "durable" }] } } });
+    ok(m.windowSize() <= 2 && m._partialBuffers.size === 0, "an eviction rebuild clears fragment buffers too");
+  }
+  {
+    const m = newRun("s9", "r9");
+    m.applyEvent(messageStart("r9", "msg_9"));
+    m.applyEvent(textDelta("r9", "một phần"));
+    m.applyEvent({ type: "run_stopped", runId: "r9", reason: "user_stop" });
+    ok(m._partialBuffers.size === 0 && turnOf(m).text === "một phần", "run_stopped drops the buffers but keeps the text already displayed");
+  }
+
+  // --- an unknown event type still follows the OLD contract: ignored, no
+  //     throw, still retained in the window (graceful degradation) ---
+  {
+    const m = newRun("s10", "r10");
+    const before = m.windowSize();
+    m.applyEvent({ type: "stream_partial_future", runId: "r10", message: { type: "stream_event", event: { type: "warp_drive" } } });
+    ok(m.windowSize() === before + 1, "an UNKNOWN event type is still retained in the window, exactly as before (only stream_partial is exempt)");
+    ok(turnOf(m).text === "", "...and is ignored without throwing");
+  }
 }
 
 console.log("\n== threat events (7.4-7.6): injection findings / probe failures / tab risk are warnings, never decisions ==");

@@ -1131,6 +1131,120 @@ async function main() {
     );
   }
 
+  console.log("== live fragments cross the real companion wire path: live model, durable transcript untouched, unknown events ignored ==");
+  {
+    // The whole point of Wave 1's transport: an SDK `stream_event` is
+    // forwarded as a transient `stream_partial`, batched through the SAME
+    // TokenBatcher every other live event uses, and never appended to the
+    // durable store. This block drives that end to end (real CompanionCore,
+    // real SessionManager/TranscriptStore/TokenBatcher, real ProtocolClient
+    // and PanelController) and checks both sides: the panel model shows the
+    // streamed text/thinking live and reconciles to exactly-once on
+    // completion, while the stored event log contains no fragment at all.
+    const partial = (event) => ({ type: "stream_event", event, uuid: "u-live", session_id: "s-live", parent_tool_use_id: null });
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const core = buildCore({
+      sdk: {
+        async *query() {
+          // Let the run's own lifecycle batch flush on its own first, so the
+          // fragment batch below is genuinely fragment-ONLY and the history
+          // gate has something real to skip. No other SDK message precedes
+          // the fragments, so nothing durable can land in this gap.
+          await sleep(60);
+          yield partial({ type: "message_start", message: { id: "msg_live", role: "assistant", content: [] } });
+          yield partial({ type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } });
+          yield partial({ type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "cân nhắc " } });
+          yield partial({ type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "kỹ" } });
+          yield partial({ type: "content_block_start", index: 1, content_block: { type: "text", text: "" } });
+          yield partial({ type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "Xin " } });
+          yield partial({ type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "chào" } });
+          // Long enough that the fragment-only batch (5ms window) flushes
+          // well before any durable event follows it.
+          await sleep(150);
+          // The pinned SDK's streamed granularity, verbatim: "one assistant
+          // message per completed content block, so several consecutive
+          // assistant messages can share message.id". Both messages below
+          // share msg_live, so this drives the real wire path with exactly
+          // the shape that used to duplicate whichever block completed
+          // second.
+          yield {
+            type: "assistant",
+            message: {
+              id: "msg_live",
+              content: [{ type: "thinking", thinking: "cân nhắc kỹ lưỡng" }]
+            }
+          };
+          yield {
+            type: "assistant",
+            message: {
+              id: "msg_live",
+              content: [{ type: "text", text: "Xin chào bạn!" }]
+            }
+          };
+          // An SDK stream event whose inner type this panel does not know:
+          // the old-panel tolerance guarantee, exercised on the new panel.
+          yield partial({ type: "warp_drive", whatever: true });
+          yield { type: "result", subtype: "success", result: "Xin chào bạn!" };
+        }
+      }
+    });
+
+    const store = new HistoryStore({ storage: memStorage() });
+    let upserts = 0;
+    const realUpsert = store.upsert.bind(store);
+    store.upsert = (entry) => {
+      upserts += 1;
+      return realUpsert(entry);
+    };
+    const protocolClient = new ProtocolClient({ createTransport: () => makeBridgeTransport(core) });
+    const panel = new PanelController({
+      protocolClient,
+      historyStore: store,
+      profileCache: new ProfileCache({ storage: memStorage({ ocic_profile_cache_v1: completeProfile() }) }),
+      identity: async () => ({ installationId: "test-install", connectionId: "test-conn-stream" }),
+      scope: "panel-scope-stream"
+    });
+    await panel.init();
+    await waitUntil(() => panel.protocol.handshakeState() === "ok");
+    await panel.startNewConversation();
+    await waitUntil(() => panel.currentConversationId != null);
+    const conversationId = panel.currentConversationId;
+    const model = panel.currentModel();
+    const upsertsAfterSnapshot = upserts;
+
+    await panel.sendMessage("cho tôi câu trả lời");
+    await waitUntil(() => panel.currentPhase() === RUN_PHASE.STREAMING);
+    const upsertsBeforeFragments = upserts;
+    await waitUntil(() => {
+      const t = model.items.find((i) => i.kind === "assistant_turn");
+      return !!t && t.text.length > 0;
+    });
+    const midTurn = model.items.find((i) => i.kind === "assistant_turn");
+    ok(midTurn.text === "Xin chào", "streamed answer fragments reach the panel model live through the real token_batch envelope");
+    ok(midTurn.thinking === "cân nhắc kỹ", "...and streamed thinking arrives in the same turn");
+    ok(midTurn.lastContentKind === "text", "...feeding the busy/working derivation exactly as a complete text block does");
+    ok(!model._windowEvents.some((e) => e.type === "stream_partial"), "no fragment is retained in the model's event window");
+    ok(
+      upserts === upsertsBeforeFragments,
+      "a fragment-only batch does not write history metadata or derive a title"
+    );
+
+    await waitUntil(() => panel.currentPhase() === RUN_PHASE.COMPLETED);
+    const turn = model.items.find((i) => i.kind === "assistant_turn");
+    ok(turn.text === "Xin chào bạn!", "the complete message reconciles with the fragments — the answer appears exactly once");
+    ok(turn.thinking === "cân nhắc kỹ lưỡng", "...and the complete thinking block appends only its missing suffix");
+    ok(turn.redactedThinking === false, "no redaction is invented for ordinary thinking");
+    ok(!model.connectionError, "the unknown transient event type was ignored without raising an error");
+    ok(upserts > upsertsAfterSnapshot, "the durable events that followed (the complete message and run_done) still persist history normally");
+
+    const stored = new TranscriptStore().snapshot(conversationId).events || [];
+    ok(!stored.some((e) => e.type === "stream_partial"), "the durable transcript contains no fragment entry at all");
+    const storedLiveMessage = stored.filter(
+      (e) => e.type === "stream_message" && e.message && e.message.message && e.message.message.id === "msg_live"
+    );
+    ok(storedLiveMessage.length === 2, "each of the id's complete block messages is stored exactly once, not once per fragment");
+  }
+
   console.log(fail === 0 ? "\nALL SIDEPANEL FAKE-COMPANION TESTS PASSED" : `\n${fail} FAILED`);
   fs.rmSync(scratchRoot, { recursive: true, force: true });
   process.exit(fail ? 1 : 0);

@@ -7,13 +7,23 @@
 // (run started/stopped, tool dispatch, approvals) are explicitly NOT
 // batched — those need to reach the panel immediately.
 
+import { isTransientEvent } from "../protocol.js";
+
 export const DEFAULT_BATCH_WINDOW_MS = 75;
 
 /**
- * @param {(event: object) => boolean} defaultIsBatchable
+ * "Batchable" is the high-frequency live streaming traffic, and that is now
+ * BOTH kinds of it: the complete SDK messages (`stream_message`) this
+ * batcher has always coalesced, and their transient fragment counterparts
+ * (`stream_partial`, see protocol.js) emitted while a message is still being
+ * produced. Giving fragments their own window (or forwarding them
+ * immediately) would break the one property the panel's live display depends
+ * on: a fragment must never overtake the tool, approval or lifecycle event
+ * that followed it, and a complete message must never arrive in a different
+ * batch than the fragments that preceded it.
  */
-export function isStreamMessageEvent(event) {
-  return !!event && event.type === "stream_message";
+export function isBatchableStreamEvent(event) {
+  return !!event && (event.type === "stream_message" || isTransientEvent(event));
 }
 
 export class TokenBatcher {
@@ -21,10 +31,12 @@ export class TokenBatcher {
    * @param {object} opts
    * @param {(item: object) => void} opts.sendImmediate - called for a
    *   non-batchable event, or once per flushed batch.
-   * @param {(event: object) => boolean} [opts.isBatchable]
+   * @param {(event: object) => boolean} [opts.isBatchable] - defaults to
+   *   `isBatchableStreamEvent` above (complete messages + transient
+   *   fragments share one window).
    * @param {number} [opts.windowMs]
    */
-  constructor({ sendImmediate, isBatchable = isStreamMessageEvent, windowMs = DEFAULT_BATCH_WINDOW_MS }) {
+  constructor({ sendImmediate, isBatchable = isBatchableStreamEvent, windowMs = DEFAULT_BATCH_WINDOW_MS }) {
     if (typeof sendImmediate !== "function") throw new Error("TokenBatcher requires sendImmediate");
     this._sendImmediate = sendImmediate;
     this._isBatchable = isBatchable;
@@ -37,7 +49,7 @@ export class TokenBatcher {
     if (!this._isBatchable(event)) {
       // A pending batch must still be flushed FIRST so ordering is
       // preserved (a tool_rejected event must not appear to have happened
-      // before the stream_message events that preceded it).
+      // before the stream_message/stream_partial events that preceded it).
       this.flush();
       this._sendImmediate(event);
       return;

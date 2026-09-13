@@ -925,7 +925,89 @@ function turnStatusNote(turn) {
   return null;
 }
 
-function renderTurnHtml(turn, { isLatestStreaming, busy = false, elapsedVisible = false }) {
+// ---- Thinking block: UI-only expansion state and its markup -------------
+//
+// The model's own reasoning for a turn is rendered in a disclosure block
+// visually subordinate to the answer (spec "Thinking is subordinate to the
+// answer"). Its expansion state is pure UI state keyed by run id, exactly
+// like `timelineExpandedRuns` below: never in conversation-model.js, never
+// persisted, never replayed, so a snapshot/reconnect rebuild cannot resurrect
+// an operator's expanded-or-collapsed choice. The difference from the
+// timeline summary is the DEFAULT: expanded while reasoning is arriving
+// (seeing the work is the point), collapsed once the run is no longer live.
+// An explicit choice is stored as an override and wins for the rest of that
+// run in either direction.
+const thinkingExpandedRuns = new Map(); // runId -> explicit boolean (UI-only)
+
+/**
+ * Whether this turn's thinking block is expanded. `opts.overrides` is
+ * injectable so the shipped decision is directly testable; the caller uses
+ * the module Set above, whose entries only an explicit disclosure toggle
+ * writes. Plain-options parameters (rather than a destructured signature) so
+ * the shipped body stays readable by this repo's brace-matching test
+ * extractor, the same way history-view.js stays readable by a fake DOM.
+ */
+function thinkingIsExpanded(turn, opts) {
+  opts = opts || {};
+  const overrides = opts.overrides || thinkingExpandedRuns;
+  const live = !!opts.live;
+  const key = String(turn && turn.runId != null ? turn.runId : "");
+  if (overrides.has(key)) return overrides.get(key);
+  return live;
+}
+
+/**
+ * The answer body of one assistant turn. While the run is live the text is
+ * painted into ONE stable `.stream-answer-text` node (design decision 6) so
+ * the in-place streaming path can update it without rebuilding the
+ * transcript; the moment the run is no longer live the structural renderer
+ * lays the same text out through `renderMarkdownLite()`, so a finished answer
+ * is formatted exactly as it was before this change.
+ */
+function renderProseHtml(turn, opts) {
+  opts = opts || {};
+  const cursor = opts.cursor || "";
+  const marginTop = opts.marginTop || 0;
+  const body = opts.live
+    ? `<span class="stream-answer-text" data-run-id="${escapeHtml(String(turn.runId ?? ""))}">${escapeHtml(turn.text || "")}</span>`
+    : renderMarkdownLite(turn.text || "");
+  return `<div class="prose" style="margin-top:${marginTop}px">${body}${cursor}</div>`;
+}
+
+/**
+ * The collapsible "Suy luận" block, or "" when this turn has no thinking at
+ * all. A `redacted_thinking` block is represented as thinking that occurred,
+ * WITHOUT content — the model never receives the block's `data`, so there is
+ * nothing here to reveal or fabricate. The disclosure reuses the
+ * timeline-summary vocabulary (a real <button> with aria-expanded +
+ * aria-controls, and a hidden body that stays in the DOM in both states), so
+ * it is keyboard-operable with an accessible name and an exposed state.
+ */
+function renderThinkingBlockHtml(turn, opts) {
+  opts = opts || {};
+  const live = !!opts.live;
+  const hasContent = typeof turn.thinking === "string" && turn.thinking.length > 0;
+  if (!hasContent && turn.redactedThinking !== true) return "";
+  const expanded = thinkingIsExpanded(turn, { live });
+  const bodyId = `think-${turn.runId}`;
+  const body = hasContent
+    ? escapeHtml(turn.thinking)
+    : `<span class="thinking-redacted">Mô hình đã suy luận nhưng nội dung không thể hiển thị.</span>`;
+  return `
+    <div class="thinking-block${live ? " is-live" : ""}" data-run-id="${escapeHtml(String(turn.runId ?? ""))}">
+      <button class="thinking-summary" type="button" aria-expanded="${expanded ? "true" : "false"}" aria-controls="${escapeHtml(bodyId)}">
+        <span class="thinking-glyph" aria-hidden="true">${iconMarkup(expanded ? "chevronDown" : "chevronRight", { size: 14 })}</span>
+        <span class="thinking-label">Suy luận</span>
+      </button>
+      <div class="thinking-body" id="${escapeHtml(bodyId)}"${expanded ? "" : " hidden"}>${body}</div>
+    </div>`;
+}
+
+function renderTurnHtml(turn, opts) {
+  opts = opts || {};
+  const isLatestStreaming = !!opts.isLatestStreaming;
+  const busy = !!opts.busy;
+  const elapsedVisible = !!opts.elapsedVisible;
   const note = turnStatusNote(turn);
   // The streaming cursor and the busy/working indicator are mutually
   // exclusive: the cursor means answer text IS flowing right now, the busy
@@ -953,6 +1035,11 @@ function renderTurnHtml(turn, { isLatestStreaming, busy = false, elapsedVisible 
   // right after the tool timeline (roughly where the tool call that
   // surfaced them ran), never mixed into the assistant's own prose.
   const warningsHtml = renderWarningsHtml(turn);
+  // Model reasoning, subordinate to and above the answer (spec "Thinking is
+  // subordinate to the answer"): collapsed by default once the turn is no
+  // longer live, expanded while it is. A turn without thinking renders
+  // exactly as before this change.
+  const thinkingHtml = renderThinkingBlockHtml(turn, { live: isLatestStreaming });
   // Mid-turn ask-user answers anchored to this turn (see
   // recordQuestionAnswer): rendered as user bubbles between the tool timeline
   // and the prose, i.e. next to the tool call that asked for them. The prose
@@ -992,8 +1079,9 @@ function renderTurnHtml(turn, { isLatestStreaming, busy = false, elapsedVisible 
       <div class="msg-assistant-body">
         ${timelineHtml}
         ${warningsHtml}
+        ${thinkingHtml}
         ${answersHtml}
-        <div class="prose" style="margin-top:${turn.toolRows.length ? "12px" : "0"}">${renderMarkdownLite(turn.text)}${cursor}</div>
+        ${renderProseHtml(turn, { cursor, marginTop: turn.toolRows.length ? 12 : 0, live: isLatestStreaming })}
         ${citationHtml}
         ${documentsHtml}
         ${busyHtml}
@@ -1313,7 +1401,9 @@ async function loadOlderTranscript() {
 
 function setOlderTranscriptStatus(text) {
   olderTranscriptNotice = text ? { conversationId: panel.currentConversationId, text } : null;
-  renderTranscript();
+  // Forced: this notice is not part of the model, so the streaming signature
+  // cannot see it change; the structural renderer must lay it out.
+  renderTranscript({ force: true });
 }
 
 // The "window is full" notice, scoped to the conversation it is about: opening
@@ -1335,10 +1425,129 @@ function renderOlderTranscriptControl(model) {
   return `<div class="older-transcript"><button class="btn btn-secondary btn-sm" type="button" id="btn-older-transcript"${notice ? " disabled" : ""}>Tải lịch sử cũ hơn</button>${note}</div>`;
 }
 
-function renderTranscript() {
+// ---- In-place streaming tail (design decision 6) ------------------------
+//
+// While the ONLY change since the last render is the latest turn's growing
+// answer/thinking text, the transcript must not be rebuilt: a wholesale
+// `innerHTML` replacement would destroy the reader's scroll offset, text
+// selection and focus on every 75 ms batch, which is exactly what the spec
+// forbids. `transcriptStructureSignature()` reduces everything the structural
+// renderer's SHAPE depends on (item kinds and order, turn lifecycles, tool
+// rows and their statuses, warnings/documents/answers, whether thinking or
+// text exists at all, the busy indicator, the conversation) to one string.
+// Two renders with the same signature differ only in streamed buffer CONTENT,
+// so the in-place path paints the buffers into the nodes the structural
+// renderer already created and leaves everything else — including the
+// streaming cursor — untouched. Any structural change goes through the
+// structural renderer, which stays the authority.
+//
+// The length of the text/thinking is deliberately NOT part of the signature;
+// their EXISTENCE is, because that is what toggles the block/copy-button
+// markup.
+let lastStructureSignature = null;
+
+function transcriptStructureSignature(model, opts) {
+  opts = opts || {};
+  const busy = !!opts.busy;
+  const parts = [String(model.conversationId ?? ""), model.hasOlderEvents?.() ? "older" : "newest"];
+  for (const item of model.items) {
+    switch (item.kind) {
+      case "user":
+        parts.push(`u:${item.runId ?? ""}:${item.isPlaceholder ? 1 : 0}:${(item.attachments || []).length}`);
+        break;
+      case "recording":
+        parts.push(`rec:${item.recordingId}:${item.transcriptStatus || ""}`);
+        break;
+      case "download_notice":
+        parts.push(`dn:${item.outcome}:${item.filename || ""}:${item.url || ""}`);
+        break;
+      case "download_decision":
+        parts.push(`dd:${item.requestId}:${item.decision}`);
+        break;
+      case "assistant_turn":
+        parts.push([
+          "t",
+          String(item.runId ?? ""),
+          item.lifecycle,
+          item.complete ? 1 : 0,
+          item.text ? 1 : 0,
+          item.thinking ? 1 : 0,
+          item.redactedThinking ? 1 : 0,
+          (item.toolRows || []).map((r) => r.status).join("."),
+          (item.warnings || []).map((w) => w.kind).join("."),
+          (item.documents || []).map((d) => d.documentId).join("."),
+          (item.questionAnswers || []).length
+        ].join(","));
+        break;
+      default:
+        parts.push(`x:${item.kind}`);
+        break;
+    }
+  }
+  return parts.join("|") + (busy ? "|busy" : "");
+}
+
+/** The nodes the in-place path updates: the live turn's answer span and, when
+ * a thinking block exists for it, its body. Null when the transcript does not
+ * currently hold this turn in its streaming shape — in which case the caller
+ * falls back to the structural render. */
+function streamingTailNodes() {
+  const answer = el.transcript.querySelector(".prose .stream-answer-text");
+  if (!answer) return null;
+  const thinkingBlock = el.transcript.querySelector(".thinking-block.is-live");
+  return {
+    answer,
+    thinking: thinkingBlock ? thinkingBlock.querySelector(".thinking-body") : null
+  };
+}
+
+/**
+ * Grow a streamed node's text WITHOUT replacing its children, so the text
+ * node the live answer is anchored in (and any selection range inside it)
+ * survives every batch — design decision 6's "appends fragments into those
+ * nodes as batches arrive". When the new value is a prefix-extension of what
+ * the node's single text node already holds, only the missing delta is
+ * written, via `appendData()`: assigning the whole string to `data` would run
+ * the DOM "replace data" algorithm over the already-visible range and collapse
+ * any live selection or caret inside it, which is the defect this path exists
+ * to avoid. Anything else (a supersede, a redacted body, the initial paint)
+ * replaces the children, exactly as before.
+ */
+function setNodeTextIfChanged(node, text) {
+  if (!node) return;
+  const next = String(text == null ? "" : text);
+  const child = node.firstChild;
+  if (child && child.nodeType === 3 && typeof child.data === "string") {
+    if (child.data === next) return;
+    if (next.startsWith(child.data)) {
+      child.appendData(next.slice(child.data.length));
+      return;
+    }
+  }
+  if (node.textContent !== next) node.textContent = next;
+}
+
+/**
+ * Paint the latest turn's streamed buffers into the EXISTING nodes, in place.
+ * No element is created, replaced or cleared, and the growing text is written
+ * into the same text node it already occupies (`setNodeTextIfChanged`), so a
+ * text selection or focused control inside the transcript, the streaming
+ * cursor that sits after the growing text, and the reading position all
+ * survive a batch. The thinking body is only rewritten when there IS thinking
+ * content, so a redacted block's message is never wiped by an empty buffer.
+ */
+function paintStreamingTail(nodes, turn) {
+  if (!nodes || !nodes.answer) return false;
+  setNodeTextIfChanged(nodes.answer, turn.text);
+  if (nodes.thinking && turn.thinking) setNodeTextIfChanged(nodes.thinking, turn.thinking);
+  return true;
+}
+
+function renderTranscript({ force = false } = {}) {
   const model = panel.currentModel();
   el.emptyStateSlot.innerHTML = "";
   if (!model || model.items.length === 0) {
+    lastStructureSignature = null;
     el.transcript.innerHTML = "";
     el.emptyStateSlot.innerHTML = emptyStateHtml();
     wireEmptyStateSuggestions();
@@ -1350,6 +1559,20 @@ function renderTranscript() {
   // the reflow when text actually arrives replaces it in place.
   const isBusy = !!model.isBusy?.() && model.isBusy();
   const elapsedVisible = isBusy && model.busyElapsedSeconds() >= 3;
+  const signature = transcriptStructureSignature(model, { busy: isBusy });
+  const latest = model.items[model.items.length - 1];
+  if (!force && signature === lastStructureSignature && latest.kind === "assistant_turn") {
+    const nodes = streamingTailNodes();
+    if (nodes && paintStreamingTail(nodes, latest)) {
+      // Same as the structural path's near-bottom snap: a reader already at
+      // the bottom follows the growing text, a reader who scrolled away is
+      // left exactly where they were. No innerHTML write, no re-wiring, and
+      // nothing touches the polite live region.
+      if (preserveScroll) el.panelScroll.scrollTop = el.panelScroll.scrollHeight;
+      updateJumpLatest();
+      return;
+    }
+  }
   const html = model.items
     .map((item, idx) => {
       if (item.kind === "user") return renderUserItemHtml(item);
@@ -1366,6 +1589,7 @@ function renderTranscript() {
     .join("");
   el.transcript.innerHTML = renderOlderTranscriptControl(model) + html;
   wireToolRowIcons(model);
+  wireThinkingToggles();
   wireThumbButtons();
   wireDocumentCards();
   wireCopyButtons(model);
@@ -1374,6 +1598,7 @@ function renderTranscript() {
   });
   if (preserveScroll) el.panelScroll.scrollTop = el.panelScroll.scrollHeight;
   updateJumpLatest();
+  lastStructureSignature = signature;
 }
 
 function wireToolRowIcons(model) {
@@ -1447,6 +1672,41 @@ function toggleTimelineSummary(btn) {
   else timelineExpandedRuns.delete(runId);
   btn.setAttribute("aria-expanded", willExpand ? "true" : "false");
   if (list) list.hidden = !willExpand;
+  if (glyph) glyph.innerHTML = iconMarkup(willExpand ? "chevronDown" : "chevronRight", { size: 14 });
+}
+
+// Thinking-block disclosure wiring. Same `.wired` sentinel convention as
+// `wireTimelineToggles`: a structural re-render preserves the listeners, and
+// the toggle mutates only DOM visibility plus the UI-only override map, never
+// the model. The button is a real <button>, so Enter/Space activation is
+// native; the explicit keydown handler keeps that true if the element ever
+// changes. `aria-expanded` is the source of truth for which way a click
+// toggles, because the value may have come from the live default rather than
+// an explicit choice.
+function wireThinkingToggles() {
+  el.transcript.querySelectorAll(".thinking-summary").forEach((btn) => {
+    if (btn.dataset.wired === "1") return;
+    btn.dataset.wired = "1";
+    btn.addEventListener("click", () => toggleThinkingSummary(btn));
+    btn.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " " || e.key === "Spacebar") {
+        e.preventDefault();
+        toggleThinkingSummary(btn);
+      }
+    });
+  });
+}
+
+function toggleThinkingSummary(btn) {
+  const wrap = btn.closest(".thinking-block");
+  if (!wrap) return;
+  const runId = wrap.dataset.runId;
+  const body = wrap.querySelector(".thinking-body");
+  const glyph = btn.querySelector(".thinking-glyph");
+  const willExpand = btn.getAttribute("aria-expanded") !== "true";
+  thinkingExpandedRuns.set(runId, willExpand);
+  btn.setAttribute("aria-expanded", willExpand ? "true" : "false");
+  if (body) body.hidden = !willExpand;
   if (glyph) glyph.innerHTML = iconMarkup(willExpand ? "chevronDown" : "chevronRight", { size: 14 });
 }
 

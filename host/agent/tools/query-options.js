@@ -835,6 +835,22 @@ export function buildIsolatedOptions({
     strictMcpConfig: true,
     settingSources: [],
     cwd: skills.cwd,
+    // openspec/changes/add-live-streaming-and-thinking (design.md decision 1):
+    // the panel run's own SDK switch for the incremental partial-message
+    // stream — `Options.includePartialMessages`, sdk.d.ts: "When true,
+    // `SDKPartialAssistantMessage` events will be emitted during streaming."
+    // Without it the SDK emits complete assistant messages only, so there is
+    // nothing for the panel to show live; companion.js's `_runQuery` pump
+    // forwards those events under protocol.js's transient
+    // STREAM_PARTIAL_EVENT_TYPE and the durable sink skips them, so enabling
+    // it adds live traffic without changing the stored record.
+    //
+    // Set HERE and nowhere else: the prompt-enhancement path
+    // (host/agent/enhance-prompt.js's `buildEnhanceOptions`) and the
+    // capability test (host/agent/settings/capability-test.js) build their
+    // own options objects and never route through this builder, so no other
+    // caller's traffic changes. Nothing else in this options object changes.
+    includePartialMessages: true,
     // The session's approved skill snapshots are made discoverable by
     // loading them as a LOCAL PLUGIN at an explicit absolute path
     // (design.md decision 9, superseding decision 7's `settingSources:

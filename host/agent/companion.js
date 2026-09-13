@@ -49,7 +49,8 @@ import {
   versionMismatchEnvelope,
   helloAckEnvelope,
   wrapAgentMessage,
-  unwrapAgentMessage
+  unwrapAgentMessage,
+  STREAM_PARTIAL_EVENT_TYPE
 } from "./protocol.js";
 import { TranscriptStore } from "./storage/transcript-store.js";
 import { PendingRecordingsStore } from "./storage/pending-recordings.js";
@@ -312,8 +313,16 @@ export class CompanionCore {
    *   including one that would otherwise open a real OAuth callback listener
    *   on port 1455 or write a real OS credential — without either. Additive:
    *   omitted, the ops resolve the real module lazily.
+   * @param {object} [deps.chatgptUsageReader] - the same "lazy, injectable,
+   *   defaults to the real module" pattern as `chatgptAuthProvider`, for the
+   *   one ChatGPT account-usage op (`chatgpt_usage`): an object with
+   *   `readUsage(profileId) -> Promise<{ok:true,result}|{ok:false,error}>`
+   *   (host/agent/chatgpt/usage.js's createUsageReader()). Injectable so a
+   *   test can drive the reply shape — and every failure code — without a
+   *   network call. Additive: omitted, the op resolves the real module
+   *   lazily.
    */
-  constructor({ toolBridge, sessionManager, lease, coerceArgs, sdk, profileProvider, settingsProvider, chatgptAuthProvider, artifactStore, attachmentStore, askUserToolFactory, documentStore }) {
+  constructor({ toolBridge, sessionManager, lease, coerceArgs, sdk, profileProvider, settingsProvider, chatgptAuthProvider, chatgptUsageReader, artifactStore, attachmentStore, askUserToolFactory, documentStore }) {
     this.toolBridge = toolBridge;
     this.sessionManager = sessionManager;
     this.lease = lease;
@@ -334,6 +343,11 @@ export class CompanionCore {
     // `chatgptAuthProvider` doc. Same shape as `_settingsModulePromise` above.
     this.chatgptAuthProvider = chatgptAuthProvider || null;
     this._chatgptAuthModulePromise = null;
+    // ChatGPT account-usage reader: injected double (tests) or the real
+    // host/agent/chatgpt/usage.js reader, resolved lazily — see the
+    // constructor's `chatgptUsageReader` doc.
+    this.chatgptUsageReader = chatgptUsageReader || null;
+    this._chatgptUsageModulePromise = null;
     this._unsubscribeCredentialRevoked = null;
     this._negotiatedVersion = null;
     this._browserIdentity = null;
@@ -1402,6 +1416,20 @@ export class CompanionCore {
     return this._chatgptAuthModulePromise;
   }
 
+  /** Lazily resolve the `chatgpt_usage` op's reader: an injected
+   * `chatgptUsageReader` (tests) or a real host/agent/chatgpt/usage.js
+   * instance built with its own production defaults. Same discipline as
+   * `_getChatgptAuthModule()` above: a companion that never serves a
+   * `chatgpt` profile never imports the usage module (nor, transitively, the
+   * auth module it defaults to). */
+  async _getChatgptUsageReader() {
+    if (this.chatgptUsageReader) return this.chatgptUsageReader;
+    if (!this._chatgptUsageModulePromise) {
+      this._chatgptUsageModulePromise = import("./chatgpt/usage.js").then((mod) => mod.createUsageReader());
+    }
+    return this._chatgptUsageModulePromise;
+  }
+
   /**
    * Defensive outbound scan for the six ChatGPT ops: no agent_settings reply
    * may carry a raw credential field. The ChatGPT secret already lives only in
@@ -1887,6 +1915,23 @@ export class CompanionCore {
           // trip. Same profileId-guard as `get_profile` above.
           const profile = await settings.loadProfile();
           return ok(this._assertAgentSettingsResultSecretFree(profile && profile.profileId === envelope.profileId ? profile : null));
+        }
+        case "chatgpt_usage": {
+          // Account-usage read (spec: "ChatGPT account usage read"). The
+          // reader resolves its own eligibility (signed in / has credential)
+          // before any network call and never throws for an ordinary
+          // failure, so this case only forwards its structured result —
+          // translation lives in host/agent/chatgpt/usage.js, not here.
+          if (typeof envelope.profileId !== "string" || !envelope.profileId) {
+            return fail("PROTOCOL_ERROR", "chatgpt_usage requires a profileId");
+          }
+          const reader = await this._getChatgptUsageReader();
+          const outcome = await reader.readUsage(envelope.profileId);
+          if (outcome && outcome.ok === true) {
+            return ok(this._assertAgentSettingsResultSecretFree(outcome.result));
+          }
+          const error = (outcome && outcome.error) || {};
+          return fail(error.code || "NETWORK_ERROR", error.message || "the ChatGPT usage read failed");
         }
         default:
           return fail("PROTOCOL_ERROR", `unknown agent_settings op ${JSON.stringify(op)}`);
@@ -2770,7 +2815,23 @@ export class CompanionCore {
             }
           }
         }
-        run.emit({ type: "stream_message", message });
+        // add-live-streaming-and-thinking (design.md decision 2): with
+        // `includePartialMessages` set for panel runs (see
+        // buildIsolatedOptions()), the SDK additionally yields raw
+        // `SDKPartialAssistantMessage` events (`type: "stream_event"`) while
+        // an assistant message is still being produced. Those get their OWN
+        // transient identity here — live-only traffic the durable sink in
+        // SessionManager.startRun() drops before it can reach the store,
+        // while the batcher below still coalesces them with complete
+        // messages into the one bounded window so their order relative to
+        // the tool/lifecycle events around them never changes. A complete
+        // assistant/user message keeps the `stream_message` identity every
+        // existing consumer already knows, unchanged.
+        if (message.type === "stream_event") {
+          run.emit({ type: STREAM_PARTIAL_EVENT_TYPE, message });
+        } else {
+          run.emit({ type: "stream_message", message });
+        }
       }
     } catch (err) {
       // A deliberate user/system stop already emitted run_stopped and
