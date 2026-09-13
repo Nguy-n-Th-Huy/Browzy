@@ -13,6 +13,9 @@ import { ProfileCache, READINESS } from "./profile-cache.js";
 import { PageContextTracker, sameIdentity } from "./page-context.js";
 import { referencesCurrentPage } from "./context-binding.js";
 import { RecordingsClient, listRecordings } from "./recordings-model.js";
+import { HistoryListView, historyErrorText } from "./history-view.js";
+import { HistoryPrivacyControls } from "./history-privacy.js";
+import { normalizeExportFormat } from "./history-export.js";
 import { toolRowDisplay } from "./conversation-model.js";
 import { RUN_PHASE, PHASE_LABEL_VI, BUSY_LABEL_VI, phaseVisualClass } from "./run-states.js";
 import { renderMarkdownLite, escapeHtml } from "./markdown-lite.js";
@@ -68,8 +71,19 @@ const el = {
   btnHistoryBack: $("btn-history-back"),
   btnNewChat: $("btn-new-chat"),
   btnHistoryNew: $("btn-history-new"),
+  btnHistoryClearAll: $("btn-history-clear-all"),
   iconNewPlus: $("icon-new-plus"),
+  historyScroll: $("history-scroll"),
   conversationList: $("conversation-list"),
+  historySearch: $("history-search"),
+  historyFrom: $("history-from"),
+  historyTo: $("history-to"),
+  historyDomain: $("history-domain"),
+  historyFilterSummary: $("history-filter-summary"),
+  btnHistoryClearFilters: $("btn-history-clear-filters"),
+  historyStatus: $("history-status"),
+  historyPrivacyToggle: $("history-privacy-toggle"),
+  historyRetentionOutcome: $("history-retention-outcome"),
   recordingList: $("recording-list"),
   recorderStatusLabel: $("recorder-status-label"),
   btnToggleRecording: $("btn-toggle-recording"),
@@ -143,6 +157,49 @@ const panel = new PanelController({
 });
 
 let pageContext = null;
+
+// tasks.md 2.3: the debounced local cache and any queued presentation
+// metadata must not die with the document. `pagehide` fires when the tab is
+// closed AND when the side panel document itself is torn down, so this is the
+// last chance to persist what the debounce window still holds.
+window.addEventListener("pagehide", () => {
+  try {
+    panel.flushHistory();
+  } catch {
+    /* best-effort at unload — never block teardown */
+  }
+});
+
+// Live synchronization (spec chat-history-browsing "Live synchronization"):
+// another panel's write — or a delete/clear made here — updates the cache and
+// the history screen re-renders if it is the visible one. Deliberately
+// ignores the reconcile/upsert/retention notifications this same view's own
+// `refreshHistoryView()` produces (it already re-renders from the result),
+// which is what keeps the listener from re-entering the reconcile that
+// notified it. `policy` is the one exception: turning raw-prompt caching off
+// (here or in the other panel) drops prompt previews the list was searching
+// against and flips the privacy switch, so the screen has to re-read both.
+// No-op while chatting.
+historyStore.onChange((event) => {
+  if (el.historyView.hidden || !event) return;
+  if (event.type === "external_change" || event.type === "removed" || event.type === "cleared" || event.type === "policy") {
+    refreshHistoryView({ reconcile: false });
+  }
+});
+
+/** Drop every remembered-conversation key whose tab no longer exists
+ * (tasks.md 2.3). Best-effort by construction: an unenumerable tab list
+ * leaves the keys alone (history-store.js's pruneLastActive treats an empty
+ * valid set as "cannot determine", never as "nothing exists"). */
+async function pruneStaleLastActiveKeys() {
+  if (typeof chrome === "undefined" || !chrome.tabs || typeof chrome.tabs.query !== "function") return;
+  try {
+    const tabs = await chrome.tabs.query({});
+    await historyStore.pruneLastActive((tabs || []).map((tab) => String(tab.id)));
+  } catch {
+    /* best-effort sweep */
+  }
+}
 
 async function currentWindowId() {
   try {
@@ -260,6 +317,14 @@ function renderSetupBanner() {
       actionBtn = testConnectionButton("Kiểm tra lại kết nối");
       break;
     }
+    case READINESS.CHATGPT_SIGN_IN_REQUIRED:
+      p.innerHTML = `<strong>Chưa đăng nhập ChatGPT.</strong> Đăng nhập với tài khoản ChatGPT trong Cài đặt trước khi trò chuyện.`;
+      actionBtn = settingsButton("Đăng nhập ChatGPT");
+      break;
+    case READINESS.CHATGPT_SESSION_EXPIRED:
+      p.innerHTML = `<strong>Phiên ChatGPT đã hết hạn.</strong> Đăng nhập lại trong Cài đặt để tiếp tục trò chuyện.`;
+      actionBtn = settingsButton("Đăng nhập lại");
+      break;
     case READINESS.NOT_CONFIGURED:
     default:
       p.innerHTML = `<strong>Chưa cấu hình nhà cung cấp.</strong> Thêm Base URL, API key và chọn model trong Cài đặt để bắt đầu trò chuyện.`;
@@ -439,6 +504,31 @@ function renderContextChip() {
 const permissionsClient = createPermissionsClient();
 let permissionMode = { mode: "auto", modeSource: "local", loaded: false, syncing: false };
 
+// Retry ladder for a failed mode load (see loadPermissionMode below). The
+// live "click Auto, nothing opens" regression was TWO faults in series: the
+// relay refused the op (fixed in background.js's allowlist) AND this panel
+// gave up permanently after one silent failure — syncPermissionMode() only
+// attempts a load once per ok handshake, so the menu stayed empty forever
+// while everything else looked healthy. A failed load now surfaces on the
+// trigger and schedules a backoff retry while the handshake is up; the state
+// lives in ONE object so the schedule and the success path share it.
+const PERMISSION_MODE_RETRY_BASE_MS = 2000;
+const PERMISSION_MODE_RETRY_MAX_MS = 30000;
+const permissionModeRetry = { timer: null, delayMs: PERMISSION_MODE_RETRY_BASE_MS };
+
+function schedulePermissionModeRetry() {
+  if (permissionModeRetry.timer != null) return; // one retry in flight at a time
+  permissionModeRetry.timer = setTimeout(() => {
+    permissionModeRetry.timer = null;
+    // Only while the handshake is up — a disconnect resets the ladder (see
+    // syncPermissionMode) and its fresh-handshake path owns the reload.
+    if (panel.protocol.handshakeState() === "ok") loadPermissionMode();
+  }, permissionModeRetry.delayMs);
+  // Grow for the NEXT failure; a success resets to base (see
+  // loadPermissionMode). 2s, 4s, 8s, ... capped at 30s.
+  permissionModeRetry.delayMs = Math.min(permissionModeRetry.delayMs * 2, PERMISSION_MODE_RETRY_MAX_MS);
+}
+
 function renderModeMenu() {
   const managed = permissionMode.modeSource === "managed";
   el.modeTriggerLabel.textContent = modeLabel(permissionMode.mode);
@@ -503,13 +593,28 @@ async function changePermissionMode(mode) {
 async function loadPermissionMode() {
   if (permissionMode.syncing) return;
   permissionMode.syncing = true;
+  let result;
   try {
-    const result = await permissionsClient.getPermissionState();
-    permissionMode = { mode: result.mode, modeSource: result.modeSource, loaded: true, syncing: false };
+    result = await permissionsClient.getPermissionState();
   } catch {
+    // NEVER give up silently: a single transient failure used to leave the
+    // badge on its static "Auto" label and the menu empty forever (the
+    // "click Auto, nothing opens" regression). Surface the state on the
+    // trigger and schedule a backoff retry.
     permissionMode.syncing = false;
+    el.modeTrigger.title = "Không tải được chế độ cấp quyền — đang thử lại…";
+    schedulePermissionModeRetry();
     return;
   }
+  // Success: cancel any scheduled retry and reset the ladder for the next
+  // unrelated failure. renderModeMenu() rewrites the title to the real mode
+  // description, clearing any failure message above.
+  permissionModeRetry.delayMs = PERMISSION_MODE_RETRY_BASE_MS;
+  if (permissionModeRetry.timer != null) {
+    clearTimeout(permissionModeRetry.timer);
+    permissionModeRetry.timer = null;
+  }
+  permissionMode = { mode: result.mode, modeSource: result.modeSource, loaded: true, syncing: false };
   renderModeMenu();
 }
 
@@ -526,6 +631,10 @@ function syncPermissionMode() {
     loadPermissionMode();
   } else if (!ok) {
     permissionModeHandshakeSeen = false;
+    // A disconnect resets the retry ladder: the next ok handshake is a
+    // fresh start, not a continuation of a grown backoff. Any pending retry
+    // timer's callback is already a no-op while disconnected.
+    permissionModeRetry.delayMs = PERMISSION_MODE_RETRY_BASE_MS;
   }
 }
 
@@ -1146,6 +1255,86 @@ function isNearBottom() {
   return s.scrollHeight - s.scrollTop - s.clientHeight < 80;
 }
 
+/**
+ * Whether the transcript's scroll position should pull the next older page
+ * (tasks.md 3.2's lazy older-event retrieval, driven from the UI).
+ *
+ * Deliberately a tiny pure predicate rather than logic inlined in the scroll
+ * listener: it is the one decision of this feature that can be reasoned about
+ * without a DOM, and the cost of getting it wrong is a load-per-scroll-event
+ * loop or a conversation whose older history is unreachable.
+ */
+function shouldLoadOlderTranscript(metrics) {
+  const { scrollTop = 0, hasOlder = false, loading = false, threshold = 48 } = metrics || {};
+  if (!hasOlder || loading) return false;
+  return scrollTop <= threshold;
+}
+
+// One older page at a time: the model cannot hold more than its window
+// (tasks.md 3.3), and two concurrent pulls would race each other's
+// scroll-height compensation.
+let loadingOlderTranscript = false;
+
+/**
+ * Load one older transcript page and keep the reader where they were. The
+ * transcript is rendered top-to-bottom, so prepending items pushes the current
+ * paragraph DOWN by exactly the height that was added; adding that delta back
+ * to `scrollTop` leaves the reading position visually unchanged (the archived
+ * design's "preserve scroll position when reading older content"). This is the
+ * same reason `renderTranscript()`'s own near-bottom snap must not run for
+ * this case — being pulled to the bottom is the opposite of what the reader
+ * asked for.
+ */
+async function loadOlderTranscript() {
+  const model = panel.currentModel();
+  if (!model || loadingOlderTranscript || !model.hasOlderEvents?.()) return null;
+  loadingOlderTranscript = true;
+  const beforeHeight = el.panelScroll.scrollHeight;
+  const beforeTop = el.panelScroll.scrollTop;
+  try {
+    const applied = await panel.loadOlderEvents(model.conversationId);
+    if (!applied) return null;
+    // Everything that was on screen is now `added` pixels further down; putting
+    // the reader back there leaves the reading position unchanged. A reader who
+    // was already at the bottom is clamped right back to the bottom, which is
+    // the auto-follow behaviour they expect.
+    const added = el.panelScroll.scrollHeight - beforeHeight;
+    if (added > 0) el.panelScroll.scrollTop = beforeTop + added;
+    if (applied.limitReached) {
+      // The window is full (tasks.md 3.3's memory budget). Say so on the
+      // control instead of leaving a button that can never do anything.
+      setOlderTranscriptStatus("Đã đạt giới hạn bộ nhớ hiển thị — mở lại cuộc trò chuyện để xem phần cũ hơn.");
+    }
+    return applied;
+  } finally {
+    loadingOlderTranscript = false;
+  }
+}
+
+function setOlderTranscriptStatus(text) {
+  olderTranscriptNotice = text ? { conversationId: panel.currentConversationId, text } : null;
+  renderTranscript();
+}
+
+// The "window is full" notice, scoped to the conversation it is about: opening
+// a different conversation must not show a notice that was earned elsewhere.
+let olderTranscriptNotice = null;
+
+/**
+ * The transcript's "older history" affordance: a control at the top of a
+ * windowed conversation (the model reports `hasOlderEvents()`), which also
+ * loads automatically when the reader scrolls to the very top — the two halves
+ * of tasks.md 3.2 ("lazy older-event retrieval") being usable at all. Without
+ * it the window is invisible: a long conversation would simply begin
+ * mid-history with nothing saying so.
+ */
+function renderOlderTranscriptControl(model) {
+  if (!model || typeof model.hasOlderEvents !== "function" || !model.hasOlderEvents()) return "";
+  const notice = olderTranscriptNotice && olderTranscriptNotice.conversationId === model.conversationId ? olderTranscriptNotice.text : null;
+  const note = notice ? `<span class="field-hint">${escapeHtml(notice)}</span>` : "";
+  return `<div class="older-transcript"><button class="btn btn-secondary btn-sm" type="button" id="btn-older-transcript"${notice ? " disabled" : ""}>Tải lịch sử cũ hơn</button>${note}</div>`;
+}
+
 function renderTranscript() {
   const model = panel.currentModel();
   el.emptyStateSlot.innerHTML = "";
@@ -1175,11 +1364,14 @@ function renderTranscript() {
       });
     })
     .join("");
-  el.transcript.innerHTML = html;
+  el.transcript.innerHTML = renderOlderTranscriptControl(model) + html;
   wireToolRowIcons(model);
   wireThumbButtons();
   wireDocumentCards();
   wireCopyButtons(model);
+  el.transcript.querySelector("#btn-older-transcript")?.addEventListener("click", () => {
+    loadOlderTranscript();
+  });
   if (preserveScroll) el.panelScroll.scrollTop = el.panelScroll.scrollHeight;
   updateJumpLatest();
 }
@@ -1368,6 +1560,19 @@ function updateJumpLatest() {
 el.panelScroll.addEventListener("scroll", () => {
   wasNearBottom = isNearBottom();
   updateJumpLatest();
+  // Reaching the very top of a windowed conversation pulls the next older
+  // page (tasks.md 3.2). The predicate is pure and the actual load is
+  // re-entrancy guarded, so a scroll event storm cannot start two.
+  const model = panel.currentModel();
+  if (
+    shouldLoadOlderTranscript({
+      scrollTop: el.panelScroll.scrollTop,
+      hasOlder: !!model && typeof model.hasOlderEvents === "function" && model.hasOlderEvents(),
+      loading: loadingOlderTranscript
+    })
+  ) {
+    loadOlderTranscript();
+  }
 });
 
 function announcePhase(phase) {
@@ -2584,6 +2789,149 @@ el.addMenuFiles.addEventListener("click", () => {
 restoreEffort();
 // ---- history / recordings view ------------------------------------------
 
+// The history list itself (tasks.md 4.1-4.3). Every policy decision lives in
+// history-view.js — this file only feeds it the cache, wires the toolbar and
+// performs the host operations the view asks for. `container` is filled from
+// scratch by the view; `scrollContainer` is the scrolling ancestor, which is
+// also the element the paging/scroll-preservation logic measures.
+const historyView = new HistoryListView({
+  container: el.conversationList,
+  scrollContainer: el.historyScroll || el.conversationList,
+  document,
+  actions: {
+    onOpen: (entry) => openHistoryEntry(entry),
+    onDelete: (entry) => deleteHistoryEntry(entry),
+    onRename: (entry) => renameHistoryEntry(entry),
+    onPin: (entry) => applyPresentationUpdate(entry, { pinned: !entry.pinned }),
+    onArchive: (entry) => applyPresentationUpdate(entry, { archived: !entry.archived }),
+    onExport: (entry) => exportHistoryEntry(entry),
+    onRetry: () => refreshHistoryView(),
+    // Every render (including the debounced search's, which the panel never
+    // asks for) refreshes the filter summary from the report.
+    onRender: () => syncHistoryFilterSummary()
+  }
+});
+
+// The privacy switch and the retention outcome line (tasks.md 2.2; spec
+// chat-history-storage "Privacy control" and "Bounded retention"). The store
+// owns both facts; this binds the screen's controls to them — the switch
+// disables raw-prompt caching (dropping already-cached previews), and the
+// line reports what retention evicted so "the user can see the outcome". It
+// is synced from `refreshHistoryView()` so a policy changed in another panel
+// shows up here as well.
+const historyPrivacy = new HistoryPrivacyControls({
+  store: historyStore,
+  toggle: el.historyPrivacyToggle,
+  outcome: el.historyRetentionOutcome
+});
+
+// Reopening a conversation from the list (spec browser-assistant-panel
+// "Reopen a conversation" / chat-history-lifecycle). The row's own "open"
+// control is disabled while the conversation is stale, so an orphan can never
+// be reopened into an empty transcript.
+async function openHistoryEntry(entry) {
+  await panel.reopenConversation(entry.conversationId);
+  showChatView();
+}
+
+// Delete (tasks.md 1.3, unchanged contract): the HOST is asked first, and a
+// failure is never presented as a success — the row stays and the operator is
+// told why.
+async function deleteHistoryEntry(entry) {
+  const confirmed = window.confirm(
+    `Xóa cuộc trò chuyện "${entry.title || entry.conversationId}"? ` +
+      `Bản ghi hội thoại trên máy chủ companion và bản lưu cục bộ đều sẽ bị xóa.`
+  );
+  if (!confirmed) return;
+  const result = await panel.deleteConversation(entry.conversationId);
+  if (!result.ok) {
+    window.alert(`Không xóa được cuộc trò chuyện: ${historyErrorText(result.reason)}. Dữ liệu vẫn còn nguyên.`);
+    return;
+  }
+  // The store's own removal already notified this view; reconcile: false
+  // re-renders from that new state instead of asking the host a second time.
+  await refreshHistoryView({ reconcile: false });
+}
+
+/**
+ * Rename / pin / archive (spec chat-history-lifecycle "Organization and
+ * export"). One host operation behind all three: the host owns presentation
+ * metadata and revisions it, so a stale edit from another panel comes back as
+ * a conflict the operator is told about rather than a silent overwrite.
+ */
+async function applyPresentationUpdate(entry, patch) {
+  const result = await panel.updateConversationPresentation(entry.conversationId, patch);
+  if (!result.ok) {
+    window.alert(`Không cập nhật được cuộc trò chuyện: ${historyErrorText(result.reason)}.`);
+  }
+  await refreshHistoryView({ reconcile: false });
+}
+
+async function renameHistoryEntry(entry) {
+  const current = entry.title || "";
+  const next = window.prompt("Đổi tên cuộc trò chuyện:", current);
+  if (next == null) return;
+  const title = next.trim();
+  if (!title || title === current) return; // nothing to write — and the host rejects an empty patch
+  await applyPresentationUpdate(entry, { title });
+}
+
+/**
+ * Export one conversation (spec chat-history-lifecycle "Organization and
+ * export"). The transcript comes from the HOST page by page
+ * (panel-controller.js's exportConversation), never from this panel's bounded
+ * window, and the artifact is written locally with a blob URL — no network,
+ * no `downloads` permission, nothing leaves the machine (the same mechanism
+ * the document viewer's download control uses).
+ */
+async function exportHistoryEntry(entry) {
+  const choice = window.prompt('Xuất cuộc trò chuyện dưới dạng nào? Nhập "md" (Markdown) hoặc "json".', "md");
+  if (choice == null) return;
+  const format = normalizeExportFormat(choice);
+  if (!format) {
+    window.alert(`Định dạng không hợp lệ: ${historyErrorText("unknown_format")}.`);
+    return;
+  }
+  setHistoryStatus("Đang xuất cuộc trò chuyện…");
+  historyView.setBusy({ conversationId: entry.conversationId, action: "export" });
+  historyView.render();
+  try {
+    const result = await panel.exportConversation(entry.conversationId, { format });
+    if (!result.ok) {
+      setHistoryStatus("");
+      window.alert(`Không xuất được cuộc trò chuyện: ${historyErrorText(result.reason)}.`);
+      return;
+    }
+    downloadTextArtifact(result);
+    setHistoryStatus(`Đã xuất ${result.filename} (${result.messageCount} tin nhắn).`);
+  } finally {
+    historyView.setBusy(null);
+    historyView.render();
+  }
+}
+
+/** Save a text artifact to the operator's machine. A blob URL plus
+ * `<a download>`: no `downloads` permission, no network request. The URL is
+ * revoked right after the click so the bytes are not pinned by the object URL
+ * registry (mirrors downloadDocument()'s own note). */
+function downloadTextArtifact({ filename, mimeType, content }) {
+  const blob = new Blob([content], { type: mimeType || "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename || "cuoc-tro-chuyen.md";
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+function setHistoryStatus(text) {
+  if (!el.historyStatus) return;
+  el.historyStatus.textContent = text || "";
+  el.historyStatus.hidden = !text;
+}
+
 function showHistoryView() {
   el.chatView.style.display = "none";
   el.historyView.hidden = false;
@@ -2635,43 +2983,97 @@ el.btnHistoryNew.addEventListener("click", async () => {
   showChatView();
 });
 
-async function refreshHistoryView() {
-  const conversations = await historyStore.list();
-  el.conversationList.innerHTML = "";
-  if (!conversations.length) {
-    el.conversationList.innerHTML = `<p class="field-hint">Chưa có cuộc trò chuyện nào.</p>`;
+// tasks.md 1.3's delete-all: the HOST is asked first and the local cache is
+// cleared only for a sweep it confirmed. A partial failure leaves the cache
+// alone and reports what happened, so "cleared" is never claimed over a
+// half-deleted host.
+el.btnHistoryClearAll.addEventListener("click", async () => {
+  const confirmed = window.confirm(
+    "Xóa TẤT CẢ cuộc trò chuyện khỏi máy chủ companion và bản lưu cục bộ? Thao tác này không thể hoàn tác."
+  );
+  if (!confirmed) return;
+  el.btnHistoryClearAll.disabled = true;
+  const label = el.btnHistoryClearAll.textContent;
+  el.btnHistoryClearAll.textContent = "Đang xóa…";
+  try {
+    const result = await panel.deleteAllConversations();
+    if (!result.ok) {
+      const failed = Array.isArray(result.failed) ? result.failed.length : 0;
+      const detail = failed ? `còn ${failed} cuộc trò chuyện chưa xóa được` : historyErrorText(result.reason);
+      window.alert(`Không xóa được toàn bộ: ${detail}. Danh sách cục bộ được giữ nguyên.`);
+    }
+  } finally {
+    el.btnHistoryClearAll.disabled = false;
+    el.btnHistoryClearAll.textContent = label;
+    refreshHistoryView();
   }
-  for (const c of conversations) {
-    const row = document.createElement("div");
-    row.className = "list-item";
-    if (c.conversationId === panel.currentConversationId) row.setAttribute("aria-current", "true");
-    row.innerHTML = `
-      <span class="list-item-icon">${iconMarkup("page", { size: 18 })}</span>
-      <span class="list-item-main">
-        <span class="list-item-title"></span>
-        <span class="list-item-sub"></span>
-      </span>
-      ${c.interrupted ? `<span class="status-pill is-unknown">Bị gián đoạn</span>` : ""}
-      <button class="btn-icon" data-act="open" aria-label="Mở lại cuộc trò chuyện">${iconMarkup("externalLink", { size: 16 })}</button>
-      <button class="btn-icon" data-act="delete" aria-label="Xóa cuộc trò chuyện">${iconMarkup("trash", { size: 16 })}</button>
-    `;
-    row.querySelector(".list-item-title").textContent = c.title || "Cuộc trò chuyện";
-    row.querySelector(".list-item-sub").textContent = new Date(c.updatedAt || c.createdAt || Date.now()).toLocaleString("vi-VN") + (c.hostname ? ` · ${c.hostname}` : "");
-    row.querySelector('[data-act="open"]').addEventListener("click", async () => {
-      await panel.reopenConversation(c.conversationId);
-      showChatView();
-    });
-    row.querySelector('[data-act="delete"]').addEventListener("click", async () => {
-      const confirmed = window.confirm(
-        `Xóa cuộc trò chuyện "${c.title || c.conversationId}" khỏi danh sách này trên thiết bị này? ` +
-          `Thao tác này chỉ xóa khỏi danh sách trên trình duyệt này — không đảm bảo xóa dữ liệu đã lưu trên máy chủ companion.`
-      );
-      if (!confirmed) return;
-      await panel.deleteConversationLocally(c.conversationId);
-      refreshHistoryView();
-    });
-    el.conversationList.appendChild(row);
+});
+
+/**
+ * Should this cached conversation occupy a row in the history LIST?
+ *
+ * Only an explicit `false` hides a row — the conversation is then KNOWN to be
+ * empty (no stored event on the host, no item in this panel's model for it).
+ * `true` and "no opinion" both render: an entry cached before this field
+ * existed, or a conversation a summary from an older companion never graded,
+ * is unknown, and hiding unknown conversations would hide real history. This
+ * is a DISPLAY decision only: the conversation is still in the cache and the
+ * host's list, so boot restore, reopen, rename, pin, archive, export and
+ * delete/delete-all all keep reachable for it.
+ */
+function isListableHistoryEntry(entry) {
+  return !!entry && entry.hasData !== false;
+}
+
+/**
+ * Load the list into the view and render it (tasks.md 1.2 + 4.1-4.3).
+ *
+ * tasks.md 1.2: the host's list is authoritative. Reconcile first (it also
+ * marks or drops orphans), then render from the local cache — which now
+ * mirrors the host. When the host does not answer, the cached list renders
+ * as-is, every row it cannot vouch for is already/soon marked stale, and the
+ * view says which of the three reasons it is (offline / protocol too old /
+ * no answer) instead of showing an unexplained empty list.
+ *
+ * The list is filtered to conversations that have data BEFORE it is handed to
+ * the view (see `isListableHistoryEntry()`): an empty conversation renders no
+ * row, and everything downstream — the rows, the "N/M match the filter"
+ * readout, the empty state, the domain options — derives from that one feed,
+ * so the screen cannot disagree with itself.
+ *
+ * `reconcile: false` is for a re-render triggered by a cache change (the
+ * onChange subscription, a local delete): the cache is already the freshest
+ * thing available, and asking the host again would re-enter this method
+ * through the reconcile notification.
+ *
+ * The render token is claimed BEFORE the awaits: a keystroke or another
+ * panel's write can render a newer pass while this one is in flight, and the
+ * older pass must then be discarded rather than rolling the screen back.
+ */
+async function refreshHistoryView({ reconcile = true, token = null } = {}) {
+  const renderToken = token == null ? historyView.nextRenderToken() : token;
+  let offline = false;
+  let error = null;
+  if (reconcile) {
+    historyView.setState({ loading: true });
+    historyView.render({ token: renderToken }); // first open: say "loading" instead of "empty"
+    const reconciled = await panel.reconcileHistory().catch(() => null);
+    if (!reconciled) ({ offline, error } = describeHistoryHostState());
+  } else {
+    ({ offline, error } = describeHistoryHostState());
   }
+  const conversations = (await historyStore.list()).filter(isListableHistoryEntry);
+  historyView.setActiveConversation(panel.currentConversationId);
+  historyView.setEntries(conversations);
+  historyView.setState({ loading: false, offline, error });
+  syncHistoryDomainOptions();
+  syncHistoryFilterSummary();
+  historyView.render({ token: renderToken });
+
+  // The privacy switch and the retention outcome live on this screen and read
+  // the same store: adopt whatever policy is persisted (another panel may
+  // have changed it) and show what retention did to the local cache.
+  await historyPrivacy.sync();
 
   await refreshRecordingsStatus();
   const recordings = await listRecordings();
@@ -2696,6 +3098,104 @@ async function refreshHistoryView() {
     });
     el.recordingList.appendChild(row);
   }
+}
+
+/**
+ * Why the host could not answer, in the two shapes the history screen shows
+ * differently (tasks.md 4.3): unreachable (`offline` — the connection is not
+ * up, cached rows are the local copy) versus a companion that answered and
+ * cannot serve history (`error` — an outdated companion, or one that simply
+ * did not answer the request in time).
+ *
+ * `hostHistorySupport()` is tri-state on purpose: "not proven yet" (null) is
+ * NOT the same fact as "refused" (false), and only the latter is a reason to
+ * tell the operator their companion needs updating.
+ */
+function describeHistoryHostState() {
+  const handshake = panel.protocol.handshakeState();
+  if (panel.hostHistorySupport() === false) return { offline: false, error: "host_protocol_unsupported" };
+  if (handshake !== "ok") return { offline: true, error: null };
+  return { offline: false, error: "host_unavailable" };
+}
+
+/**
+ * The domain filter's options come from the cache, so a domain the operator
+ * has never visited is not offered (an option that can only ever produce "no
+ * matches" is a trap, not a filter). The current selection survives a refresh
+ * when that domain still exists.
+ */
+function syncHistoryDomainOptions() {
+  if (!el.historyDomain) return;
+  const selected = historyView.filters().domain;
+  const options = historyView.domainOptions();
+  el.historyDomain.textContent = "";
+  const all = document.createElement("option");
+  all.value = "";
+  all.textContent = "Tất cả trang";
+  el.historyDomain.appendChild(all);
+  for (const option of options) {
+    const node = document.createElement("option");
+    node.value = option.value;
+    node.textContent = option.label;
+    el.historyDomain.appendChild(node);
+  }
+  const stillOffered = options.some((option) => option.value === selected);
+  el.historyDomain.value = stillOffered ? selected : "";
+  if (selected && !stillOffered) {
+    // The filter pointed at a domain that no longer has any conversation
+    // (deleted, or evicted): drop it rather than leaving the list silently
+    // filtered by something the operator can no longer see in the control.
+    historyView.setDomain("");
+  }
+}
+
+/** How many conversations the current filters hide — the toolbar's own
+ * feedback, and the only place "filtered" is visible when rows ARE rendered. */
+function syncHistoryFilterSummary() {
+  if (!el.historyFilterSummary) return;
+  const report = historyView.report();
+  if (!historyView.hasActiveFilters()) {
+    el.historyFilterSummary.textContent = "";
+    return;
+  }
+  el.historyFilterSummary.textContent = `${report.matched}/${report.total} cuộc trò chuyện khớp bộ lọc.`;
+}
+
+// ---- history toolbar (tasks.md 4.1) --------------------------------------
+//
+// The search box is debounced inside the view (a burst of typing is one
+// filter+render pass, and a newer keystroke cancels the pending one); the date
+// and domain controls are discrete and apply immediately. Every control is
+// wired here with addEventListener — never an inline handler (this panel's CSP
+// forbids one).
+el.historySearch?.addEventListener("input", () => {
+  historyView.setQuery(el.historySearch.value);
+});
+el.historySearch?.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    historyView.flushQuery();
+  }
+});
+el.historyFrom?.addEventListener("change", () => applyHistoryFilters());
+el.historyTo?.addEventListener("change", () => applyHistoryFilters());
+el.historyDomain?.addEventListener("change", () => applyHistoryFilters());
+el.btnHistoryClearFilters?.addEventListener("click", () => {
+  historyView.clearFilters();
+  el.historySearch.value = "";
+  el.historyFrom.value = "";
+  el.historyTo.value = "";
+  el.historyDomain.value = "";
+  applyHistoryFilters();
+});
+el.historyScroll?.addEventListener("scroll", () => {
+  historyView.onScroll();
+});
+
+function applyHistoryFilters() {
+  historyView.setDateRange({ from: el.historyFrom ? el.historyFrom.value : null, to: el.historyTo ? el.historyTo.value : null });
+  if (el.historyDomain) historyView.setDomain(el.historyDomain.value);
+  historyView.render();
 }
 
 async function refreshRecordingsStatus() {
@@ -2786,6 +3286,19 @@ async function boot() {
   // for that case rather than restoring one (spec "No identifiable scope").
   const scopeSnapshot = pageContext.snapshot();
   panelScope = scopeSnapshot && scopeSnapshot.tabId != null ? scopeSnapshot.tabId : null;
+  // tasks.md 2.3: a remembered last-active conversation is only meaningful
+  // while its TAB exists (see history-store.js's LAST_ACTIVE_KEY_PREFIX
+  // comment), and these keys live in session storage — without this sweep a
+  // key would survive every tab that ever hosted a panel for the rest of the
+  // browser session. Two halves: drop what is already stale now (covering
+  // tabs closed while no panel was open), and drop a key the moment its own
+  // tab goes away.
+  await pruneStaleLastActiveKeys();
+  if (typeof chrome !== "undefined" && chrome.tabs && chrome.tabs.onRemoved) {
+    chrome.tabs.onRemoved.addListener((tabId) => {
+      historyStore.forgetLastActive(String(tabId)).catch(() => {});
+    });
+  }
   loadPickerCatalog(); // fire-and-forget: first "/" press already has this resolved (or the picker's own empty state covers the not-yet-loaded gap)
   await panel.init();
   // Resumes the conversation the operator was last looking at IN THIS TAB

@@ -589,6 +589,146 @@ body {
   color: var(--color-text-secondary);
 }
 
+/* ===================== History search, filters and rows (tasks.md 4.1-4.3) == *
+ * The toolbar is a vertical stack of full-width controls so the 320px panel
+ * does not end up with a squeezed two-column date row; the three discrete
+ * filters wrap into as many lines as they need. The list itself keeps the
+ * shared .list-item look (screenshots already exist for it) and only re-lays
+ * the row out: the icon stays, and the title/subtitle/actions become a column
+ * so a long title cannot push the controls off-screen.
+ */
+
+.history-toolbar {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+}
+
+.history-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.history-filters > .field {
+  flex: 1 1 120px;
+  min-width: 0;
+}
+
+.history-filters .input,
+.history-filters .select {
+  min-height: var(--target-min);
+}
+
+.history-filters-actions {
+  flex: 0 1 auto;
+  justify-content: flex-end;
+}
+
+.history-status {
+  color: var(--color-text-secondary);
+}
+
+/* Privacy / retention controls (tasks.md 2.2; spec chat-history-storage
+   "Privacy control" and "Bounded retention"): what the local cache keeps, and
+   what retention did to it. The switch reuses the shared .switch component;
+   this block only lays the row out and gives the outcome line its own slot. */
+.history-privacy {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border-subtle);
+}
+
+.history-privacy-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2) var(--space-3);
+}
+
+.history-privacy-label {
+  flex: 1;
+  min-width: 0;
+}
+
+.history-privacy-label .field-label {
+  display: block;
+}
+
+.history-list {
+  /* Paging appends rows as the operator scrolls; without this the scroll
+     container's height would jump under the pointer on every page. */
+  scroll-behavior: auto;
+}
+
+.history-row {
+  align-items: flex-start;
+}
+
+.history-row .list-item-main {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.history-row-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.history-row-badges {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+
+.history-row .list-item-actions {
+  flex-wrap: wrap;
+  justify-content: flex-start;
+}
+
+.history-row[aria-current="true"] {
+  border-color: var(--color-accent);
+}
+
+.history-group {
+  margin: var(--space-2) 0 0;
+}
+
+.history-group:first-of-type {
+  margin-top: 0;
+}
+
+.history-more {
+  align-self: flex-start;
+}
+
+.history-state {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+/* Older-history control at the top of a windowed transcript (tasks.md 3.2's
+   lazy older-page retrieval, made reachable from the UI). */
+.older-transcript {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
+}
+
 /* aria-live region: visually hidden, present for screen readers/assistive
    tech only -- the polite streaming announcement (spec: "a polite live
    region without announcing every token"). */

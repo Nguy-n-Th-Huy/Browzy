@@ -460,5 +460,149 @@ console.log("\n== threat events (7.4-7.6): injection findings / probe failures /
   ok(m.getTabRisk(7).category === "elevated", "tabRisk is rebuilt from the replayed events, matching the snapshot exactly");
 }
 
+console.log("== transcript window: a long run cannot grow rendered memory without bound (tasks.md 3.3) ==");
+{
+  const CAP = 10;
+  const m = new ConversationModel("w1", { maxWindowEvents: CAP });
+  const textEvent = (seq, runId) => ({
+    seq,
+    type: "stream_message",
+    runId,
+    message: { type: "assistant", message: { content: [{ type: "text", text: "x".repeat(10) }] } }
+  });
+  const appliedSeqs = [];
+  const totalEvents = 200;
+  for (let i = 0; i < totalEvents; i++) appliedSeqs.push(i + 1);
+  m.applyEvent({ seq: 1, type: "run_created", runId: "rw" });
+  m.applyEvent({ seq: 2, type: "run_started", runId: "rw" });
+  for (let seq = 3; seq <= totalEvents; seq++) m.applyEvent(textEvent(seq, "rw"));
+
+  ok(m.windowSize() <= CAP, `retained events stay at or below the cap (${m.windowSize()} <= ${CAP})`);
+  ok(m.highestSeq() === totalEvents, "the high watermark still reflects everything applied");
+  ok(m.hasOlderEvents() === true, "the model knows it dropped real history and reports hasOlderEvents");
+  ok(m.oldestLoadedSeq() === totalEvents - m.windowSize() + 1, "oldestLoadedSeq names the retained window's first event");
+  const turn = m.items.find((it) => it.kind === "assistant_turn");
+  ok(turn && turn.lifecycle === "running", "the live turn state survives eviction");
+  ok(turn.text.length <= CAP * 10, `the aggregated text is bounded by the retained window too (${turn.text.length} <= ${CAP * 10})`);
+  ok(m.items.length === 2, "item count stays bounded (one user item + one turn), not one item per event");
+
+  // A late duplicate inside the retained range is a no-op, not a re-append.
+  const before = m.windowSize();
+  const textBefore = turn.text.length;
+  m.applyEvent(textEvent(totalEvents, "rw"));
+  m.applyEvent(textEvent(totalEvents - 1, "rw"));
+  ok(m.windowSize() === before && turn.text.length === textBefore, "re-applying an already-incorporated seq changes nothing (no duplicate events)");
+
+  // A genuinely new event still lands.
+  m.applyEvent(textEvent(totalEvents + 1, "rw"));
+  ok(m.highestSeq() === totalEvents + 1 && turn.text.length > textBefore, "an event above the watermark is applied normally");
+}
+
+console.log("== lazy older pages: prepending reaches back without duplicating or losing replay correctness (tasks.md 3.2) ==");
+{
+  const whole = [];
+  for (let seq = 1; seq <= 12; seq++) {
+    whole.push({
+      seq,
+      type: seq === 1 ? "run_created" : seq === 2 ? "run_started" : "stream_message",
+      runId: "ro",
+      ...(seq > 2
+        ? { message: { type: "assistant", message: { content: [{ type: "text", text: `mảnh ${seq} ` }] } } }
+        : {})
+    });
+  }
+  // Cold open: the newest five only (what a bounded snapshot reply carries).
+  const m = new ConversationModel("w2", { maxWindowEvents: 20 });
+  m.applySnapshot({ conversationId: "w2", meta: {}, lastSeq: 12, firstSeq: 8, hasOlder: true, events: whole.slice(7) });
+  ok(m.windowSize() === 5 && m.hasOlderEvents() === true, "the cold open holds the newest page and admits more exists below");
+
+  // One older page (3..7), exactly what transcriptWindow({beforeSeq:8}) returns.
+  const page = { events: whole.slice(2, 7), firstSeq: 3, lastSeq: 7, hasOlder: true, limit: 5 };
+  const applied = m.applyOlderPage(page);
+  ok(applied.added === 5, "all five older events were accepted while the window had room");
+  ok(m.oldestLoadedSeq() === 3 && m.windowSize() === 10, "the window now starts at the older page and contains 10 events");
+  const turn = m.items.find((it) => it.kind === "assistant_turn");
+  const text = turn.text;
+  ok(text.includes("mảnh 3") && text.includes("mảnh 12"), "the rendered text spans both the newer page and the older one");
+  ok(text.indexOf("mảnh 7") < text.indexOf("mảnh 8"), "older content is ordered BEFORE newer content, not appended after it");
+
+  // Applying the same page again must not duplicate anything.
+  const again = m.applyOlderPage(page);
+  ok(again.added === 0, "re-applying an already-merged page adds nothing");
+  ok(m.items.filter((it) => it.kind === "assistant_turn").length === 1, "and never creates a second turn for the same run");
+
+  // The oldest page, then a live event on top of the merged window.
+  const lastPage = m.applyOlderPage({ events: whole.slice(0, 2), firstSeq: 1, lastSeq: 2, hasOlder: false, limit: 5 });
+  ok(lastPage.added === 2 && lastPage.hasOlder === false, "the last page lands and hasOlder finally reports false");
+  ok(m.oldestLoadedSeq() === 1, "the full history is now reachable in the window");
+  m.applyEvent({ seq: 13, type: "stream_message", runId: "ro", message: { type: "assistant", message: { content: [{ type: "text", text: "mảnh 13 " }] } } });
+  ok(m.highestSeq() === 13 && m.windowSize() === 13, "a live event after the merge is applied exactly once");
+
+  // A tight cap refuses (rather than silently dropping) what does not fit.
+  const tight = new ConversationModel("w3", { maxWindowEvents: 4 });
+  tight.applySnapshot({ conversationId: "w3", meta: {}, lastSeq: 12, firstSeq: 9, hasOlder: true, events: whole.slice(8) });
+  const refused = tight.applyOlderPage(page);
+  ok(refused.limitReached === true && tight.windowSize() <= 4, "a full window accepts only what fits and reports limitReached");
+  ok(refused.hasOlder === true, "and still tells the caller history remains below");
+}
+
+console.log("== large transcript benchmark: 5000 events stay bounded and duplicate-free ==");
+{
+  const CAP = 500;
+  const m = new ConversationModel("bench", { maxWindowEvents: CAP });
+  const started = Date.now();
+  m.applyEvent({ seq: 1, type: "run_created", runId: "rb" });
+  m.applyEvent({ seq: 2, type: "run_started", runId: "rb" });
+  for (let seq = 3; seq <= 5000; seq++) {
+    m.applyEvent({
+      seq,
+      type: "stream_message",
+      runId: "rb",
+      message: { type: "assistant", message: { content: [{ type: "text", text: "delta " }] } }
+    });
+  }
+  const elapsed = Date.now() - started;
+  ok(m.windowSize() <= CAP, `5000 events leave at most ${CAP} retained (got ${m.windowSize()})`);
+  ok(m.items.length === 2, `rendered item count is bounded (got ${m.items.length})`);
+  const turn = m.items.find((it) => it.kind === "assistant_turn");
+  ok(turn.text.length <= CAP * 6 + 64, `aggregated text is bounded by the window (got ${turn.text.length} chars)`);
+  ok(m.highestSeq() === 5000, "the watermark reached the last event");
+  const nonEmptyRetained = m.windowSize();
+  ok(new Set(m._windowEvents.map((e) => e.seq)).size === nonEmptyRetained, "no duplicate seq inside the retained window");
+  ok(elapsed < 5000, `the benchmark completes promptly (${elapsed}ms)`);
+}
+
+console.log("== reconnect replay overlap: a snapshot page plus replayed live events never duplicates ==");
+{
+  const m = new ConversationModel("w4");
+  const events = [
+    { seq: 1, type: "run_created", runId: "rr" },
+    { seq: 2, type: "run_started", runId: "rr" },
+    { seq: 3, type: "stream_message", runId: "rr", message: { type: "assistant", message: { content: [{ type: "text", text: "phần một " }] } } },
+    { seq: 4, type: "stream_message", runId: "rr", message: { type: "assistant", message: { content: [{ type: "text", text: "phần hai" }] } } },
+    { seq: 5, type: "run_done", runId: "rr" }
+  ];
+  // Live first (no seqs, the optimistic path), then the durable replay of the
+  // SAME facts from the host: the rebuild must replace, not append.
+  m.addLocalUserMessage("câu hỏi");
+  m.applyEvent({ type: "run_created", runId: "rr" });
+  m.applyEvent({ type: "run_started", runId: "rr" });
+  m.applyEvent({ type: "stream_message", runId: "rr", message: { type: "assistant", message: { content: [{ type: "text", text: "phần một " }] } } });
+  const liveItems = m.items.length;
+  m.applySnapshot({ conversationId: "w4", meta: {}, lastSeq: 5, firstSeq: 1, hasOlder: false, events });
+  m.applySnapshot({ conversationId: "w4", meta: {}, lastSeq: 5, firstSeq: 1, hasOlder: false, events });
+  ok(m.items.length === liveItems, "two identical snapshot replays never duplicate transcript items");
+  const turn = m.items.find((it) => it.kind === "assistant_turn");
+  ok(turn.text === "phần một phần hai", "the rebuilt text is exact, not doubled");
+  ok(turn.complete === true, "the replayed run_done is honoured");
+
+  // Live traffic overlapping the replay (the real race: a stream_event that
+  // was also in the snapshot) must be ignored, while newer ones apply.
+  m.applyEvent({ seq: 3, type: "stream_message", runId: "rr", message: { type: "assistant", message: { content: [{ type: "text", text: "phần một " }] } } });
+  ok(turn.text === "phần một phần hai", "an overlapping live event at seq <= the watermark is dropped");
+  m.applyEvent({ seq: 6, type: "stream_message", runId: "rr", message: { type: "assistant", message: { content: [{ type: "text", text: " ba" }] } } });
+  ok(turn.text === "phần một phần hai ba" && m.highestSeq() === 6, "a newer event is applied exactly once");
+}
+
 console.log(fail === 0 ? "\nALL SIDEPANEL CONVERSATION-MODEL TESTS PASSED" : `\n${fail} FAILED`);
 process.exit(fail ? 1 : 0);

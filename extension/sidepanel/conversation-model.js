@@ -70,13 +70,48 @@ function nextKey(prefix) {
 }
 
 export class ConversationModel {
-  /** @param {string} conversationId */
-  constructor(conversationId) {
+  /**
+   * @param {string} conversationId
+   * @param {object} [opts]
+   * @param {number} [opts.maxWindowEvents] - hard ceiling on the number of
+   *   stored events this model retains for rendering (tasks.md 3.3 — "cap
+   *   rendered model memory"). Live traffic evicts the OLDEST retained
+   *   events once the window is full; an explicit older page
+   *   (`applyOlderPage`) is accepted only while the window has room, so
+   *   memory is bounded no matter how long a conversation runs. The host's
+   *   own snapshot page is the same order of magnitude (transcript-store.js's
+   *   `maxSnapshotEvents`), so a cold rebuild fits with room to page back.
+   */
+  constructor(conversationId, { maxWindowEvents = 1000 } = {}) {
     this.conversationId = conversationId;
+    this.maxWindowEvents = maxWindowEvents;
     this._reset();
   }
 
   _reset() {
+    this._resetItems();
+    // The rendered window: the raw stored events (ascending seq) the items
+    // below were built from. Kept because evicting the oldest events must not
+    // mean "evict an arbitrary aggregate item" — an assistant_turn item can
+    // span dozens of events (text deltas, tool rows), so only the event
+    // sequence itself identifies what is safe to drop. Bounded by
+    // maxWindowEvents.
+    this._windowEvents = [];
+    // Watermarks (tasks.md 3.3, "no duplicate events"):
+    //   _highSeq — highest seq ever incorporated. Any event at or below it
+    //     has already been applied, which is what makes a live/replay
+    //     overlap (a reconnect, a replayed snapshot, a retried token batch)
+    //     a no-op instead of a duplicated transcript.
+    //   _lowSeq — lowest seq still in the window; events below it are
+    //     already loaded but were evicted (or never loaded).
+    // Events WITHOUT a seq (live traffic that predates durable replay) are
+    // still applied, but cannot participate in either watermark.
+    this._highSeq = 0;
+    this._lowSeq = 0;
+    this._hasOlderEvents = false;
+  }
+
+  _resetItems() {
     this.items = []; // ordered: {kind:"user"|"assistant_turn"|"recording"}
     this.lastSeq = 0;
     this.meta = null;
@@ -160,7 +195,10 @@ export class ConversationModel {
   }
 
   /** Full rebuild from a `snapshot` reply payload ({conversationId, meta,
-   * lastSeq, events}), per design decision 3 above. */
+   * lastSeq, firstSeq, hasOlder, events}), per design decision 3 above. The
+   * host bounds `events` to its own newest page; `hasOlder` says whether the
+   * conversation continues below it, so the model never pretends the window
+   * is the whole transcript. */
   applySnapshot(snapshot) {
     const keepPrompts = this._localPrompts;
     this._reset();
@@ -168,9 +206,183 @@ export class ConversationModel {
     if (!snapshot) return;
     this.meta = snapshot.meta || null;
     this.lastSeq = snapshot.lastSeq || 0;
-    for (const event of snapshot.events || []) {
-      this.applyEvent(event);
+    const events = snapshot.events || [];
+    for (const event of events) this.applyEvent(event, { trim: false });
+    this._maybeTrimWindow();
+    // The host's own watermark can be ahead of the newest event in the page
+    // (it is the log's true last sequence). Keeping it means a later live
+    // event at that seq is not mistaken for new.
+    if (typeof snapshot.lastSeq === "number" && snapshot.lastSeq > this._highSeq) this._highSeq = snapshot.lastSeq;
+    this.lastSeq = Math.max(this.lastSeq, this._highSeq);
+    this._lowSeq = this._windowEvents.length ? this._windowSeq(this._windowEvents[0]) : 0;
+    // OR, never overwrite: the host says whether history continues below the
+    // page it sent, and eviction above may have dropped part of that page
+    // too. Either way there IS more history, and the model must not claim
+    // otherwise.
+    this._hasOlderEvents = this._hasOlderEvents || snapshot.hasOlder === true;
+  }
+
+  /** Oldest sequence number still in the rendered window (0 when the window
+   * holds no seq-bearing event, e.g. a purely live, never-persisted
+   * conversation). */
+  oldestLoadedSeq() {
+    for (const event of this._windowEvents) {
+      const seq = this._windowSeq(event);
+      if (seq > 0) return seq;
     }
+    return 0;
+  }
+
+  /** Highest sequence number this model has incorporated. */
+  highestSeq() {
+    return this._highSeq;
+  }
+
+  /** Whether the host reported (or eviction produced) events below the
+   * rendered window — the signal a UI uses to offer "load earlier". */
+  hasOlderEvents() {
+    return this._hasOlderEvents;
+  }
+
+  /** How many stored events are currently retained (the memory-bound
+   * observable tasks.md 3.3's benchmark asserts). */
+  windowSize() {
+    return this._windowEvents.length;
+  }
+
+  _windowSeq(event) {
+    return event && typeof event.seq === "number" ? event.seq : 0;
+  }
+
+  /**
+   * Merge one OLDER page (from the host's transcript_window reply) below the
+   * current window. Events at or above `_lowSeq` are already rendered and are
+   * dropped; the page is accepted only while the window has room, so
+   * retained memory can never exceed `maxWindowEvents`. The items are rebuilt
+   * from the combined event window (a prepend cannot be done incrementally
+   * without splitting an aggregate turn).
+   *
+   * @returns {{added: number, hasOlder: boolean, limitReached: boolean}}
+   */
+  applyOlderPage(page) {
+    const events = (page && page.events) || [];
+    const low = this.oldestLoadedSeq();
+    const older = events.filter((event) => {
+      const seq = this._windowSeq(event);
+      return seq > 0 && (low === 0 || seq < low);
+    });
+    if (!older.length) {
+      this._hasOlderEvents = page && page.hasOlder === true ? true : this._hasOlderEvents;
+      return { added: 0, hasOlder: !!page && page.hasOlder === true, limitReached: false };
+    }
+    const room = Math.max(0, this.maxWindowEvents - this._windowEvents.length);
+    // Keep the NEWEST events of the older page (the ones adjacent to the
+    // current window) when the page does not fit — the rest stays reachable
+    // through another request.
+    const accepted = older.length > room ? older.slice(older.length - room) : older;
+    if (!accepted.length) {
+      this._hasOlderEvents = true;
+      return { added: 0, hasOlder: true, limitReached: true };
+    }
+    this._windowEvents = accepted.concat(this._windowEvents);
+    this._lowSeq = this._windowSeq(accepted[0]) || low;
+    // History remains below this window if the page was truncated to fit, or
+    // if the host said there was more beyond the page we were given.
+    this._hasOlderEvents = accepted.length < older.length || (page && page.hasOlder === true);
+    this._rebuildItems();
+    return {
+      added: accepted.length,
+      hasOlder: this._hasOlderEvents,
+      limitReached: this._windowEvents.length >= this.maxWindowEvents
+    };
+  }
+
+  /** Rebuild `items` from `_windowEvents` (used after an older-page prepend or
+   * an eviction). Watermarks are preserved: this is a re-render of
+   * already-incorporated events, not a reset.
+   *
+   * `preserveLiveState` keeps the state that events OUTSIDE the retained
+   * window established — a run's lifecycle/error, an outstanding approval or
+   * question, the latest tab-risk entries, a connection error. Without it,
+   * evicting the `run_started` at the head of a long run would silently
+   * demote a live run to "created" (the panel would show it as idle while it
+   * is still streaming), and an eviction during a pending approval would drop
+   * the card the operator is looking at. The window is about MEMORY, not
+   * about forgetting what the conversation is currently doing. */
+  _rebuildItems({ preserveLiveState = true } = {}) {
+    const windowEvents = this._windowEvents;
+    const keepPrompts = this._localPrompts;
+    const highSeq = this._highSeq;
+    const carry = preserveLiveState ? this._captureLiveState() : null;
+    this._resetItems();
+    this._localPrompts = keepPrompts;
+    for (const event of windowEvents) this._applyEventToItems(event);
+    this.lastSeq = highSeq;
+    if (windowEvents.length) {
+      const last = this._windowSeq(windowEvents[windowEvents.length - 1]);
+      if (last > 0) this.lastSeq = Math.max(this.lastSeq, last);
+    }
+    if (carry) this._restoreLiveState(carry);
+  }
+
+  _captureLiveState() {
+    const pendingUser = this._pendingUserIndex != null ? this.items[this._pendingUserIndex] : null;
+    return {
+      pendingApproval: this.pendingApproval,
+      pendingQuestion: this.pendingQuestion,
+      pendingDownloadDecision: this.pendingDownloadDecision,
+      connectionError: this.connectionError,
+      tabRisk: new Map(this.tabRisk),
+      pendingUserText: pendingUser && pendingUser.kind === "user" ? pendingUser.text : null,
+      turns: new Map(
+        [...this._turnsByRunId].map(([runId, turn]) => [
+          runId,
+          { lifecycle: turn.lifecycle, complete: turn.complete, errorInfo: turn.errorInfo, ts: turn.ts, lastContentKind: turn.lastContentKind }
+        ])
+      )
+    };
+  }
+
+  _restoreLiveState(carry) {
+    for (const [runId, saved] of carry.turns) {
+      const turn = this._turnsByRunId.get(runId);
+      if (!turn) continue;
+      turn.lifecycle = saved.lifecycle;
+      turn.complete = saved.complete;
+      turn.errorInfo = saved.errorInfo;
+      turn.ts = saved.ts;
+      turn.lastContentKind = saved.lastContentKind;
+    }
+    if (carry.pendingApproval) this.pendingApproval = carry.pendingApproval;
+    if (carry.pendingQuestion) this.pendingQuestion = carry.pendingQuestion;
+    if (carry.pendingDownloadDecision) this.pendingDownloadDecision = carry.pendingDownloadDecision;
+    if (carry.connectionError) this.connectionError = carry.connectionError;
+    for (const [tabId, entry] of carry.tabRisk) this.tabRisk.set(tabId, entry);
+    if (carry.pendingUserText != null) {
+      for (let i = this.items.length - 1; i >= 0; i--) {
+        if (this.items[i].kind === "user" && this.items[i].runId == null) {
+          this._pendingUserIndex = i;
+          break;
+        }
+      }
+    }
+  }
+
+  /**
+   * Drop the oldest events once the window is over budget. Evicted in BATCHES
+   * (a quarter window) so the rebuild cost is amortized O(1) per event rather
+   * than a full re-render on every token delta.
+   */
+  _maybeTrimWindow() {
+    if (this._windowEvents.length <= this.maxWindowEvents) return;
+    const batch = Math.max(1, Math.floor(this.maxWindowEvents / 4));
+    const drop = this._windowEvents.length - this.maxWindowEvents + batch;
+    const dropped = this._windowEvents.splice(0, drop);
+    // Dropped events are gone from the window but were real — there is
+    // history below whatever remains.
+    if (dropped.length) this._hasOlderEvents = true;
+    this._lowSeq = this._windowEvents.length ? this._windowSeq(this._windowEvents[0]) : this._highSeq;
+    if (this._windowEvents.length) this._rebuildItems();
   }
 
   /**
@@ -249,11 +461,33 @@ export class ConversationModel {
 
   /** One event from a `stream_event` envelope's `event` field, a
    * `token_batch` envelope's `events[i]`, or a stored snapshot event (all
-   * three shapes carry the same fields plus, for snapshot events, `seq`). */
-  applyEvent(event) {
+   * three shapes carry the same fields plus, for snapshot events, `seq`).
+   *
+   * Duplicate suppression (tasks.md 3.3 "no duplicate events"): an event
+   * whose `seq` is at or below the highest sequence already incorporated is
+   * dropped. That single watermark is what makes a live/replay overlap — a
+   * reconnect's snapshot page, a replayed window, a redelivered batch —
+   * impossible to render twice, without a per-event seen-set that would
+   * itself grow without bound. Live events that carry no `seq` (the panel's
+   * own optimistic traffic before the host has persisted anything) are still
+   * applied, exactly as before. */
+  applyEvent(event, { trim = true } = {}) {
     if (!event || typeof event !== "object") return;
-    if (typeof event.seq === "number" && event.seq > this.lastSeq) this.lastSeq = event.seq;
+    const seq = this._windowSeq(event);
+    if (seq > 0) {
+      if (seq <= this._highSeq) return; // already incorporated — replay overlap
+      this._highSeq = seq;
+      if (seq > this.lastSeq) this.lastSeq = seq;
+    }
+    this._windowEvents.push(event);
+    this._applyEventToItems(event);
+    if (trim) this._maybeTrimWindow();
+  }
 
+  /** The pure event → items application, with no window bookkeeping. Split
+   * out so a rebuild can replay the retained window without re-triggering
+   * dedupe/trimming. */
+  _applyEventToItems(event) {
     switch (event.type) {
       case "run_created":
         // Live traffic never actually delivers this one (it is appended via

@@ -217,10 +217,25 @@ function memStorage(seed = {}) {
   const data = { ...seed };
   return {
     async get(key) {
+      // history-store.js v2 reads the whole local area (`get(null)`) to
+      // enumerate its per-conversation cache keys and supports batched
+      // key-array reads; both must behave like chrome.storage.local here, or
+      // a second HistoryStore instance over the same storage would see an
+      // empty world and the cross-panel cases below would silently pass
+      // against nothing.
+      if (key == null) return { ...data };
+      if (Array.isArray(key)) {
+        const out = {};
+        for (const k of key) if (k in data) out[k] = data[k];
+        return out;
+      }
       return key in data ? { [key]: data[key] } : {};
     },
     async set(obj) {
       Object.assign(data, obj);
+    },
+    async remove(keys) {
+      for (const key of Array.isArray(keys) ? keys : [keys]) delete data[key];
     }
   };
 }
@@ -621,7 +636,10 @@ async function main() {
     await panelA.startNewConversation();
     await waitUntil(() => panelA.currentConversationId != null);
     const conversationId = panelA.currentConversationId;
-    await panelA.deleteConversationLocally(conversationId);
+    // Host-first delete (tasks.md 1.3): the companion really removes this
+    // conversation, and only then does the panel drop it locally.
+    const deleted = await panelA.deleteConversation(conversationId);
+    ok(deleted.ok === true, "the host confirmed the delete before the panel dropped it locally");
 
     let resumeCalls = 0;
     const protocolClientB = new ProtocolClient({ createTransport: () => makeBridgeTransport(core) });

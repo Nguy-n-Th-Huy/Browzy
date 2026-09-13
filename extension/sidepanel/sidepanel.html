@@ -138,12 +138,68 @@
       <button class="btn-icon" id="btn-history-back" aria-label="Quay lại cuộc trò chuyện"></button>
       <span class="panel-header-title" style="font-size:var(--font-size-h2)">Lịch sử &amp; bản ghi</span>
       <div class="panel-header-actions">
+        <button class="btn btn-secondary btn-sm" type="button" id="btn-history-clear-all">Xóa tất cả</button>
         <button class="btn btn-primary btn-sm" type="button" id="btn-history-new"><span id="icon-new-plus"></span>Mới</button>
       </div>
     </header>
     <main class="panel-scroll" id="history-scroll" aria-label="Lịch sử trò chuyện và bản ghi">
       <p class="section-heading">Cuộc trò chuyện</p>
-      <div class="list-column" id="conversation-list"></div>
+      <!-- Search / filters (tasks.md 4.1). Every control is wired in
+           sidepanel.js; the panel's CSP forbids inline handlers. -->
+      <div class="history-toolbar" role="search">
+        <div class="field history-search-field">
+          <label class="field-label" for="history-search">Tìm cuộc trò chuyện</label>
+          <input
+            class="input"
+            type="search"
+            id="history-search"
+            placeholder="Tên, nội dung đã hỏi, trang, mã hội thoại…"
+            autocomplete="off"
+          />
+        </div>
+        <div class="history-filters">
+          <div class="field">
+            <label class="field-label" for="history-from">Từ ngày</label>
+            <input class="input" type="date" id="history-from" />
+          </div>
+          <div class="field">
+            <label class="field-label" for="history-to">Đến ngày</label>
+            <input class="input" type="date" id="history-to" />
+          </div>
+          <div class="field">
+            <label class="field-label" for="history-domain">Trang</label>
+            <select class="select" id="history-domain">
+              <option value="">Tất cả trang</option>
+            </select>
+          </div>
+          <div class="field history-filters-actions">
+            <span class="field-label" aria-hidden="true">&nbsp;</span>
+            <button class="btn btn-secondary btn-sm" type="button" id="btn-history-clear-filters">Xóa bộ lọc</button>
+          </div>
+        </div>
+        <p class="field-hint" id="history-filter-summary" role="status"></p>
+        <p class="field-hint history-status" id="history-status" role="status" hidden></p>
+      </div>
+      <!-- Privacy / retention (tasks.md 2.2; spec chat-history-storage
+           "Privacy control" and "Bounded retention"). The switch disables
+           raw-prompt caching and the line reports what retention evicted; both
+           are wired in sidepanel.js — the panel's CSP forbids inline
+           handlers. -->
+      <div class="history-privacy">
+        <div class="history-privacy-row">
+          <span class="history-privacy-label">
+            <span class="field-label">Không lưu nội dung câu hỏi</span>
+            <span class="field-hint">Bật thì bản lưu cục bộ chỉ giữ tiêu đề, trang và thời gian; nội dung đã lưu trước đó sẽ bị xóa.</span>
+          </span>
+          <label class="switch">
+            <input type="checkbox" id="history-privacy-toggle" aria-label="Không lưu nội dung câu hỏi vào bản lưu cục bộ" />
+            <span class="switch-track"></span>
+            <span class="switch-thumb"></span>
+          </label>
+        </div>
+        <p class="field-hint history-status" id="history-retention-outcome" role="status" hidden></p>
+      </div>
+      <div class="list-column history-list" id="conversation-list"></div>
       <p class="section-heading">Ghi âm thao tác</p>
       <div class="recorder-row">
         <span class="list-item-icon" id="icon-mic-row"></span>

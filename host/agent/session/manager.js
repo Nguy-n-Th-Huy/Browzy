@@ -93,32 +93,82 @@ export class SessionManager {
     return conversationId;
   }
 
-  listConversations() {
-    return this.store.listConversations();
+  listConversations(limit) {
+    return this.store.listConversations(limit);
   }
 
   /**
    * Wire-facing summaries for the LIST_CONVERSATIONS protocol message (see
    * host/agent/companion.js's _handleListConversations()). Every field the
-   * panel's history screen needs to render and reopen a conversation,
-   * including the interrupted flag that survives a companion restart
-   * (resumeConversation()/recoverAfterRestart() below) and whether THIS
-   * process currently has that conversation's run actively queued or
-   * running — in-memory, per-process, which is exactly right: after a
-   * restart recoverAfterRestart() already clears any stale activeRunId and
-   * sets interrupted instead of leaving a ghost "active" conversation for a
+   * panel's history screen needs to render and reopen a conversation: the
+   * presentation metadata the host is authoritative for (tasks.md 1.1 —
+   * `title`, `hostname`, `pinned`, `archived`, `revision`), the interrupted
+   * flag that survives a companion restart (resumeConversation()/
+   * recoverAfterRestart() below), and whether THIS process currently has
+   * that conversation's run actively queued or running — in-memory,
+   * per-process, which is exactly right: after a restart
+   * recoverAfterRestart() already clears any stale activeRunId and sets
+   * interrupted instead of leaving a ghost "active" conversation for a
    * process that no longer exists.
    *
-   * @returns {Array<{conversationId:string, createdAt:number, updatedAt:number, interrupted:boolean, hasActiveRun:boolean}>}
+   * `hasData` is the store's answer to "does this conversation hold at least
+   * one stored event" (transcript-store.js's listConversations() derives it
+   * from the live seq allocator, so it is true for a conversation whose meta
+   * has not flushed yet). The panel hides conversations that are explicitly
+   * empty from its history LIST; nothing is filtered HERE, because a page of
+   * empty conversations must never hide real ones from paging, orphans or
+   * delete-all, which all run against this same authoritative list.
+   *
+   * @param {object} [opts]
+   * @param {number} [opts.limit] - cap on returned summaries; `total` still
+   *   reports the full count so the panel can tell a capped list apart from
+   *   a complete one.
+   * @returns {{conversations: Array<object>, total: number, hasMore: boolean}}
    */
-  conversationSummaries() {
-    return this.store.listConversations().map((meta) => ({
-      conversationId: meta.conversationId,
-      createdAt: meta.createdAt,
-      updatedAt: meta.updatedAt,
-      interrupted: Boolean(meta.interrupted),
-      hasActiveRun: this.hasActiveRun(meta.conversationId)
-    }));
+  conversationSummaries({ limit } = {}) {
+    const total = this.store.conversationCount();
+    const list = this.store.listConversations(limit);
+    return {
+      conversations: list.map((meta) => ({
+        conversationId: meta.conversationId,
+        createdAt: meta.createdAt,
+        updatedAt: meta.updatedAt,
+        title: meta.title ?? null,
+        hostname: meta.hostname ?? null,
+        pinned: meta.pinned === true,
+        archived: meta.archived === true,
+        revision: meta.revision || 0,
+        interrupted: Boolean(meta.interrupted),
+        hasActiveRun: this.hasActiveRun(meta.conversationId),
+        hasData: meta.hasData === true
+      })),
+      total,
+      hasMore: list.length < total
+    };
+  }
+
+  /**
+   * Write presentation metadata the panel owns (title/hostname) or asks for
+   * (pin/archive) — tasks.md 1.1/1.3. Guarded by the delete tombstone like
+   * every other write path on this class: a conversation deleted in THIS
+   * process must never be resurrected by a late metadata write from a panel
+   * that had not yet seen the delete.
+   *
+   * @returns {{ok: true, meta: object} | {ok: false, reason: string, revision: number}}
+   */
+  updateConversationPresentation(conversationId, patch = {}) {
+    if (this._deletedConversations.has(conversationId)) {
+      return { ok: false, reason: "conversation_deleted", revision: 0 };
+    }
+    return this.store.updatePresentation(conversationId, patch);
+  }
+
+  /** Whether this process already committed a delete for this conversation
+   * (the tombstone — see deleteConversation()'s doc comment). Lets the
+   * DELETE_CONVERSATION handler answer a second delete idempotently instead
+   * of falsely reporting `unknown_conversation`. */
+  wasDeleted(conversationId) {
+    return this._deletedConversations.has(conversationId);
   }
 
   /** Whether a conversation with this id currently exists on disk (not
@@ -159,6 +209,11 @@ export class SessionManager {
 
   snapshotSince(conversationId, afterSeq = 0) {
     return this.store.snapshot(conversationId, afterSeq);
+  }
+
+  /** One older page of the durable event log, by sequence range (task 3.2). */
+  transcriptWindow(conversationId, opts) {
+    return this.store.transcriptWindow(conversationId, opts);
   }
 
   hasActiveRun(conversationId) {
@@ -602,7 +657,7 @@ export class SessionManager {
    * late-unwind sweep retries this exact removal once the aborting run has
    * genuinely finished, closing the window without resurrecting anything.
    *
-   * @returns {{ hadActiveRun: boolean }}
+   * @returns {{ hadActiveRun: boolean, onDiskRemoved: boolean }}
    */
   deleteConversation(conversationId) {
     this._deletedConversations.add(conversationId);
@@ -623,12 +678,53 @@ export class SessionManager {
     } catch {
       // best-effort — see above
     }
+    let onDiskRemoved = false;
     try {
-      this.store.deleteConversation(conversationId);
+      const result = this.store.deleteConversation(conversationId);
+      onDiskRemoved = !result || result.removed !== false;
     } catch {
-      // best-effort — see comment above; finishRun()'s late-unwind sweep retries
+      // A still-open handle from the aborting SDK subprocess can defeat the
+      // rmSync on Windows (see the docstring); finishRun()'s late-unwind
+      // sweep retries it. Reported, never hidden: the caller must be able to
+      // say "the host no longer serves this conversation, but its bytes are
+      // not gone yet".
+      onDiskRemoved = false;
     }
-    return { hadActiveRun };
+    return { hadActiveRun, onDiskRemoved };
+  }
+
+  /**
+   * Delete-all (tasks.md 1.3): tombstone + stop + sweep every
+   * conversation-owned side record for every conversation, then remove the
+   * on-disk tree. A partial sweep is reported, never rounded up to success —
+   * the panel may only clear its local cache for a delete-all the host
+   * actually completed.
+   *
+   * @returns {{ removed: string[], failed: Array<{conversationId: string, reason: string}>, hadActiveRuns: number }}
+   */
+  deleteAllConversations() {
+    const ids = this.store.listConversations().map((meta) => meta.conversationId);
+    let hadActiveRuns = 0;
+    for (const conversationId of ids) {
+      this._deletedConversations.add(conversationId);
+      if (this.hasActiveRun(conversationId)) hadActiveRuns += 1;
+      this.stopRun(conversationId, "conversation_deleted");
+      this._activeRuns.delete(conversationId);
+      this._actionEventCursors.delete(conversationId);
+      this._actionEventCursorsSeeded.delete(conversationId);
+      try {
+        this.usageLedger.deleteForConversation(conversationId);
+      } catch {
+        // best-effort — the tombstone above already commits the delete
+      }
+      try {
+        this.recordingAttachments.deleteForConversation(conversationId);
+      } catch {
+        // best-effort — see above
+      }
+    }
+    const { removed, failed } = this.store.deleteAllConversations();
+    return { removed, failed, hadActiveRuns };
   }
 
   /**

@@ -160,7 +160,7 @@ async function main() {
     // spec.md "No transcript or run side effects" / "No browser or tool
     // access": a completed enhancement created no conversation, appended
     // nothing to any transcript, and never touched the browser lease.
-    ok(core.sessionManager.conversationSummaries().length === 0, "no conversation was created or advanced by this request");
+    ok(core.sessionManager.conversationSummaries().conversations.length === 0, "no conversation was created or advanced by this request");
     ok(core.lease.isHeld() === false, "the browser lease was never acquired");
     ok(core.lease.queuedRunIds().length === 0, "nothing was ever queued for the lease either");
   }

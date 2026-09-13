@@ -63,6 +63,42 @@ export const AGENT_MESSAGE_TYPES = Object.freeze({
   LIST_CONVERSATIONS: "list_conversations",
   DELETE_CONVERSATION: "delete_conversation",
 
+  // Presentation metadata write (openspec/changes/optimize-chat-history
+  // tasks.md 1.1): the panel pushes the title it derived from the user's
+  // first message and the hostname of the page a run was bound to, so the
+  // host summary — not the panel's local index — is the canonical record
+  // every panel lists and reconciles against. `revision`/`ifRevision` give
+  // two panels editing the same conversation a conflict instead of a silent
+  // last-write-wins clobber (design.md "Cross-panel races"). Same
+  // request/reply-reuses-one-type convention as LIST_CONVERSATIONS above.
+  // Wire shape:
+  //   panel -> companion  {v, type:"update_conversation", conversationId,
+  //                         title?, hostname?, pinned?, archived?,
+  //                         ifRevision?}
+  //   companion -> panel  {v, type:"update_conversation", conversationId,
+  //                         ok:true, revision, meta}
+  //   companion -> panel  {v, type:"update_conversation", conversationId,
+  //                         ok:false, reason}
+  UPDATE_CONVERSATION: "update_conversation",
+
+  // Delete-all (tasks.md 1.3): "clear all locally cached history" against
+  // the HOST, not just this browser profile. Reply reports the per-
+  // conversation outcome so a partial sweep can never be presented as
+  // success. Carries an idempotency key exactly like DELETE_CONVERSATION.
+  DELETE_ALL_CONVERSATIONS: "delete_all_conversations",
+
+  // Transcript paging (tasks.md 3.2 / design.md decision 3): one OLDER page
+  // of a conversation's durable event log, selected by sequence range. A
+  // snapshot reply carries the newest bounded window plus `hasOlder`; this
+  // request asks for the page below `beforeSeq` so a reopening panel can
+  // lazily load history without ever treating the window as the whole log.
+  //   panel -> companion  {v, type:"transcript_window_request", conversationId,
+  //                         beforeSeq, limit}
+  //   companion -> panel  {v, type:"transcript_window", conversationId,
+  //                         events, firstSeq, lastSeq, hasOlder, limit}
+  TRANSCRIPT_WINDOW_REQUEST: "transcript_window_request",
+  TRANSCRIPT_WINDOW: "transcript_window",
+
   // Settings relay (task: close reports/05-panel-evidence.md's "Known gaps"
   // #2 — "agent_settings has a client-and-relay contract but no
   // companion-side handler yet"). extension/settings/settings-client.js and
@@ -591,6 +627,66 @@ export function validateStartElementRecord(value) {
       rectClipped
     }
   };
+}
+
+// --- Conversation presentation metadata (optimize-chat-history tasks.md 1.1)
+//
+// The panel is the only writer, but these fields end up in every panel's
+// history list, so they are bounded here rather than trusted: a hostile or
+// buggy panel must not be able to make the host's summaries unreadable or
+// unbounded.
+export const CONVERSATION_TITLE_MAX_CHARS = 200;
+export const CONVERSATION_HOSTNAME_MAX_CHARS = 255;
+export const IDEMPOTENCY_KEY_MAX_CHARS = 200;
+
+/**
+ * Validate an UPDATE_CONVERSATION request body. Only the fields present are
+ * written; an empty patch is rejected rather than bumping the revision for
+ * nothing.
+ *
+ * @returns {{ok: true, patch: object} | {ok: false, reason: string}}
+ */
+export function validateConversationUpdate(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return { ok: false, reason: "malformed_conversation_update" };
+  const patch = {};
+  if ("title" in value) {
+    if (value.title !== null && typeof value.title !== "string") return { ok: false, reason: "malformed_conversation_title" };
+    if (typeof value.title === "string" && value.title.length > CONVERSATION_TITLE_MAX_CHARS) return { ok: false, reason: "conversation_title_too_long" };
+    patch.title = value.title;
+  }
+  if ("hostname" in value) {
+    if (value.hostname !== null && typeof value.hostname !== "string") return { ok: false, reason: "malformed_conversation_hostname" };
+    if (typeof value.hostname === "string" && value.hostname.length > CONVERSATION_HOSTNAME_MAX_CHARS) return { ok: false, reason: "conversation_hostname_too_long" };
+    patch.hostname = value.hostname;
+  }
+  if ("pinned" in value) {
+    if (typeof value.pinned !== "boolean") return { ok: false, reason: "malformed_conversation_pinned" };
+    patch.pinned = value.pinned;
+  }
+  if ("archived" in value) {
+    if (typeof value.archived !== "boolean") return { ok: false, reason: "malformed_conversation_archived" };
+    patch.archived = value.archived;
+  }
+  if ("ifRevision" in value && value.ifRevision !== null && value.ifRevision !== undefined) {
+    if (!Number.isInteger(value.ifRevision) || value.ifRevision < 0) return { ok: false, reason: "malformed_conversation_revision" };
+    patch.ifRevision = value.ifRevision;
+  }
+  if (Object.keys(patch).length === 0) return { ok: false, reason: "empty_conversation_update" };
+  return { ok: true, patch };
+}
+
+/**
+ * Validate an optional idempotency key on DELETE_CONVERSATION /
+ * DELETE_ALL_CONVERSATIONS (design.md decision 5). Absent is valid — an
+ * older panel sends none and the operation is still idempotent by its own
+ * end state; a present key must be a short non-empty string.
+ *
+ * @returns {{ok: true, key: string|null} | {ok: false, reason: string}}
+ */
+export function validateIdempotencyKey(value) {
+  if (value === undefined || value === null || value === "") return { ok: true, key: null };
+  if (typeof value !== "string" || value.length > IDEMPOTENCY_KEY_MAX_CHARS) return { ok: false, reason: "malformed_idempotency_key" };
+  return { ok: true, key: value };
 }
 
 // --- Wire framing over native messaging ---------------------------------

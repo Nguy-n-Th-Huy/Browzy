@@ -47,6 +47,21 @@ export const MSG = Object.freeze({
   STREAM_EVENT: "stream_event",
   TOKEN_BATCH: "token_batch",
   RECORDING_COMPLETE: "recording_complete",
+  // Conversation management (host/agent/protocol.js's LIST_CONVERSATIONS /
+  // DELETE_CONVERSATION / UPDATE_CONVERSATION / DELETE_ALL_CONVERSATIONS /
+  // TRANSCRIPT_WINDOW_REQUEST, added for openspec/changes/optimize-chat-history
+  // tasks 1.1–1.3 and 3.2). Request/reply share one type name exactly as the
+  // host documents; every reply is correlated by `requestId` (or, for the
+  // list family, carries the host's authoritative array). Additive under
+  // PROTOCOL_VERSION 1: an older companion answers `unknown_message_type`
+  // through the existing ERROR path, which the panel already maps to a
+  // "companion needs updating" state rather than hanging.
+  LIST_CONVERSATIONS: "list_conversations",
+  DELETE_CONVERSATION: "delete_conversation",
+  UPDATE_CONVERSATION: "update_conversation",
+  DELETE_ALL_CONVERSATIONS: "delete_all_conversations",
+  TRANSCRIPT_WINDOW_REQUEST: "transcript_window_request",
+  TRANSCRIPT_WINDOW: "transcript_window",
   // Composer prompt enhancement (host/agent/protocol.js's
   // AGENT_MESSAGE_TYPES.ENHANCE_PROMPT). Additive, no PROTOCOL_VERSION bump —
   // an older companion answers through the existing `unknown_message_type`
@@ -190,6 +205,47 @@ export class ProtocolClient {
 
   newConversation(meta = {}) {
     this._send(envelope(MSG.NEW, { meta }));
+  }
+
+  /**
+   * Ask for the host's AUTHORITATIVE conversation list (tasks.md 1.2). The
+   * reply reuses this type name and is correlated by `requestId` — the panel
+   * layer resolves it through onEnvelope() like every other pair here.
+   */
+  listConversations({ requestId, limit } = {}) {
+    const payload = { requestId };
+    if (Number.isInteger(limit) && limit > 0) payload.limit = limit;
+    this._send(envelope(MSG.LIST_CONVERSATIONS, payload));
+  }
+
+  /** Push presentation metadata the panel owns (title/hostname) or the
+   * operator asked for (pin/archive). `patch` carries only changed fields;
+   * `ifRevision` (inside `patch`) makes a stale write fail with a conflict
+   * instead of clobbering a newer edit from another panel. */
+  updateConversation({ conversationId, patch, requestId }) {
+    this._send(envelope(MSG.UPDATE_CONVERSATION, { conversationId, ...(patch || {}), requestId }));
+  }
+
+  /**
+   * Host-side delete with an idempotency key (tasks.md 1.3, design.md
+   * decision 5). The reply carries `deleted` — the panel may only drop its
+   * local cache for a confirmed `deleted:true`.
+   */
+  deleteConversation({ conversationId, idempotencyKey, requestId }) {
+    this._send(envelope(MSG.DELETE_CONVERSATION, { conversationId, idempotencyKey, requestId }));
+  }
+
+  /** Host-side delete-all; same confirmation contract as deleteConversation. */
+  deleteAllConversations({ idempotencyKey, requestId }) {
+    this._send(envelope(MSG.DELETE_ALL_CONVERSATIONS, { idempotencyKey, requestId }));
+  }
+
+  /** One older transcript page by sequence range (tasks.md 3.2). */
+  requestTranscriptWindow({ conversationId, beforeSeq, limit, requestId }) {
+    const payload = { conversationId, requestId };
+    if (Number.isInteger(beforeSeq) && beforeSeq > 0) payload.beforeSeq = beforeSeq;
+    if (Number.isInteger(limit) && limit > 0) payload.limit = limit;
+    this._send(envelope(MSG.TRANSCRIPT_WINDOW_REQUEST, payload));
   }
 
   resumeConversation(conversationId, afterSeq = 0) {

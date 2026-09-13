@@ -35,11 +35,32 @@
 
 import { ConversationModel } from "./conversation-model.js";
 import { DocumentsClient } from "./documents-client.js";
+import { buildConversationArtifact, normalizeExportFormat } from "./history-export.js";
 import { RUN_PHASE } from "./run-states.js";
 import { buildContextMetadata } from "./context-binding.js";
 import { isProfileComplete, deriveReadinessState, READINESS } from "./profile-cache.js";
 
 export { READINESS };
+
+// Run-terminal events, the points design.md decision 2 requires a final
+// synchronous best-effort flush at: nothing the run produced may still be
+// sitting in the debounce window when the run is over.
+const RUN_TERMINAL_EVENT_TYPES = new Set(["run_done", "run_stopped", "run_error", "run_interrupted_by_restart"]);
+
+function isRunTerminalEvent(event) {
+  return !!event && RUN_TERMINAL_EVENT_TYPES.has(event.type);
+}
+
+// Coalescing window for presentation-metadata pushes and the local cache
+// (tasks.md 2.1: 500–1000ms).
+const HISTORY_FLUSH_DELAY_MS = 700;
+
+// Hard ceiling on the pages one export will pull (the host pages 500 events
+// at a time): 200 pages = 100k events, far beyond any real conversation, and
+// the loop stops on its own long before this for anything that is one. It
+// exists so a host that keeps claiming "more below" cannot pin the panel in a
+// loop forever — the export fails and says so.
+const MAX_EXPORT_PAGES = 200;
 
 export class PanelController {
   /**
@@ -71,7 +92,7 @@ export class PanelController {
    *   trivial resolver so every internal call site can treat `this._scope`
    *   uniformly as "call it".
    */
-  constructor({ protocolClient, historyStore, profileCache, identity, scope }) {
+  constructor({ protocolClient, historyStore, profileCache, identity, scope, requestTimeoutMs = 15000 }) {
     this.protocol = protocolClient;
     this.historyStore = historyStore;
     this.profileCache = profileCache;
@@ -79,6 +100,49 @@ export class PanelController {
     this._scope = typeof scope === "function" ? scope : () => scope ?? null;
     this.models = new Map(); // conversationId -> ConversationModel
     this.currentConversationId = null;
+    this._requestTimeoutMs = requestTimeoutMs;
+    // Reply correlation for the request/reply history operations (LIST /
+    // DELETE / DELETE_ALL / UPDATE / TRANSCRIPT_WINDOW). Each entry is
+    // `{ resolve, timer }`; a reply carrying the matching `requestId` settles
+    // it, and a timeout settles it with `null` so a dead port can never leave
+    // a delete hanging and, more importantly, can never let the panel claim a
+    // success the host never acknowledged (tasks.md 1.3).
+    this._pendingRequests = new Map();
+    this._requestSeq = 0;
+    // Per-conversation presentation metadata this panel last PUSHED to the
+    // host, so the (streaming) history persist path does not re-send an
+    // unchanged title/hostname on every token batch.
+    this._hostMetadataSent = new Map();
+    this._hostMetadataTimer = null;
+    // The HOST's own title per conversation, as last confirmed by a
+    // `list_conversations` reply, an accepted `update_conversation`, or the
+    // local cache row adopted when the panel resumes a conversation (see
+    // `_adoptCachedHostTitle()`). A title is derived from the first user
+    // message only while the host has none (see `_derivedTitleFor()`): the
+    // operator can rename a conversation (tasks.md 4.3) and the next stream
+    // tick must not overwrite that rename with the same derived default it
+    // started from.
+    this._hostTitles = new Map();
+    // The FIRST question this panel knows for each conversation: the earliest
+    // recorded prompt (the local prompt store records in run order) or the
+    // prompt the panel is sending right now. Kept in memory because
+    // `_derivedTitleFor()` runs synchronously inside the coalesced persist
+    // path and must not await storage; `historyStore.promptsFor()` is the
+    // durable source the map is hydrated from at resume time.
+    this._firstPromptText = new Map();
+    // Migration-plan rollout gate: null = not yet proven, true = the host
+    // answered a history request, false = the host refused one with
+    // `unknown_message_type`. See hostHistorySupport().
+    this._hostHistorySupported = null;
+    this._hostHistoryProbe = null;
+    // Metadata the panel has derived but not yet pushed to the host, keyed by
+    // conversation — the coalescing buffer behind _queueHostMetadata().
+    this._pendingHostMetadata = new Map();
+    // Hostname of the page each conversation's runs were bound to (from the
+    // Send-time page context), so the host summary can carry it (task 1.1)
+    // without the panel having to re-resolve a page it no longer displays.
+    this._pageHostnameByConversation = new Map();
+    this._idempotencySeq = 0;
     // Set while a NEW request is outstanding, so the snapshot that answers it
     // is adopted as the active conversation even though one is already open.
     // The wire envelope carries no request id (see protocol-client.js's
@@ -182,12 +246,418 @@ export class PanelController {
     for (const fn of this._updateHandlers) fn();
   }
 
+  // ---- host-authoritative history (tasks.md 1.1-1.3, 3.2) -----------------
+
+  /**
+   * Send one request/reply history operation and settle on the reply that
+   * carries the matching `requestId`. Always resolves (never rejects): a dead
+   * port, a timeout, or a companion that does not know the message type all
+   * settle as `null`, which every caller below treats as "the host did not
+   * confirm" — the state from which a panel must NOT claim success.
+   */
+  _sendRequest(method, payload) {
+    const requestId = `req_${++this._requestSeq}`;
+    return new Promise((resolve) => {
+      // Deliberately NOT unref'd: a pending request's deadline is the only
+      // thing standing between "the host never answered" and a promise that
+      // never settles. It is cleared the moment the reply (or a refusal)
+      // arrives, and it is short-lived either way.
+      const timer = setTimeout(() => {
+        this._pendingRequests.delete(requestId);
+        resolve(null);
+      }, this._requestTimeoutMs);
+      this._pendingRequests.set(requestId, { resolve, timer });
+      try {
+        this.protocol[method]({ ...payload, requestId });
+      } catch {
+        // The request never left (ProtocolClient throws when its port is
+        // gone) — settle now instead of waiting out the timeout.
+        clearTimeout(timer);
+        this._pendingRequests.delete(requestId);
+        resolve(null);
+      }
+    });
+  }
+
+  /** Settle the pending request this reply answers. Returns true when the
+   * reply was consumed (i.e. it belonged to a request we sent). */
+  _resolveRequest(env) {
+    if (!env || typeof env.requestId !== "string") return false;
+    const pending = this._pendingRequests.get(env.requestId);
+    if (!pending) return false;
+    clearTimeout(pending.timer);
+    this._pendingRequests.delete(env.requestId);
+    pending.resolve(env);
+    return true;
+  }
+
+  /** Settle every outstanding history request with "no answer" — used when
+   * the host has proven it cannot answer any of them (see the
+   * unknown_message_type branch in _onEnvelope). */
+  _settleAllRequests() {
+    for (const [, pending] of this._pendingRequests) {
+      clearTimeout(pending.timer);
+      pending.resolve(null);
+    }
+    this._pendingRequests.clear();
+  }
+
+  /**
+   * Fetch the host's AUTHORITATIVE conversation list and reconcile the local
+   * cache against it (tasks.md 1.2, spec chat-history-lifecycle
+   * "Authoritative listing and reconciliation").
+   *
+   * @returns {Promise<{reconciled: number, orphans: string[], removed: string[]}|null>}
+   *   `null` when the host did not answer — the caller keeps the cached list
+   *   and shows an offline/stale state rather than inventing one.
+   */
+  async reconcileHistory({ limit } = {}) {
+    if (this._hostHistorySupported === false) return null; // host cannot answer — keep the cache, show the offline state
+    const reply = await this._sendRequest("listConversations", limit ? { limit } : {});
+    if (!reply || !Array.isArray(reply.conversations)) return null;
+    this._hostHistorySupported = true;
+    for (const summary of reply.conversations) {
+      if (!summary || typeof summary.conversationId !== "string") continue;
+      this._hostTitles.set(summary.conversationId, summary.title ?? null);
+    }
+    return this.historyStore.reconcile(reply.conversations);
+  }
+
+  /**
+   * Load one older transcript page into a conversation's model (tasks.md 3.2
+   * / design.md decision 3 — "lazy older-event retrieval"). The model caps
+   * how much of it can be retained; the reply's `limitReached` tells the
+   * caller the memory budget is exhausted.
+   */
+  async loadOlderEvents(conversationId = this.currentConversationId, { limit } = {}) {
+    const model = conversationId ? this.models.get(conversationId) : null;
+    if (!model || this._hostHistorySupported === false) return null;
+    const beforeSeq = model.oldestLoadedSeq();
+    const reply = await this._sendRequest("requestTranscriptWindow", { conversationId, beforeSeq, limit });
+    if (!reply || !Array.isArray(reply.events)) return null;
+    const applied = model.applyOlderPage(reply);
+    this._notify();
+    return applied;
+  }
+
+  /**
+   * Delete one conversation on the HOST, and only then drop it locally
+   * (tasks.md 1.3 / design.md decision 5: "clear local cache only after
+   * acknowledgement, then reconcile"). A failure or an unacknowledged
+   * request leaves the local cache untouched and returns `ok:false` — the UI
+   * must never present a local-only removal as a completed deletion (spec
+   * chat-history-lifecycle "Complete deletion": "the UI never claims success
+   * for a local-only removal").
+   */
+  async deleteConversation(conversationId, { idempotencyKey } = {}) {
+    if (this._hostHistorySupported === false) {
+      // This host answered `unknown_message_type` for our history protocol:
+      // there is nothing to ask it, and a local-only removal is exactly what
+      // the spec forbids. Fail explicitly instead.
+      return { ok: false, reason: "host_protocol_unsupported" };
+    }
+    const key = idempotencyKey || this._newIdempotencyKey("del", conversationId);
+    const reply = await this._sendRequest("deleteConversation", { conversationId, idempotencyKey: key });
+    if (!reply || reply.deleted !== true) {
+      return { ok: false, reason: (reply && reply.reason) || (this._hostHistorySupported === false ? "host_protocol_unsupported" : "host_unavailable") };
+    }
+    await this.historyStore.remove(conversationId);
+    this.models.delete(conversationId);
+    this._hostMetadataSent.delete(conversationId);
+    this._hostTitles.delete(conversationId);
+    this._firstPromptText.delete(conversationId);
+    this._pendingHostMetadata.delete(conversationId);
+    this._pageHostnameByConversation.delete(conversationId);
+    if (this.currentConversationId === conversationId) this._setCurrentConversationId(null);
+    this._notify();
+    return {
+      ok: true,
+      onDiskRemoved: reply.onDiskRemoved !== false,
+      hadActiveRun: !!reply.hadActiveRun,
+      alreadyDeleted: !!reply.alreadyDeleted
+    };
+  }
+
+  /**
+   * Delete-all against the host (tasks.md 1.3). The local cache is cleared
+   * only for a sweep the host completed in full; a partial sweep keeps the
+   * cache and reports the failures so the operator sees what actually
+   * happened.
+   */
+  async deleteAllConversations({ idempotencyKey } = {}) {
+    if (this._hostHistorySupported === false) return { ok: false, reason: "host_protocol_unsupported", failed: [] };
+    const key = idempotencyKey || this._newIdempotencyKey("delall", "all");
+    const reply = await this._sendRequest("deleteAllConversations", { idempotencyKey: key });
+    if (!reply || reply.deleted !== true) {
+      const reason = (reply && reply.reason) || (this._hostHistorySupported === false ? "host_protocol_unsupported" : "host_unavailable");
+      return { ok: false, reason, failed: (reply && reply.failed) || [] };
+    }
+    const cleared = await this.historyStore.clearAll();
+    this.models.clear();
+    this._hostMetadataSent.clear();
+    this._hostTitles.clear();
+    this._firstPromptText.clear();
+    this._pendingHostMetadata.clear();
+    this._pageHostnameByConversation.clear();
+    this._setCurrentConversationId(null);
+    this._notify();
+    return { ok: true, count: typeof reply.count === "number" ? reply.count : cleared, hadActiveRuns: reply.hadActiveRuns || 0 };
+  }
+
+  _newIdempotencyKey(prefix, conversationId) {
+    this._idempotencySeq = (this._idempotencySeq || 0) + 1;
+    return `${prefix}_${conversationId}_${this._idempotencySeq}_${Date.now()}`;
+  }
+
+  /**
+   * Rename / pin / archive one conversation on the HOST (tasks.md 4.3, spec
+   * chat-history-lifecycle "Organization and export": "rename, pin, archive,
+   * and export a conversation without changing its transcript contents"). One
+   * operation for all three, because they are one thing: a presentation
+   * metadata write the host owns and revisions.
+   *
+   * The `ifRevision` guard is what makes two panels editing the same row safe
+   * (design.md risk "Cross-panel races"): the panel sends the revision it last
+   * saw, and a stale one comes back as `revision_conflict` instead of
+   * silently clobbering a newer edit from the other panel.
+   *
+   * @returns {Promise<{ok: true, meta: object} | {ok: false, reason: string}>}
+   */
+  async updateConversationPresentation(conversationId, patch = {}) {
+    if (this._hostHistorySupported === false) return { ok: false, reason: "host_protocol_unsupported" };
+    if (!patch || Object.keys(patch).length === 0) return { ok: false, reason: "empty_conversation_update" };
+    const entry = await this.historyStore.get(conversationId);
+    const ifRevision = entry && Number.isInteger(entry.revision) ? entry.revision : null;
+    // `ifRevision` travels INSIDE the patch object: protocol-client.js's
+    // updateConversation() spreads a patch into the flat wire envelope
+    // (`{conversationId, ...patch, requestId}`), which is the shape
+    // host/agent/protocol.js's validateConversationUpdate() reads.
+    const reply = await this._sendRequest("updateConversation", {
+      conversationId,
+      patch: { ...patch, ...(ifRevision != null ? { ifRevision } : {}) }
+    });
+    if (!reply || reply.ok !== true) {
+      return { ok: false, reason: (reply && reply.reason) || "host_unavailable" };
+    }
+    const meta = reply.meta || {};
+    // Adopt exactly what the host confirmed, and nothing else: `reconcile()`
+    // is wrong here — it treats every conversation the reply does not mention
+    // as an orphan, and this reply mentions one. `upsert()` leaves the fields
+    // the host did not answer for (hostname/createdAt) alone.
+    await this.historyStore.upsert({
+      conversationId,
+      title: meta.title ?? null,
+      hostname: meta.hostname ?? null,
+      updatedAt: typeof meta.updatedAt === "number" ? meta.updatedAt : Date.now(),
+      pinned: meta.pinned === true,
+      archived: meta.archived === true,
+      revision: Number.isInteger(meta.revision) ? meta.revision : undefined,
+      stale: false,
+      // Propagated only when the host's own record carries it; `undefined`
+      // leaves the entry's existing knowledge (including "unknown") intact.
+      hasData: typeof meta.hasData === "boolean" ? meta.hasData : undefined
+    });
+    // The host's title is now settled, so the derived default must never be
+    // re-sent over it (see `_deriveHostMetadataPatch()`), and neither must the
+    // title/hostname this panel already pushed.
+    this._hostTitles.set(conversationId, meta.title ?? null);
+    const sent = this._hostMetadataSent.get(conversationId) || {};
+    const nextSent = { ...sent };
+    for (const key of Object.keys(patch)) if (key in meta) nextSent[key] = meta[key];
+    this._hostMetadataSent.set(conversationId, nextSent);
+    this._notify();
+    return { ok: true, meta };
+  }
+
+  /**
+   * Read a conversation's WHOLE transcript from the host, newest page first
+   * (the host pages downward by `beforeSeq`), for export.
+   *
+   * The panel's own model cannot answer this: it is a bounded window (tasks.md
+   * 3.3) that deliberately holds only the newest slice of a long
+   * conversation. Export walks the host's pages instead, so the artifact
+   * contains the transcript rather than whatever the screen happened to be
+   * showing.
+   *
+   * @returns {Promise<{ok: true, events: Array<object>, pages: number}
+   *   | {ok: false, reason: string}>}
+   */
+  async collectTranscript(conversationId, { limit } = {}) {
+    if (this._hostHistorySupported === false) return { ok: false, reason: "host_protocol_unsupported" };
+    if (!conversationId) return { ok: false, reason: "unknown_conversation" };
+    const pages = [];
+    const events = [];
+    let beforeSeq = 0;
+    for (let fetched = 0; fetched < MAX_EXPORT_PAGES; fetched += 1) {
+      const reply = await this._sendRequest("requestTranscriptWindow", {
+        conversationId,
+        beforeSeq,
+        ...(limit ? { limit } : {})
+      });
+      if (!reply || !Array.isArray(reply.events)) {
+        return { ok: false, reason: (reply && reply.reason) || "host_unavailable" };
+      }
+      pages.push(reply);
+      events.push(...reply.events);
+      const firstSeq = Number.isInteger(reply.firstSeq) ? reply.firstSeq : 0;
+      // Stops on: the host says there is nothing older, an empty page, or a
+      // page that does not move the cursor. The last two are the same
+      // defensive stop — a host answering with its newest page again must not
+      // make this loop forever.
+      if (reply.hasOlder !== true || reply.events.length === 0 || !firstSeq || firstSeq === beforeSeq) break;
+      beforeSeq = firstSeq;
+    }
+    return { ok: true, events, pages: pages.length };
+  }
+
+  /**
+   * Export one conversation as a local Markdown/JSON artifact (spec
+   * chat-history-lifecycle "Organization and export"). Builds the text only —
+   * the caller writes the download; nothing here mutates the transcript, the
+   * cache, or the host.
+   *
+   * @returns {Promise<{ok: true, format, filename, mimeType, content,
+   *   eventCount, messageCount} | {ok: false, reason: string}>}
+   */
+  async exportConversation(conversationId, { format = "md", exportedAt } = {}) {
+    const normalized = normalizeExportFormat(format);
+    if (!normalized) return { ok: false, reason: "unknown_format" };
+    const collected = await this.collectTranscript(conversationId);
+    if (!collected.ok) return collected;
+    const entry = await this.historyStore.get(conversationId);
+    const summary = { ...(entry || {}), conversationId };
+    const prompts = await this.historyStore.promptsFor(conversationId);
+    const artifact = buildConversationArtifact({
+      summary,
+      events: collected.events,
+      prompts,
+      format: normalized,
+      exportedAt: exportedAt ?? Date.now()
+    });
+    return { ok: true, ...artifact };
+  }
+
+  /**
+   * Push the presentation metadata this panel owns to the host (tasks.md
+   * 1.1), coalesced like the local cache itself: at most one write per
+   * conversation per window, and only when a field actually changed. A run
+   * terminal or a snapshot flushes immediately (lifecycle), streaming
+   * updates ride the timer.
+   */
+  _queueHostMetadata(model, { immediate = false } = {}) {
+    if (!model || !model.conversationId) return;
+    const patch = this._deriveHostMetadataPatch(model);
+    if (!patch) return;
+    const pending = this._pendingHostMetadata.get(model.conversationId) || {};
+    this._pendingHostMetadata.set(model.conversationId, { ...pending, ...patch });
+    if (immediate) {
+      this._flushHostMetadata();
+      return;
+    }
+    if (this._hostMetadataTimer) return;
+    this._hostMetadataTimer = setTimeout(() => {
+      this._hostMetadataTimer = null;
+      this._flushHostMetadata();
+    }, HISTORY_FLUSH_DELAY_MS);
+    if (this._hostMetadataTimer.unref) this._hostMetadataTimer.unref();
+  }
+
+  /**
+   * The title this panel may DERIVE for a conversation, or null when there is
+   * none to give. A derived title is a DEFAULT, never an edit, so it is only
+   * ever offered while the host has no title of its own — an operator rename
+   * (tasks.md 4.3) lives there, and a panel that resumes someone else's
+   * conversation must never overwrite a title it did not author.
+   *
+   * The text is the conversation's FIRST question and nothing else. A later
+   * question is not this conversation's name, and a conversation rebuilt from
+   * a snapshot without a local prompt echo holds an explicit placeholder in
+   * that first slot — pushing either as a title would be worse than pushing
+   * nothing. `_firstPromptText` is consulted first (the earliest recorded
+   * prompt, synchronous by construction — see its field comment); the model's
+   * own leading user item is the fallback, which is what covers a prompt this
+   * panel just sent before the host echoed a runId back.
+   */
+  _derivedTitleFor(model) {
+    if (this._hostTitles.get(model.conversationId)) return null;
+    const remembered = this._firstPromptText.get(model.conversationId);
+    let text = typeof remembered === "string" && remembered ? remembered : null;
+    if (text == null) {
+      const firstUser = model.items.find((i) => i.kind === "user");
+      text = firstUser && firstUser.isPlaceholder !== true ? firstUser.text : null;
+    }
+    return text ? text.slice(0, 60) : null;
+  }
+
+  /** Remember a conversation's FIRST question, once, from whichever flow
+   * learned it first — the earliest recorded prompt (`reopenConversation()`)
+   * or the prompt the panel is sending right now (the START envelope). A
+   * later prompt never replaces an earlier one. */
+  _rememberFirstPrompt(conversationId, text) {
+    if (this._firstPromptText.has(conversationId)) return;
+    if (typeof text !== "string" || !text) return;
+    this._firstPromptText.set(conversationId, text);
+  }
+
+  /** Adopt the host title this conversation's LOCAL CACHE row carries, when
+   * nothing fresher is known. `_hostTitles` is filled by `reconcileHistory()`
+   * and accepted renames, but boot does not reconcile — so a resumed
+   * conversation's title would otherwise look unknown and the derived default
+   * would overwrite a rename the panel simply had not listed yet. A title a
+   * fresher reply already put in the map wins; a row with no title adopts
+   * null, which is the honest "still untitled" the derive gate needs. */
+  async _adoptCachedHostTitle(conversationId) {
+    if (this._hostTitles.has(conversationId)) return;
+    const entry = await this.historyStore.get(conversationId);
+    if (this._hostTitles.has(conversationId)) return;
+    this._hostTitles.set(conversationId, (entry && entry.title) || null);
+  }
+
+  _deriveHostMetadataPatch(model) {
+    const sent = this._hostMetadataSent.get(model.conversationId) || {};
+    const patch = {};
+    const derivedTitle = this._derivedTitleFor(model);
+    if (derivedTitle && derivedTitle !== sent.title) patch.title = derivedTitle;
+    const hostname = this._pageHostnameByConversation.get(model.conversationId);
+    if (hostname && hostname !== sent.hostname) patch.hostname = hostname;
+    return Object.keys(patch).length ? patch : null;
+  }
+
+  _flushHostMetadata() {
+    if (this._hostMetadataTimer) {
+      clearTimeout(this._hostMetadataTimer);
+      this._hostMetadataTimer = null;
+    }
+    const queued = [...this._pendingHostMetadata];
+    this._pendingHostMetadata.clear();
+    for (const [conversationId, patch] of queued) {
+      const sent = this._hostMetadataSent.get(conversationId) || {};
+      // Recorded only on a confirmed write: a failed push must be retried by
+      // the next change rather than silently marked as sent. An accepted title
+      // is also the host's title from now on, which is what stops the derived
+      // default from being re-sent (see `_deriveHostMetadataPatch()`).
+      this._sendRequest("updateConversation", { conversationId, patch }).then((reply) => {
+        if (!reply || reply.ok !== true) return;
+        this._hostMetadataSent.set(conversationId, { ...sent, ...patch });
+        if ("title" in patch) this._hostTitles.set(conversationId, (reply.meta && reply.meta.title) ?? patch.title ?? null);
+      });
+    }
+  }
+
+  /** Flush everything the debounce holds for one model (run terminal, stop,
+   * snapshot, unload). The local cache flush is fire-and-forget; the host
+   * metadata push is coalesced but immediate. */
+  flushHistory(model = this.currentModel()) {
+    if (model) this._queueHostMetadata(model, { immediate: true });
+    this.historyStore.flush();
+  }
+
   /**
    * The ONLY place `currentConversationId` is assigned (design.md "Funnel all
    * active-conversation assignment through one setter"). Every one of the
    * four spots that used to write the field directly — both adopt branches in
    * `_onEnvelope`'s `snapshot` case, `reopenConversation()`, and the clear in
-   * `deleteConversationLocally()` — now calls this instead, so the persisted
+   * `deleteConversation()` — now calls this instead, so the persisted
    * "last active" identity can never drift from the in-memory one: whichever
    * of the four transitions actually happens, this setter sees it.
    *
@@ -217,6 +687,19 @@ export class PanelController {
       this._notify();
     });
     this.protocol.connect();
+    // The panel's history operations are ADDITIVE protocol messages (see
+    // protocol-client.js's MSG comments). This is the migration plan's
+    // rollout gate, wired to the only thing that can actually decide it: does
+    // THIS host answer them? Until a host proves it does, the panel behaves
+    // exactly as it did before this change — the local cache as the list, the
+    // full host-bounded snapshot instead of a window, and no delete that
+    // claims the host removed something. `_probeHostHistory()` runs on every
+    // handshake that becomes ok, so the modern case flips to the bounded,
+    // host-authoritative behaviour as soon as the connection exists.
+    this.protocol.onHandshakeChange((state) => {
+      if (state === "ok" && this._hostHistorySupported == null) this._probeHostHistory();
+    });
+    this._probeHostHistory();
     // In production the panel connects to extension/background.js's
     // "ocic-agent" relay, which ALREADY performs its own hello on every
     // native-host connect (background.js's sendAgentHello(), using the
@@ -235,6 +718,41 @@ export class PanelController {
     if (identity && identity.installationId) {
       this.protocol.sendHello(identity);
     }
+  }
+
+  /**
+   * Whether the connected host speaks this change's history protocol
+   * (`list_conversations` / `update_conversation` / `delete_conversation` /
+   * `delete_all_conversations` / `transcript_window_request`): `null` = not
+   * yet proven (no answer to the probe), `true` = a history request was
+   * answered, `false` = the host refused the protocol with
+   * `unknown_message_type`.
+   *
+   * The three states are deliberately distinct, and every consumer compares
+   * against `false` explicitly rather than truthiness. "We do not know yet"
+   * is not a refusal: the history view reports it as a different state
+   * (tasks.md 4.3's offline vs error), and the model cap treats anything
+   * short of an actual refusal as the windowed protocol (see
+   * `_getOrCreateModel`).
+   */
+  hostHistorySupport() {
+    return this._hostHistorySupported;
+  }
+
+  /** Ask the host once whether it speaks the history protocol. Fire-and-
+   * forget: the answer only decides which implementation the panel uses. A
+   * probe that learned nothing (no handshake yet, a dropped reply) is NOT
+   * memoized, so the next handshake change tries again instead of latching
+   * the panel into the fallback forever. */
+  _probeHostHistory() {
+    if (this._hostHistorySupported === false) return null;
+    if (this._hostHistoryProbe) return this._hostHistoryProbe;
+    this._hostHistoryProbe = this._sendRequest("listConversations", {}).then((reply) => {
+      if (reply && Array.isArray(reply.conversations)) this._hostHistorySupported = true;
+      else this._hostHistoryProbe = null;
+      return this._hostHistorySupported;
+    });
+    return this._hostHistoryProbe;
   }
 
   hasCompleteProfile() {
@@ -274,7 +792,21 @@ export class PanelController {
   _getOrCreateModel(conversationId) {
     let model = this.models.get(conversationId);
     if (!model) {
-      model = new ConversationModel(conversationId);
+      // Windowed rendering is only honest when the host can serve older pages
+      // (migration plan's feature gate): against a host that has REFUSED the
+      // history protocol, the panel renders the whole host-bounded snapshot
+      // exactly as before rather than a window with no way to load more.
+      //
+      // The tri-state matters here, not a boolean: `null` (the probe has not
+      // answered yet) is not a refusal, and a model created during that
+      // window keeps whatever cap it was built with for the panel's whole
+      // lifetime. Treating "not proven yet" as "cannot serve pages" is what
+      // let a snapshot that beat the probe reply sit on an unbounded event
+      // window forever; the windowed protocol is the expected surface, so
+      // anything short of an actual refusal stays capped.
+      model = new ConversationModel(conversationId, {
+        maxWindowEvents: this.hostHistorySupport() === false ? Infinity : undefined
+      });
       this.models.set(conversationId, model);
     }
     return model;
@@ -318,6 +850,19 @@ export class PanelController {
     const model = this._getOrCreateModel(conversationId);
     const prompts = await this.historyStore.promptsFor(conversationId);
     model.seedLocalPrompts(prompts);
+    // The store records prompts in run order, so its FIRST entry is this
+    // conversation's first question. Remembering it here is what lets an
+    // untitled conversation be titled from a question asked before this panel
+    // instance existed (a resumed, reloaded or otherwise older conversation)
+    // instead of only from a question this panel happened to send itself.
+    this._rememberFirstPrompt(conversationId, prompts.size ? prompts.values().next().value : null);
+    // The host's own title for a conversation this panel instance has not
+    // listed is still known LOCALLY: the cache row carries the title the last
+    // reconcile (or this panel's own rename) put there. Adopt it before
+    // anything can derive a default, so resuming can never overwrite a title
+    // this panel did not author. `reconcileHistory()` runs on a later History
+    // open and its fresher, host-authoritative answer wins over this adoption.
+    await this._adoptCachedHostTitle(conversationId);
     // A startup restore must never steal the DISPLAY away from an operator's
     // own explicit reopen — including one that only started, not
     // necessarily finished, before this line runs (`_explicitReopenSinceBoot`
@@ -465,7 +1010,11 @@ export class PanelController {
     if (lastActiveId) {
       const list = await this.historyStore.list();
       const entry = list.find((c) => c.conversationId === lastActiveId);
-      restorable = !!entry && !entry.deletedLocally;
+      // `stale` (tasks.md 1.2): the host's authoritative list no longer
+      // reports this conversation, so the local row is a leftover, not a
+      // reopenable conversation — never auto-resume it. `deletedLocally` is
+      // kept for entries migrated from the v1 index.
+      restorable = !!entry && !entry.deletedLocally && !entry.stale;
     }
     if (!restorable) {
       await this._startNewConversationSafely();
@@ -514,6 +1063,11 @@ export class PanelController {
     const model = this.currentModel();
     if (!model) throw new Error("PanelController.sendMessage: no active conversation");
     model.addLocalUserMessage(text, { attachments: attachments || [] });
+    // Remember which page this conversation is bound to, so the host summary
+    // can carry a hostname even after the operator navigates away (task 1.1).
+    if (pageContext && pageContext.hostname) {
+      this._pageHostnameByConversation.set(this.currentConversationId, pageContext.hostname);
+    }
     this._notify();
     this._pendingSend = { conversationId: this.currentConversationId, text };
     // `prompt` is the user's own literal text, UNCHANGED (design.md section
@@ -645,19 +1199,15 @@ export class PanelController {
   }
 
   // scope-conversation-restore-per-tab: clearing the remembered identity
-  // already routes through `_setCurrentConversationId(null)` below, which
-  // writes under `this._scope()` — so a delete only ever clears THIS
-  // controller's own scope's entry, never another scope's. The guard
-  // (`currentConversationId === conversationId`) is unchanged from before
-  // this task: this scope's remembered id can only ever equal
-  // `currentConversationId`, since the setter is the sole place either is
-  // assigned, so the two can never drift apart.
-  async deleteConversationLocally(conversationId) {
-    await this.historyStore.removeLocal(conversationId);
-    this.models.delete(conversationId);
-    if (this.currentConversationId === conversationId) this._setCurrentConversationId(null);
-    this._notify();
-  }
+  // happens inside deleteConversation() via `_setCurrentConversationId(null)`,
+  // which writes under `this._scope()` — so a delete only ever clears THIS
+  // controller's own scope's entry, never another scope's.
+  //
+  // The old local-only `deleteConversationLocally()` is GONE: it removed the
+  // panel's list entry while the host transcript stayed put, which is exactly
+  // the "UI claims success for a local-only removal" failure the lifecycle
+  // spec forbids. Callers use `deleteConversation()` above, which talks to
+  // the host first.
 
   /**
    * Fetch one agent-created document's bytes for the card the operator just
@@ -724,7 +1274,7 @@ export class PanelController {
     //  2. `currentConversationId !== pending.conversationId` — a secondary,
     //     belt-and-suspenders check for any other transition that moved the
     //     active conversation away from this restore's target without going
-    //     through an explicit reopen (e.g. `deleteConversationLocally()`).
+    //     through an explicit reopen (e.g. `deleteConversation()`).
     //
     // Leaving the error on `pending.conversationId`'s own model above is
     // enough even when this guard skips the fallback: nobody may be looking
@@ -746,7 +1296,39 @@ export class PanelController {
     // sequence (a screenshot artifact reply) still falls through untouched.
     if (this.documents.handleEnvelope(env)) return;
 
+    // A refusal is an ANSWER. An `error` envelope carrying one of OUR
+    // requestIds (the companion's history handlers echo the id on their
+    // failure replies) settles that request — it must not fall through to the
+    // conversation-scoped error handling, and the caller must not have to
+    // wait out a timeout and misreport an answered refusal as an unreachable
+    // host.
+    if (env.type === "error" && this._resolveRequest(env)) return;
+
+    // An OLDER companion answers each of our history messages with the
+    // existing `unknown_message_type` error (and no requestId — it has never
+    // heard of this protocol, see protocol-client.js's MSG comments). That is
+    // the migration plan's gate closing: remember it, settle every
+    // outstanding history request right now (waiting out each one's timeout
+    // would be a stall, not a fallback), and from here on behave exactly as
+    // the pre-change panel did.
+    if (env.type === "error" && env.reason === "unknown_message_type") {
+      this._hostHistorySupported = false;
+      this._settleAllRequests();
+      this._notify();
+      return;
+    }
+
     switch (env.type) {
+      // Request/reply history replies (tasks.md 1.1-1.3, 3.2). Each settles
+      // the promise `_sendRequest()` created for it; nothing here mutates a
+      // conversation model, so they return rather than falling through.
+      case "list_conversations":
+      case "delete_conversation":
+      case "delete_all_conversations":
+      case "transcript_window":
+      case "update_conversation":
+        this._resolveRequest(env);
+        return;
       case "snapshot": {
         const model = this._getOrCreateModel(env.conversationId);
         model.applySnapshot(env);
@@ -758,6 +1340,11 @@ export class PanelController {
         // currentConversationId itself before asking, and never sets the flag.
         if (this._awaitingNewConversation) {
           this._awaitingNewConversation = false;
+          // This panel asked for a NEW conversation and this is its snapshot,
+          // so the display adopts it even though one was already open. A
+          // conversation merely RESUMED is never adopted here:
+          // reopenConversation() sets currentConversationId itself before
+          // asking and never sets the flag.
           this._setCurrentConversationId(env.conversationId);
         } else if (this.currentConversationId == null) {
           this._setCurrentConversationId(env.conversationId);
@@ -770,7 +1357,7 @@ export class PanelController {
         // attributed to it (see the "error" case below and the
         // `_pendingResumes` field comment).
         this._resolvePendingResume(env.conversationId);
-        this._persistHistoryEntry(model);
+        this._persistHistoryEntry(model, { immediate: true });
         this._notify();
         break;
       }
@@ -780,8 +1367,15 @@ export class PanelController {
           if (model) {
             model.bindRunToLastUserMessage(env.runId);
             if (this._pendingSend) {
-              this.historyStore.recordPrompt(env.conversationId, env.runId, this._pendingSend.text).catch(() => {});
+              const promptText = this._pendingSend.text;
+              this.historyStore.recordPrompt(env.conversationId, env.runId, promptText).catch(() => {});
               this._pendingSend = null;
+              // Mirror the store's own first-write-wins order: this send is
+              // the conversation's first question only while its user item is
+              // the leading one. In a resumed conversation whose earlier
+              // question is unknown, this later question must not become the
+              // title (see `_derivedTitleFor()`).
+              if (model.items.find((i) => i.kind === "user")?.runId === env.runId) this._rememberFirstPrompt(env.conversationId, promptText);
             }
           }
         }
@@ -792,7 +1386,7 @@ export class PanelController {
         const model = this.models.get(env.conversationId);
         if (model) {
           model.applyEvent(normalizeEvent(env.event, env.runId));
-          this._persistHistoryEntry(model);
+          this._persistHistoryEntry(model, { immediate: isRunTerminalEvent(env.event) });
         }
         this._notify();
         break;
@@ -800,8 +1394,12 @@ export class PanelController {
       case "token_batch": {
         const model = this.models.get(env.conversationId);
         if (model && Array.isArray(env.events)) {
-          for (const e of env.events) model.applyEvent(normalizeEvent(e, env.runId));
-          this._persistHistoryEntry(model);
+          let terminal = false;
+          for (const e of env.events) {
+            model.applyEvent(normalizeEvent(e, env.runId));
+            if (isRunTerminalEvent(e)) terminal = true;
+          }
+          this._persistHistoryEntry(model, { immediate: terminal });
         }
         this._notify();
         break;
@@ -879,16 +1477,39 @@ export class PanelController {
     }
   }
 
-  _persistHistoryEntry(model) {
-    const firstUser = model.items.find((i) => i.kind === "user");
+  /**
+   * Cache this model's conversation row locally and tell the host the
+   * presentation metadata it owns (tasks.md 1.1/2.1).
+   *
+   * Both halves are COALESCED by default — a token batch must not rewrite
+   * storage or hit the wire per event — and flushed immediately at the
+   * lifecycle points design.md decision 2 names (`immediate: true` from a run
+   * terminal or a snapshot).
+   */
+  _persistHistoryEntry(model, { immediate = false } = {}) {
+    // The local cache gets the same derived default as the host push (see
+    // `_derivedTitleFor()`): only while no title is known yet, and only from
+    // this conversation's first real question. Otherwise the cache keeps
+    // whatever the host reconcile put there, so a rename is not reverted on
+    // the row either.
+    const derivedTitle = this._derivedTitleFor(model);
     this.historyStore
       .upsert({
         conversationId: model.conversationId,
-        title: firstUser ? firstUser.text.slice(0, 60) : undefined,
-        hostname: undefined,
-        interrupted: model.meta ? !!model.meta.interrupted : model.hasActiveRun() ? false : undefined
+        title: derivedTitle || undefined,
+        hostname: this._pageHostnameByConversation.get(model.conversationId) || undefined,
+        interrupted: model.meta ? !!model.meta.interrupted : model.hasActiveRun() ? false : undefined,
+        // What this panel can see for itself: a model with at least one item
+        // has a question or a run in it. `false` therefore means "this
+        // conversation is empty right now" — a brand-new conversation is
+        // known-empty before any reconcile, and its first question (or the
+        // host's own transcript, rebuilt through a snapshot) flips it back to
+        // true on the very next persist.
+        hasData: model.items.length > 0
       })
       .catch(() => {});
+    this._queueHostMetadata(model, { immediate });
+    if (immediate) this.historyStore.flush();
   }
 }
 
