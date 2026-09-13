@@ -241,19 +241,22 @@ await test("Manual mode forces ask for an ordinary mutating call that Auto leave
   );
 });
 
-await test("Manual mode also forces ask for webmcp_call_tool — the one send-class tool bare-listed in allowedTools for its ordinary case", async () => {
-  // Unlike computer/javascript_tool/browser_batch (excluded from
-  // allowedTools outright, so they always reach canUseTool regardless of
-  // mode), webmcp_call_tool stays bare-listed for its ordinary,
-  // always-approve-unknown call (mapping.js's classifySendClassCall). Under
-  // Manual it must still ask — the same "every mutating/send action decides"
-  // requirement, closed here by treating SEND like MUTATING under manual.
+await test("Manual mode also forces ask for webmcp_call_tool — send-class, now excluded from allowedTools (defense in depth)", async () => {
+  // webmcp_call_tool used to be the one send-class tool left in
+  // `allowedTools`; stored conversation logs showed the consequence — a bare
+  // entry skips `canUseTool` entirely, so the decision the dispatch check
+  // requires could never be recorded and every call was refused
+  // `stale_approval`. It is excluded from `allowedTools` now
+  // (query-options.js), which is what routes it to `canUseTool` under both
+  // Auto and Manual. This branch is the Manual half's defense in depth: SEND
+  // is treated like MUTATING, so Manual keeps asking for it even if an
+  // `allowedTools` edit ever re-listed it.
   const qualified = `mcp__${SDK_MCP_SERVER_NAME}__webmcp_call_tool`;
   const args = { tabId: 1, name: "search", input: {} };
 
   const autoHook = createPermissionModeGateHook({ policySnapshot: () => ({ mode: "auto" }) });
   const autoOutput = await autoHook({ hook_event_name: "PreToolUse", tool_name: qualified, tool_input: args });
-  assert(!autoOutput || !autoOutput.hookSpecificOutput, `Auto mode must leave webmcp_call_tool's ordinary call alone — got ${JSON.stringify(autoOutput)}`);
+  assert(!autoOutput || !autoOutput.hookSpecificOutput, `Auto mode must leave webmcp_call_tool to canUseTool (the hook adds no override) — got ${JSON.stringify(autoOutput)}`);
 
   const manualHook = createPermissionModeGateHook({ policySnapshot: () => ({ mode: "manual" }) });
   const manualOutput = await manualHook({ hook_event_name: "PreToolUse", tool_name: qualified, tool_input: args });

@@ -30,7 +30,8 @@
 //      server name, plus "Skill", are present in the SDK's `tools`
 //      (availability) allowlist.
 //   2. Every ALWAYS-AUTOMATIC registry-backed browser tool (30 minus the
-//      gated `computer`, `javascript_tool`, and `browser_batch`) is ALSO
+//      gated `computer`, `javascript_tool`, `browser_batch` and
+//      `webmcp_call_tool`) is ALSO
 //      present in `allowedTools` (auto-approval) — and "Skill" is deliberately
 //      NOT, since passing 'Skill' through `allowedTools` is itself deprecated
 //      (sdk.d.ts:1447) — the `skills` option (already wired) covers it
@@ -153,7 +154,7 @@ await test("all 30 registry-backed browser tools, namespaced under this run's mc
   );
 });
 
-await test("all 27 always-automatic browser tools are auto-approved via allowedTools; computer, javascript_tool & browser_batch stay available through tools only (task 9.1)", async () => {
+await test("all 26 always-automatic browser tools are auto-approved via allowedTools; computer, javascript_tool, browser_batch & webmcp_call_tool stay available through tools only (task 9.1, extended)", async () => {
   // Task 9.1 (design.md section 8) narrowed `allowedTools`: `computer` and
   // `javascript_tool` are each capable of producing both an always-automatic
   // call AND a send/submit-class call under the identical tool name, so they
@@ -164,11 +165,17 @@ await test("all 27 always-automatic browser tools are auto-approved via allowedT
   // add-browser-batch-tool adds `browser_batch` to that excluded set for the
   // same reason at the whole-tool grain: a batch is one call whose items can
   // each be send/submit-class, so the gate must see the items.
-  // The remaining 27 browser tools stay in `allowedTools` unchanged — zero
+  // webmcp_call_tool is the fourth exclusion (the webmcp stale_approval
+  // fix): it classifies approve-unknown unconditionally, so a bare
+  // `allowedTools` entry meant the SDK auto-approved it before `canUseTool`
+  // ran, no gate verdict/grant could ever be recorded, and the handler-side
+  // pre-dispatch check refused every call — see query-options.js's
+  // derivation comment for the stored-log evidence.
+  // The remaining 26 browser tools stay in `allowedTools` unchanged — zero
   // added latency,
   // no dependency on `canUseTool` being invoked for them. The first-pass
   // regression this suite caught (tools in `tools` only, never in
-  // `allowedTools`) is still caught here for the 27 always-automatic tools.
+  // `allowedTools`) is still caught here for the 26 always-automatic tools.
   assert(
     TOOLS.length === 30,
     `expected the known 30-entry registry baseline (26 preserved + 5 post-baseline - 1 removed; see test/registry-baseline.test.mjs), got ${TOOLS.length} — if the registry grew or shrank on purpose, this assertion must be updated deliberately, not silently`
@@ -186,9 +193,9 @@ await test("all 27 always-automatic browser tools are auto-approved via allowedT
 
   assert(Array.isArray(options.allowedTools), "options.allowedTools must be an explicit array, never omitted");
 
-  const sendClassToolNames = new Set(["computer", "javascript_tool", "browser_batch"]);
+  const sendClassToolNames = new Set(["computer", "javascript_tool", "browser_batch", "webmcp_call_tool"]);
   const alwaysAutomatic = TOOLS.filter((t) => !sendClassToolNames.has(t.name));
-  assert(alwaysAutomatic.length === 27, `internal sanity: 27 always-automatic tools expected, got ${alwaysAutomatic.length}`);
+  assert(alwaysAutomatic.length === 26, `internal sanity: 26 always-automatic tools expected, got ${alwaysAutomatic.length}`);
 
   // Every always-automatic tool MUST be in allowedTools (the regression this
   // suite originally caught — any always-automatic tool absent here would
@@ -200,21 +207,23 @@ await test("all 27 always-automatic browser tools are auto-approved via allowedT
       `always-automatic tool "${t.name}" must be auto-approved as "${qualified}" via allowedTools — being present only in \`tools\` still leaves it behind a permission prompt nothing can answer`
     );
   }
-  // WebSearch and Task are auto-approved alongside the 27 always-automatic
+  // WebSearch and Task are auto-approved alongside the 26 always-automatic
   // browser tools (see query-options.js's `allowedTools` comment); WebFetch
   // is deliberately excluded so its calls route through canUseTool's URL
   // guard instead.
   assert(
     options.allowedTools.length === alwaysAutomatic.length + 2,
-    `allowedTools must contain exactly the 27 always-automatic browser tools plus WebSearch and Task (${alwaysAutomatic.length + 2}), no more and no fewer — got ${options.allowedTools.length}: ${JSON.stringify(options.allowedTools)}`
+    `allowedTools must contain exactly the 26 always-automatic browser tools plus WebSearch and Task (${alwaysAutomatic.length + 2}), no more and no fewer — got ${options.allowedTools.length}: ${JSON.stringify(options.allowedTools)}`
   );
   assert(options.allowedTools.includes("WebSearch"), "WebSearch must be auto-approved");
   assert(options.allowedTools.includes("Task"), "Task must be auto-approved");
   assert(!options.allowedTools.includes("WebFetch"), "WebFetch must NOT be auto-approved — it must route through canUseTool's URL guard");
 
-  // `computer`, `javascript_tool` and `browser_batch` MUST be in `tools`
-  // (availability) but ABSENT from `allowedTools` — this is the load-bearing
-  // consequence of task 9.1 (extended to batching by add-browser-batch-tool):
+  // `computer`, `javascript_tool`, `browser_batch` and `webmcp_call_tool`
+  // MUST be in `tools` (availability) but ABSENT from `allowedTools` — this
+  // is the load-bearing consequence of task 9.1 (extended to batching by
+  // add-browser-batch-tool, and to webmcp_call_tool by the stale_approval
+  // fix):
   // removing them from `allowedTools` routes every one of their calls through
   // `canUseTool`, where `isSendClassCall()` decides per call rather than the
   // SDK preapproving the submit case wholesale.

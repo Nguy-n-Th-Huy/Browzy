@@ -759,8 +759,21 @@ export function buildIsolatedOptions({
   // every batch through `canUseTool`, which walks the items and classifies
   // each with the same classifier a standalone call uses.
   //
-  // add-permission-modes-and-threat-signals: this set stays exactly the three
-  // send/submit-capable tools, and is deliberately NOT widened to every
+  // fix(webmcp stale_approval): `webmcp_call_tool` joins for the strongest
+  // form of the same reason — it is `approve-unknown` UNCONDITIONALLY
+  // (mapping.js: a page-defined effect "cannot be bounded from outside the
+  // page"; "never a silent allow"), so it has no always-automatic case
+  // `allowedTools` could preapprove even in principle. While bare-listed, the
+  // SDK auto-approved it before `canUseTool` ran, so no gate verdict or grant
+  // could ever exist — and the handler-side pre-dispatch check refuses
+  // exactly that — making every call fail `stale_approval` (stored
+  // conversation logs: three calls, zero approval cards, all rejected). The
+  // archived consume-webmcp-page-tools proposal's own note that no
+  // end-to-end invocation had ever executed is why the gap stayed invisible
+  // until a real page-declared tool was exercised.
+  //
+  // add-permission-modes-and-threat-signals: this set remains the
+  // send/submit-gated tools only, and is deliberately NOT widened to every
   // mutating tool or to every protected-capable tool (form_input,
   // gif_creator). Task 9.1's own test
   // (host/test/agent-tool-permission-preapproval.test.mjs) fixes the
@@ -794,7 +807,23 @@ export function buildIsolatedOptions({
   // `_mutationClassificationCoverage` stays imported for callers/tests that
   // want the raw read-only/mutating split directly.
   void _mutationClassificationCoverage;
-  const ALLOWED_TOOL_EXCLUDE = new Set(["computer", "javascript_tool", "browser_batch"]);
+  // Every send/submit-gated tool name stays OUT of `allowedTools`: a bare
+  // entry here means the SDK auto-approves the whole tool before `canUseTool`
+  // is consulted (see the SDK warning quoted in the comment above), while the
+  // handler-side pre-dispatch check (verifyPreDispatchApproval,
+  // host/agent/tools/adapter.js) refuses a send-class dispatch that carries no
+  // recorded gate verdict or approval grant — so a bare-listed send-class
+  // tool can never dispatch at all. `webmcp_call_tool` was the one send-class
+  // tool still left bare ("Auto-safe") until stored conversation logs showed
+  // the consequence: every call refused `stale_approval`, with no approval
+  // card ever raised, because nothing could ever record the decision the
+  // dispatch check requires. It classifies `approve-unknown` UNCONDITIONALLY
+  // (mapping.js: "never a silent allow"), so there is no always-automatic
+  // case `allowedTools` could preapprove even in principle — it must reach
+  // `canUseTool`, whose Auto path decides it as SEND-class
+  // (`auto-mode-send-class` → the decision card that IS the user's
+  // authorization for a page-defined effect).
+  const ALLOWED_TOOL_EXCLUDE = new Set(["computer", "javascript_tool", "browser_batch", "webmcp_call_tool"]);
   const autoApprovedBrowserToolNames = qualifiedBrowserToolNames.filter(
     (qname) => !ALLOWED_TOOL_EXCLUDE.has(legacyToolNameFromSdkName(qname))
   );
@@ -847,10 +876,11 @@ export function buildIsolatedOptions({
     // `allowedTools`'s own docstring, passing `'Skill'` through it is
     // deprecated; the `skills` option below already makes it unnecessary.
     //
-    // Task 9.1 additionally excludes `computer` and `javascript_tool`
-    // (see autoApprovedBrowserToolNames derivation above) so their calls
-    // reach `canUseTool`, where `isSendClassCall()` decides per call rather
-    // than the SDK preapproving the submit case wholesale.
+    // Task 9.1 additionally excludes `computer` and `javascript_tool`, and
+    // later fixes `browser_batch` and `webmcp_call_tool` (see
+    // autoApprovedBrowserToolNames derivation above), so their calls reach
+    // `canUseTool`, where `isSendClassCall()` decides per call rather than
+    // the SDK preapproving the submit case wholesale.
     // "WebSearch" and "Task" are auto-approved here too: WebSearch is
     // read-only, and Task only spawns a subagent inside this same
     // sandboxed run, so neither opens a door beyond what's already true.

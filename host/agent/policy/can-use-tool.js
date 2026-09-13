@@ -628,12 +628,14 @@ export function createCanUseTool({
  *      structurally possible for the first time: `buildIsolatedOptions`'s
  *      static `allowedTools` array cannot itself vary per call, so it alone
  *      could never satisfy Manual's per-call requirement no matter how it is
- *      computed at query() construction time. Send-class is included here
- *      too because `webmcp_call_tool` (SEND_CLASS_TOOL_NAMES) is, unlike
- *      `computer`/`javascript_tool`/`browser_batch`, bare-listed in
- *      `allowedTools` for its ordinary (Auto-safe, always approve-unknown)
- *      case — so without this branch it would stay silently preapproved
- *      under Manual exactly like an ordinary mutating call would.
+ *      computed at query() construction time. Send-class stays included
+ *      here as defense in depth: every SEND_CLASS_TOOL_NAMES tool is also
+ *      excluded from `allowedTools` outright (query-options.js), so those
+ *      calls reach `canUseTool` on their own — `webmcp_call_tool` included,
+ *      after its former bare-listing produced nothing but `stale_approval`
+ *      refusals in stored conversation logs. If one were ever re-listed
+ *      there, this branch keeps Manual's per-call requirement structural
+ *      instead of silently preapproving it.
  * Every other call (read-only always, send-class always — already routed
  * through canUseTool by staying out of `allowedTools`, mutating-non-protected
  * under Auto/Skip) resolves `{}` — no override, no added latency, identical

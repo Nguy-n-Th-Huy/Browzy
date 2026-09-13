@@ -4,10 +4,11 @@
 //   - isSendClassCall() narrows only `computer` and `javascript_tool`
 //   - Reuses (does not duplicate) isMutatingCall()'s existing table —
 //     a non-send call still executes with no prompt
-//   - Every other browser tool stays in `allowedTools` unchanged
-//   - computer and javascript_tool stay AVAILABLE in `tools` but are absent
-//     from `allowedTools` (auto-approval) so every one of their calls reaches
-//     `canUseTool`
+//   - Every other always-automatic browser tool stays in `allowedTools`
+//     unchanged; the send/submit-gated `computer`, `javascript_tool`,
+//     `browser_batch` and `webmcp_call_tool` stay AVAILABLE in `tools` but
+//     are absent from `allowedTools` (auto-approval) so every one of their
+//     calls reaches `canUseTool`
 //
 // Run: node test/send-class-classifier.test.mjs
 
@@ -174,11 +175,15 @@ await test("query-options.js keeps every other (always-automatic) browser tool i
   // add-browser-batch-tool adds `browser_batch` to this excluded set for the
   // SAME reason `computer`/`javascript_tool` are there: a batch is one call
   // whose items can each be send/submit-class, and the gate must see the
-  // items rather than auto-approving the whole tool. It therefore joins the
-  // excluded set here instead of the always-automatic set this assertion
-  // sweeps — the assertion's contract (every ALWAYS-AUTOMATIC tool stays
-  // auto-approved) is unchanged and still enforced for all the others.
-  const sendClassToolNames = new Set(["computer", "javascript_tool", "browser_batch"]);
+  // items rather than auto-approving the whole tool. The webmcp
+  // stale_approval fix adds `webmcp_call_tool`: it is unconditionally
+  // approve-unknown, so a bare `allowedTools` entry guaranteed a dispatch
+  // refusal (no gate decision could ever be recorded) — see query-options.js's
+  // derivation comment for the stored-log evidence. Both join the excluded
+  // set here instead of the always-automatic set this assertion sweeps — the
+  // assertion's contract (every ALWAYS-AUTOMATIC tool stays auto-approved) is
+  // unchanged and still enforced for all the others.
+  const sendClassToolNames = new Set(["computer", "javascript_tool", "browser_batch", "webmcp_call_tool"]);
   for (const t of TOOLS) {
     if (sendClassToolNames.has(t.name)) continue;
     const qualified = `mcp__${SDK_MCP_SERVER_NAME}__${t.name}`;

@@ -15,6 +15,13 @@
 // the pre-3.1 classifier read bare "click" and `args.script`, which no real
 // registered call ever carries, so the gate was structurally unreachable.
 //
+// PLUS the webmcp stale_approval regression: `webmcp_call_tool` used to be
+// bare-listed in `allowedTools`, so the SDK auto-approved it before
+// `canUseTool` ran and every call was refused at dispatch for want of a
+// decision nothing could record (stored conversation logs, 2026-09-13).
+// Under Auto the gate must now raise its card, and an approved call must
+// dispatch.
+//
 // Run: node test/approval-evidence-binding.test.mjs
 
 import fs from "node:fs";
@@ -292,6 +299,44 @@ await test("changed evidence: full gate→dispatch happy path dispatches through
   const result = await computerHandler.handler({ ...args });
   assert(dispatched && dispatched.name === "computer", `approved call must dispatch, got ${JSON.stringify(dispatched)}`);
   assert(!result.isError, `dispatch must succeed, got ${JSON.stringify(result)}`);
+});
+
+await test("webmcp stale_approval loop: under Auto, the gate raises webmcp_call_tool's card and an approved call dispatches through the real handler", async () => {
+  // Stored conversation logs (2026-09-13) showed every webmcp_call_tool call
+  // refused `stale_approval` with no approval card ever raised: the tool was
+  // bare-listed in `allowedTools` (host/agent/tools/query-options.js), so the
+  // SDK auto-approved it before this gate could run and nothing could ever
+  // record the decision the pre-dispatch check requires. The fix excludes it
+  // from `allowedTools`; this test drives the fixed chain end to end under
+  // Auto — the exact mode the live regression ran under.
+  const run = await begunRun({ tabScope: [42] });
+  const tracker = new RequestIdTracker();
+  const canUseTool = createCanUseTool({
+    run,
+    approvals: run.approvals,
+    requestIdTracker: tracker,
+    policySnapshot: () => ({ mode: "auto" })
+  });
+  const args = { name: "studio_api_post_projects_inspect", tabId: 42, toolArgs: { body: {} } };
+  const promise = canUseTool({ toolName: "mcp__browzy-in-chrome-browser__webmcp_call_tool", toolUseID: "req_webmcp", input: { ...args } });
+  await approveAfterTick(tracker, "req_webmcp");
+  const allowed = await promise;
+  assert(allowed.behavior === "allow", `an approved webmcp_call_tool must be allowed, got ${JSON.stringify(allowed)}`);
+
+  let dispatched = null;
+  const toolBridge = new ToolBridge({ init: async () => {}, callTool: async (name, a) => { dispatched = { name, a }; return { content: [{ type: "text", text: "ran" }] }; }, shutdown: () => {} });
+  const handlers = buildSdkTools({ toolBridge, coerceArgs: (a) => a, run });
+  const handler = handlers.find((h) => h.name === "webmcp_call_tool");
+  const result = await handler.handler({ ...args });
+  assert(dispatched && dispatched.name === "webmcp_call_tool", `the approved call must reach the bridge, got ${JSON.stringify(dispatched)}`);
+  assert(!result.isError, `dispatch must succeed, got ${JSON.stringify(result)}`);
+
+  // The dispatch check itself is NOT weakened: a webmcp_call_tool dispatch
+  // that never passed the gate is still refused (the invariant the
+  // bare-listing used to trip over — now closed by the gate running first,
+  // not by relaxing this check).
+  const ungated = await handler.handler({ name: "another_tool", tabId: 42, toolArgs: { body: {} } });
+  assert(ungated.isError === true, "a webmcp_call_tool dispatch that never passed the gate must still be refused");
 });
 
 await test("changed evidence: handler invoked without ever passing the gate is stale (bypass closed)", async () => {
