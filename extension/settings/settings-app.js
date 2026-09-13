@@ -42,6 +42,109 @@ $("ic-chevr-skills").innerHTML = iconMarkup("chevronRight", { size: 16 });
 $("ic-permissions").innerHTML = iconMarkup("lock", { size: 18 });
 $("ic-chevr-permissions").innerHTML = iconMarkup("chevronRight", { size: 16 });
 
+// ChatGPT sign-in copy per phase (add-chatgpt-subscription-provider tasks.md
+// 5.3) — kept as one small lookup so the aria-live status paragraph and any
+// other place needing "what's happening right now" text stay in sync.
+const CHATGPT_PHASE_STATUS_VI = {
+  starting_browser: "Đang mở trang đăng nhập ChatGPT…",
+  pending_browser: "Đang chờ bạn hoàn tất đăng nhập trong tab trình duyệt vừa mở…",
+  starting_device: "Đang lấy mã đăng nhập…",
+  pending_device: "Nhập mã bên dưới tại trang xác minh để hoàn tất đăng nhập.",
+  cancelling: "Đang hủy đăng nhập…"
+};
+
+// Tracks the device code last shown, so focus is moved to it only the
+// MOMENT it newly appears (tasks.md 5.5's accessibility requirement) —
+// never on every re-render while it's already visible and already focused
+// once, which would otherwise steal focus back from whatever the user is
+// doing next (e.g. tabbing to the copy button).
+let lastDeviceCodeShown = null;
+let chatgptCountdownTimer = null;
+
+function formatCountdown(expiresAt) {
+  const msLeft = expiresAt - Date.now();
+  if (msLeft <= 0) return "Mã đã hết hạn — bấm \"Dùng mã thay thế\" để lấy mã mới.";
+  const totalSeconds = Math.floor(msLeft / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `Mã hết hạn sau ${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+function stopChatgptCountdown() {
+  if (chatgptCountdownTimer !== null) {
+    clearInterval(chatgptCountdownTimer);
+    chatgptCountdownTimer = null;
+  }
+}
+
+/** Ticks the visible device-code expiry text once a second — a purely local
+ * UI countdown, never a network call (the actual pending/expired outcome
+ * still comes only from controller.js's own status poll). */
+function startChatgptCountdown(expiresAt) {
+  stopChatgptCountdown();
+  const tick = () => {
+    const el = $("chatgpt-code-expiry");
+    if (el) el.textContent = formatCountdown(expiresAt);
+  };
+  tick();
+  chatgptCountdownTimer = setInterval(tick, 1000);
+}
+
+function renderChatgptFields(state) {
+  const signIn = state.signIn;
+  const phase = signIn.phase;
+  const isPending = phase === "pending_browser" || phase === "pending_device" || phase === "cancelling";
+  const isStarting = phase === "starting_browser" || phase === "starting_device";
+
+  $("chatgpt-status-live").textContent = CHATGPT_PHASE_STATUS_VI[phase] || "";
+
+  const showSignedOut = phase === "idle" && state.chatgptSessionState !== "signed_in" && state.chatgptSessionState !== "session_expired";
+  const showPending = isPending || isStarting;
+  const showSignedIn = phase === "idle" && state.chatgptSessionState === "signed_in";
+  const showExpired = phase === "idle" && state.chatgptSessionState === "session_expired";
+
+  $("chatgpt-signed-out-actions").hidden = !showSignedOut;
+  $("chatgpt-pending-actions").hidden = !showPending;
+  $("chatgpt-signed-in-info").hidden = !showSignedIn;
+  $("chatgpt-session-expired-actions").hidden = !showExpired;
+
+  $("btn-chatgpt-signin-browser").disabled = isStarting;
+  $("btn-chatgpt-use-code").disabled = isStarting;
+  $("btn-chatgpt-signin-browser").textContent = phase === "starting_browser" ? "Đang mở…" : "Đăng nhập với ChatGPT";
+  $("btn-chatgpt-use-code").textContent = phase === "starting_device" ? "Đang lấy mã…" : "Dùng mã thay thế";
+  $("btn-chatgpt-cancel-signin").disabled = phase === "cancelling";
+  $("btn-chatgpt-signout").disabled = state.signingOut;
+  $("btn-chatgpt-signout").textContent = state.signingOut ? "Đang đăng xuất…" : "Đăng xuất";
+
+  const deviceCodeBox = $("chatgpt-device-code-box");
+  const showDeviceCode = phase === "pending_device" && Boolean(signIn.userCode);
+  deviceCodeBox.hidden = !showDeviceCode;
+  if (showDeviceCode) {
+    $("chatgpt-device-code").value = signIn.userCode;
+    $("chatgpt-verification-link").href = signIn.verificationUrl || "#";
+    startChatgptCountdown(signIn.expiresAt);
+    // Accessibility (tasks.md 5.5): move focus to the device code the MOMENT
+    // it newly appears, never on a re-render where it was already showing.
+    if (lastDeviceCodeShown !== signIn.signInId) {
+      lastDeviceCodeShown = signIn.signInId;
+      $("chatgpt-device-code").focus();
+    }
+  } else {
+    stopChatgptCountdown();
+    if (phase !== "pending_device") lastDeviceCodeShown = null;
+  }
+
+  if (showSignedIn && state.chatgptAccount) {
+    // A memory-only sign-in (the offer accepted after SECURE_STORAGE_UNAVAILABLE)
+    // looks identical to a persisted one otherwise, so it is named here —
+    // the user must know the sign-in will not survive a companion restart.
+    const memoryOnlySuffix = state.memoryOnlyCredential ? " · chỉ trong bộ nhớ" : "";
+    $("chatgpt-account-line").textContent = `Đã đăng nhập với ${state.chatgptAccount.email} (gói ${state.chatgptAccount.planType}${memoryOnlySuffix}).`;
+  } else {
+    $("chatgpt-account-line").textContent = "";
+  }
+}
+
 function iconEl(name, opts) {
   const span = document.createElement("span");
   span.className = "ui-icon";
@@ -88,13 +191,24 @@ function renderBanner(state) {
     box.appendChild(p);
   }
   if (state.pendingMemoryOnlyOffer) {
+    // Two different memory-only confirmations share this offer block, told
+    // apart by `state.memoryOnlyOfferKind`: retrying an API-key save
+    // (anthropic) or re-running a ChatGPT sign-in that could not persist its
+    // credential (specs/agent-settings "Secret isolation": "a clearly labeled
+    // memory-only mode SHALL be offered"). The label names which one.
+    const isSignInOffer = state.memoryOnlyOfferKind === "sign_in";
     const actions = document.createElement("div");
     actions.className = "field-row-actions";
     const confirmBtn = document.createElement("button");
     confirmBtn.className = "btn btn-secondary btn-sm";
     confirmBtn.type = "button";
-    confirmBtn.textContent = "Lưu chỉ trong bộ nhớ";
-    confirmBtn.addEventListener("click", () => controller.confirmMemoryOnlyCredential());
+    confirmBtn.textContent = isSignInOffer ? "Đăng nhập chỉ trong bộ nhớ" : "Lưu chỉ trong bộ nhớ";
+    confirmBtn.addEventListener("click", async () => {
+      const result = isSignInOffer ? await controller.confirmMemoryOnlySignIn() : await controller.confirmMemoryOnlyCredential();
+      // A browser sign-in retry is a NEW authorization URL that must be
+      // opened, exactly like the ordinary sign-in button above.
+      if (isSignInOffer && result && result.ok && result.authUrl) openInNewTab(result.authUrl);
+    });
     const cancelBtn = document.createElement("button");
     cancelBtn.className = "btn btn-ghost btn-sm";
     cancelBtn.type = "button";
@@ -219,6 +333,29 @@ function wireChipNav() {
 }
 
 function renderProvider(state) {
+  $("provider-type-anthropic").checked = state.providerType === "anthropic";
+  $("provider-type-chatgpt").checked = state.providerType === "chatgpt";
+  $("provider-type-anthropic").disabled = state.switchingProviderType;
+  $("provider-type-chatgpt").disabled = state.switchingProviderType;
+
+  const isChatgpt = state.providerType === "chatgpt";
+  $("anthropic-baseurl-item").hidden = isChatgpt;
+  $("anthropic-key-item").hidden = isChatgpt;
+  $("chatgpt-fields").hidden = !isChatgpt;
+  $("test-disclosure-anthropic").hidden = isChatgpt;
+  $("test-disclosure-chatgpt").hidden = !isChatgpt;
+  // The saved-credential status line/remove-key button only mean something
+  // for the API-key half of the page; the ChatGPT half has its own signed-
+  // in/signed-out affordances below (see the final `$("key-status-text")`/
+  // `$("btn-remove-key")` block further down, which also checks `isChatgpt`).
+  $("key-status-text").hidden = isChatgpt;
+
+  if (isChatgpt) {
+    renderChatgptFields(state);
+  } else {
+    stopChatgptCountdown();
+  }
+
   const urlInput = $("base-url");
   if (document.activeElement !== urlInput) urlInput.value = state.baseUrlDraft;
   urlInput.setAttribute("aria-invalid", state.fieldErrors.baseUrl ? "true" : "false");
@@ -229,7 +366,7 @@ function renderProvider(state) {
   keyStatus.textContent = state.hasCredential
     ? `Đã lưu API key${state.memoryOnlyCredential ? " (chỉ trong bộ nhớ)" : ""}`
     : "Chưa lưu API key";
-  $("btn-remove-key").hidden = !state.hasCredential;
+  $("btn-remove-key").hidden = isChatgpt || !state.hasCredential;
   $("btn-remove-key").disabled = state.removingCredential;
 
   // NOTE: the key <input> is deliberately left UNCONTROLLED — its value is
@@ -371,7 +508,63 @@ function render(state) {
   renderModels(state);
 }
 
+/** Opens `url` in a new tab via `chrome.tabs.create` (tasks.md 5.3); falls
+ * back to `window.open` only when `chrome.tabs` is unavailable (e.g. this
+ * page loaded outside the extension, such as a visual-QA capture). */
+function openInNewTab(url) {
+  if (!url) return;
+  if (typeof chrome !== "undefined" && chrome.tabs && typeof chrome.tabs.create === "function") {
+    chrome.tabs.create({ url });
+  } else {
+    window.open(url, "_blank", "noopener");
+  }
+}
+
 function wireEvents() {
+  $("provider-type-anthropic").addEventListener("change", () => {
+    if ($("provider-type-anthropic").checked) controller.setProviderType("anthropic");
+  });
+  $("provider-type-chatgpt").addEventListener("change", () => {
+    if ($("provider-type-chatgpt").checked) controller.setProviderType("chatgpt");
+  });
+
+  $("btn-chatgpt-signin-browser").addEventListener("click", async () => {
+    const result = await controller.startBrowserSignIn();
+    if (result.ok) openInNewTab(result.authUrl);
+  });
+  $("btn-chatgpt-signin-again").addEventListener("click", async () => {
+    const result = await controller.startBrowserSignIn();
+    if (result.ok) openInNewTab(result.authUrl);
+  });
+  $("btn-chatgpt-use-code").addEventListener("click", () => controller.startDeviceSignIn());
+  $("btn-chatgpt-cancel-signin").addEventListener("click", () => controller.cancelSignIn());
+  $("btn-chatgpt-signout").addEventListener("click", async () => {
+    if (!confirm("Đăng xuất khỏi ChatGPT? Các phiên đang chạy dùng tài khoản này sẽ bị hủy.")) return;
+    await controller.signOut();
+  });
+  $("btn-chatgpt-copy-code").addEventListener("click", async () => {
+    const code = $("chatgpt-device-code").value;
+    if (!code) return;
+    try {
+      await navigator.clipboard.writeText(code);
+    } catch {
+      // Clipboard permission denied/unavailable — the code is still visible
+      // and selectable in the (readonly) input itself, so this is degraded,
+      // not broken.
+      $("chatgpt-device-code").select();
+    }
+  });
+
+  // Status polling stops while this page is hidden/unloaded and resumes when
+  // it becomes visible again (tasks.md 5.3's "stop ... when the page is
+  // hidden/unloaded"; see settings-controller.js's pauseSignInPolling()/
+  // resumeSignInPolling() doc comments).
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) controller.pauseSignInPolling();
+    else controller.resumeSignInPolling();
+  });
+  window.addEventListener("pagehide", () => controller.pauseSignInPolling());
+
   $("base-url").addEventListener("input", (e) => controller.setBaseUrlDraft(e.target.value));
   $("base-url").addEventListener("blur", () => controller.validateBaseUrlField());
 

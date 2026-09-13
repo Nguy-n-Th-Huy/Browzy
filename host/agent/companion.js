@@ -43,6 +43,8 @@ import {
   attachmentKind,
   makeEnvelope,
   validateHello,
+  validateConversationUpdate,
+  validateIdempotencyKey,
   isSupportedVersion,
   versionMismatchEnvelope,
   helloAckEnvelope,
@@ -116,6 +118,30 @@ import {
   readAdvertisedCommands,
   deriveApprovedBuiltinCommands
 } from "./settings/advertised-commands.js";
+// add-chatgpt-subscription-provider: a pure, dependency-free constant (no
+// chatgpt/ or secret-store runtime behind it) — safe to import statically
+// here alongside every other settings/ import above.
+import { CHATGPT_CAPABILITY_TEST_MARKER } from "./settings/profile-schema.js";
+// `agent_settings`' ChatGPT sign-in ops translate one failure mode that has no
+// code of its own (below, `_chatgptSignInStatus`/`_chatgptSignInCancel`), so
+// this handler needs the error taxonomy itself. Like profile-schema.js above,
+// errors.js is dependency-free — nothing Node-specific or credential-bearing
+// rides into this module through it.
+import { ProviderError } from "./settings/errors.js";
+
+// auth.js's `getSignInStatus`/`cancelSignIn` answer "no sign-in with this id"
+// (never started, or its terminal record already pruned after retention) with a
+// plain Error, because `errors.js` deliberately has no code for it: it is a
+// caller mistake, not one of the spec's named sign-in failure modes
+// (SIGN_IN_TIMEOUT / SIGN_IN_CANCELLED / SIGN_IN_FAILED / CALLBACK_PORT_IN_USE
+// / SESSION_EXPIRED). Without this, the handler's catch-all would label it
+// `NETWORK_ERROR` — implying a network call was made and failed, which is a
+// materially different thing for the settings page to show.
+function asProtocolError(err, message) {
+  if (err && err.code) throw err; // already coded (a ProviderError, or a system error)
+  throw new ProviderError("PROTOCOL_ERROR", message, { cause: err });
+}
+
 
 // A prompt is treated as an explicit slash dispatch only when it is a plain
 // string starting with "/" once trimmed — the exact composer convention
@@ -277,8 +303,17 @@ export class CompanionCore {
    *   persisted/resolved (storage/action-timeline.js). Defaults to a real
    *   one so every existing test double that never passes this stays valid
    *   (additive dependency, same pattern as settingsProvider above).
+   * @param {object} [deps.chatgptAuthProvider] - the same "lazy, injectable,
+   *   defaults to the real module" pattern as `settingsProvider`, for the
+   *   surface the six ChatGPT `agent_settings` ops delegate to
+   *   (host/agent/chatgpt/auth.js's default instance:
+   *   startBrowserSignIn/startDeviceSignIn/getSignInStatus/cancelSignIn/
+   *   signOut). Injectable so a test can drive every reply shape —
+   *   including one that would otherwise open a real OAuth callback listener
+   *   on port 1455 or write a real OS credential — without either. Additive:
+   *   omitted, the ops resolve the real module lazily.
    */
-  constructor({ toolBridge, sessionManager, lease, coerceArgs, sdk, profileProvider, settingsProvider, artifactStore, attachmentStore, askUserToolFactory, documentStore }) {
+  constructor({ toolBridge, sessionManager, lease, coerceArgs, sdk, profileProvider, settingsProvider, chatgptAuthProvider, artifactStore, attachmentStore, askUserToolFactory, documentStore }) {
     this.toolBridge = toolBridge;
     this.sessionManager = sessionManager;
     this.lease = lease;
@@ -294,6 +329,11 @@ export class CompanionCore {
     this.documentStore = documentStore || new DocumentStore();
     this.attachmentStore = attachmentStore || new UserAttachmentStore();
     this._settingsModulePromise = null;
+    // ChatGPT auth provider: injected double (tests) or the real auth.js
+    // default instance, resolved lazily — see the constructor's
+    // `chatgptAuthProvider` doc. Same shape as `_settingsModulePromise` above.
+    this.chatgptAuthProvider = chatgptAuthProvider || null;
+    this._chatgptAuthModulePromise = null;
     this._unsubscribeCredentialRevoked = null;
     this._negotiatedVersion = null;
     this._browserIdentity = null;
@@ -343,6 +383,18 @@ export class CompanionCore {
     // conversation deletion (_handleDeleteConversation) so a long-lived
     // companion does not accumulate one entry per conversation forever.
     this._tabRiskByConversation = new Map(); // conversationId -> TabRiskRegistry
+
+    // Success-only idempotency memo for DELETE_CONVERSATION /
+    // DELETE_ALL_CONVERSATIONS (optimize-chat-history task 1.3, design.md
+    // decision 5: "Treat delete/export as host operations with idempotency
+    // keys"). A panel that retried a delete after losing the reply gets the
+    // ORIGINAL success back instead of a second, differently-shaped answer
+    // (and never a spurious failure). Failures are deliberately not memoized
+    // — a retry must be able to genuinely retry. In-memory, per process:
+    // after a companion restart the delete's end state is still idempotent
+    // by itself (a tombstoned or already-gone conversation answers
+    // alreadyDeleted / unknown_conversation honestly).
+    this._deleteReplies = new Map(); // idempotencyKey -> reply envelope
 
     // Permission-mode/managed-policy state (add-permission-modes-and-threat-
     // signals): a live source consulted at EVERY decision (createCanUseTool's
@@ -406,6 +458,12 @@ export class CompanionCore {
         return this._handleListConversations(envelope);
       case AGENT_MESSAGE_TYPES.DELETE_CONVERSATION:
         return this._handleDeleteConversation(envelope);
+      case AGENT_MESSAGE_TYPES.UPDATE_CONVERSATION:
+        return this._handleUpdateConversation(envelope);
+      case AGENT_MESSAGE_TYPES.DELETE_ALL_CONVERSATIONS:
+        return this._handleDeleteAllConversations(envelope);
+      case AGENT_MESSAGE_TYPES.TRANSCRIPT_WINDOW_REQUEST:
+        return this._handleTranscriptWindowRequest(envelope);
       case AGENT_MESSAGE_TYPES.AGENT_SETTINGS:
         return this._handleAgentSettings(envelope);
       case AGENT_MESSAGE_TYPES.MANAGED_POLICY_SNAPSHOT:
@@ -770,12 +828,78 @@ export class CompanionCore {
    * per-session query about this bridge's conversations, not a
    * bridge-level fact independent of any session (contrast
    * _handleRecordingComplete/_handleAgentSettings below).
+   *
+   * Since optimize-chat-history task 1.1 this is the AUTHORITATIVE list: the
+   * reply carries the host's own title/hostname/pinned/archived/revision
+   * metadata, and `total`/`hasMore` let a capped reply be told apart from a
+   * complete one.
    */
   _handleListConversations(envelope) {
     if (!this._requireHello()) return this._notHandshaked(envelope);
+    const limit = Number.isInteger(envelope.limit) && envelope.limit > 0 ? envelope.limit : undefined;
     return makeEnvelope(AGENT_MESSAGE_TYPES.LIST_CONVERSATIONS, {
-      conversations: this.sessionManager.conversationSummaries()
+      ...this.sessionManager.conversationSummaries({ limit }),
+      requestId: envelope.requestId ?? null
     });
+  }
+
+  /**
+   * Presentation-metadata write (optimize-chat-history task 1.1). Validated
+   * at the wire boundary; rejected (never silently ignored) when the
+   * conversation does not exist or the caller's `ifRevision` guard is stale,
+   * so a second panel editing the same row gets a conflict it can resolve
+   * instead of overwriting a newer title.
+   */
+  _handleUpdateConversation(envelope) {
+    if (!this._requireHello()) return this._notHandshaked(envelope);
+    const { conversationId } = envelope;
+    if (!conversationId) return makeEnvelope(AGENT_MESSAGE_TYPES.ERROR, { reason: "missing_conversation_id" });
+    const validated = validateConversationUpdate(envelope);
+    if (!validated.ok) {
+      return makeEnvelope(AGENT_MESSAGE_TYPES.UPDATE_CONVERSATION, {
+        conversationId,
+        ok: false,
+        reason: validated.reason,
+        requestId: envelope.requestId ?? null
+      });
+    }
+    const result = this.sessionManager.updateConversationPresentation(conversationId, validated.patch);
+    if (!result.ok) {
+      return makeEnvelope(AGENT_MESSAGE_TYPES.UPDATE_CONVERSATION, {
+        conversationId,
+        ok: false,
+        reason: result.reason,
+        revision: result.revision,
+        requestId: envelope.requestId ?? null
+      });
+    }
+    return makeEnvelope(AGENT_MESSAGE_TYPES.UPDATE_CONVERSATION, {
+      conversationId,
+      ok: true,
+      revision: result.meta.revision,
+      meta: result.meta,
+      requestId: envelope.requestId ?? null
+    });
+  }
+
+  /**
+   * One OLDER transcript page by sequence range (optimize-chat-history task
+   * 3.2). Read-only; the panel asks only for pages below what it already
+   * holds, so this can never drop replay correctness.
+   */
+  _handleTranscriptWindowRequest(envelope) {
+    if (!this._requireHello()) return this._notHandshaked(envelope);
+    const { conversationId } = envelope;
+    const requestId = envelope.requestId ?? null;
+    if (!conversationId) return makeEnvelope(AGENT_MESSAGE_TYPES.ERROR, { reason: "missing_conversation_id", requestId });
+    if (!this.sessionManager.hasConversation(conversationId)) {
+      return makeEnvelope(AGENT_MESSAGE_TYPES.ERROR, { reason: "unknown_conversation", conversationId, requestId });
+    }
+    const page = this.sessionManager.transcriptWindow(conversationId, {
+      beforeSeq: Number.isInteger(envelope.beforeSeq) ? envelope.beforeSeq : 0,
+      limit: envelope.limit
+    });
+    return makeEnvelope(AGENT_MESSAGE_TYPES.TRANSCRIPT_WINDOW, { ...page, requestId });
   }
 
   /**
@@ -789,24 +913,105 @@ export class CompanionCore {
    * "handled explicitly, not left racy" requirement (see
    * SessionManager.deleteConversation()'s own doc comment for how the race
    * itself is closed).
+   *
+   * optimize-chat-history task 1.3 adds the honesty/idempotency contract:
+   *   - `deleted` is true only when the host has committed the delete (a
+   *     tombstone, or a previously tombstoned conversation) — a
+   *     conversation this host never had answers `deleted:false` with
+   *     `unknown_conversation`, so a panel can never turn a no-op into a
+   *     claimed success.
+   *   - `onDiskRemoved:false` (with `deleted:true`) means the logical delete
+   *     is committed but the bytes are still held by an aborting SDK
+   *     subprocess; finishRun()'s late-unwind sweep retries. Reported, never
+   *     hidden.
+   *   - an `idempotencyKey` already answered with success replays that same
+   *     reply, so a panel retry after a lost reply cannot flip a completed
+   *     delete into a failure (nor delete anything twice).
    */
   _handleDeleteConversation(envelope) {
     if (!this._requireHello()) return this._notHandshaked(envelope);
     const { conversationId } = envelope;
-    if (!conversationId) return makeEnvelope(AGENT_MESSAGE_TYPES.ERROR, { reason: "missing_conversation_id" });
+    const requestId = envelope.requestId ?? null;
+    if (!conversationId) return makeEnvelope(AGENT_MESSAGE_TYPES.ERROR, { reason: "missing_conversation_id", requestId });
+    const key = validateIdempotencyKey(envelope.idempotencyKey);
+    if (!key.ok) return makeEnvelope(AGENT_MESSAGE_TYPES.ERROR, { reason: key.reason, conversationId, requestId });
+    const replay = key.key ? this._deleteReplyFor(key.key) : null;
+    if (replay) return { ...replay, requestId };
     if (!this.sessionManager.hasConversation(conversationId)) {
-      return makeEnvelope(AGENT_MESSAGE_TYPES.ERROR, { reason: "unknown_conversation", conversationId });
+      if (this.sessionManager.wasDeleted(conversationId)) {
+        const already = makeEnvelope(AGENT_MESSAGE_TYPES.DELETE_CONVERSATION, {
+          conversationId,
+          idempotencyKey: key.key,
+          deleted: true,
+          alreadyDeleted: true,
+          onDiskRemoved: true,
+          hadActiveRun: false
+        });
+        if (key.key) this._rememberDeleteReply(key.key, already);
+        return { ...already, requestId };
+      }
+      // Carries `requestId` so the panel can attribute the refusal to its own
+      // request instead of waiting out a timeout and misreporting the host as
+      // unreachable — a refusal is an ANSWER, not silence.
+      return makeEnvelope(AGENT_MESSAGE_TYPES.ERROR, { reason: "unknown_conversation", conversationId, requestId });
     }
-    const { hadActiveRun } = this.sessionManager.deleteConversation(conversationId);
+    const { hadActiveRun, onDiskRemoved } = this.sessionManager.deleteConversation(conversationId);
     // This conversation is gone — its TabRiskRegistry (see
     // _tabRiskRegistryFor()) would otherwise linger in memory forever in a
     // long-lived companion process.
     this._tabRiskByConversation.delete(conversationId);
-    return makeEnvelope(AGENT_MESSAGE_TYPES.DELETE_CONVERSATION, {
+    const reply = makeEnvelope(AGENT_MESSAGE_TYPES.DELETE_CONVERSATION, {
       conversationId,
+      idempotencyKey: key.key,
       deleted: true,
+      onDiskRemoved,
       hadActiveRun
     });
+    if (key.key) this._rememberDeleteReply(key.key, reply);
+    return { ...reply, requestId };
+  }
+
+  /**
+   * Delete-all (optimize-chat-history task 1.3). `deleted:true` only for a
+   * sweep where EVERY conversation was removed; a partial sweep replies
+   * `deleted:false` with the per-conversation failures, and the panel must
+   * keep its local cache rather than clearing it over a half-deleted host.
+   * An empty store is a success (the end state holds).
+   */
+  _handleDeleteAllConversations(envelope) {
+    if (!this._requireHello()) return this._notHandshaked(envelope);
+    const requestId = envelope.requestId ?? null;
+    const key = validateIdempotencyKey(envelope.idempotencyKey);
+    if (!key.ok) return makeEnvelope(AGENT_MESSAGE_TYPES.ERROR, { reason: key.reason, requestId });
+    const replay = key.key ? this._deleteReplyFor(key.key) : null;
+    if (replay) return { ...replay, requestId };
+    const { removed, failed, hadActiveRuns } = this.sessionManager.deleteAllConversations();
+    for (const conversationId of removed) this._tabRiskByConversation.delete(conversationId);
+    const reply = makeEnvelope(AGENT_MESSAGE_TYPES.DELETE_ALL_CONVERSATIONS, {
+      idempotencyKey: key.key,
+      deleted: failed.length === 0,
+      count: removed.length,
+      failed,
+      hadActiveRuns,
+      reason: failed.length === 0 ? null : "partial_failure"
+    });
+    if (key.key && reply.deleted) this._rememberDeleteReply(key.key, reply);
+    return { ...reply, requestId };
+  }
+
+  /** Success-only idempotency memo (design.md decision 5). A failure is
+   * never memoized — a retry must be able to genuinely retry. Bounded so a
+   * long-lived companion cannot grow this without limit. */
+  _rememberDeleteReply(key, reply) {
+    this._deleteReplies.set(key, reply);
+    if (this._deleteReplies.size > 256) {
+      const oldest = this._deleteReplies.keys().next().value;
+      this._deleteReplies.delete(oldest);
+    }
+  }
+
+  _deleteReplyFor(key) {
+    return this._deleteReplies.get(key) || null;
   }
 
   /** Explicit per-message protocol-version check, matching the pattern
@@ -1125,6 +1330,13 @@ export class CompanionCore {
     if (!settings || typeof settings.onCredentialRevoked !== "function") return;
     this._unsubscribeCredentialRevoked = settings.onCredentialRevoked(({ profileId }) => {
       this._cancelRunsForRevokedCredential(profileId);
+      // add-chatgpt-subscription-provider: this SAME listener already fires
+      // for a ChatGPT sign-out (recordChatgptSignOut) and a rejected refresh
+      // (recordChatgptSessionExpired) — both call profile.js's existing
+      // onCredentialRevoked machinery exactly like removeCredential() does.
+      // Fire-and-forget: a gateway revocation failure must never block a run
+      // from being cancelled above.
+      this._revokeGatewayTokensForProfile(profileId).catch(() => {});
     });
   }
 
@@ -1142,6 +1354,112 @@ export class CompanionCore {
         detail: `the credential for profile ${JSON.stringify(profileId)} was removed`
       });
       this.sessionManager.stopRun(conversationId, "credential_revoked");
+      // stopRun() aborts the SDK query() below (Run.stop()), which unwinds
+      // into _runQuery's own `finally` and releases this run's own gateway
+      // token there — nothing further to do for the run itself here.
+    }
+  }
+
+  /**
+   * add-chatgpt-subscription-provider spec ("Credential removal" /
+   * "Reused refresh token"): sign-out and a rejected refresh both revoke
+   * `profileId`'s gateway tokens, not only cancel its active runs — a
+   * `chatgpt` profile can have an issued-but-not-yet-used token (e.g. a
+   * capability test that started just before the revocation) with no
+   * associated run for `_cancelRunsForRevokedCredential` to find. Dynamic,
+   * lazy import (matching `_getSettingsModule()`'s own pattern just above):
+   * a companion that never touches a `chatgpt` profile never loads the
+   * gateway module or starts its `node:http` server at all.
+   */
+  async _revokeGatewayTokensForProfile(profileId) {
+    let gateway;
+    try {
+      gateway = await import("./chatgpt/gateway.js");
+    } catch {
+      return; // never block a revocation over this — see the pattern above
+    }
+    try {
+      gateway.revokeGatewayTokensForProfile(profileId);
+    } catch {
+      // Best-effort, same rationale.
+    }
+  }
+
+  /** Lazily resolves the ChatGPT auth module (host/agent/chatgpt/auth.js).
+   * Same dynamic/lazy discipline as `_getSettingsModule()` above and the
+   * gateway reference in `_revokeGatewayTokensForProfile()` below: a
+   * companion that never serves a `chatgpt` profile never imports the auth
+   * module (and so never pulls `secret-store.js`'s OAuth path or opens a
+   * callback listener) at all. Only the six ChatGPT `agent_settings` ops
+   * below await this. When a test injects `chatgptAuthProvider` (constructor
+   * `chatgptAuthProvider`), that object is returned verbatim — no dynamic
+   * import — so the test can drive every reply shape without ever touching a
+   * real OAuth listener or OS credential store (additive: production never
+   * passes this arg, so nothing there changes). */
+  async _getChatgptAuthModule() {
+    if (this.chatgptAuthProvider) return this.chatgptAuthProvider;
+    if (!this._chatgptAuthModulePromise) this._chatgptAuthModulePromise = import("./chatgpt/auth.js");
+    return this._chatgptAuthModulePromise;
+  }
+
+  /**
+   * Defensive outbound scan for the six ChatGPT ops: no agent_settings reply
+   * may carry a raw credential field. The ChatGPT secret already lives only in
+   * the OS store / in-memory token map, so this is a second, fail-closed layer
+   * — same discipline as profile-protocol.js's assertSecretFree. A `secretHint`
+   * (when held) catches a verbatim token value even under an innocuous key.
+   *
+   * Returns the validated `value` unchanged so a call site can assert and
+   * reply in one expression. This is load-bearing for the ops that hand
+   * through an object this layer did not construct — `chatgpt_sign_in_status`
+   * (auth's status object) and the two profile-returning ops — where field
+   * projection alone would not stop an unexpected extra key. The anchored key
+   * test deliberately does NOT match the profile's own `hasCredential` /
+   * `credentialRevision` / `secretBackend` bookkeeping fields, which are
+   * non-secret by design.
+   */
+  _assertAgentSettingsResultSecretFree(value, secretHint) {
+    let found = false;
+    const visit = (node) => {
+      if (found || node === null || node === undefined) return;
+      if (typeof node === "string") {
+        if (secretHint && node === secretHint) found = true;
+        return;
+      }
+      if (typeof node !== "object") return;
+      for (const key of Object.keys(node)) {
+        if (/^(secret|apiKey|api_key|credential|accessToken|access_token|refreshToken|refresh_token|idToken|id_token)$/i.test(key)) {
+          found = true;
+          return;
+        }
+        visit(node[key]);
+      }
+    };
+    visit(value);
+    // PROTOCOL_ERROR, not the catch-all's NETWORK_ERROR: an invariant
+    // violation here means a reply was shaped wrongly, and no network call was
+    // made or failed. The message names the rule rather than echoing content.
+    if (found) throw new ProviderError("PROTOCOL_ERROR", "agent_settings refused to emit a secret-bearing result");
+    return value;
+  }
+
+  /** Release a `chatgpt` run's gateway token at the moment this run settles
+   * (add-chatgpt-subscription-provider design.md decision 2: a run token is
+   * bound to exactly one run and revoked when it settles, not left to expire
+   * on its own). `run.releaseGatewayToken` is only ever set for a `chatgpt`
+   * run (see the assignment right after `resolveProfileSnapshot()` above) —
+   * an `anthropic` run's `release` call here is always a no-op. Idempotent:
+   * cleared after the first call so a run that settles through more than one
+   * of this method's call sites (it never does, but this makes that
+   * impossible to get wrong) never double-releases. */
+  _releaseRunGatewayToken(run) {
+    if (!run || typeof run.releaseGatewayToken !== "function") return;
+    const release = run.releaseGatewayToken;
+    run.releaseGatewayToken = null;
+    try {
+      release();
+    } catch {
+      // A release failure must never block finishing the run.
     }
   }
 
@@ -1453,6 +1771,123 @@ export class CompanionCore {
           const removed = revokeAllSiteEntries();
           return ok({ removed });
         }
+        // add-chatgpt-subscription-provider Batch E1 — the six provider/
+        // ChatGPT ops on the single-profile `agent_settings` path. Every
+        // case is a direct delegation to an already-built, independently-
+        // tested module: `set_provider_type` -> host/agent/settings/profile.js's
+        // `setProviderType`; the five ChatGPT cases -> host/agent/chatgpt/
+        // auth.js's default instance (loaded lazily via
+        // `_getChatgptAuthModule()`, so a companion that never serves a
+        // `chatgpt` profile never imports the auth module at all — the same
+        // discipline every other gateway/auth reference already follows).
+        // Request payloads and reply shapes match the Batch E2 wire contract
+        // verbatim (see reports/implementation-evidence.md): `signInId`+`authUrl`,
+        // `signInId`+`userCode`+`verificationUrl`+`expiresAt`, the three-state
+        // status, `{cancelled:true}`, and the updated profile for the two
+        // profile-returning ops. `chatgpt_sign_in_status`/`chatgpt_sign_in_cancel`
+        // are keyed by `signInId` ONLY — background.js tracks the
+        // signInId→profileId association itself.
+        //
+        // Token discipline, three independent layers:
+        //   - the two start replies are destructured field-by-field rather than
+        //     spread, so a future auth.js that returned more can never widen
+        //     what crosses the wire;
+        //   - every reply passes `_assertAgentSettingsResultSecretFree` below;
+        //   - the auth failure modes that DO carry a code (CALLBACK_PORT_IN_USE,
+        //     SIGN_IN_TIMEOUT/CANCELLED/FAILED, SESSION_EXPIRED, SECRET_TOO_LARGE)
+        //     are ProviderErrors and reach the outer catch unchanged, which
+        //     already forwards `err.code` verbatim.
+        case "set_provider_type": {
+          const providerType = envelope.providerType;
+          if (typeof envelope.profileId !== "string" || !envelope.profileId) {
+            return fail("PROTOCOL_ERROR", "set_provider_type requires a profileId");
+          }
+          if (providerType !== "anthropic" && providerType !== "chatgpt") {
+            return fail("INVALID_PROFILE", `unknown provider type: ${JSON.stringify(providerType)}`);
+          }
+          const profile = await settings.setProviderType(envelope.profileId, providerType);
+          return ok(this._assertAgentSettingsResultSecretFree(profile));
+        }
+        case "chatgpt_sign_in_start": {
+          if (typeof envelope.profileId !== "string" || !envelope.profileId) {
+            return fail("PROTOCOL_ERROR", "chatgpt_sign_in_start requires a profileId");
+          }
+          if (envelope.memoryOnly !== undefined && typeof envelope.memoryOnly !== "boolean") {
+            return fail("PROTOCOL_ERROR", "chatgpt_sign_in_start memoryOnly must be a boolean when present");
+          }
+          const auth = await this._getChatgptAuthModule();
+          // `memoryOnly: true` is the user's explicit, informed choice after
+          // the companion reported SECURE_STORAGE_UNAVAILABLE (specs/
+          // agent-settings "Secret isolation": "a clearly labeled memory-only
+          // mode SHALL be offered") — auth.js then never writes the refresh
+          // credential to the OS store and records the backend as "memory".
+          const { signInId, authUrl } = await auth.startBrowserSignIn({
+            profileId: envelope.profileId,
+            memoryOnly: envelope.memoryOnly === true
+          });
+          return ok(this._assertAgentSettingsResultSecretFree({ signInId, authUrl }));
+        }
+        case "chatgpt_device_start": {
+          if (typeof envelope.profileId !== "string" || !envelope.profileId) {
+            return fail("PROTOCOL_ERROR", "chatgpt_device_start requires a profileId");
+          }
+          if (envelope.memoryOnly !== undefined && typeof envelope.memoryOnly !== "boolean") {
+            return fail("PROTOCOL_ERROR", "chatgpt_device_start memoryOnly must be a boolean when present");
+          }
+          const auth = await this._getChatgptAuthModule();
+          const { signInId, userCode, verificationUrl, expiresAt } = await auth.startDeviceSignIn({
+            profileId: envelope.profileId,
+            memoryOnly: envelope.memoryOnly === true
+          });
+          return ok(this._assertAgentSettingsResultSecretFree({ signInId, userCode, verificationUrl, expiresAt }));
+        }
+        case "chatgpt_sign_in_status": {
+          const signInId = envelope.signInId;
+          if (typeof signInId !== "string" || !signInId) {
+            return fail("PROTOCOL_ERROR", "chatgpt_sign_in_status requires a signInId");
+          }
+          const auth = await this._getChatgptAuthModule();
+          // An unknown/pruned signInId is a caller bug, not a network failure —
+          // coded explicitly rather than falling through to NETWORK_ERROR.
+          let status;
+          try {
+            status = auth.getSignInStatus(signInId);
+          } catch (err) {
+            asProtocolError(err, `chatgpt_sign_in_status: unknown signInId ${JSON.stringify(signInId)}`);
+          }
+          return ok(this._assertAgentSettingsResultSecretFree(status));
+        }
+        case "chatgpt_sign_in_cancel": {
+          const signInId = envelope.signInId;
+          if (typeof signInId !== "string" || !signInId) {
+            return fail("PROTOCOL_ERROR", "chatgpt_sign_in_cancel requires a signInId");
+          }
+          const auth = await this._getChatgptAuthModule();
+          try {
+            await auth.cancelSignIn(signInId);
+          } catch (err) {
+            asProtocolError(err, `chatgpt_sign_in_cancel: unknown signInId ${JSON.stringify(signInId)}`);
+          }
+          return ok({ cancelled: true });
+        }
+        case "chatgpt_sign_out": {
+          if (typeof envelope.profileId !== "string" || !envelope.profileId) {
+            return fail("PROTOCOL_ERROR", "chatgpt_sign_out requires a profileId");
+          }
+          const auth = await this._getChatgptAuthModule();
+          // Idempotent by design: auth.signOut() deletes the secret and fires
+          // onSignedOut (recordChatgptSignOut → credential-revision bump +
+          // revocation listeners, which already revoke this profile's gateway
+          // tokens) even when nothing was signed in. The settings page's
+          // sign-out button is only shown while signed_in, but a stale page
+          // can still call this.
+          await auth.signOut(envelope.profileId);
+          // Return the fresh, secret-free profile the sign-out just updated,
+          // so background.js can mirror it without a second get_profile round
+          // trip. Same profileId-guard as `get_profile` above.
+          const profile = await settings.loadProfile();
+          return ok(this._assertAgentSettingsResultSecretFree(profile && profile.profileId === envelope.profileId ? profile : null));
+        }
         default:
           return fail("PROTOCOL_ERROR", `unknown agent_settings op ${JSON.stringify(op)}`);
       }
@@ -1582,6 +2017,18 @@ export class CompanionCore {
       return fail("GENERATION_FAILED", (err && err.message) || String(err));
     } finally {
       this._enhanceRequests.delete(requestId);
+      // add-chatgpt-subscription-provider: this call resolves a snapshot the
+      // exact same way a run does (see the comment above), so a `chatgpt`
+      // profile's snapshot here also carries a gateway token that must be
+      // released when this one-off request ends — there is no SessionManager
+      // run for `_releaseRunGatewayToken`'s own call sites to cover.
+      if (snapshot && typeof snapshot.releaseGatewayToken === "function") {
+        try {
+          snapshot.releaseGatewayToken();
+        } catch {
+          // best-effort — see _releaseRunGatewayToken's identical rationale
+        }
+      }
     }
   }
 
@@ -1752,6 +2199,7 @@ export class CompanionCore {
       newSdkSession: sessionChoiceResult.newSdkSession
     }).catch((err) => {
       run.emit({ type: "run_error", error: String((err && err.message) || err) });
+      this._releaseRunGatewayToken(run);
       this.sessionManager.finishRun(conversationId);
     });
 
@@ -1954,6 +2402,14 @@ export class CompanionCore {
       this.sessionManager.finishRun(conversationId);
       return;
     }
+    // add-chatgpt-subscription-provider design.md decision 2: a `chatgpt`
+    // profile's snapshot carries a run-scoped gateway token release handle
+    // (an `anthropic` snapshot never sets this field). Stashed on the run
+    // itself so every later settle point in this method — and _runQuery's
+    // own `finally` below — can release it exactly once via
+    // `_releaseRunGatewayToken()`, regardless of which one this run actually
+    // reaches.
+    run.releaseGatewayToken = typeof snapshot.releaseGatewayToken === "function" ? snapshot.releaseGatewayToken : null;
 
     // Tasks.md 2.4: resume-compatibility gate, run BEFORE any SDK call is
     // made (before options are even built) — decision 2.4: "reject
@@ -1980,7 +2436,16 @@ export class CompanionCore {
     const currentIdentityForCompat = {
       appProfile: buildAppProfileIdentity({
         profileId,
-        baseUrl: snapshot.env.ANTHROPIC_BASE_URL,
+        // add-chatgpt-subscription-provider design.md decision 2: a `chatgpt`
+        // run's real endpoint is `http://127.0.0.1:<ephemeral port>`, which
+        // changes every companion start — recording it verbatim would make
+        // assessResumeCompatibility() above treat a companion restart alone
+        // as an endpoint change and block resume. The fixed
+        // `chatgpt:codex` marker (the same one profile-schema.js's
+        // capability-test key already uses for a chatgpt profile) is
+        // recorded instead, identifying "this conversation runs through the
+        // ChatGPT gateway" without embedding the ephemeral port.
+        baseUrl: run.releaseGatewayToken ? CHATGPT_CAPABILITY_TEST_MARKER : snapshot.env.ANTHROPIC_BASE_URL,
         modelId: snapshot.model,
         credentialRevision: snapshot.credentialRevision ?? null
       }),
@@ -1995,6 +2460,7 @@ export class CompanionCore {
         mismatches: compatibility.mismatches
       });
       run.stop("conversation_identity_incompatible");
+      this._releaseRunGatewayToken(run);
       this.sessionManager.finishRun(conversationId);
       return;
     }
@@ -2160,6 +2626,7 @@ export class CompanionCore {
     } catch (err) {
       run.emit({ type: "run_error", reason: "options_build_failed", detail: err.message });
       run.stop("options_build_failed");
+      this._releaseRunGatewayToken(run);
       this.sessionManager.finishRun(conversationId);
       return;
     }
@@ -2338,6 +2805,7 @@ export class CompanionCore {
         run.emit({ type: "run_error", reason, detail });
       }
     } finally {
+      this._releaseRunGatewayToken(run);
       this.sessionManager.finishRun(run.conversationId);
     }
   }
@@ -2522,9 +2990,29 @@ export function _resetForTests() {
 // channel and was launched by native-host.js's supervision code), so
 // importing companion.js for unit tests never spawns this side-effecting
 // path.
+/**
+ * Best-effort, bounded close of the ChatGPT gateway's `node:http` server
+ * (add-chatgpt-subscription-provider spec: "started on first need and closed
+ * when the companion exits"). Dynamic import so a companion that never
+ * touched a `chatgpt` profile never loads this module at all; closing a
+ * never-started (or already-closed) gateway is a documented no-op
+ * (gateway.js's own `close()`). Bounded so a hung close can never delay
+ * process exit indefinitely.
+ */
+async function closeGatewayBestEffort() {
+  try {
+    const gateway = await import("./chatgpt/gateway.js");
+    await Promise.race([gateway.closeGateway(), new Promise((resolve) => setTimeout(resolve, 2000).unref?.())]);
+  } catch {
+    // A shutdown must never hang or throw over this.
+  }
+}
+
 async function runAsForkedChild() {
   const { watchParent } = await import("./../parent-watch.js");
-  watchParent(() => process.exit(0));
+  watchParent(() => {
+    closeGatewayBestEffort().finally(() => process.exit(0));
+  });
 
   const core = await startCompanionProcess();
 

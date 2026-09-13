@@ -123,7 +123,7 @@ you talk to them.
 | | **Side panel** (recommended) | **External MCP** (legacy, still supported) |
 |---|---|---|
 | Client | Built into the extension's own side panel | A Claude Code session |
-| Account needed | None — your own Anthropic-compatible Base URL + API key + model, entered once in Settings | A Claude Code session (its own auth, separate from this extension) |
+| Account needed | None — your own Anthropic-compatible Base URL + API key + model, entered once in Settings; or a paid ChatGPT subscription, signed in to once in Settings | A Claude Code session (its own auth, separate from this extension) |
 | Runs on | The official [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk) inside a local native companion process | Claude Code's own MCP client, talking to `host/mcp-server.js` (or the codemode/hybrid variants) |
 | Daily use | Open the browser, open the side panel, type. No terminal. | Start Claude Code, `/mcp` connect if needed, ask it to use the browser |
 | Setup, once | Load the extension, run the installer, open Settings and enter your provider credential | Load the extension, run the installer, `claude mcp add ...` |
@@ -216,9 +216,11 @@ which path from [Quick start](#quick-start-two-ways-to-run-it) you want.
 - **Any Chromium browser** (Chrome, Edge, or Brave on Windows is this
   project's currently-tested matrix for the side panel; other Chromium
   browsers and platforms are supported for the external-MCP path as before)
-- For the **side panel**: your own Anthropic-compatible Base URL, API key, and
-  at least one model ID — no Claude account, subscription, or Claude Code
-  install needed
+- For the **side panel**: either your own Anthropic-compatible Base URL, API
+  key, and at least one model ID — or a paid ChatGPT subscription to sign in
+  with (see [Run it on a ChatGPT
+  subscription](#run-it-on-a-chatgpt-subscription)) — no Claude account,
+  subscription, or Claude Code install needed
 - For **external MCP**: Claude Code v2.1.80+ (the recorder needs channels;
   browser automation alone works on v2.0.73+)
 - For the **recorder** (either path): an OpenAI API key, used only to
@@ -310,6 +312,16 @@ No terminal and no Claude Code client are needed from here on for daily use.
 
 ### Configure your provider
 
+Settings has two provider types, chosen per profile under **Loại nhà cung cấp**
+("Provider type"): **API tương thích Anthropic** (an Anthropic-compatible Base
+URL and API key — the default, and what every existing profile uses) and **Tài
+khoản ChatGPT** (your own ChatGPT Plus/Pro/Team subscription — see
+[Run it on a ChatGPT subscription](#run-it-on-a-chatgpt-subscription) below).
+The side panel, the tools, approvals, skills, and conversation history are
+identical either way; only where the model calls come from differs.
+
+#### Anthropic-compatible API key (default)
+
 1. Open the side panel (click the toolbar icon) and click its **settings**
    icon — or right-click the extension icon → **Options** — to open
    **Settings**.
@@ -337,6 +349,77 @@ key only affects new conversations — a conversation already in progress keeps
 using the snapshot it started with, and deleting a key cancels the runs that
 depended on it.
 
+#### Run it on a ChatGPT subscription
+
+If your paid model access is a ChatGPT subscription (the same Plus/Pro/Team
+plan Codex CLI signs in with) rather than API credit, a profile can use that
+subscription directly — no Base URL, no API key. This is opt-in and never
+automatic: the profile stays on the Anthropic type until you switch it.
+
+1. In **Settings**, set the provider type to **Tài khoản ChatGPT** ("ChatGPT
+   account") and **Save**. The Base URL and API key fields disappear; nothing
+   is entered there.
+2. Click **Đăng nhập với ChatGPT** ("Sign in with ChatGPT"). A new browser tab
+   opens on OpenAI's sign-in page; approve there and the tab tells you it is
+   safe to close it. Settings then shows the signed-in account's email and
+   plan, and seeds the model list with the Codex model ids for that plan
+   (applied only while the list is empty — your own edits are never
+   overwritten, and the ids stay manually editable).
+3. **Device-code fallback.** If the browser sign-in cannot start — almost
+   always because port `1455`, which sign-in listens on, is already held (a
+   running Codex CLI login holds it) — Settings says so and offers **Dùng mã
+   thay thế** ("Use an alternative code") instead. That shows a one-time code,
+   a link to `https://auth.openai.com/codex/device`, and a countdown; enter
+   the code there and the panel signs in on its own. Either flow can be
+   cancelled, and a sign-in that is never completed times out (5 minutes for
+   the browser flow, 15 for the code) storing nothing.
+4. Click **Test connection**. Same one small real request as the API-key path,
+   except the UI says what it means here: the call **counts against your
+   ChatGPT usage limit**. The assistant will not run on a `chatgpt` profile
+   until that test passes, and signing in again invalidates a previous pass.
+5. **Sign out** is in the same place, and it takes effect immediately: the
+   stored credential is deleted, any run using it is cancelled, and in-flight
+   requests through it stop being served.
+
+**Usage limits.** A ChatGPT subscription is metered, and this provider does not
+work around that. When the account hits its limit, the request fails and the
+panel reports the limit and its reset time, and nothing is retried behind your
+back — no second attempt on other credentials, because there are none.
+
+**What this actually is — read this before relying on it.** It reaches ChatGPT
+through an **unofficial, undocumented backend** (the same one Codex CLI uses),
+not an OpenAI product for third-party clients. OpenAI can change or close it at
+any time, and a provider that worked yesterday can stop working with no
+browzy-side release involved. **OpenAI's Terms of Service apply to your
+account**, and using your subscription this way is your decision to make;
+Browzy is not affiliated with or endorsed by OpenAI, and no behaviour here
+tries to pass one client off as another — the backend is told this is `browzy`.
+If that disclosure is unacceptable for your account, use an API-key provider
+instead.
+
+**Not supported, deliberately:**
+
+- **Account pooling, rotation, or failover.** Exactly one signed-in account per
+  profile, always that account, no automatic fallback to another.
+- **Other clients using this gateway.** The local translation endpoint exists
+  only to serve this companion's own runs and connection tests. It binds to
+  `127.0.0.1`, on a port chosen by the OS, and every request needs a per-run
+  token issued at run start and revoked when that run ends — so it is not a
+  proxy you can point a Codex CLI, IDE, or script at.
+- **Model discovery.** There is no Codex model-listing endpoint, so the list
+  comes from the plan's known ids and your own edits.
+
+The refresh credential is stored under the same OS credential store and
+isolation rules as an API key (`browzy-in-chrome/chatgpt/<profile>`), and short-
+lived access tokens are held in memory only — never on disk, never in extension
+storage, never in a log. Like the API key, the sign-in is per machine: setting
+up a second machine means signing in again there. Running a `chatgpt` profile on
+two companion processes at once (e.g. two browsers) is not coordinated: one of
+them will find its session expired and be asked to sign in again.
+
+The external-MCP path is unaffected — it keeps using whatever model/auth your
+Claude Code session supplies.
+
 ### Use it
 
 Open the browser and click the toolbar icon (or use the keyboard shortcut) to
@@ -353,9 +436,16 @@ no separate MCP server.
 
 Real and working today: streaming chat, model selection and switching,
 human-readable tool activity in the transcript, connection/error states,
-send/stop, conversation history (list/reopen/delete), and recording
-list/attach/start/stop — all screenshot-verified at 320/400/480px in light and
-dark (`reports/05-panel-evidence.md`, `reports/05-visual-system.md`) — plus
+send/stop, conversation history (debounced search, date and domain filters,
+grouping, list/reopen, rename, pin, archive, Markdown/JSON export, delete that
+removes the host's own transcript, a switch that stops the local cache from
+keeping prompt text, and a line reporting what retention evicted), and
+recording list/attach/start/stop — the chat and history screens are
+screenshot-verified at 320/400/480px in light and dark
+(`reports/05-panel-evidence.md`, `reports/05-visual-system.md`); the
+search/filter/export/privacy surface added later by
+`openspec/changes/optimize-chat-history` is covered by that change's
+`reports/implementation-evidence.md` rather than by new screenshots — plus
 composer prompt enhancement (the "Cải thiện prompt" control next to Send).
 
 **Documents the agent creates.** When a run produces something that is a

@@ -16,6 +16,36 @@
 //   op: "discover_models"      payload: { profileId }
 //   op: "export_profile"       payload: { profileId }
 //
+// ChatGPT subscription provider ops (add-chatgpt-subscription-provider,
+// design.md decisions 3/5/7 — see this change's
+// reports/implementation-evidence.md, "Batch E2 — wire contract" for the
+// exact shapes this was implemented against; host/agent/settings/
+// profile-protocol.js's companion-side dispatch matches this verbatim):
+//   op: "set_provider_type"      payload: { profileId, providerType: "anthropic"|"chatgpt" }
+//                                 -> result: the updated secret-free profile
+//                                 (same result shape as "save_profile")
+//   op: "chatgpt_sign_in_start"  payload: { profileId, memoryOnly? }
+//                                 -> result: { signInId, authUrl }
+//   op: "chatgpt_device_start"   payload: { profileId, memoryOnly? }
+//                                 -> result: { signInId, userCode, verificationUrl, expiresAt }
+//                                 (expiresAt is an epoch-millisecond number)
+//   `memoryOnly: true` is sent ONLY for an explicit, user-confirmed retry
+//   after the companion reported SECURE_STORAGE_UNAVAILABLE, and means the
+//   same thing it means for `set_credential`: hold the ChatGPT refresh
+//   credential in memory only, never in the OS credential store (specs/
+//   agent-settings "Secret isolation"). Omitted on every ordinary sign-in.
+//   op: "chatgpt_sign_in_status" payload: { signInId }
+//                                 -> result: { state: "pending" }
+//                                          | { state: "signed_in", account: { email, planType } }
+//                                          | { state: "failed", code, message }
+//   op: "chatgpt_sign_in_cancel" payload: { signInId }
+//                                 -> result: { cancelled: true }
+//   op: "chatgpt_sign_out"       payload: { profileId }
+//                                 -> result: the updated secret-free profile
+//                                 (same result shape as "save_profile")
+// No ChatGPT op ever carries a token/credential value in either direction —
+// the companion resolves and stores those itself (host/agent/chatgpt/auth.js).
+//
 // IMPORTANT — scope note: design.md decision 1 says the real transport for
 // agent traffic is a native-messaging port relay owned by
 // extension/background.js (the "ocic-agent" port, hello/version handshake,
@@ -105,6 +135,16 @@ export function createSettingsClient(opts = {}) {
     createProfile: (input) => call("create_profile", { ...(input || {}) }),
     updateProfile: (profileId, patch) => call("update_profile", { profileId, ...(patch || {}) }),
     deleteProfile: (profileId) => call("delete_profile", { profileId }),
-    selectProfile: (profileId) => call("select_profile", { profileId })
+    selectProfile: (profileId) => call("select_profile", { profileId }),
+
+    // ChatGPT subscription provider (add-chatgpt-subscription-provider) —
+    // see the wire-contract block above this class for the exact request/
+    // reply shapes. Never sends or receives a token/credential value.
+    setProviderType: (profileId, providerType) => call("set_provider_type", { profileId, providerType }),
+    chatgptSignInStart: (profileId, options) => call("chatgpt_sign_in_start", { profileId, ...(options || {}) }),
+    chatgptDeviceStart: (profileId, options) => call("chatgpt_device_start", { profileId, ...(options || {}) }),
+    chatgptSignInStatus: (signInId) => call("chatgpt_sign_in_status", { signInId }),
+    chatgptSignInCancel: (signInId) => call("chatgpt_sign_in_cancel", { signInId }),
+    chatgptSignOut: (profileId) => call("chatgpt_sign_out", { profileId })
   };
 }

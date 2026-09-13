@@ -54,6 +54,19 @@
   }
   #capability-detail { display: flex; flex-wrap: wrap; gap: var(--space-1); margin-top: var(--space-1); }
   .test-disclosure { margin: 0; }
+
+  /* Provider type switch (add-chatgpt-subscription-provider) */
+  .provider-type-row { flex-wrap: wrap; gap: var(--space-3); }
+  .provider-type-option { display: inline-flex; align-items: center; gap: var(--space-1); font-size: var(--font-size-small); cursor: pointer; }
+  .provider-type-option input[type="radio"] { accent-color: var(--color-accent); }
+  #chatgpt-fields > * + * { margin-top: var(--space-2); }
+  .chatgpt-device-code-input {
+    font-family: var(--font-mono);
+    font-size: 1.3em;
+    letter-spacing: 0.12em;
+    text-align: center;
+    max-width: 220px;
+  }
   #model-add-form { display: flex; flex-wrap: wrap; gap: var(--space-2); align-items: flex-end; margin-top: var(--space-3); }
   /* Same shared-.btn/[hidden] specificity defect this file already documents
      below — the form is a <form>, but its own hidden state is toggled here
@@ -187,19 +200,81 @@
     <div class="field-group">
       <div class="field-group-item">
         <div class="field" style="margin-bottom:0">
+          <span class="field-label" id="provider-type-label">Loại nhà cung cấp</span>
+          <div class="field-row provider-type-row" role="radiogroup" aria-labelledby="provider-type-label">
+            <label class="provider-type-option">
+              <input type="radio" name="provider-type" id="provider-type-anthropic" value="anthropic" checked />
+              API tương thích Anthropic
+            </label>
+            <label class="provider-type-option">
+              <input type="radio" name="provider-type" id="provider-type-chatgpt" value="chatgpt" />
+              Tài khoản ChatGPT
+            </label>
+          </div>
+        </div>
+      </div>
+
+      <!-- Anthropic-compatible API fields: hidden entirely for a `chatgpt` profile (tasks.md 5.3). -->
+      <div class="field-group-item" id="anthropic-baseurl-item">
+        <div class="field" style="margin-bottom:0">
           <label class="field-label" for="base-url">Base URL</label>
           <input class="input" id="base-url" type="text" autocomplete="off" spellcheck="false" />
           <p class="field-hint" id="base-url-hint">Origin có thể kèm tiền tố cổng gateway. Bắt buộc HTTPS trừ điểm cuối loopback dành cho phát triển.</p>
           <p class="field-hint" id="base-url-error" role="alert" hidden style="color:var(--color-status-danger)"></p>
         </div>
       </div>
-      <div class="field-group-item">
+      <div class="field-group-item" id="anthropic-key-item">
         <div class="field" style="margin-bottom:0">
           <label class="field-label" for="key-input">API key</label>
           <input class="input" id="key-input" type="password" autocomplete="off" placeholder="Nhập API key mới…" />
           <p class="field-hint">Được lưu trong kho bảo mật của hệ điều hành. Không bao giờ hiển thị lại khóa đã lưu; trang chỉ giữ giá trị vừa nhập tạm thời để gửi đi, và xóa ngay sau khi gửi.</p>
         </div>
       </div>
+
+      <!-- ChatGPT subscription provider (add-chatgpt-subscription-provider). -->
+      <div class="field-group-item" id="chatgpt-fields" hidden>
+        <p class="field-hint" id="chatgpt-disclosure">
+          Sử dụng gói đăng ký ChatGPT của bạn thông qua một backend không chính thức, có thể thay đổi hoặc ngừng hoạt động bất kỳ lúc nào. Áp dụng Điều khoản dịch vụ của OpenAI.
+        </p>
+
+        <p id="chatgpt-status-live" class="field-hint" role="status" aria-live="polite"></p>
+
+        <div id="chatgpt-signed-out-actions" hidden>
+          <div class="field-row-actions">
+            <button class="btn btn-primary btn-sm" type="button" id="btn-chatgpt-signin-browser">Đăng nhập với ChatGPT</button>
+            <button class="btn btn-ghost btn-sm" type="button" id="btn-chatgpt-use-code">Dùng mã thay thế</button>
+          </div>
+        </div>
+
+        <div id="chatgpt-pending-actions" hidden>
+          <div id="chatgpt-device-code-box" hidden>
+            <label class="field-label" for="chatgpt-device-code">Mã thiết bị</label>
+            <div class="field-row">
+              <input class="input chatgpt-device-code-input" id="chatgpt-device-code" type="text" readonly tabindex="-1" />
+              <div class="field-row-actions">
+                <button class="btn btn-secondary btn-sm" type="button" id="btn-chatgpt-copy-code">Sao chép</button>
+                <a class="btn btn-ghost btn-sm" id="chatgpt-verification-link" target="_blank" rel="noopener noreferrer">Mở trang xác minh</a>
+              </div>
+            </div>
+            <p class="field-hint" id="chatgpt-code-expiry"></p>
+          </div>
+          <div class="field-row-actions">
+            <button class="btn btn-ghost btn-sm" type="button" id="btn-chatgpt-cancel-signin">Hủy đăng nhập</button>
+          </div>
+        </div>
+
+        <div id="chatgpt-signed-in-info" hidden>
+          <p class="field-hint" id="chatgpt-account-line"></p>
+          <div class="field-row-actions">
+            <button class="btn btn-ghost btn-sm" type="button" id="btn-chatgpt-signout">Đăng xuất</button>
+          </div>
+        </div>
+
+        <div id="chatgpt-session-expired-actions" hidden>
+          <button class="btn btn-primary btn-sm" type="button" id="btn-chatgpt-signin-again">Đăng nhập lại</button>
+        </div>
+      </div>
+
       <div class="field-group-item">
         <div class="field-row">
           <span class="connection-state" id="connection-state"><span class="connection-dot"></span> Chưa kiểm tra kết nối</span>
@@ -209,7 +284,8 @@
             <button class="btn btn-primary btn-sm" type="button" id="btn-save">Lưu</button>
           </div>
         </div>
-        <p class="field-hint test-disclosure">Kiểm tra kết nối gửi một yêu cầu nhỏ tới nhà cung cấp và có thể phát sinh chi phí API.</p>
+        <p class="field-hint test-disclosure" id="test-disclosure-anthropic">Kiểm tra kết nối gửi một yêu cầu nhỏ tới nhà cung cấp và có thể phát sinh chi phí API.</p>
+        <p class="field-hint test-disclosure" id="test-disclosure-chatgpt" hidden>Kiểm tra kết nối sẽ tính vào giới hạn sử dụng của tài khoản ChatGPT.</p>
         <p class="field-hint" id="key-status-text">Chưa lưu API key</p>
         <div id="capability-detail"></div>
       </div>

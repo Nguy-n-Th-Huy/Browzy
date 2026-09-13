@@ -33,6 +33,27 @@ import { describeErrorCode } from "./errors-ui.js";
 
 const DEFAULT_PROFILE_ID = "default";
 
+// ChatGPT sign-in status poll interval (design.md decision 7 / tasks.md
+// 5.3): "poll status every 1 s while pending". A plain constant, not a
+// magic number repeated at each call site below.
+const CHATGPT_SIGNIN_POLL_MS = 1000;
+
+/** A fresh, idle sign-in sub-state — used both for the initial state and to
+ * reset back to "nothing in flight" after every terminal outcome (signed in,
+ * failed, or cancelled). Kept as its own small factory so every reset site
+ * below produces the exact same shape (never a half-cleared previous one). */
+function emptySignInState() {
+  return {
+    phase: "idle", // idle | starting_browser | starting_device | pending_browser | pending_device | cancelling
+    signInId: null,
+    authUrl: null,
+    userCode: null,
+    verificationUrl: null,
+    expiresAt: null, // epoch ms
+    error: null // { code, message } — set only on a "failed" outcome, cleared on the next attempt
+  };
+}
+
 function emptyState(profileId) {
   return {
     profileId,
@@ -48,6 +69,26 @@ function emptyState(profileId) {
     memoryOnlyCredential: false,
     secretBackend: null,
     pendingMemoryOnlyOffer: false, // true only while awaiting an explicit memory-only confirmation
+    // Which half of the page the outstanding offer belongs to: "credential"
+    // (the API-key save path) or "sign_in" (a ChatGPT sign-in that failed
+    // with SECURE_STORAGE_UNAVAILABLE). The DOM layer labels and wires the
+    // confirm button from this — the two confirmations are different
+    // operations (retry the save vs. re-run the sign-in flow with
+    // `memoryOnly: true`). null when no offer is outstanding.
+    memoryOnlyOfferKind: null,
+
+    // Provider type (add-chatgpt-subscription-provider design.md decisions
+    // 3/5/7). `chatgptAccount`/`chatgptSessionState` mirror
+    // host/agent/settings/profile.js's loadProfile() fields verbatim; see
+    // _applyProfile() below. `signIn` is this controller's OWN transient
+    // state for an in-progress ChatGPT sign-in — it is never part of the
+    // stored profile and never survives init()/switchProfile().
+    providerType: "anthropic",
+    chatgptAccount: null,
+    chatgptSessionState: "signed_out",
+    switchingProviderType: false,
+    signingOut: false,
+    signIn: emptySignInState(),
 
     saving: false,
     testing: false,
@@ -71,15 +112,32 @@ export class SettingsController {
    * included by JSON.stringify(this) or getState(); see file header. */
   #pendingSecretForRetry = null;
 
+  /** @type {"browser"|"device"|null} which ChatGPT sign-in flow a pending
+   * memory-only offer would retry. Private for the same reason as
+   * `#pendingSecretForRetry` above: it is transient UI bookkeeping, not
+   * profile state. */
+  #pendingSignInFlow = null;
+
   /**
    * @param {ReturnType<import("./settings-client.js").createSettingsClient>} client
-   * @param {{ profileId?: string, onChange?: (state: object) => void }} [opts]
+   * @param {{ profileId?: string, onChange?: (state: object) => void,
+   *   setIntervalFn?: Function, clearIntervalFn?: Function, pollIntervalMs?: number }} [opts]
+   *   `setIntervalFn`/`clearIntervalFn` default to the real timer globals —
+   *   overridable so a test can drive the ChatGPT sign-in poll deterministically
+   *   without a real 1-second wait (this module has no `document`/`chrome`
+   *   reference; see file header — timers are the one platform primitive it
+   *   does need, so they are injectable the same way host/agent/chatgpt/auth.js
+   *   injects its own clock/network dependencies).
    */
   constructor(client, opts = {}) {
     this.client = client;
     this.onChange = opts.onChange || null;
     this.state = emptyState(opts.profileId || DEFAULT_PROFILE_ID);
     this.#pendingSecretForRetry = null;
+    this._setIntervalFn = opts.setIntervalFn || ((fn, ms) => setInterval(fn, ms));
+    this._clearIntervalFn = opts.clearIntervalFn || ((id) => clearInterval(id));
+    this._pollIntervalMs = opts.pollIntervalMs || CHATGPT_SIGNIN_POLL_MS;
+    this._pollTimer = null;
   }
 
   getState() {
@@ -101,6 +159,24 @@ export class SettingsController {
     s.hasCredential = Boolean(profile.hasCredential);
     s.memoryOnlyCredential = Boolean(profile.memoryOnlyCredential);
     s.secretBackend = profile.secretBackend || null;
+    s.providerType = profile.providerType || "anthropic";
+    s.chatgptAccount = profile.chatgptAccount || null;
+    s.chatgptSessionState = profile.chatgptSessionState || "signed_out";
+    // A chatgpt profile whose session expired host-side (auth.js's refresh
+    // saw `invalid_grant`/`refresh_token_reused` → recordChatgptSessionExpired)
+    // has no other way to tell the user from a cold load: the side panel shows
+    // its own banner, but the settings page must surface it too
+    // (add-chatgpt-subscription-provider, tasks.md 5.3's "SESSION_EXPIRED
+    // banner"). Set only when nothing more specific is already being shown —
+    // every caller below assigns its own banner AFTER _applyProfile, so this
+    // never clobbers a just-performed action's result.
+    if (
+      s.providerType === "chatgpt" &&
+      s.chatgptSessionState === "session_expired" &&
+      !s.banner
+    ) {
+      s.banner = { kind: "error", code: "SESSION_EXPIRED", ...describeErrorCode("SESSION_EXPIRED") };
+    }
     // First-run is about whether a WORKING configuration exists yet (no
     // credential and no model to run against), independent of whether the
     // user already typed a non-default Base URL — see
@@ -116,14 +192,15 @@ export class SettingsController {
    * fresh — no field, pending key, banner or connection status survives
    * from a different profile. */
   async init(profileId) {
+    this._stopSignInPolling();
     if (profileId !== undefined) {
       this.state = emptyState(profileId);
-      this.#pendingSecretForRetry = null;
     } else {
       const pid = this.state.profileId;
       this.state = emptyState(pid);
-      this.#pendingSecretForRetry = null;
     }
+    this.#pendingSecretForRetry = null;
+    this.#pendingSignInFlow = null;
     this._notify();
     try {
       const profile = await this.client.getProfile(this.state.profileId);
@@ -145,6 +222,238 @@ export class SettingsController {
   /** Alias documenting the "profile switching" test intent explicitly. */
   async switchProfile(profileId) {
     return this.init(profileId);
+  }
+
+  // --- Provider type & ChatGPT sign-in (add-chatgpt-subscription-provider) -
+  //
+  // Model list editing (addModel/editModel/removeModel/reorderModel/
+  // setDefaultModel below) and save() are unchanged for either provider type
+  // — only the credential half differs: an `anthropic` profile's credential
+  // is the API key handled by save()/removeCredential() above; a `chatgpt`
+  // profile's credential is the OAuth session handled entirely by the
+  // methods below, and setCredential/removeCredential are never called for
+  // it.
+
+  /** Switch between `anthropic` and `chatgpt`. Never touches the model list
+   * or (for `chatgpt`) a previously signed-in account — switching back and
+   * forth is nondestructive (mirrors host/agent/settings/profile.js's own
+   * setProviderType() doc comment). */
+  async setProviderType(providerType) {
+    if (providerType !== "anthropic" && providerType !== "chatgpt") {
+      return { ok: false, error: `unknown provider type: ${providerType}` };
+    }
+    if (providerType === this.state.providerType) return { ok: true };
+    this._stopSignInPolling();
+    this.state.signIn = emptySignInState();
+    this.state.switchingProviderType = true;
+    this.state.banner = null;
+    this._notify();
+    try {
+      const profile = await this.client.setProviderType(this.state.profileId, providerType);
+      this._applyProfile(profile);
+      // A credential (or lack of one) recorded under the OTHER provider type
+      // says nothing about this one's readiness — the prior connection
+      // result is no longer meaningful once the provider type itself changed.
+      this.state.connectionStatus = null;
+      this.state.switchingProviderType = false;
+      this._notify();
+      return { ok: true };
+    } catch (err) {
+      this.state.switchingProviderType = false;
+      this.state.banner = { kind: "error", code: err.code, ...describeErrorCode(err.code, { op: "set_provider_type" }) };
+      this._notify();
+      return { ok: false, error: err.message, code: err.code };
+    }
+  }
+
+  _startSignInPolling() {
+    this._stopSignInPolling();
+    this._pollTimer = this._setIntervalFn(() => this._pollSignInStatus(), this._pollIntervalMs);
+  }
+
+  _stopSignInPolling() {
+    if (this._pollTimer !== null) {
+      this._clearIntervalFn(this._pollTimer);
+      this._pollTimer = null;
+    }
+  }
+
+  /** Called by the DOM layer (settings-app.js) on `visibilitychange`/`pagehide`
+   * — "stops ... when the page is hidden/unloaded" (tasks.md 5.3). Never
+   * cancels the sign-in itself, only this page's own polling of it: the
+   * companion keeps the sign-in alive, so returning to the tab can resume
+   * watching it (see resumeSignInPolling() below). */
+  pauseSignInPolling() {
+    this._stopSignInPolling();
+  }
+
+  /** Called by the DOM layer when the page becomes visible again. A no-op
+   * unless a sign-in is actually still pending — never resurrects a sign-in
+   * that already reached a terminal state while the page was hidden. */
+  resumeSignInPolling() {
+    if (this._pollTimer !== null) return;
+    if (this.state.signIn.phase === "pending_browser" || this.state.signIn.phase === "pending_device") {
+      this._pollSignInStatus();
+      this._startSignInPolling();
+    }
+  }
+
+  /** One poll tick: never throws, never lets a transient poll failure
+   * abandon a sign-in the user may be actively completing in another tab —
+   * only a definitive "signed_in"/"failed" reply from the companion ends the
+   * poll loop. */
+  async _pollSignInStatus() {
+    const signInId = this.state.signIn.signInId;
+    if (!signInId) {
+      this._stopSignInPolling();
+      return;
+    }
+    let status;
+    try {
+      status = await this.client.chatgptSignInStatus(signInId);
+    } catch {
+      return; // transient — keep polling, do not tear down the pending UI
+    }
+    if (!status || status.state === "pending") return;
+
+    this._stopSignInPolling();
+    if (status.state === "signed_in") {
+      this.state.signIn = emptySignInState();
+      try {
+        const profile = await this.client.getProfile(this.state.profileId);
+        if (profile) this._applyProfile(profile);
+      } catch {
+        // The sign-in itself already succeeded host-side even if this
+        // supplemental refresh fails; the next init()/switchProfile() (or a
+        // manual reload) will pick up the full profile.
+      }
+      this.state.connectionStatus = null;
+      this.state.banner = {
+        kind: "success",
+        title: "Đã đăng nhập ChatGPT",
+        message: status.account && status.account.email ? `Đã đăng nhập với ${status.account.email}.` : "Đã đăng nhập ChatGPT.",
+        action: ""
+      };
+      this._notify();
+      return;
+    }
+    // state === "failed"
+    // Which flow the user was in when it failed — needed before the sign-in
+    // sub-state is replaced below, and only used for the memory-only offer.
+    const failedFlow = this.state.signIn.phase === "pending_device" ? "device" : "browser";
+    this.state.signIn = { ...emptySignInState(), error: { code: status.code, message: status.message } };
+    if (status.code === "SECURE_STORAGE_UNAVAILABLE") {
+      // specs/agent-settings "Secret isolation": "If secure storage is
+      // unavailable, persistence SHALL fail explicitly and a clearly labeled
+      // memory-only mode SHALL be offered." The banner below IS the explicit
+      // failure; this is the offer. Confirming it re-runs the SAME flow with
+      // `memoryOnly: true` (host/agent/chatgpt/auth.js already supports that
+      // end to end — it then never writes the refresh credential to the OS
+      // store and records the backend as "memory").
+      this.#pendingSignInFlow = failedFlow;
+      this.state.pendingMemoryOnlyOffer = true;
+      this.state.memoryOnlyOfferKind = "sign_in";
+    }
+    this.state.banner = { kind: "error", code: status.code, ...describeErrorCode(status.code, { op: "chatgpt_sign_in_status" }) };
+    this._notify();
+  }
+
+  /** Start the "Sign in with ChatGPT" (browser) flow. Returns `authUrl` so
+   * the DOM layer can open it with `chrome.tabs.create` (tasks.md 5.3) —
+   * this controller has no `chrome` reference of its own (file header).
+   * `memoryOnly: true` is passed ONLY by confirmMemoryOnlySignIn() below —
+   * the user's explicit choice of the memory-only mode offered after a
+   * SECURE_STORAGE_UNAVAILABLE failure; an ordinary call passes no options. */
+  async startBrowserSignIn({ memoryOnly = false } = {}) {
+    if (this.state.signIn.phase !== "idle") return { ok: false, error: "a sign-in is already in progress" };
+    this.state.signIn = { ...emptySignInState(), phase: "starting_browser" };
+    this.state.banner = null;
+    this._notify();
+    try {
+      const { signInId, authUrl } = await this.client.chatgptSignInStart(
+        this.state.profileId,
+        memoryOnly ? { memoryOnly: true } : undefined
+      );
+      this.state.signIn = { ...emptySignInState(), phase: "pending_browser", signInId, authUrl };
+      this._notify();
+      this._startSignInPolling();
+      return { ok: true, signInId, authUrl };
+    } catch (err) {
+      this.state.signIn = emptySignInState();
+      this.state.banner = { kind: "error", code: err.code, ...describeErrorCode(err.code, { op: "chatgpt_sign_in_start" }) };
+      this._notify();
+      return { ok: false, error: err.message, code: err.code };
+    }
+  }
+
+  /** Start the "Use a code instead" (device-code) flow. `memoryOnly` has the
+   * same meaning as in startBrowserSignIn() above. */
+  async startDeviceSignIn({ memoryOnly = false } = {}) {
+    if (this.state.signIn.phase !== "idle") return { ok: false, error: "a sign-in is already in progress" };
+    this.state.signIn = { ...emptySignInState(), phase: "starting_device" };
+    this.state.banner = null;
+    this._notify();
+    try {
+      const { signInId, userCode, verificationUrl, expiresAt } = await this.client.chatgptDeviceStart(
+        this.state.profileId,
+        memoryOnly ? { memoryOnly: true } : undefined
+      );
+      this.state.signIn = { ...emptySignInState(), phase: "pending_device", signInId, userCode, verificationUrl, expiresAt };
+      this._notify();
+      this._startSignInPolling();
+      return { ok: true, signInId, userCode, verificationUrl, expiresAt };
+    } catch (err) {
+      this.state.signIn = emptySignInState();
+      this.state.banner = { kind: "error", code: err.code, ...describeErrorCode(err.code, { op: "chatgpt_device_start" }) };
+      this._notify();
+      return { ok: false, error: err.message, code: err.code };
+    }
+  }
+
+  /** Cancel a pending sign-in (either flow). Best-effort on the wire: the
+   * sign-in is discarded from THIS page's state regardless of whether the
+   * companion's own cancel round-trip succeeds — an already-gone or already-
+   * terminal signInId on the companion side is not a reason to leave the
+   * settings page showing a pending state the user just asked to cancel. */
+  async cancelSignIn() {
+    const signInId = this.state.signIn.signInId;
+    this._stopSignInPolling();
+    if (!signInId) {
+      this.state.signIn = emptySignInState();
+      this._notify();
+      return { ok: true };
+    }
+    this.state.signIn.phase = "cancelling";
+    this._notify();
+    try {
+      await this.client.chatgptSignInCancel(signInId);
+    } catch {
+      // Discarded locally regardless — see doc comment above.
+    }
+    this.state.signIn = emptySignInState();
+    this.state.banner = { kind: "info", code: "SIGN_IN_CANCELLED", ...describeErrorCode("SIGN_IN_CANCELLED", { op: "chatgpt_sign_in_cancel" }) };
+    this._notify();
+    return { ok: true };
+  }
+
+  /** Sign out of the currently signed-in ChatGPT account. */
+  async signOut() {
+    this.state.signingOut = true;
+    this._notify();
+    try {
+      const profile = await this.client.chatgptSignOut(this.state.profileId);
+      this._applyProfile(profile);
+      this.state.connectionStatus = null;
+      this.state.signingOut = false;
+      this.state.banner = { kind: "info", title: "Đã đăng xuất ChatGPT", message: "Cần đăng nhập lại trước khi dùng trợ lý.", action: "" };
+      this._notify();
+      return { ok: true };
+    } catch (err) {
+      this.state.signingOut = false;
+      this.state.banner = { kind: "error", code: err.code, ...describeErrorCode(err.code, { op: "chatgpt_sign_out" }) };
+      this._notify();
+      return { ok: false, error: err.message, code: err.code };
+    }
   }
 
   // --- Base URL -----------------------------------------------------------
@@ -300,15 +609,20 @@ export class SettingsController {
           this.state.secretBackend = result.backend;
           this.state.connectionStatus = null; // credential changed -> prior results invalidated (host-side truth)
           this.#pendingSecretForRetry = null;
+          this.state.pendingMemoryOnlyOffer = false;
+          this.state.memoryOnlyOfferKind = null;
         } catch (err) {
           if (err.code === "SECURE_STORAGE_UNAVAILABLE") {
             // Retained ONLY in the private field, only for this explicit,
             // user-visible offer — never re-shown in any field/state.
             this.#pendingSecretForRetry = secretToSend;
             this.state.pendingMemoryOnlyOffer = true;
+            this.state.memoryOnlyOfferKind = "credential";
             this.state.banner = { kind: "error", code: err.code, ...describeErrorCode(err.code) };
           } else {
             this.#pendingSecretForRetry = null;
+            this.state.pendingMemoryOnlyOffer = false;
+            this.state.memoryOnlyOfferKind = null;
             this.state.banner = { kind: "error", code: err.code, ...describeErrorCode(err.code) };
           }
         }
@@ -328,6 +642,28 @@ export class SettingsController {
     }
   }
 
+  /** Explicit, user-confirmed retry of a ChatGPT sign-in that failed because
+   * no OS credential store is available — re-runs the SAME flow the user was
+   * in, now with `memoryOnly: true`, so host/agent/chatgpt/auth.js holds the
+   * refresh credential in the companion's memory only and never writes it to
+   * the OS store (specs/agent-settings "Secret isolation"). This is the
+   * ChatGPT counterpart of confirmMemoryOnlyCredential() below; the DOM
+   * layer picks between the two by `state.memoryOnlyOfferKind`.
+   * @returns {Promise<{ ok: boolean, authUrl?: string, signInId?: string, userCode?: string, verificationUrl?: string, expiresAt?: number, error?: string }>}
+   *   the retry's own result — a browser retry returns a NEW `authUrl` the
+   *   DOM layer must open, exactly like startBrowserSignIn(). */
+  async confirmMemoryOnlySignIn() {
+    const flow = this.#pendingSignInFlow;
+    if (!flow) {
+      return { ok: false, error: "no pending ChatGPT sign-in to retry" };
+    }
+    this.#pendingSignInFlow = null;
+    this.state.pendingMemoryOnlyOffer = false;
+    this.state.memoryOnlyOfferKind = null;
+    this._notify();
+    return flow === "device" ? this.startDeviceSignIn({ memoryOnly: true }) : this.startBrowserSignIn({ memoryOnly: true });
+  }
+
   /** Explicit, user-confirmed retry after a SECURE_STORAGE_UNAVAILABLE
    * offer — the only path that ever persists a credential with
    * `memoryOnly: true`. */
@@ -338,6 +674,7 @@ export class SettingsController {
     const secretToSend = this.#pendingSecretForRetry;
     this.#pendingSecretForRetry = null;
     this.state.pendingMemoryOnlyOffer = false;
+    this.state.memoryOnlyOfferKind = null;
     this._notify();
     try {
       const result = await this.client.setCredential(this.state.profileId, secretToSend, { memoryOnly: true });
@@ -357,7 +694,9 @@ export class SettingsController {
 
   cancelMemoryOnlyOffer() {
     this.#pendingSecretForRetry = null;
+    this.#pendingSignInFlow = null;
     this.state.pendingMemoryOnlyOffer = false;
+    this.state.memoryOnlyOfferKind = null;
     this._notify();
   }
 
@@ -372,6 +711,7 @@ export class SettingsController {
       this.state.connectionStatus = null;
       this.#pendingSecretForRetry = null;
       this.state.pendingMemoryOnlyOffer = false;
+      this.state.memoryOnlyOfferKind = null;
       this.state.banner = { kind: "info", title: "Đã xóa API key", message: "Cần nhập lại API key trước khi dùng trợ lý.", action: "" };
       this.state.removingCredential = false;
       this._notify();
@@ -386,6 +726,33 @@ export class SettingsController {
 
   // --- Connection test --------------------------------------------------
 
+  /** The "not usable yet" banner for the CURRENT provider type — NO_CREDENTIAL
+   * ("enter an API key") is only ever correct for an `anthropic` profile. A
+   * `chatgpt` profile's missing credential means "sign in with ChatGPT", and a
+   * session that expired host-side says so explicitly (specs/agent-settings
+   * "ChatGPT profile not signed in"; tasks.md 5.3's SESSION_EXPIRED banner).
+   * @returns {{ kind: string, code?: string, title?: string, message?: string, action?: string }|null}
+   *   null when the profile IS usable (caller proceeds), otherwise the banner
+   *   to show and return a failure with. */
+  _notUsableBanner() {
+    if (this.state.providerType === "chatgpt") {
+      if (this.state.chatgptSessionState === "session_expired") {
+        return { kind: "error", code: "SESSION_EXPIRED", ...describeErrorCode("SESSION_EXPIRED") };
+      }
+      if (this.state.chatgptSessionState === "signed_in") return null;
+      return {
+        kind: "error",
+        title: "Chưa đăng nhập ChatGPT",
+        message: "Đăng nhập với tài khoản ChatGPT trước khi dùng thao tác này.",
+        action: "Bấm \"Đăng nhập với ChatGPT\" ở mục Nhà cung cấp phía trên."
+      };
+    }
+    if (!this.state.hasCredential) {
+      return { kind: "error", code: "NO_CREDENTIAL", ...describeErrorCode("NO_CREDENTIAL") };
+    }
+    return null;
+  }
+
   async testConnection(modelId) {
     const model = modelId || this.state.defaultModelId;
     if (!model) {
@@ -393,8 +760,9 @@ export class SettingsController {
       this._notify();
       return { ok: false };
     }
-    if (!this.state.hasCredential) {
-      this.state.banner = { kind: "error", code: "NO_CREDENTIAL", ...describeErrorCode("NO_CREDENTIAL") };
+    const notUsable = this._notUsableBanner();
+    if (notUsable) {
+      this.state.banner = notUsable;
       this._notify();
       return { ok: false };
     }
@@ -429,8 +797,9 @@ export class SettingsController {
   // --- Discovery ----------------------------------------------------------
 
   async discoverModels() {
-    if (!this.state.hasCredential) {
-      this.state.banner = { kind: "error", code: "NO_CREDENTIAL", ...describeErrorCode("NO_CREDENTIAL") };
+    const notUsable = this._notUsableBanner();
+    if (notUsable) {
+      this.state.banner = notUsable;
       this._notify();
       return { ok: false };
     }

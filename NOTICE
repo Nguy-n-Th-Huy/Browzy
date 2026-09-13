@@ -72,3 +72,44 @@ a free license derived from the Bitstream Vera Fonts Copyright:
 
 The full license text ships with the dependency at
 `node_modules/dejavu-fonts-ttf/LICENSE`.
+
+Third-party code: CLIProxyAPI
+-----------------------------
+
+`host/agent/chatgpt/` is ported from `router-for-me/CLIProxyAPI` (Go), at
+commit `ac02da6`, under the MIT License. What was ported is the wire
+behaviour: the Codex OAuth shape (endpoints, public client id, PKCE,
+device-flow fields), the Anthropic Messages ↔ Codex `responses` request and
+stream translation, the upstream request header/body rules, and the upstream
+error-classification table. Per-file headers name the specific reference
+files.
+
+Deliberately NOT ported: client impersonation (the `codex-tui` user agent and
+originator), uTLS browser fingerprinting, multi-account pooling and failover,
+identity obfuscation, and automatic `image_generation` tool injection. The
+gateway identifies itself honestly as `browzy`.
+
+The upstream copyright and permission notice:
+
+    MIT License
+
+    Copyright (c) 2025-2005.9 Luis Pater
+    Copyright (c) 2025.9-present Router-For.ME
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.

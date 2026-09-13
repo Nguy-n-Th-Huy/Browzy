@@ -18,7 +18,17 @@ export const PROVIDER_ERROR_CODES = /** @type {const} */ ([
   "VISION_ERROR", // the model/gateway rejected or never completed the image sub-test
   "REDIRECT_REJECTED", // the endpoint issued a cross-origin redirect for an authenticated request
   "NO_CREDENTIAL", // snapshotForRun called with no stored/available credential
-  "INVALID_PROFILE" // the stored profile itself fails validation (corrupt, or references a removed model)
+  "INVALID_PROFILE", // the stored profile itself fails validation (corrupt, or references a removed model)
+
+  // ChatGPT subscription provider (add-chatgpt-subscription-provider).
+  "CALLBACK_PORT_IN_USE", // the loopback OAuth callback listener could not bind 127.0.0.1:1455
+  "SIGN_IN_TIMEOUT", // 5 minutes (browser) or 15 minutes (device code) passed without a valid callback/approval
+  "SIGN_IN_CANCELLED", // the user cancelled an in-progress sign-in, or a new sign-in superseded it
+  "SIGN_IN_FAILED", // the authorization/token exchange failed for a reason other than timeout or cancellation
+  "SESSION_EXPIRED", // a ChatGPT refresh was rejected (invalid_grant/refresh_token_reused) — sign-in required again
+  "SECRET_TOO_LARGE", // the credential does not fit the OS secret store's size limit and was NOT truncated
+  "USAGE_LIMIT_REACHED", // upstream reported the signed-in ChatGPT account's usage limit
+  "UPSTREAM_REJECTED_CLIENT" // upstream 403/400 whose message names the client/originator/instructions
 ]);
 
 export class ProviderError extends Error {

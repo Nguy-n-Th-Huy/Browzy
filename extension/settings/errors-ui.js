@@ -8,13 +8,33 @@
 // generic diagnostic text the companion already sanitized
 // (host/agent/secrets/redact.js runs upstream of anything reaching here).
 
+// The agent_settings ops this change adds (add-chatgpt-subscription-provider)
+// — a PROTOCOL_ERROR on one of these means the connected companion predates
+// ChatGPT sign-in support, not that the endpoint itself is incompatible
+// (which is what PROTOCOL_ERROR means for every pre-existing op). See
+// describeErrorCode()'s PROTOCOL_ERROR case below.
+const CHATGPT_OPS = new Set([
+  "set_provider_type",
+  "chatgpt_sign_in_start",
+  "chatgpt_device_start",
+  "chatgpt_sign_in_status",
+  "chatgpt_sign_in_cancel",
+  "chatgpt_sign_out"
+]);
+
 /**
  * @param {string} code one of host/agent/settings/errors.js's
  *   PROVIDER_ERROR_CODES, or "SECURE_STORAGE_UNAVAILABLE",
  *   "INVALID_BASE_URL", "INVALID_MODELS", or an unrecognized code.
+ * @param {{ op?: string }} [opts] `op` is the agent_settings op that failed —
+ *   read for the PROTOCOL_ERROR case (see CHATGPT_OPS above) and for
+ *   SECURE_STORAGE_UNAVAILABLE, which promises a memory-only option: on a
+ *   ChatGPT op that option is the sign-in's memory-only mode, not an API
+ *   key. Every existing call site with no second argument is unaffected.
  * @returns {{ title: string, message: string, action: string }}
  */
-export function describeErrorCode(code) {
+export function describeErrorCode(code, opts = {}) {
+  const isChatgptOp = Boolean(opts.op) && CHATGPT_OPS.has(opts.op);
   switch (code) {
     case "STARTUP_ERROR":
       return {
@@ -53,6 +73,13 @@ export function describeErrorCode(code) {
         action: "Kiểm tra Base URL, chứng chỉ TLS và kết nối mạng."
       };
     case "PROTOCOL_ERROR":
+      if (isChatgptOp) {
+        return {
+          title: "Cần cập nhật companion",
+          message: "Update the Browzy companion to use ChatGPT sign-in.",
+          action: "Cập nhật Browzy companion lên phiên bản mới nhất rồi thử lại."
+        };
+      }
       return {
         title: "Không tương thích giao thức",
         message: "Điểm cuối không nói giao thức Anthropic Messages API (ví dụ chỉ hỗ trợ OpenAI Chat Completions).",
@@ -89,6 +116,16 @@ export function describeErrorCode(code) {
         action: "Chọn lại một mô hình có trong danh sách."
       };
     case "SECURE_STORAGE_UNAVAILABLE":
+      if (isChatgptOp) {
+        // The memory-only option this promises is the ChatGPT sign-in's own
+        // (retry the sign-in with the refresh credential held in memory
+        // only) — never an API key on a ChatGPT profile.
+        return {
+          title: "Không có kho lưu trữ bảo mật của hệ điều hành",
+          message: "Không tìm thấy Windows Credential Manager / macOS Keychain / Linux Secret Service khả dụng trên máy này, nên thông tin đăng nhập ChatGPT chưa được lưu.",
+          action: "Bạn có thể đăng nhập chỉ trong bộ nhớ (mất khi companion khởi động lại), không bao giờ lưu vào kho hệ điều hành hay tệp."
+        };
+      }
       return {
         title: "Không có kho lưu trữ bảo mật của hệ điều hành",
         message: "Không tìm thấy Windows Credential Manager / macOS Keychain / Linux Secret Service khả dụng trên máy này.",
@@ -111,6 +148,57 @@ export function describeErrorCode(code) {
         title: "Không có mạng",
         message: "Không thể kết nối tới companion ngay bây giờ.",
         action: "Lưu cài đặt vẫn hoạt động khi ngoại tuyến; hãy thử Kiểm tra kết nối lại khi có mạng."
+      };
+
+    // ChatGPT subscription provider (add-chatgpt-subscription-provider,
+    // host/agent/settings/errors.js's PROVIDER_ERROR_CODES).
+    case "CALLBACK_PORT_IN_USE":
+      return {
+        title: "Cổng đăng nhập đang bận",
+        message: "Không thể mở cổng cục bộ (1455) mà luồng đăng nhập ChatGPT qua trình duyệt cần dùng.",
+        action: "Đóng ứng dụng khác đang chiếm cổng 1455, hoặc bấm \"Dùng mã thay thế\" để đăng nhập bằng mã thiết bị."
+      };
+    case "SIGN_IN_TIMEOUT":
+      return {
+        title: "Hết thời gian đăng nhập",
+        message: "Không nhận được xác nhận đăng nhập ChatGPT trong thời gian cho phép.",
+        action: "Bấm \"Đăng nhập với ChatGPT\" để thử lại."
+      };
+    case "SIGN_IN_CANCELLED":
+      return {
+        title: "Đã hủy đăng nhập",
+        message: "Quá trình đăng nhập ChatGPT đã bị hủy.",
+        action: "Bấm \"Đăng nhập với ChatGPT\" để thử lại khi sẵn sàng."
+      };
+    case "SIGN_IN_FAILED":
+      return {
+        title: "Đăng nhập ChatGPT thất bại",
+        message: "Không thể hoàn tất đăng nhập ChatGPT.",
+        action: "Thử đăng nhập lại. Nếu vẫn lỗi, kiểm tra kết nối mạng rồi thử lại sau."
+      };
+    case "SESSION_EXPIRED":
+      return {
+        title: "Phiên ChatGPT đã hết hạn",
+        message: "Cần đăng nhập lại để tiếp tục dùng tài khoản ChatGPT này.",
+        action: "Bấm \"Đăng nhập lại\" để đăng nhập lại."
+      };
+    case "SECRET_TOO_LARGE":
+      return {
+        title: "Thông tin đăng nhập quá lớn",
+        message: "Thông tin đăng nhập ChatGPT vượt quá giới hạn kích thước của kho lưu trữ bảo mật hệ điều hành và KHÔNG được lưu.",
+        action: "Thử đăng nhập lại. Nếu vẫn lỗi, đây là sự cố cần báo cáo."
+      };
+    case "USAGE_LIMIT_REACHED":
+      return {
+        title: "Đã đạt giới hạn sử dụng ChatGPT",
+        message: "Tài khoản ChatGPT đã đạt giới hạn sử dụng của gói đăng ký.",
+        action: "Đợi giới hạn được đặt lại, hoặc dùng một tài khoản/nhà cung cấp khác."
+      };
+    case "UPSTREAM_REJECTED_CLIENT":
+      return {
+        title: "Bị ChatGPT từ chối",
+        message: "Backend ChatGPT (không chính thức) đã từ chối yêu cầu từ ứng dụng này.",
+        action: "Thử lại sau. Nếu vẫn lỗi, backend không chính thức này có thể đã thay đổi hoặc ngừng hoạt động."
       };
 
     // Skills catalog codes (host/agent/skills/errors.js — task 7.3).

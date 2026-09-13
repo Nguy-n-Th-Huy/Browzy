@@ -1,9 +1,4 @@
-# agent-settings Specification
-
-## Purpose
-Allow users to configure Anthropic-compatible endpoints, credentials, and model choices from the extension while protecting secrets and exposing actionable connection errors.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Editable provider profile
 A provider profile SHALL have a provider type, `anthropic` or `chatgpt`. A profile persisted before provider types existed SHALL load as `anthropic` without any change to its other fields.

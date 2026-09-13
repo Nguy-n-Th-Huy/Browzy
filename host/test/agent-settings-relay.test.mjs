@@ -81,7 +81,7 @@ function agentSettingsEnvelope(op, payload = {}, { v = PROTOCOL_VERSION, request
  * exercised end-to-end. `sdk` stays fake/injectable so run-lifecycle tests
  * (credential revocation cancelling an active run) never spawn a real
  * Claude Code CLI process. */
-function buildRealSettingsCore({ sdk } = {}) {
+function buildRealSettingsCore({ sdk, chatgptAuthProvider } = {}) {
   const store = new TranscriptStore();
   const lease = new BrowserLease();
   const approvals = new ApprovalRegistry();
@@ -96,10 +96,14 @@ function buildRealSettingsCore({ sdk } = {}) {
     sessionManager,
     lease,
     coerceArgs: (a) => a,
-    sdk: sdk || { async *query() {} }
+    sdk: sdk || { async *query() {} },
     // Deliberately no profileProvider/settingsProvider override: both
     // default to the REAL host/agent/settings/profile.js module, scoped to
-    // the scratch OCIC_AGENT_CONFIG_DIR above.
+    // the scratch OCIC_AGENT_CONFIG_DIR above. `chatgptAuthProvider` is left
+    // undefined for every test above (they never send a ChatGPT op, so the
+    // auth module is never imported); only the ChatGPT op tests below inject
+    // a fake, so no test here ever binds port 1455 or touches a real OS store.
+    ...(chatgptAuthProvider ? { chatgptAuthProvider } : {})
   });
 }
 
@@ -272,6 +276,227 @@ await test("a missing protocol version on agent_settings also fails closed", asy
   delete envelope.v;
   const reply = await core.handleEnvelope(envelope);
   assert(reply.ok === false && reply.error.code === "PROTOCOL_ERROR", "a missing version must never be assumed to be the current one");
+});
+
+// --- ChatGPT subscription provider ops (Batch E1 host protocol) -----------
+//
+// These drive the six new agent_settings ops through CompanionCore's real
+// _handleAgentSettings() dispatcher, with the REAL settings/profile.js (so
+// set_provider_type/chatgpt_sign_out persist and reload for real) and an
+// INJECTED chatgptAuthProvider double (so no op here ever binds port 1455 or
+// touches a real OS credential store). The double stands in for
+// host/agent/chatgpt/auth.js — whose own behaviour is independently covered by
+// chatgpt-auth.test.mjs — leaving these checks about the PROTOCOL layer only:
+// the exact reply shapes the Batch E2 wire contract promises the extension,
+// the input validation, the error-code mapping, and that no token ever crosses
+// the wire.
+
+// A configurable fake of auth.js's default-instance surface. Each ChatGPT op's
+// companion case calls exactly one of these; the returned values are shaped to
+// the auth contract so the dispatcher's field-projection is observable.
+function makeFakeAuth(overrides = {}) {
+  const calls = [];
+  const base = {
+    _calls: calls,
+    startBrowserSignIn: async ({ profileId, memoryOnly }) => {
+      calls.push(["startBrowserSignIn", profileId, memoryOnly]);
+      return { signInId: "sign-in-1", authUrl: "https://auth.openai.com/oauth/authorize?x=1" };
+    },
+    startDeviceSignIn: async ({ profileId, memoryOnly }) => {
+      calls.push(["startDeviceSignIn", profileId, memoryOnly]);
+      return { signInId: "sign-in-2", userCode: "ABCD-EFGH", verificationUrl: "https://auth.openai.com/codex/device", expiresAt: 1_800_000_000_000 };
+    },
+    getSignInStatus: (signInId) => {
+      calls.push(["getSignInStatus", signInId]);
+      return { state: "pending" };
+    },
+    cancelSignIn: async (signInId) => {
+      calls.push(["cancelSignIn", signInId]);
+    },
+    signOut: async (profileId) => {
+      calls.push(["signOut", profileId]);
+    }
+  };
+  return { ...base, ...overrides };
+}
+
+await test("set_provider_type persists the switch through the real profile.js and replies the updated secret-free profile", async () => {
+  const core = buildRealSettingsCore();
+  await core.handleEnvelope(
+    agentSettingsEnvelope("save_profile", { profileId: PROFILE_ID, baseUrl: "https://api.example-provider.invalid", models: [{ id: "m", label: "M" }], defaultModelId: "m" })
+  );
+  const reply = await core.handleEnvelope(agentSettingsEnvelope("set_provider_type", { profileId: PROFILE_ID, providerType: "chatgpt" }));
+  assert(reply.ok === true, `set_provider_type must succeed: ${JSON.stringify(reply.error)}`);
+  assert(reply.result.providerType === "chatgpt", "the reply is the updated profile (its providerType field flipped)");
+  // The non-secret baseUrl must survive the switch untouched (rollback safety —
+  // a chatgpt profile keeps a valid baseUrl so old code reports NO_CREDENTIAL).
+  assert(reply.result.baseUrl === "https://api.example-provider.invalid", "set_provider_type never disturbs the other profile fields");
+  assert(!("secret" in reply.result) && !("apiKey" in reply.result), "the profile reply carries no credential field");
+});
+
+await test("set_provider_type with an unknown providerType is INVALID_PROFILE, never persisted", async () => {
+  const core = buildRealSettingsCore();
+  const reply = await core.handleEnvelope(agentSettingsEnvelope("set_provider_type", { profileId: PROFILE_ID, providerType: "openai" }));
+  assert(reply.ok === false && reply.error.code === "INVALID_PROFILE", `expected INVALID_PROFILE, got ${JSON.stringify(reply.error)}`);
+});
+
+await test("set_provider_type without a profileId is a PROTOCOL_ERROR", async () => {
+  const core = buildRealSettingsCore();
+  const reply = await core.handleEnvelope(agentSettingsEnvelope("set_provider_type", { providerType: "chatgpt" }));
+  assert(reply.ok === false && reply.error.code === "PROTOCOL_ERROR");
+});
+
+await test("chatgpt_sign_in_start replies {signInId, authUrl} ONLY (no profile, no token) and forwards the profileId to auth", async () => {
+  const auth = makeFakeAuth();
+  const core = buildRealSettingsCore({ chatgptAuthProvider: auth });
+  const reply = await core.handleEnvelope(agentSettingsEnvelope("chatgpt_sign_in_start", { profileId: PROFILE_ID }));
+  assert(reply.ok === true, `chatgpt_sign_in_start must succeed: ${JSON.stringify(reply.error)}`);
+  assert(reply.result.signInId === "sign-in-1" && reply.result.authUrl.startsWith("https://auth.openai.com/"), "reply is exactly {signInId, authUrl}");
+  assert(!("profile" in reply.result) && !("models" in reply.result), "the start reply never includes the profile object (E2 hard rule)");
+  assert(auth._calls.some((c) => c[0] === "startBrowserSignIn" && c[1] === PROFILE_ID), "auth.startBrowserSignIn got the profileId");
+});
+
+await test("chatgpt_sign_in_start / chatgpt_device_start forward the memory-only choice and default it to false", async () => {
+  // The user-confirmed memory-only retry after SECURE_STORAGE_UNAVAILABLE
+  // (specs/agent-settings "Secret isolation") must reach auth.js, which
+  // already supports it end to end (never writes the refresh credential to
+  // the OS store, records the backend as "memory").
+  const auth = makeFakeAuth();
+  const core = buildRealSettingsCore({ chatgptAuthProvider: auth });
+
+  await core.handleEnvelope(agentSettingsEnvelope("chatgpt_sign_in_start", { profileId: PROFILE_ID, memoryOnly: true }));
+  let call = auth._calls.find((c) => c[0] === "startBrowserSignIn");
+  assert(call && call[2] === true, `auth.startBrowserSignIn must receive memoryOnly:true — got ${JSON.stringify(call)}`);
+
+  await core.handleEnvelope(agentSettingsEnvelope("chatgpt_sign_in_start", { profileId: PROFILE_ID }));
+  call = auth._calls.filter((c) => c[0] === "startBrowserSignIn")[1];
+  assert(call && call[2] === false, `an ordinary sign-in must carry memoryOnly:false, never undefined — got ${JSON.stringify(call)}`);
+
+  await core.handleEnvelope(agentSettingsEnvelope("chatgpt_device_start", { profileId: PROFILE_ID, memoryOnly: true }));
+  call = auth._calls.find((c) => c[0] === "startDeviceSignIn");
+  assert(call && call[2] === true, `auth.startDeviceSignIn must receive memoryOnly:true — got ${JSON.stringify(call)}`);
+
+  await core.handleEnvelope(agentSettingsEnvelope("chatgpt_device_start", { profileId: PROFILE_ID }));
+  call = auth._calls.filter((c) => c[0] === "startDeviceSignIn")[1];
+  assert(call && call[2] === false, `an ordinary device sign-in must carry memoryOnly:false — got ${JSON.stringify(call)}`);
+
+  // The reply shapes are unchanged by the flag — still no profile, no token.
+  const reply = await core.handleEnvelope(agentSettingsEnvelope("chatgpt_sign_in_start", { profileId: PROFILE_ID, memoryOnly: true }));
+  assert(reply.ok === true && reply.result.signInId === "sign-in-1" && !("memoryOnly" in reply.result), "the start reply stays exactly {signInId, authUrl}");
+});
+
+await test("chatgpt_sign_in_start / chatgpt_device_start reject a non-boolean memoryOnly before auth is ever called", async () => {
+  const auth = makeFakeAuth();
+  const core = buildRealSettingsCore({ chatgptAuthProvider: auth });
+  for (const [op, badValue] of [
+    ["chatgpt_sign_in_start", "true"],
+    ["chatgpt_device_start", 1]
+  ]) {
+    const reply = await core.handleEnvelope(agentSettingsEnvelope(op, { profileId: PROFILE_ID, memoryOnly: badValue }));
+    assert(reply.ok === false && reply.error.code === "PROTOCOL_ERROR", `${op} with memoryOnly ${JSON.stringify(badValue)} must be PROTOCOL_ERROR, got ${JSON.stringify(reply.error)}`);
+  }
+  assert(auth._calls.length === 0, `auth must not be invoked for a malformed memoryOnly — got ${JSON.stringify(auth._calls)}`);
+});
+
+await test("chatgpt_device_start replies {signInId, userCode, verificationUrl, expiresAt} with expiresAt an epoch-ms number", async () => {
+  const auth = makeFakeAuth();
+  const core = buildRealSettingsCore({ chatgptAuthProvider: auth });
+  const reply = await core.handleEnvelope(agentSettingsEnvelope("chatgpt_device_start", { profileId: PROFILE_ID }));
+  assert(reply.ok === true, `chatgpt_device_start must succeed: ${JSON.stringify(reply.error)}`);
+  assert(reply.result.userCode === "ABCD-EFGH", "the user code is returned for display");
+  assert(typeof reply.result.expiresAt === "number", "expiresAt crosses as an epoch-ms number, not a Date/ISO string");
+});
+
+await test("chatgpt_sign_in_status forwards each auth state verbatim: pending / signed_in(account) / failed(code)", async () => {
+  const cases = [
+    [{ state: "pending" }, (r) => r.state === "pending"],
+    [{ state: "signed_in", account: { email: "u@example.com", planType: "plus" } }, (r) => r.state === "signed_in" && r.account.email === "u@example.com" && r.account.planType === "plus"],
+    [{ state: "failed", code: "SIGN_IN_TIMEOUT", message: "timed out" }, (r) => r.state === "failed" && r.code === "SIGN_IN_TIMEOUT"]
+  ];
+  for (const [status, check] of cases) {
+    const auth = makeFakeAuth({ getSignInStatus: () => status });
+    const core = buildRealSettingsCore({ chatgptAuthProvider: auth });
+    const reply = await core.handleEnvelope(agentSettingsEnvelope("chatgpt_sign_in_status", { signInId: "sign-in-x" }));
+    assert(reply.ok === true, `status must succeed: ${JSON.stringify(reply.error)}`);
+    assert(check(reply.result), `the ${status.state} status is passed through unchanged`);
+  }
+});
+
+await test("chatgpt_sign_in_status keyed by signInId ONLY — a request with no profileId still works", async () => {
+  const auth = makeFakeAuth();
+  const core = buildRealSettingsCore({ chatgptAuthProvider: auth });
+  const reply = await core.handleEnvelope(agentSettingsEnvelope("chatgpt_sign_in_status", { signInId: "only-signin" }));
+  assert(reply.ok === true && reply.result.state === "pending");
+  assert(auth._calls.some((c) => c[0] === "getSignInStatus" && c[1] === "only-signin"), "auth got the signInId, not a profileId");
+});
+
+await test("chatgpt_sign_in_status for an unknown signInId (auth throws a codeless Error) is PROTOCOL_ERROR, not NETWORK_ERROR", async () => {
+  // Mirrors auth.js: getSignInStatus throws a plain Error for an
+  // unknown/pruned sign-in id. Without the dispatcher's explicit mapping the
+  // outer catch would label it NETWORK_ERROR (a misleading "network failed").
+  const auth = makeFakeAuth({
+    getSignInStatus: () => {
+      throw new Error("unknown ChatGPT sign-in id: nope");
+    }
+  });
+  const core = buildRealSettingsCore({ chatgptAuthProvider: auth });
+  const reply = await core.handleEnvelope(agentSettingsEnvelope("chatgpt_sign_in_status", { signInId: "nope" }));
+  assert(reply.ok === false, "an unknown sign-in id is a failure, not a fabricated pending");
+  assert(reply.error.code === "PROTOCOL_ERROR", `expected PROTOCOL_ERROR, got ${JSON.stringify(reply.error)}`);
+});
+
+await test("chatgpt_sign_in_status WITHOUT a signInId is a PROTOCOL_ERROR before auth is ever called", async () => {
+  const auth = makeFakeAuth();
+  const core = buildRealSettingsCore({ chatgptAuthProvider: auth });
+  const reply = await core.handleEnvelope(agentSettingsEnvelope("chatgpt_sign_in_status", {}));
+  assert(reply.ok === false && reply.error.code === "PROTOCOL_ERROR");
+  assert(!auth._calls.some((c) => c[0] === "getSignInStatus"), "auth must not be invoked for a malformed request");
+});
+
+await test("chatgpt_sign_in_cancel replies {cancelled:true}", async () => {
+  const auth = makeFakeAuth();
+  const core = buildRealSettingsCore({ chatgptAuthProvider: auth });
+  const reply = await core.handleEnvelope(agentSettingsEnvelope("chatgpt_sign_in_cancel", { signInId: "sign-in-1" }));
+  assert(reply.ok === true && reply.result.cancelled === true);
+  assert(auth._calls.some((c) => c[0] === "cancelSignIn" && c[1] === "sign-in-1"));
+});
+
+await test("chatgpt_sign_out calls auth.signOut and replies the fresh secret-free profile", async () => {
+  const auth = makeFakeAuth();
+  const core = buildRealSettingsCore({ chatgptAuthProvider: auth });
+  const saved = await core.handleEnvelope(
+    agentSettingsEnvelope("save_profile", { profileId: PROFILE_ID, baseUrl: "https://api.example-provider.invalid", models: [{ id: "m", label: "M" }], defaultModelId: "m" })
+  );
+  assert(saved.ok === true, `setup save_profile failed: ${JSON.stringify(saved.error)}`);
+  const reply = await core.handleEnvelope(agentSettingsEnvelope("chatgpt_sign_out", { profileId: PROFILE_ID }));
+  assert(reply.ok === true, `chatgpt_sign_out must succeed: ${JSON.stringify(reply.error)}`);
+  assert(reply.result && reply.result.profileId === PROFILE_ID, "sign-out replies the reloaded profile so background.js can mirror it");
+  assert(!("accessToken" in reply.result) && !("refresh_token" in reply.result), "no token field on the sign-out profile reply");
+  assert(!/access_token|refresh_token|id_token/i.test(JSON.stringify(reply)), "no serialized token appears anywhere in the sign-out reply");
+  assert(auth._calls.some((c) => c[0] === "signOut" && c[1] === PROFILE_ID));
+});
+
+await test("chatgpt_sign_out without a profileId is a PROTOCOL_ERROR and never calls auth", async () => {
+  const auth = makeFakeAuth();
+  const core = buildRealSettingsCore({ chatgptAuthProvider: auth });
+  const reply = await core.handleEnvelope(agentSettingsEnvelope("chatgpt_sign_out", {}));
+  assert(reply.ok === false && reply.error.code === "PROTOCOL_ERROR");
+  assert(!auth._calls.some((c) => c[0] === "signOut"));
+});
+
+await test("a start reply that DID carry a token field fails closed (secret-free scan) rather than emit it", async () => {
+  // The dispatcher destructures known fields only, so a well-behaved auth.js
+  // never leaks — but a future auth that returned MORE must still be blocked.
+  // Here the injected double returns the known fields PLUS an accessToken, and
+  // the reply is built by field projection, so the token is dropped even before
+  // the scan. Assert the scan + projection jointly keep it off the wire.
+  const auth = makeFakeAuth({
+    startBrowserSignIn: async () => ({ signInId: "s", authUrl: "https://x", accessToken: "SECRET-TOKEN-XYZ", refreshToken: "SECRET-REF-XYZ" })
+  });
+  const core = buildRealSettingsCore({ chatgptAuthProvider: auth });
+  const reply = await core.handleEnvelope(agentSettingsEnvelope("chatgpt_sign_in_start", { profileId: PROFILE_ID }));
+  assert(JSON.stringify(reply).indexOf("SECRET-TOKEN-XYZ") === -1, "an accessToken must never appear in the reply");
+  assert(JSON.stringify(reply).indexOf("SECRET-REF-XYZ") === -1, "a refreshToken must never appear in the reply");
 });
 
 // --- test helpers ----------------------------------------------------------

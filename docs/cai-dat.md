@@ -18,7 +18,11 @@ Extension **không tự chạy được**. Nó nói chuyện với companion qua
 - **[Node.js](https://nodejs.org)** bản LTS — companion chạy trên Node, không có Node thì không cài được.
 - **Git** — để lấy mã nguồn.
 - Một trình duyệt nhân Chromium: **Chrome**, **Edge** hoặc **Brave**.
-- **API key** của một nhà cung cấp tương thích Anthropic. Browzy không kèm sẵn key nào và không có máy chủ trung gian.
+- **Một trong hai thứ**, cho panel chat:
+  - **API key** của một nhà cung cấp tương thích Anthropic, **hoặc**
+  - **một gói ChatGPT trả phí** (Plus/Pro/Team — cùng gói mà Codex CLI đăng nhập). Xem [Đăng nhập bằng gói ChatGPT](#đăng-nhập-bằng-gói-chatgpt).
+
+  Browzy không kèm sẵn key nào và không có máy chủ trung gian.
 
 ---
 
@@ -66,9 +70,40 @@ Muốn đăng ký cho một số trình duyệt thôi:
 
 Không phải copy ID nào cả. Manifest mang sẵn một khoá công khai cố định, nên extension nhận **cùng một ID** trên mọi máy và mọi lần nạp lại — đó chính là ID mà bước 2 vừa đăng ký.
 
-### 4. Nhập API key
+### 4. Chọn nhà cung cấp
 
-Mở panel Browzy → **Settings** → dán API key. Key nằm lại trên máy bạn.
+Mở panel Browzy → **Settings**. Mục **Loại nhà cung cấp** có hai lựa chọn:
+
+- **API tương thích Anthropic** (mặc định) — dán Base URL + API key. Key nằm lại trên máy bạn.
+- **Tài khoản ChatGPT** — dùng gói ChatGPT trả phí của bạn, không cần key nào. Xem [Đăng nhập bằng gói ChatGPT](#đăng-nhập-bằng-gói-chatgpt).
+
+Sau khi chọn, bấm **Kiểm tra kết nối**. Panel sẽ không chạy cho tới khi phép thử này đạt với đúng cấu hình hiện tại.
+
+---
+
+## Đăng nhập bằng gói ChatGPT
+
+Nếu bạn đã trả phí cho ChatGPT (Plus/Pro/Team — cùng gói mà Codex CLI đăng nhập) và không muốn mua thêm API credit, một profile có thể dùng thẳng gói đó. Đây là lựa chọn bạn phải bật, không bao giờ tự xảy ra: profile vẫn là loại Anthropic cho tới khi bạn đổi.
+
+1. **Settings** → chọn **Tài khoản ChatGPT** → **Lưu**. Hai ô Base URL và API key biến mất; không phải nhập gì ở đó.
+2. Bấm **Đăng nhập với ChatGPT**. Một tab trình duyệt mới mở ra trang đăng nhập của OpenAI; xác nhận ở đó rồi tab sẽ báo là đóng được. Settings khi ấy hiện email và gói của tài khoản đã đăng nhập, còn danh sách mô hình được nạp các ID mô hình Codex của gói đó — chỉ khi danh sách đang trống, nên những gì bạn tự sửa không bao giờ bị ghi đè, và vẫn sửa được tiếp.
+3. **Đăng nhập bằng mã, nếu cách trên không chạy được.** Đăng nhập qua trình duyệt cần cổng `1455` để nhận kết quả; nếu cổng đã bị chiếm (phổ biến nhất là một phiên Codex CLI đang đăng nhập), Settings sẽ báo và đưa cho bạn nút **Dùng mã thay thế**. Nút này hiện một mã dùng một lần, đường dẫn tới `https://auth.openai.com/codex/device`, và đồng hồ đếm ngược; nhập mã ở trang đó thì panel tự đăng nhập. Cả hai cách đều hủy được, và nếu không hoàn tất thì tự hết hạn (5 phút cho cách trình duyệt, 15 phút cho cách mã) mà không lưu gì.
+4. Bấm **Kiểm tra kết nối**. Cũng là một yêu cầu nhỏ thật, như đường API key, chỉ khác ở chỗ: ở đây nó **tính vào giới hạn sử dụng ChatGPT của bạn**.
+5. **Đăng xuất** nằm ngay chỗ đó. Có hiệu lực lập tức: credential đã lưu bị xoá, phiên đang chạy bằng nó bị hủy, và các request đang bay qua nó không được phục vụ nữa.
+
+**Giới hạn sử dụng.** Gói ChatGPT có định mức, và nhà cung cấp này không tìm cách lách. Khi tài khoản chạm ngưỡng, yêu cầu thất bại và panel báo rõ ngưỡng đó cùng thời điểm reset — không có lần thử lại nào ẩn phía sau, vì cũng không có credential thứ hai nào để thử.
+
+**Bản chất của cách này — đọc trước khi phụ thuộc vào nó.** Browzy tới ChatGPT qua **một backend không chính thức, không có tài liệu** (đúng backend Codex CLI dùng), không phải một sản phẩm OpenAI mở cho bên thứ ba. OpenAI có thể thay đổi hoặc đóng nó bất cứ lúc nào, và một nhà cung cấp hôm qua còn chạy tốt có thể ngừng chạy mà chẳng cần bản phát hành nào phía Browzy. **Điều khoản dịch vụ của OpenAI áp dụng cho tài khoản của bạn**, và việc dùng gói theo cách này là quyết định của bạn. Browzy không liên kết hay được OpenAI bảo trợ, và không có hành vi nào ở đây giả danh khách khác — backend được báo rõ đây là `browzy`. Nếu điều khoản đó không ổn với tài khoản của bạn, hãy dùng nhà cung cấp API key.
+
+**Không hỗ trợ, có chủ đích:**
+
+- **Gộp / xoay vòng / dự phòng nhiều tài khoản.** Mỗi profile đúng một tài khoản đã đăng nhập, luôn là tài khoản đó.
+- **Khách khác dùng cổng cục bộ này.** Endpoint dịch thuật chỉ phục vụ chính các phiên chạy và phép thử kết nối của companion này. Nó chỉ buộc tại `127.0.0.1` trên một cổng do hệ điều hành chọn, mọi request đều phải có token cấp lúc bắt đầu phiên và thu hồi khi phiên kết thúc — nên đây không phải một proxy để bạn trỏ Codex CLI, IDE hay script vào.
+- **Khám phá mô hình.** Không có endpoint liệt kê mô hình Codex; danh sách lấy theo các ID của gói và do bạn tự sửa.
+
+Credential để refresh nằm trong kho bảo mật của hệ điều hành, cùng quy tắc cách ly như API key (`browzy-in-chrome/chatgpt/<profile>`); access token ngắn hạn chỉ giữ trong bộ nhớ — không ra đĩa, không vào storage của extension, không vào log. Cũng như API key, đăng nhập tính theo từng máy: thêm máy thứ hai là phải đăng nhập lại ở máy đó. Việc chạy cùng một profile ChatGPT trên hai tiến trình companion cùng lúc (hai trình duyệt chẳng hạn) không được phối hợp: một trong hai sẽ thấy phiên hết hạn và được yêu cầu đăng nhập lại.
+
+Đường external MCP không liên quan — vẫn dùng model và auth mà phiên Claude Code của bạn tự cung cấp.
 
 ---
 

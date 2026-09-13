@@ -247,6 +247,77 @@ async function main() {
     ok(deriveReadinessState(legacyFailed).state === READINESS.TEST_FAILED, "legacy shape with ok:false -> test_failed, not unconfigured");
   }
 
+  console.log("== ChatGPT subscription provider: sign-in required / session expired / falls through once signed in ==");
+  {
+    ok(
+      deriveReadinessState({ providerType: "chatgpt", chatgptSessionState: "signed_out", models: [], defaultModelId: null, hasCredential: false }).state ===
+        READINESS.CHATGPT_SIGN_IN_REQUIRED,
+      "a chatgpt profile that has never signed in -> chatgpt_sign_in_required, never not_configured"
+    );
+    ok(
+      deriveReadinessState({ providerType: "chatgpt", models: [], defaultModelId: null, hasCredential: false }).state === READINESS.CHATGPT_SIGN_IN_REQUIRED,
+      "an absent chatgptSessionState on a chatgpt profile defaults to signed_out's outcome (sign-in required), not not_configured"
+    );
+    ok(
+      deriveReadinessState({
+        providerType: "chatgpt",
+        chatgptSessionState: "session_expired",
+        chatgptAccount: { email: "a@example.com", planType: "plus" },
+        models: [{ id: "gpt-5.5", label: "gpt-5.5" }],
+        defaultModelId: "gpt-5.5",
+        hasCredential: false
+      }).state === READINESS.CHATGPT_SESSION_EXPIRED,
+      "session_expired reports its own distinct state, never sign-in-required or no_credential"
+    );
+    ok(
+      !isProfileComplete({ providerType: "chatgpt", chatgptSessionState: "session_expired", models: [], defaultModelId: null, hasCredential: false }),
+      "isProfileComplete() is false for chatgpt sign-in-required and session-expired alike"
+    );
+
+    // Signed in, but with no models yet (a theoretical race — sign-in seeds
+    // models host-side, but the mirror hasn't caught up) falls through to
+    // the SAME model-completeness check every anthropic profile gets.
+    ok(
+      deriveReadinessState({ providerType: "chatgpt", chatgptSessionState: "signed_in", models: [], defaultModelId: null, hasCredential: true }).state ===
+        READINESS.PARTIAL,
+      "signed in but no models yet falls through to the ordinary PARTIAL check, not a chatgpt-specific one"
+    );
+
+    // Signed in, fully configured, capability test recorded under the fixed
+    // chatgpt marker key (not the profile's real baseUrl, which stays the
+    // unrelated Anthropic default) -> READY.
+    {
+      const key = capabilityTestKey({ baseUrl: "chatgpt:codex", modelId: "gpt-5.5", credentialRevision: 1 });
+      const signedInReady = {
+        providerType: "chatgpt",
+        chatgptSessionState: "signed_in",
+        chatgptAccount: { email: "a@example.com", planType: "plus" },
+        baseUrl: "https://api.anthropic.com", // untouched leftover default — must NOT be used as the capability-test key
+        models: [{ id: "gpt-5.5", label: "gpt-5.5" }],
+        defaultModelId: "gpt-5.5",
+        hasCredential: true,
+        credentialRevision: 1,
+        lastCapabilityTest: { [key]: { status: "pass", capabilities: { text: "pass", tool: "pass", vision: "pass" }, errors: {} } }
+      };
+      ok(deriveReadinessState(signedInReady).state === READINESS.READY, "a signed-in chatgpt profile with a passing test under the fixed marker key -> ready");
+      ok(isProfileComplete(signedInReady), "isProfileComplete() agrees for a fully ready chatgpt profile");
+
+      const staleAfterNewSignIn = { ...signedInReady, credentialRevision: 2 }; // a fresh sign-in bumped credentialRevision
+      ok(
+        deriveReadinessState(staleAfterNewSignIn).state === READINESS.STALE && deriveReadinessState(staleAfterNewSignIn).reason === "credential",
+        "a re-sign-in (new credentialRevision) invalidates the prior chatgpt capability test exactly like a rotated API key does"
+      );
+    }
+
+    // Anthropic profiles are completely unaffected by any of the above —
+    // resolveCapabilityStanding still keys off the real baseUrl for them.
+    ok(
+      deriveReadinessState({ providerType: "anthropic", baseUrl: "https://api.anthropic.com", models: [], defaultModelId: null, hasCredential: false })
+        .state === READINESS.NOT_CONFIGURED,
+      "an anthropic profile's states are unchanged by the chatgpt branch"
+    );
+  }
+
   console.log("== structural: sidepanel.js links every re-testable not-ready state to Settings' Test connection control ==");
   {
     const src = fs.readFileSync(path.join(ROOT, "extension", "sidepanel", "sidepanel.js"), "utf8");
@@ -255,6 +326,16 @@ async function main() {
     ok(/case READINESS\.STALE: \{[\s\S]{0,600}?testConnectionButton\(/.test(src), "STALE links to Test connection, not a generic 'open settings'");
     ok(/case READINESS\.TEST_FAILED: \{[\s\S]{0,600}?testConnectionButton\(/.test(src), "TEST_FAILED links to Test connection, not a generic 'open settings'");
     ok(/case READINESS\.NOT_CONFIGURED:[\s\S]{0,120}?default:[\s\S]{0,300}?settingsButton\(/.test(src), "NOT_CONFIGURED keeps the original generic 'open settings' action (there is nothing to test yet)");
+    ok(
+      /case READINESS\.CHATGPT_SIGN_IN_REQUIRED:[\s\S]{0,300}?settingsButton\(/.test(src),
+      "CHATGPT_SIGN_IN_REQUIRED links to Settings (there is no companion connection to re-test — a sign-in is required first)"
+    );
+    ok(!/case READINESS\.CHATGPT_SIGN_IN_REQUIRED:[\s\S]{0,300}?testConnectionButton\(/.test(src), "CHATGPT_SIGN_IN_REQUIRED never offers a Test connection action");
+    ok(
+      /case READINESS\.CHATGPT_SESSION_EXPIRED:[\s\S]{0,300}?settingsButton\(/.test(src),
+      "CHATGPT_SESSION_EXPIRED links to Settings (re-signing in, not re-testing, is the fix)"
+    );
+    ok(!/case READINESS\.CHATGPT_SESSION_EXPIRED:[\s\S]{0,300}?testConnectionButton\(/.test(src), "CHATGPT_SESSION_EXPIRED never offers a Test connection action");
   }
 
   console.log(fail === 0 ? "\nALL SIDEPANEL READINESS-STATE TESTS PASSED" : `\n${fail} FAILED`);

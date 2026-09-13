@@ -44,6 +44,57 @@ console.log("== static source grep: no console logging call anywhere in the sett
   }
 }
 
+console.log("== static source grep: extension/settings/** carries no ChatGPT token identifier in executable code ==");
+{
+  // Spec ("Secret isolation"): ChatGPT access and ID tokens SHALL never reach
+  // the extension. The identity used to carry a Google OAuth/Bearer value
+  // anywhere in this module would be the first sign that guarantee is
+  // slipping, so it is asserted structurally as well as at runtime below.
+  // Full-line and block comments are stripped first: the design rationale
+  // legitimately names `refresh_token_reused` (auth.js's SESSION_EXPIRED
+  // trigger) in prose.
+  const TOKEN_SHAPED = /\b(accessToken|refreshToken|idToken|refresh_token|access_token|id_token)\b|Bearer\s/;
+  const files = fs.readdirSync(SETTINGS_DIR).filter((f) => f.endsWith(".js") || f.endsWith(".html"));
+  ok(files.length > 0, "settings source files found to scan");
+  for (const file of files) {
+    const code = fs
+      .readFileSync(path.join(SETTINGS_DIR, file), "utf-8")
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/^[ \t]*\/\/.*$/gm, "");
+    ok(!TOKEN_SHAPED.test(code), `${file}: no access/refresh/ID token identifier in code (the settings page never handles a ChatGPT token)`);
+  }
+}
+
+console.log("== runtime: a full ChatGPT sign-in flow never puts a token-shaped value into any state snapshot or wire call ==");
+{
+  const companion = createScriptedCompanion({
+    profileId: "default", baseUrl: "https://api.anthropic.com", models: [{ id: "gpt-5.5", label: "gpt-5.5" }],
+    defaultModelId: "gpt-5.5", hasCredential: false, memoryOnlyCredential: false, secretBackend: null, revision: 2,
+    providerType: "chatgpt", chatgptAccount: null, chatgptSessionState: "signed_out"
+  });
+  const snapshots = [];
+  // The poll is deliberately never fired here (interval ids that never tick) —
+  // the flow under test is the request/cancel/reply surface, not the timer.
+  const c = new SettingsController(companion.client, { setIntervalFn: () => 1, clearIntervalFn: () => {} });
+  c.onChange = (s) => snapshots.push(s);
+  await c.init();
+  await c.setProviderType("chatgpt");
+  await c.startBrowserSignIn();
+  await c.cancelSignIn();
+  await c.startDeviceSignIn();
+  await c.cancelSignIn();
+  await c.signOut();
+
+  const serialized = snapshots.map((s) => JSON.stringify(s)).join("\n");
+  ok(!/\b(access_token|refresh_token|id_token|accessToken|refreshToken|idToken)\b/.test(serialized),
+    "no token field ever appears in an emitted state snapshot");
+  ok(!/Bearer\s/.test(serialized), "no Bearer authorization value ever appears in a state snapshot");
+  const signInKeys = Object.keys(c.getState().signIn);
+  ok(!signInKeys.some((k) => /token|secret/i.test(k)), `the sign-in state carries no token/secret field (keys: ${signInKeys.join(",")})`);
+  ok(!/\b(access_token|refresh_token|id_token|accessToken|refreshToken|idToken)\b|Bearer\s/.test(JSON.stringify(companion.calls)),
+    "no token-shaped field crossed the wire during the whole sign-in flow");
+}
+
 console.log("== runtime: a real save+test+remove flow never exposes the sentinel key in any state snapshot ==");
 {
   const companion = createScriptedCompanion(null);

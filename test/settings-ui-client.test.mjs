@@ -47,6 +47,54 @@ console.log("== outgoing message shape ==");
   ok(calls[6].op === "export_profile", "exportProfile op");
 }
 
+console.log("== outgoing message shape: the six ChatGPT subscription ops ==");
+{
+  const calls = [];
+  const client = createSettingsClient({ sendMessage: async (msg) => { calls.push(msg); return { ok: true, result: {} }; } });
+
+  await client.setProviderType("default", "chatgpt");
+  ok(calls[0].type === "agent_settings" && calls[0].op === "set_provider_type" && calls[0].profileId === "default" && calls[0].providerType === "chatgpt",
+    `setProviderType sends { op: "set_provider_type", profileId, providerType } — got ${JSON.stringify(calls[0])}`);
+
+  await client.chatgptSignInStart("default");
+  ok(calls[1].op === "chatgpt_sign_in_start" && calls[1].profileId === "default" && !("signInId" in calls[1]),
+    "chatgptSignInStart forwards profileId only (no signInId, no token)");
+
+  await client.chatgptDeviceStart("default");
+  ok(calls[2].op === "chatgpt_device_start" && calls[2].profileId === "default",
+    "chatgptDeviceStart forwards profileId only");
+
+  await client.chatgptSignInStatus("sign-in-1");
+  ok(calls[3].op === "chatgpt_sign_in_status" && calls[3].signInId === "sign-in-1" && !("profileId" in calls[3]),
+    "chatgptSignInStatus is keyed by signInId ONLY — never a profile or credential");
+
+  await client.chatgptSignInCancel("sign-in-1");
+  ok(calls[4].op === "chatgpt_sign_in_cancel" && calls[4].signInId === "sign-in-1" && !("profileId" in calls[4]),
+    "chatgptSignInCancel is keyed by signInId ONLY");
+
+  await client.chatgptSignOut("default");
+  ok(calls[5].op === "chatgpt_sign_out" && calls[5].profileId === "default",
+    "chatgptSignOut forwards profileId only");
+
+  // The user-confirmed memory-only retry (specs/agent-settings "Secret
+  // isolation") is the ONLY case that carries an option on the two start ops
+  // — `memoryOnly: true`, never an explicit false.
+  await client.chatgptSignInStart("default", { memoryOnly: true });
+  ok(calls[6].op === "chatgpt_sign_in_start" && calls[6].profileId === "default" && calls[6].memoryOnly === true,
+    `chatgptSignInStart forwards memoryOnly:true for the memory-only retry — got ${JSON.stringify(calls[6])}`);
+
+  await client.chatgptDeviceStart("default", { memoryOnly: true });
+  ok(calls[7].op === "chatgpt_device_start" && calls[7].profileId === "default" && calls[7].memoryOnly === true,
+    `chatgptDeviceStart forwards memoryOnly:true for the memory-only retry — got ${JSON.stringify(calls[7])}`);
+
+  // The wire contract forbids a token/credential value in EITHER direction.
+  const SECRET_SHAPED = /token|secret|credential|password|apikey|api_key/i;
+  for (const msg of calls) {
+    const offending = Object.keys(msg).filter((k) => SECRET_SHAPED.test(k));
+    ok(offending.length === 0, `no secret-shaped field on ${msg.op}: ${offending.length ? offending.join(",") : "none"}`);
+  }
+}
+
 console.log("== success response translation ==");
 {
   const client = createSettingsClient({ sendMessage: async () => ({ ok: true, result: { hello: "world" } }) });

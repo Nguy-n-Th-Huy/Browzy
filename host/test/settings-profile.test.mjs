@@ -319,6 +319,317 @@ await check("exportProfileRedacted never includes the stored secret (the profile
   assert(!serialized.includes("sk-should-never-be-exported"), `secret leaked into export: ${serialized}`);
 });
 
+await check("loadProfile defaults providerType to anthropic and chatgptAccount to null when absent", async () => {
+  useScratchConfigDir();
+  await profile.saveProfile({ profileId: TEST_PROFILE_ID, baseUrl: "https://api.anthropic.com", models: [], defaultModelId: null });
+  const loaded = await profile.loadProfile();
+  assert(loaded.providerType === "anthropic", `expected anthropic, got ${loaded.providerType}`);
+  assert(loaded.chatgptAccount === null, `expected null chatgptAccount, got ${JSON.stringify(loaded.chatgptAccount)}`);
+});
+
+await check("a legacy profile file with no providerType/chatgptAccount field loads unchanged as anthropic (upgrade migration)", async () => {
+  useScratchConfigDir();
+  // A profile shaped exactly as one saved before provider types existed —
+  // no providerType, no chatgptAccount field at all, not even as undefined.
+  const legacy = createEmptyProfile(TEST_PROFILE_ID);
+  delete legacy.providerType;
+  delete legacy.chatgptAccount;
+  legacy.baseUrl = "https://api.anthropic.com";
+  legacy.models = [{ id: "claude-legacy", label: "Legacy" }];
+  legacy.defaultModelId = "claude-legacy";
+  legacy.revision = 7;
+  legacy.credentialRevision = 2;
+  writeProfileToDisk(legacy);
+
+  const loaded = await profile.loadProfile();
+  assert(loaded.providerType === "anthropic", `expected anthropic, got ${loaded.providerType}`);
+  assert(loaded.chatgptAccount === null, `expected null chatgptAccount, got ${JSON.stringify(loaded.chatgptAccount)}`);
+  // Every other field survives byte-for-byte equivalent.
+  assert(loaded.baseUrl === "https://api.anthropic.com");
+  assert(loaded.models.length === 1 && loaded.models[0].id === "claude-legacy");
+  assert(loaded.defaultModelId === "claude-legacy", `defaultModelId: ${loaded.defaultModelId}`);
+  assert(loaded.revision === 7, `expected revision 7, got ${loaded.revision}`);
+  assert(loaded.credentialRevision === 2, `expected credentialRevision 2, got ${loaded.credentialRevision}`);
+});
+
+await check("setProviderType switches a profile's provider type and bumps revision", async () => {
+  useScratchConfigDir();
+  await profile.saveProfile({ profileId: TEST_PROFILE_ID, baseUrl: "https://api.anthropic.com", models: [], defaultModelId: null });
+  const before = await profile.loadProfile();
+  const after = await profile.setProviderType(TEST_PROFILE_ID, "chatgpt");
+  assert(after.providerType === "chatgpt", `expected chatgpt, got ${after.providerType}`);
+  assert(after.revision > before.revision, "setProviderType must bump the profile revision");
+});
+
+await check("setProviderType rejects an unknown provider type", async () => {
+  useScratchConfigDir();
+  await profile.saveProfile({ profileId: TEST_PROFILE_ID, baseUrl: "https://api.anthropic.com", models: [], defaultModelId: null });
+  let threw = false;
+  try {
+    await profile.setProviderType(TEST_PROFILE_ID, "openai");
+  } catch {
+    threw = true;
+  }
+  assert(threw, "expected setProviderType to reject an unrecognized provider type");
+});
+
+await check("setChatgptAccount stores and clears the non-secret email/plan fields", async () => {
+  useScratchConfigDir();
+  await profile.saveProfile({ profileId: TEST_PROFILE_ID, baseUrl: "https://api.anthropic.com", models: [], defaultModelId: null });
+  await profile.setProviderType(TEST_PROFILE_ID, "chatgpt");
+  const withAccount = await profile.setChatgptAccount(TEST_PROFILE_ID, { email: "user@example.com", planType: "plus" });
+  assert(withAccount.chatgptAccount && withAccount.chatgptAccount.email === "user@example.com", JSON.stringify(withAccount.chatgptAccount));
+  assert(withAccount.chatgptAccount.planType === "plus", JSON.stringify(withAccount.chatgptAccount));
+  const cleared = await profile.setChatgptAccount(TEST_PROFILE_ID, null);
+  assert(cleared.chatgptAccount === null, JSON.stringify(cleared.chatgptAccount));
+});
+
+await check("seedChatgptModelsForPlan seeds the plan's Codex model ids only when the model list is empty", async () => {
+  useScratchConfigDir();
+  await profile.saveProfile({ profileId: TEST_PROFILE_ID, baseUrl: "https://api.anthropic.com", models: [], defaultModelId: null });
+  await profile.setProviderType(TEST_PROFILE_ID, "chatgpt");
+
+  const seeded = await profile.seedChatgptModelsForPlan(TEST_PROFILE_ID, "plus");
+  assert(seeded.models.length > 0, "expected the plan's Codex models to be seeded");
+  assert(seeded.models.some((m) => m.id === "gpt-6-astra"), "expected a paid-plan model id, got " + JSON.stringify(seeded.models));
+  assert(seeded.defaultModelId === seeded.models[0].id, "expected the first seeded model to become the default");
+
+  // A second call — even for a different plan — must never overwrite a
+  // model list that is no longer empty (manual edits stay manual).
+  const reseeded = await profile.seedChatgptModelsForPlan(TEST_PROFILE_ID, "free");
+  assert(JSON.stringify(reseeded.models) === JSON.stringify(seeded.models), "a nonempty model list must never be reseeded");
+});
+
+await check("seedChatgptModelsForPlan falls back to the free-plan seed list for an unrecognized plan", async () => {
+  useScratchConfigDir();
+  await profile.saveProfile({ profileId: TEST_PROFILE_ID, baseUrl: "https://api.anthropic.com", models: [], defaultModelId: null });
+  await profile.setProviderType(TEST_PROFILE_ID, "chatgpt");
+  const seeded = await profile.seedChatgptModelsForPlan(TEST_PROFILE_ID, "some-unrecognized-plan");
+  assert(!seeded.models.some((m) => m.id === "gpt-6-astra"), "an unrecognized plan must not get the paid-only model id");
+  assert(seeded.models.some((m) => m.id === "gpt-5.6-terra"), JSON.stringify(seeded.models));
+});
+
+await check("loadProfile defaults chatgptSessionState to signed_out when absent", async () => {
+  useScratchConfigDir();
+  await profile.saveProfile({ profileId: TEST_PROFILE_ID, baseUrl: "https://api.anthropic.com", models: [], defaultModelId: null });
+  const loaded = await profile.loadProfile();
+  assert(loaded.chatgptSessionState === "signed_out", `expected signed_out, got ${loaded.chatgptSessionState}`);
+});
+
+await check("recordChatgptSignIn sets the account, seeds models, bumps credentialRevision, and records the backend (host/agent/chatgpt/auth.js's contract)", async () => {
+  useScratchConfigDir();
+  await profile.saveProfile({ profileId: TEST_PROFILE_ID, baseUrl: "https://api.anthropic.com", models: [], defaultModelId: null });
+  await profile.setProviderType(TEST_PROFILE_ID, "chatgpt");
+  const before = await profile.loadProfile();
+  assert(before.credentialRevision === 0);
+
+  const after = await profile.recordChatgptSignIn(TEST_PROFILE_ID, { email: "signed-in@example.com", planType: "pro", backend: "fake-os" });
+  assert(after.chatgptAccount && after.chatgptAccount.email === "signed-in@example.com", JSON.stringify(after.chatgptAccount));
+  assert(after.chatgptAccount.planType === "pro", JSON.stringify(after.chatgptAccount));
+  assert(after.models.length > 0, "expected the plan's Codex models to be seeded on sign-in");
+  assert(after.credentialRevision === 1, `expected credentialRevision 1, got ${after.credentialRevision}`);
+  assert(after.hasCredential === true);
+  assert(after.memoryOnlyCredential === false, "a non-memory backend must not be reported as memoryOnlyCredential");
+  assert(after.secretBackend === "fake-os", after.secretBackend);
+  assert(after.chatgptSessionState === "signed_in", after.chatgptSessionState);
+});
+
+await check("recordChatgptSignIn marks memoryOnlyCredential true for the memory backend", async () => {
+  useScratchConfigDir();
+  await profile.saveProfile({ profileId: TEST_PROFILE_ID, baseUrl: "https://api.anthropic.com", models: [], defaultModelId: null });
+  await profile.setProviderType(TEST_PROFILE_ID, "chatgpt");
+  const after = await profile.recordChatgptSignIn(TEST_PROFILE_ID, { email: "mem@example.com", planType: "free", backend: "memory" });
+  assert(after.memoryOnlyCredential === true);
+  assert(after.secretBackend === "memory");
+});
+
+await check("recordChatgptSignOut clears the account, credential flags, fires onCredentialRevoked, and sets chatgptSessionState to signed_out", async () => {
+  useScratchConfigDir();
+  await profile.saveProfile({ profileId: TEST_PROFILE_ID, baseUrl: "https://api.anthropic.com", models: [], defaultModelId: null });
+  await profile.setProviderType(TEST_PROFILE_ID, "chatgpt");
+  await profile.recordChatgptSignIn(TEST_PROFILE_ID, { email: "bye@example.com", planType: "plus", backend: "memory" });
+
+  let revokedEvent = null;
+  const unsubscribe = profile.onCredentialRevoked((event) => {
+    revokedEvent = event;
+  });
+  try {
+    await profile.recordChatgptSignOut(TEST_PROFILE_ID);
+    assert(revokedEvent && revokedEvent.profileId === TEST_PROFILE_ID, `expected a revocation event, got ${JSON.stringify(revokedEvent)}`);
+
+    const after = await profile.loadProfile();
+    assert(after.chatgptAccount === null, JSON.stringify(after.chatgptAccount));
+    assert(after.hasCredential === false);
+    assert(after.memoryOnlyCredential === false);
+    assert(after.secretBackend === null);
+    assert(after.chatgptSessionState === "signed_out", after.chatgptSessionState);
+    assert(after.credentialRevision === 2, `expected credentialRevision 2 (1 sign-in + 1 sign-out), got ${after.credentialRevision}`);
+  } finally {
+    unsubscribe();
+  }
+});
+
+await check("recordChatgptSessionExpired keeps the account visible but revokes the credential and fires onCredentialRevoked", async () => {
+  useScratchConfigDir();
+  await profile.saveProfile({ profileId: TEST_PROFILE_ID, baseUrl: "https://api.anthropic.com", models: [], defaultModelId: null });
+  await profile.setProviderType(TEST_PROFILE_ID, "chatgpt");
+  await profile.recordChatgptSignIn(TEST_PROFILE_ID, { email: "expired@example.com", planType: "plus", backend: "memory" });
+
+  let revokedEvent = null;
+  const unsubscribe = profile.onCredentialRevoked((event) => {
+    revokedEvent = event;
+  });
+  try {
+    await profile.recordChatgptSessionExpired(TEST_PROFILE_ID);
+    assert(revokedEvent && revokedEvent.profileId === TEST_PROFILE_ID, `expected a revocation event, got ${JSON.stringify(revokedEvent)}`);
+
+    const after = await profile.loadProfile();
+    // Unlike sign-out, the account stays visible so the side panel can name
+    // who needs to sign in again.
+    assert(after.chatgptAccount && after.chatgptAccount.email === "expired@example.com", JSON.stringify(after.chatgptAccount));
+    assert(after.hasCredential === false);
+    assert(after.memoryOnlyCredential === false);
+    assert(after.secretBackend === null);
+    assert(after.chatgptSessionState === "session_expired", after.chatgptSessionState);
+  } finally {
+    unsubscribe();
+  }
+});
+
+await check("recordChatgptSessionExpired is idempotent: overlapping calls bump the revision and fire listeners exactly once", async () => {
+  useScratchConfigDir();
+  await profile.saveProfile({ profileId: TEST_PROFILE_ID, baseUrl: "https://api.anthropic.com", models: [], defaultModelId: null });
+  await profile.setProviderType(TEST_PROFILE_ID, "chatgpt");
+  const signedIn = await profile.recordChatgptSignIn(TEST_PROFILE_ID, { email: "burst@example.com", planType: "plus", backend: "memory" });
+  const revisionBefore = signedIn.credentialRevision;
+
+  let revocationEvents = 0;
+  const unsubscribe = profile.onCredentialRevoked((event) => {
+    if (event.profileId === TEST_PROFILE_ID) revocationEvents++;
+  });
+  try {
+    // Several in-flight requests can each be answered 401 after their own
+    // refresh retry and each ask for this same transition.
+    await Promise.all([
+      profile.recordChatgptSessionExpired(TEST_PROFILE_ID),
+      profile.recordChatgptSessionExpired(TEST_PROFILE_ID),
+      profile.recordChatgptSessionExpired(TEST_PROFILE_ID)
+    ]);
+    assert(revocationEvents === 1, `expected exactly one revocation event for the burst, got ${revocationEvents}`);
+    const after = await profile.loadProfile();
+    assert(after.chatgptSessionState === "session_expired", after.chatgptSessionState);
+    assert(
+      after.credentialRevision === revisionBefore + 1,
+      `expected exactly one revision bump from ${revisionBefore}, got ${after.credentialRevision}`
+    );
+  } finally {
+    unsubscribe();
+  }
+});
+
+await check("recordChatgptSessionExpired for an unknown profileId is a no-op", async () => {
+  useScratchConfigDir();
+  await profile.saveProfile({ profileId: TEST_PROFILE_ID, baseUrl: "https://api.anthropic.com", models: [], defaultModelId: null });
+  await profile.setProviderType(TEST_PROFILE_ID, "chatgpt");
+  await profile.recordChatgptSignIn(TEST_PROFILE_ID, { email: "noop@example.com", planType: "plus", backend: "memory" });
+
+  const before = await profile.loadProfile();
+  await profile.recordChatgptSessionExpired("ocic-test-not-this-profile");
+  const after = await profile.loadProfile();
+  assert(after.chatgptSessionState === "signed_in", `an unrelated profileId must not expire this profile, got ${after.chatgptSessionState}`);
+  assert(after.credentialRevision === before.credentialRevision, "and must not bump its revision");
+});
+
+await check("snapshotForRun fails with NO_CREDENTIAL and a sign-in message for a chatgpt profile (gateway lands in a later batch)", async () => {
+  useScratchConfigDir();
+  await profile.saveProfile({ profileId: TEST_PROFILE_ID, baseUrl: "https://api.anthropic.com", models: [{ id: "gpt-5.5", label: "gpt-5.5" }], defaultModelId: "gpt-5.5" });
+  await profile.setProviderType(TEST_PROFILE_ID, "chatgpt");
+  let code = null;
+  let message = "";
+  try {
+    await profile.snapshotForRun(TEST_PROFILE_ID, "gpt-5.5");
+  } catch (err) {
+    code = err.code;
+    message = err.message;
+  }
+  assert(code === "NO_CREDENTIAL", `expected NO_CREDENTIAL, got ${code}`);
+  assert(/sign.?in/i.test(message), `expected a sign-in message, got: ${message}`);
+});
+
+await check("testCapability fails with NO_CREDENTIAL and a sign-in message for a chatgpt profile (gateway lands in a later batch)", async () => {
+  useScratchConfigDir();
+  await profile.saveProfile({ profileId: TEST_PROFILE_ID, baseUrl: "https://api.anthropic.com", models: [{ id: "gpt-5.5", label: "gpt-5.5" }], defaultModelId: "gpt-5.5" });
+  await profile.setProviderType(TEST_PROFILE_ID, "chatgpt");
+  let code = null;
+  let message = "";
+  try {
+    await profile.testCapability(TEST_PROFILE_ID, "gpt-5.5");
+  } catch (err) {
+    code = err.code;
+    message = err.message;
+  }
+  assert(code === "NO_CREDENTIAL", `expected NO_CREDENTIAL, got ${code}`);
+  assert(/sign.?in/i.test(message), `expected a sign-in message, got: ${message}`);
+});
+
+await check("snapshotForRun and testCapability refuse an unrecognized providerType with INVALID_PROFILE, never a crash", async () => {
+  useScratchConfigDir();
+  await profile.saveProfile({ profileId: TEST_PROFILE_ID, baseUrl: "https://api.anthropic.com", models: [{ id: "claude-a", label: "A" }], defaultModelId: "claude-a" });
+  const stored = readProfileFromDisk();
+  writeProfileToDisk({ ...stored, providerType: "some-future-provider" });
+
+  let snapshotCode = null;
+  try {
+    await profile.snapshotForRun(TEST_PROFILE_ID, "claude-a");
+  } catch (err) {
+    snapshotCode = err.code;
+  }
+  assert(snapshotCode === "INVALID_PROFILE", `expected INVALID_PROFILE, got ${snapshotCode}`);
+
+  let testCode = null;
+  try {
+    await profile.testCapability(TEST_PROFILE_ID, "claude-a");
+  } catch (err) {
+    testCode = err.code;
+  }
+  assert(testCode === "INVALID_PROFILE", `expected INVALID_PROFILE, got ${testCode}`);
+
+  assert(!(await profile.isRunnable(TEST_PROFILE_ID, "claude-a")), "an unrecognized provider type must never be runnable");
+});
+
+await check("refreshDiscoveredModels reports unsupported for a chatgpt profile without requiring a credential", async () => {
+  useScratchConfigDir();
+  await profile.saveProfile({ profileId: TEST_PROFILE_ID, baseUrl: "https://api.anthropic.com", models: [], defaultModelId: null });
+  await profile.setProviderType(TEST_PROFILE_ID, "chatgpt");
+  // No credential of any kind was ever stored for this profile — discovery
+  // must still answer "unsupported" rather than throwing NO_CREDENTIAL.
+  const result = await profile.refreshDiscoveredModels(TEST_PROFILE_ID);
+  assert(result.supported === false, JSON.stringify(result));
+  assert(typeof result.reason === "string" && result.reason.length > 0, JSON.stringify(result));
+});
+
+await check("isRunnable for a chatgpt profile keys its capability-test lookup on the chatgpt:codex marker, not the baseUrl", async () => {
+  useScratchConfigDir();
+  await profile.saveProfile({ profileId: TEST_PROFILE_ID, baseUrl: "https://api.anthropic.com", models: [{ id: "gpt-5.5", label: "gpt-5.5" }], defaultModelId: "gpt-5.5" });
+  await profile.setProviderType(TEST_PROFILE_ID, "chatgpt");
+
+  // Not runnable before any recorded result.
+  assert(!(await profile.isRunnable(TEST_PROFILE_ID, "gpt-5.5")), "must not be runnable before any capability test");
+
+  // Simulate a recorded PASS the way a chatgpt-aware testCapability() will
+  // (a later batch) — keyed by the fixed marker, not profile.baseUrl.
+  const stored = readProfileFromDisk();
+  const key = capabilityTestKey({ baseUrl: "chatgpt:codex", modelId: "gpt-5.5", credentialRevision: stored.credentialRevision || 0 });
+  writeProfileToDisk({ ...stored, lastCapabilityTest: { [key]: { status: "pass" } } });
+  assert(await profile.isRunnable(TEST_PROFILE_ID, "gpt-5.5"), "expected runnable once a pass is recorded under the chatgpt:codex marker key");
+
+  // A result recorded under the real baseUrl (the anthropic key shape) must
+  // never make a chatgpt profile look runnable.
+  const wrongKey = capabilityTestKey({ baseUrl: stored.baseUrl, modelId: "gpt-5.5", credentialRevision: stored.credentialRevision || 0 });
+  writeProfileToDisk({ ...stored, lastCapabilityTest: { [wrongKey]: { status: "pass" } } });
+  assert(!(await profile.isRunnable(TEST_PROFILE_ID, "gpt-5.5")), "a result keyed by the real baseUrl must not count for a chatgpt profile");
+});
+
 const failed = results.filter((r) => !r.ok);
 console.log(`\n${results.length - failed.length}/${results.length} passed\n`);
 if (failed.length > 0) process.exitCode = 1;

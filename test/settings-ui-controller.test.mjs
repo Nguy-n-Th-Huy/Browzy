@@ -342,5 +342,304 @@ console.log("== export/import: export contains no secret; import never touches t
   ok(!("secret" in (companion.calls.find((x) => x.op === "save_profile") || {})), "import path itself never calls save_profile with a secret field");
 }
 
+// Deterministic interval driver for the ChatGPT sign-in poll (see
+// SettingsController's injectable setIntervalFn/clearIntervalFn): ticks are
+// fired explicitly instead of waiting a real second.
+function fakePollTimers() {
+  const timers = new Map();
+  let nextId = 1;
+  return {
+    setIntervalFn: (fn, ms) => { const id = nextId++; timers.set(id, { fn, ms }); return id; },
+    clearIntervalFn: (id) => { timers.delete(id); },
+    tick: async () => { for (const { fn } of [...timers.values()]) await fn(); },
+    active: () => timers.size
+  };
+}
+
+function chatgptProfile(overrides = {}) {
+  return {
+    profileId: "default",
+    baseUrl: "https://api.anthropic.com",
+    models: [{ id: "gpt-5.5", label: "gpt-5.5" }],
+    defaultModelId: "gpt-5.5",
+    hasCredential: false,
+    memoryOnlyCredential: false,
+    secretBackend: null,
+    revision: 2,
+    credentialRevision: 0,
+    providerType: "chatgpt",
+    chatgptAccount: { email: "user@example.com", planType: "plus" },
+    chatgptSessionState: "signed_out",
+    ...overrides
+  };
+}
+
+console.log("== provider type: switching to chatgpt calls set_provider_type and keeps the model list ==");
+{
+  const companion = createScriptedCompanion({
+    profileId: "default", baseUrl: "https://api.anthropic.com", models: [{ id: "gpt-5.5", label: "gpt-5.5" }],
+    defaultModelId: "gpt-5.5", hasCredential: false, memoryOnlyCredential: false, secretBackend: null, revision: 1,
+    providerType: "anthropic", chatgptAccount: null, chatgptSessionState: "signed_out"
+  });
+  const c = new SettingsController(companion.client);
+  await c.init();
+  ok(c.getState().providerType === "anthropic", "a profile with no explicit providerType loads as anthropic (upgrade migration)");
+
+  const res = await c.setProviderType("chatgpt");
+  ok(res.ok === true, "switching to the ChatGPT provider type succeeds");
+  ok(companion.calls.some((x) => x.op === "set_provider_type" && x.providerType === "chatgpt" && x.profileId === "default"),
+    "set_provider_type reaches the companion with the selected type");
+  const s = c.getState();
+  ok(s.providerType === "chatgpt", "the profile returned by the companion is applied");
+  ok(s.models.length === 1 && s.defaultModelId === "gpt-5.5", "the manual model list is untouched by a provider switch");
+  ok(s.connectionStatus === null, "the previous connection result is not carried across provider types");
+
+  const before = companion.calls.length;
+  const bad = await c.setProviderType("openai-compatible");
+  ok(bad.ok === false && companion.calls.length === before, "an unknown provider type is rejected locally, never sent to the companion");
+  ok(c.getState().providerType === "chatgpt", "a rejected switch leaves the current provider type intact");
+}
+
+console.log("== ChatGPT browser sign-in: pending state, poll, and signed_in applies the account ==");
+{
+  const companion = createScriptedCompanion(chatgptProfile());
+  const timers = fakePollTimers();
+  let statusCalls = 0;
+  companion.scripts.chatgptSignInStatus = () => {
+    statusCalls++;
+    return { state: "signed_in", account: { email: "user@example.com", planType: "plus" } };
+  };
+  const c = new SettingsController(companion.client, { setIntervalFn: timers.setIntervalFn, clearIntervalFn: timers.clearIntervalFn });
+  await c.init();
+
+  const res = await c.startBrowserSignIn();
+  ok(res.ok === true && /auth\.openai\.com/.test(res.authUrl), "startBrowserSignIn returns the authorize URL for the DOM layer to open in a tab");
+  ok(companion.calls.some((x) => x.op === "chatgpt_sign_in_start" && x.profileId === "default"), "chatgpt_sign_in_start reaches the companion");
+  let s = c.getState();
+  ok(s.signIn.phase === "pending_browser" && s.signIn.signInId === "signin-browser-1", "a pending browser sign-in is surfaced with its signInId");
+  ok(timers.active() === 1, "polling starts for the pending sign-in");
+  ok(statusCalls === 0, "no status request is sent before the first interval tick");
+
+  // Simulate the host-side completion the poll observes.
+  Object.assign(companion.getInternalProfile(), {
+    chatgptSessionState: "signed_in", hasCredential: true, chatgptAccount: { email: "user@example.com", planType: "plus" }
+  });
+  await timers.tick();
+  s = c.getState();
+  ok(companion.calls.some((x) => x.op === "chatgpt_sign_in_status" && x.signInId === "signin-browser-1" && !("profileId" in x)),
+    "the poll asks about the signInId ONLY, never a profile or credential");
+  ok(s.signIn.phase === "idle" && s.signIn.signInId === null, "the pending state clears once signed in");
+  ok(s.chatgptAccount && s.chatgptAccount.email === "user@example.com" && s.chatgptSessionState === "signed_in",
+    "the signed-in account is mirrored from the re-fetched profile");
+  ok(timers.active() === 0, "polling stops at the terminal state");
+  ok(statusCalls === 1, "exactly one status poll was needed");
+}
+
+console.log("== ChatGPT device sign-in: code/link/expiry surfaced, cancel clears the pending state ==");
+{
+  const companion = createScriptedCompanion(chatgptProfile());
+  const timers = fakePollTimers();
+  companion.scripts.chatgptSignInStatus = () => ({ state: "pending" });
+  const c = new SettingsController(companion.client, { setIntervalFn: timers.setIntervalFn, clearIntervalFn: timers.clearIntervalFn });
+  await c.init();
+
+  const res = await c.startDeviceSignIn();
+  ok(res.ok === true && res.userCode === "ABCD-EFGH", "startDeviceSignIn returns the user code");
+  ok(res.verificationUrl === "https://auth.openai.com/codex/device", "the verification URL is the spec's device URL");
+  ok(typeof res.expiresAt === "number" && res.expiresAt > Date.now(), "an expiry timestamp is surfaced for the countdown");
+  let s = c.getState();
+  ok(s.signIn.phase === "pending_device" && s.signIn.userCode === "ABCD-EFGH" && s.signIn.expiresAt === res.expiresAt,
+    "the device code and expiry are in state for the DOM layer");
+
+  await timers.tick();
+  ok(c.getState().signIn.phase === "pending_device", "a pending reply keeps the device sign-in pending");
+
+  const cancelled = await c.cancelSignIn();
+  ok(cancelled.ok === true, "cancel resolves");
+  ok(companion.calls.some((x) => x.op === "chatgpt_sign_in_cancel" && x.signInId === "signin-device-1"),
+    "cancel is sent to the companion for that signInId");
+  s = c.getState();
+  ok(s.signIn.phase === "idle" && s.signIn.userCode === null, "the pending device state is cleared");
+  ok(s.banner && s.banner.code === "SIGN_IN_CANCELLED", "a cancel confirmation banner is shown");
+  ok(timers.active() === 0, "polling stopped on cancel");
+}
+
+console.log("== ChatGPT sign-in failures: terminal failure stops polling; a transient poll error does not ==");
+{
+  const companion = createScriptedCompanion(chatgptProfile());
+  const timers = fakePollTimers();
+  companion.scripts.chatgptSignInStatus = () => ({ state: "failed", code: "SIGN_IN_TIMEOUT", message: "the sign-in timed out" });
+  const c = new SettingsController(companion.client, { setIntervalFn: timers.setIntervalFn, clearIntervalFn: timers.clearIntervalFn });
+  await c.init();
+  await c.startBrowserSignIn();
+  await timers.tick();
+  const s = c.getState();
+  ok(s.signIn.phase === "idle" && s.signIn.error && s.signIn.error.code === "SIGN_IN_TIMEOUT", "the terminal failure is recorded on the sign-in state");
+  ok(s.banner && s.banner.code === "SIGN_IN_TIMEOUT", "the failure is rendered as a banner");
+  ok(timers.active() === 0, "polling stops on a terminal failure");
+}
+{
+  // A transient poll error (host busy / relay hiccup) must not abandon a
+  // sign-in the user may still be completing in the opened tab.
+  const companion = createScriptedCompanion(chatgptProfile());
+  const timers = fakePollTimers();
+  let calls = 0;
+  companion.scripts.chatgptSignInStatus = () => {
+    calls++;
+    if (calls === 1) throw new Error("relay hiccup");
+    return { state: "pending" };
+  };
+  const c = new SettingsController(companion.client, { setIntervalFn: timers.setIntervalFn, clearIntervalFn: timers.clearIntervalFn });
+  await c.init();
+  await c.startBrowserSignIn();
+  await timers.tick();
+  ok(c.getState().signIn.phase === "pending_browser", "a transient poll error leaves the sign-in pending");
+  ok(timers.active() === 1, "polling continues after a transient error");
+}
+{
+  const { ProviderErrorLike } = await import("../extension/settings/settings-client.js");
+  const companion = createScriptedCompanion(chatgptProfile());
+  companion.scripts.chatgptSignInStart = () => { throw new ProviderErrorLike("CALLBACK_PORT_IN_USE", "port 1455 is in use"); };
+  const c = new SettingsController(companion.client);
+  await c.init();
+  const res = await c.startBrowserSignIn();
+  ok(res.ok === false && res.code === "CALLBACK_PORT_IN_USE", "a start failure surfaces the companion's own code (the device-code fallback trigger)");
+  ok(c.getState().signIn.phase === "idle", "no pending state is left behind after a failed start");
+  ok(c.getState().banner && c.getState().banner.code === "CALLBACK_PORT_IN_USE", "the failure is shown as a banner");
+}
+
+console.log("== ChatGPT sign-in: SECURE_STORAGE_UNAVAILABLE offers a labeled memory-only retry that re-runs the same flow ==");
+{
+  const companion = createScriptedCompanion(chatgptProfile());
+  const timers = fakePollTimers();
+  companion.scripts.chatgptSignInStatus = () => ({ state: "failed", code: "SECURE_STORAGE_UNAVAILABLE", message: "no OS credential store is available" });
+  const c = new SettingsController(companion.client, { setIntervalFn: timers.setIntervalFn, clearIntervalFn: timers.clearIntervalFn });
+  await c.init();
+
+  const first = await c.startBrowserSignIn();
+  ok(first.ok === true, "the first browser sign-in starts normally");
+  ok(!companion.calls.some((x) => x.op === "chatgpt_sign_in_start" && "memoryOnly" in x),
+    "an ordinary sign-in never asks the companion for memory-only");
+
+  await timers.tick(); // the poll observes the persistence failure
+  let s = c.getState();
+  ok(s.signIn.error && s.signIn.error.code === "SECURE_STORAGE_UNAVAILABLE", "the explicit persistence failure is recorded on the sign-in state");
+  ok(s.pendingMemoryOnlyOffer === true && s.memoryOnlyOfferKind === "sign_in",
+    "a memory-only offer for the ChatGPT sign-in is surfaced, labeled as the sign-in kind");
+  const banner = s.banner;
+  ok(banner && banner.code === "SECURE_STORAGE_UNAVAILABLE", "the failure is shown as a banner");
+  ok(!/API key/i.test(JSON.stringify(banner)), `the banner must not promise an API-key option on a chatgpt profile: ${JSON.stringify(banner)}`);
+  ok(/bộ nhớ/.test(banner.action || ""), "the banner's action text offers the memory-only mode");
+  ok(timers.active() === 0, "polling stops on the terminal failure");
+
+  // The user confirms: the SAME flow is re-run, this time asking the
+  // companion to hold the refresh credential in memory only.
+  const retry = await c.confirmMemoryOnlySignIn();
+  ok(retry.ok === true && /auth\.openai\.com/.test(retry.authUrl),
+    "confirming re-runs the browser flow and returns a NEW authorize URL for the DOM layer to open");
+  let startCalls = companion.calls.filter((x) => x.op === "chatgpt_sign_in_start");
+  ok(startCalls.length === 2 && startCalls[1].memoryOnly === true,
+    `the retry asks the companion for memoryOnly:true — got ${JSON.stringify(startCalls)}`);
+  s = c.getState();
+  ok(s.pendingMemoryOnlyOffer === false && s.memoryOnlyOfferKind === null, "the offer is cleared once confirmed");
+  ok(s.signIn.phase === "pending_browser", "the retried sign-in is pending again");
+  ok(timers.active() === 1, "polling resumes for the retried sign-in");
+
+  // Complete it host-side with the memory backend, and let the poll observe it.
+  companion.scripts.chatgptSignInStatus = () => ({ state: "signed_in", account: { email: "user@example.com", planType: "plus" } });
+  Object.assign(companion.getInternalProfile(), {
+    chatgptSessionState: "signed_in", hasCredential: true, memoryOnlyCredential: true, secretBackend: "memory"
+  });
+  await timers.tick();
+  s = c.getState();
+  ok(s.chatgptSessionState === "signed_in" && s.memoryOnlyCredential === true,
+    "the memory-only sign-in is mirrored as signed in with the memory backend");
+}
+
+console.log("== ChatGPT device sign-in: the memory-only offer retries the DEVICE flow, never the browser one ==");
+{
+  const companion = createScriptedCompanion(chatgptProfile());
+  const timers = fakePollTimers();
+  companion.scripts.chatgptSignInStatus = () => ({ state: "failed", code: "SECURE_STORAGE_UNAVAILABLE", message: "no OS credential store is available" });
+  const c = new SettingsController(companion.client, { setIntervalFn: timers.setIntervalFn, clearIntervalFn: timers.clearIntervalFn });
+  await c.init();
+
+  await c.startDeviceSignIn();
+  await timers.tick();
+  ok(c.getState().pendingMemoryOnlyOffer === true, "the memory-only offer follows a device-code sign-in failure too");
+
+  const retry = await c.confirmMemoryOnlySignIn();
+  ok(retry.ok === true && retry.userCode === "ABCD-EFGH", "confirming re-runs the DEVICE flow and surfaces a fresh code");
+  const deviceCalls = companion.calls.filter((x) => x.op === "chatgpt_device_start");
+  ok(deviceCalls.length === 2 && deviceCalls[1].memoryOnly === true, `the device retry asks for memoryOnly:true — got ${JSON.stringify(deviceCalls)}`);
+  ok(!companion.calls.some((x) => x.op === "chatgpt_sign_in_start"), "and never falls back to the browser flow");
+}
+
+console.log("== ChatGPT sign-in: cancelling the memory-only offer discards the retry ==");
+{
+  const companion = createScriptedCompanion(chatgptProfile());
+  const timers = fakePollTimers();
+  companion.scripts.chatgptSignInStatus = () => ({ state: "failed", code: "SECURE_STORAGE_UNAVAILABLE", message: "no OS credential store is available" });
+  const c = new SettingsController(companion.client, { setIntervalFn: timers.setIntervalFn, clearIntervalFn: timers.clearIntervalFn });
+  await c.init();
+  await c.startBrowserSignIn();
+  await timers.tick();
+
+  c.cancelMemoryOnlyOffer();
+  ok(c.getState().pendingMemoryOnlyOffer === false && c.getState().memoryOnlyOfferKind === null, "cancel clears the offer");
+  const declined = await c.confirmMemoryOnlySignIn();
+  ok(declined.ok === false, "a cancelled offer can no longer be confirmed");
+  ok(companion.calls.filter((x) => x.op === "chatgpt_sign_in_start").length === 1, "no retry sign-in was ever started");
+}
+
+console.log("== ChatGPT profile not signed in: no capability/discovery request is sent, the banner asks for sign-in ==");
+{
+  const companion = createScriptedCompanion(chatgptProfile());
+  const c = new SettingsController(companion.client);
+  await c.init();
+  const res = await c.testConnection();
+  ok(res.ok === false, "the connection test fails without a signed-in session");
+  ok(!companion.calls.some((x) => x.op === "test_capability"), "no capability request is sent for a not-signed-in chatgpt profile");
+  const banner = c.getState().banner;
+  ok(/ChatGPT/.test(banner.title || "") && !/API key|khóa API|api key/i.test(JSON.stringify(banner)),
+    "the banner asks the user to sign in with ChatGPT, never to enter an API key");
+
+  const discover = await c.discoverModels();
+  ok(discover.ok === false && !companion.calls.some((x) => x.op === "discover_models"), "model discovery is likewise blocked before sign-in");
+}
+{
+  const companion = createScriptedCompanion(chatgptProfile({ chatgptSessionState: "session_expired", hasCredential: false }));
+  const c = new SettingsController(companion.client);
+  await c.init();
+  ok(c.getState().banner && c.getState().banner.code === "SESSION_EXPIRED", "a cold load of a session-expired profile shows the SESSION_EXPIRED banner");
+  const res = await c.testConnection();
+  ok(res.ok === false && !companion.calls.some((x) => x.op === "test_capability"), "an expired session sends no capability request");
+}
+{
+  const companion = createScriptedCompanion(chatgptProfile({ chatgptSessionState: "signed_in", hasCredential: true }));
+  const c = new SettingsController(companion.client);
+  await c.init();
+  const res = await c.testConnection();
+  ok(res.ok === true, "a signed-in chatgpt profile proceeds to the capability test");
+  ok(companion.calls.some((x) => x.op === "test_capability" && x.modelId === "gpt-5.5"), "the capability test is requested for the profile's own model");
+  ok(c.getState().connectionStatus && c.getState().connectionStatus.textOnly === false, "a fully-passing chatgpt test is not reported as text-only");
+}
+
+console.log("== ChatGPT sign-out clears the mirrored account and credential state ==");
+{
+  const companion = createScriptedCompanion(chatgptProfile({
+    chatgptSessionState: "signed_in", hasCredential: true, memoryOnlyCredential: true, secretBackend: "memory", credentialRevision: 1
+  }));
+  const c = new SettingsController(companion.client);
+  await c.init();
+  const res = await c.signOut();
+  ok(res.ok === true, "sign-out succeeds");
+  ok(companion.calls.some((x) => x.op === "chatgpt_sign_out" && x.profileId === "default"), "chatgpt_sign_out reaches the companion");
+  const s = c.getState();
+  ok(s.chatgptAccount === null && s.chatgptSessionState === "signed_out" && s.hasCredential === false,
+    "the account and credential-presence fields are cleared from the page");
+  ok(s.models.length === 1, "the manual model list survives sign-out");
+}
+
 console.log(fail === 0 ? "\nALL SETTINGS-UI CONTROLLER TESTS PASSED" : `\n${fail} FAILED`);
 process.exit(fail ? 1 : 0);

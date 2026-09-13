@@ -641,6 +641,77 @@ function createAgentSettingsRelay(opts) {
   const pending = new Map(); // requestId -> { resolve, timer }
   const newId = genId || (() => crypto.randomUUID());
 
+  // The exact set of op names this relay will forward to the companion.
+  // Fail-closed gate: an op string that is not in this set never reaches the
+  // native channel — it is answered locally with the same PROTOCOL_ERROR shape
+  // the companion's own unknown_message_type case produces (see handleReply
+  // below and settings-client.js's wire contract). Without this, `handleRequest`
+  // would forward an arbitrary `op` from any extension page that can
+  // sendMessage({type:"agent_settings"}) straight through to the host, so the
+  // settings surface would be an open proxy for whatever op name a caller
+  // invents. Kept in lock-step with EVERY extension page that sends
+  // agent_settings ops — settings-client.js, the two permissions-client.js
+  // twins (sidepanel + settings), and the two skills-client.js twins (plus
+  // sidepanel/skills-client.js's get_advertised_commands) — so a new op
+  // family MUST be added both here and to the relay test's own per-family
+  // allowlist coverage. This gate is the one place where a missing entry
+  // fails silently to the user (see the permission-mode ops' comment below
+  // for the live regression that produced). Built once per relay
+  // construction (a single relay instance lives for the service worker's
+  // lifetime), not per request.
+  const ops = new Set([
+    // profile read/write + credential + capability/discovery/export
+    "get_profile",
+    "save_profile",
+    "set_credential",
+    "remove_credential",
+    "test_capability",
+    "discover_models",
+    "export_profile",
+    // named-profile collection (settings-client.js's list/create/update/...)
+    "list_profiles",
+    "get_selected",
+    "create_profile",
+    "update_profile",
+    "delete_profile",
+    "select_profile",
+    // ChatGPT subscription provider (add-chatgpt-subscription-provider, task 5.2)
+    "set_provider_type",
+    "chatgpt_sign_in_start",
+    "chatgpt_device_start",
+    "chatgpt_sign_in_status",
+    "chatgpt_sign_in_cancel",
+    "chatgpt_sign_out",
+    // Permission modes + remembered-site management
+    // (add-permission-modes-and-threat-signals, task 7.1): the sidepanel's
+    // mode badge and the settings > permissions page ride these ops over
+    // this same relay (the settings page alone also sends the two revoke
+    // ops for its remembered-sites management). They were added to the
+    // product AFTER this allowlist was written; omitted here, every call
+    // resolved LOCALLY with the unknown-op PROTOCOL_ERROR below — which is
+    // how the sidepanel's mode menu shipped empty (its one load attempt
+    // fails silently and is never retried), so clicking the "Auto" trigger
+    // opened a blank popover and the badge kept its static label forever.
+    "get_permission_state",
+    "set_permission_mode",
+    "revoke_site_entry",
+    "revoke_all_site_entries",
+    // Skills catalog + the sidepanel's advertised slash commands, sent by
+    // BOTH skills-client.js twins (redesign-settings-typed-only-skills and
+    // its sidepanel counterpart). Same class of omission as the permission
+    // ops above — blocked here, every skills read/author/enable op answers
+    // with the local PROTOCOL_ERROR and the Skills surfaces never list
+    // anything.
+    "skills_list",
+    "skills_read_source",
+    "skills_author",
+    "skills_enable",
+    "skills_disable",
+    "skills_remove",
+    "skills_set_invocation_flags",
+    "get_advertised_commands"
+  ]);
+
   function settle(requestId, response) {
     const entry = pending.get(requestId);
     if (!entry) return false;
@@ -652,6 +723,11 @@ function createAgentSettingsRelay(opts) {
 
   function handleRequest(msg) {
     return new Promise((resolve) => {
+      const op = msg && msg.op;
+      if (typeof op !== "string" || !ops.has(op)) {
+        resolve({ ok: false, error: { code: "PROTOCOL_ERROR", message: `unknown agent_settings op: ${op}` } });
+        return;
+      }
       if (!isConnected()) {
         resolve({ ok: false, error: { code: "NETWORK_ERROR", message: "native host not connected" } });
         return;
@@ -762,7 +838,17 @@ function toProfileCacheMirror(profile) {
     // renders directly in its own capability-detail pills. No secret is ever
     // part of this record.
     lastCapabilityTest:
-      profile.lastCapabilityTest && typeof profile.lastCapabilityTest === "object" ? { ...profile.lastCapabilityTest } : {}
+      profile.lastCapabilityTest && typeof profile.lastCapabilityTest === "object" ? { ...profile.lastCapabilityTest } : {},
+    // ChatGPT subscription provider (add-chatgpt-subscription-provider) —
+    // same three non-secret fields host/agent/settings/profile.js's
+    // loadProfile() adds; extension/sidepanel/profile-cache.js's
+    // deriveReadinessState() reads these to show "sign in to ChatGPT" /
+    // "session expired" instead of the API-key states. Never the OAuth
+    // token itself — that never leaves the companion (host/agent/chatgpt/
+    // auth.js stores it directly in the OS secret store).
+    providerType: profile.providerType || "anthropic",
+    chatgptAccount: profile.chatgptAccount || null,
+    chatgptSessionState: profile.chatgptSessionState || "signed_out"
   };
 }
 
@@ -789,6 +875,18 @@ async function refreshProfileCacheMirror(profileId = AGENT_SETTINGS_DEFAULT_PROF
   if (reply && reply.ok) await writeProfileCacheMirror(reply.result);
 }
 
+// ChatGPT sign-in tracking (add-chatgpt-subscription-provider): a
+// `chatgpt_sign_in_status`/`chatgpt_sign_in_cancel` request carries only
+// `signInId`, never `profileId` (see settings-client.js's wire-contract
+// header) — but a mirror refresh needs to know WHICH profile to re-fetch
+// once a sign-in resolves. Recorded here the moment `chatgpt_sign_in_start`/
+// `chatgpt_device_start` succeeds (the one point where both `profileId`
+// — the request — and `signInId` — the reply — are both in hand), and
+// always removed once that sign-in reaches a terminal outcome (signed_in,
+// failed, or cancelled) so this map never grows unbounded across a long
+// companion session.
+const chatgptSignInProfileById = new Map();
+
 /**
  * Called after every `agent_settings` request this relay answers (see the
  * chrome.runtime.onMessage listener below), AFTER the caller (the settings
@@ -806,19 +904,50 @@ async function refreshProfileCacheMirror(profileId = AGENT_SETTINGS_DEFAULT_PROF
  * new `hasCredential`/`credentialRevision`/`lastCapabilityTest` state, so
  * those four re-fetch the authoritative profile instead of hand-patching a
  * guess from the narrow reply.
- * @param {{ op?: string, profileId?: string }} request
+ *
+ * ChatGPT ops (add-chatgpt-subscription-provider) follow the same two
+ * patterns: `set_provider_type`/`chatgpt_sign_out` reply with the full
+ * updated profile (mirrored directly, exactly like `save_profile`);
+ * `chatgpt_sign_in_status` reaching a terminal `signed_in` state re-fetches
+ * the profile it was tracking (the sign-in changed `chatgptAccount`,
+ * `hasCredential`, seeded models, and `chatgptSessionState` host-side, none
+ * of which are in the status reply itself). `chatgpt_sign_in_start`/
+ * `chatgpt_device_start` never touch the mirror on their own — nothing about
+ * the profile changes until the sign-in actually completes.
+ * @param {{ op?: string, profileId?: string, signInId?: string }} request
  * @param {{ ok: boolean, result?: any }} response
  */
 async function syncProfileCacheAfterAgentSettings(request, response) {
   if (!response || !response.ok) return; // the op failed: host state did not change
   const op = request && request.op;
   const profileId = (request && request.profileId) || AGENT_SETTINGS_DEFAULT_PROFILE_ID;
-  if (op === "get_profile" || op === "save_profile") {
+
+  if (op === "get_profile" || op === "save_profile" || op === "set_provider_type" || op === "chatgpt_sign_out") {
     await writeProfileCacheMirror(response.result);
     return;
   }
   if (op === "set_credential" || op === "remove_credential" || op === "test_capability" || op === "discover_models") {
     await refreshProfileCacheMirror(profileId);
+    return;
+  }
+  if (op === "chatgpt_sign_in_start" || op === "chatgpt_device_start") {
+    if (response.result && response.result.signInId) {
+      chatgptSignInProfileById.set(response.result.signInId, profileId);
+    }
+    return;
+  }
+  if (op === "chatgpt_sign_in_status") {
+    const signInId = request && request.signInId;
+    const state = response.result && response.result.state;
+    if (state === "pending" || !signInId) return; // still in flight — nothing to sync yet
+    const trackedProfileId = chatgptSignInProfileById.get(signInId) || AGENT_SETTINGS_DEFAULT_PROFILE_ID;
+    chatgptSignInProfileById.delete(signInId); // terminal (signed_in or failed) — stop tracking either way
+    if (state === "signed_in") await refreshProfileCacheMirror(trackedProfileId);
+    return;
+  }
+  if (op === "chatgpt_sign_in_cancel") {
+    const signInId = request && request.signInId;
+    if (signInId) chatgptSignInProfileById.delete(signInId); // cancelled — nothing to sync, just stop tracking
   }
 }
 
