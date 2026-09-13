@@ -64,6 +64,38 @@ console.log("\n== system -> developer message ==");
   ok(body.input.length === 0, "an empty system produces no developer message at all");
 }
 
+console.log("\n== system-role MESSAGES are remapped to developer (the Codex backend rejects role: \"system\") ==");
+{
+  const { body } = translateAnthropicRequestToCodex(
+    {
+      messages: [
+        { role: "user", content: "hello" },
+        { role: "system", content: "remember: be terse" },
+        { role: "assistant", content: "ok" }
+      ]
+    },
+    { model: "m" }
+  );
+  ok(
+    body.input.every((item) => item.role !== "system"),
+    "no input message keeps role \"system\""
+  );
+  const remapped = body.input.find((item) => item.content && item.content.some((c) => c.text === "remember: be terse"));
+  ok(remapped && remapped.role === "developer", "a system-role message becomes a developer message in place");
+  ok(
+    body.input[0].role === "user" && body.input[body.input.length - 1].role === "assistant",
+    "user/assistant roles are untouched and ordering is preserved"
+  );
+  const { body: body2 } = translateAnthropicRequestToCodex(
+    { messages: [{ role: "system", content: [{ type: "text", text: "blocks-form reminder" }] }] },
+    { model: "m" }
+  );
+  ok(
+    body2.input[0].role === "developer" && body2.input[0].content[0].text === "blocks-form reminder",
+    "the block-content form of a system message also becomes developer text"
+  );
+}
+
 console.log("\n== user/assistant text ==");
 {
   const { body } = translateAnthropicRequestToCodex(

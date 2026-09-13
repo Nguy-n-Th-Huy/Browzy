@@ -193,7 +193,12 @@ function translateMessages(messages, toolNameMap) {
   const items = [];
 
   for (const message of Array.isArray(messages) ? messages : []) {
-    const role = message.role;
+    // The Codex backend rejects `role: "system"` input messages outright
+    // ("System messages are not allowed") — and the CLI's own request stream
+    // does carry them (injected reminders). `developer` is this backend's
+    // system-ish role, so a system-role message keeps its position and
+    // semantics as a developer message instead of being sent verbatim.
+    const role = message.role === "system" ? "developer" : message.role;
     const content = message.content;
 
     if (typeof content === "string") {
