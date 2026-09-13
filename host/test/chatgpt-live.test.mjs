@@ -26,10 +26,18 @@
 //   3. the tool result carrying a text + base64-image array is accepted on
 //      the next turn and the turn completes;
 //   4. the run token is revoked when the run ends (a subsequent request with
-//      it gets 401 authentication_error).
+//      it gets 401 authentication_error);
+//   5. one real `chatgpt_usage` read through the companion's own
+//      agent_settings op path (the route the settings page uses), asserted
+//      display-shaped — a plan type, at least one window with a numeric used
+//      percent, exactly the six documented keys — and asserted to carry no
+//      token, account id, user id, or email. Shape-only: the reply itself is
+//      never printed.
 //
 // Requests here are small but real and count against the account's ChatGPT
-// usage limit, exactly like the settings connection test.
+// usage limit, exactly like the settings connection test — except the usage
+// read above, which only reads the account's limits and consumes no model
+// quota.
 //
 // runStreamedToolRoundTrip() is exported so this file's own request/assertion
 // logic can be smoke-tested offline against the real gateway pointed at a
@@ -247,6 +255,82 @@ async function runLiveChecks() {
     assert(res.status === 401, `expected HTTP 401 after the run token was released, got ${res.status}`);
     const body = await res.json();
     assert(body.error && body.error.type === "authentication_error", JSON.stringify(body));
+  });
+
+  // The account-usage read (add-chatgpt-usage-check): one real read through
+  // the companion's own agent_settings op path — the exact route the settings
+  // page uses — so the endpoint, the credential pair the host sends, the
+  // mapping onto the display-shaped reply, and the op's reply envelope are all
+  // exercised against the live backend at once. Shape-only assertions, and the
+  // reply is never printed: this check may not leak the account's plan, its
+  // usage numbers, or any identity field, and it does not assert on their
+  // values (they are the operator's own and change over time).
+  //
+  // The companion pieces are imported HERE, after the signed-in-profile guard
+  // above, so an unset env var or an unconfigured machine still means "no
+  // work, no network, no credential read".
+  await check("one real chatgpt_usage read through the companion op is display-shaped and carries no identity", async () => {
+    const { CompanionCore } = await import("../agent/companion.js");
+    const { TranscriptStore } = await import("../agent/storage/transcript-store.js");
+    const { BrowserLease } = await import("../agent/broker/browser-lease.js");
+    const { ApprovalRegistry } = await import("../agent/policy/approvals.js");
+    const { SessionManager } = await import("../agent/session/manager.js");
+    const { ToolBridge } = await import("../agent/broker/tool-bridge.js");
+    const { AGENT_MESSAGE_TYPES, PROTOCOL_VERSION } = await import("../agent/protocol.js");
+
+    // A real CompanionCore with NO collaborator overrides: the usage reader is
+    // resolved lazily to the production host/agent/chatgpt/usage.js (whose
+    // defaults read the real profile store and the real OS credential store),
+    // which is what makes this end-to-end. The tool bridge and SDK are fakes
+    // that are never invoked — this check sends one settings op, not a run.
+    const store = new TranscriptStore();
+    const core = new CompanionCore({
+      toolBridge: new ToolBridge({ init: async () => {}, callTool: async () => ({ content: [] }), shutdown: () => {} }),
+      sessionManager: new SessionManager({ store, lease: new BrowserLease(), approvals: new ApprovalRegistry() }),
+      lease: new BrowserLease(),
+      coerceArgs: (a) => a,
+      sdk: { async *query() {} }
+    });
+
+    const reply = await core.handleEnvelope({
+      v: PROTOCOL_VERSION,
+      type: AGENT_MESSAGE_TYPES.AGENT_SETTINGS,
+      requestId: "live-chatgpt-usage-1",
+      op: "chatgpt_usage",
+      profileId: profile.profileId
+    });
+
+    assert(reply && reply.type === AGENT_MESSAGE_TYPES.AGENT_SETTINGS, "the reply is an agent_settings envelope, not a generic error or version mismatch");
+    assert(reply.ok === true, `the usage read must succeed for a signed-in profile — got ${reply.error && reply.error.code ? reply.error.code : "a structurally invalid reply"}`);
+    const usage = reply.result;
+    assert(usage && typeof usage === "object", "the op answered with a result object");
+    assert(
+      JSON.stringify(Object.keys(usage).sort()) === JSON.stringify(["allowed", "credits", "limitReached", "planType", "primary", "secondary"]),
+      `the result carries EXACTLY the six documented keys — got ${JSON.stringify(Object.keys(usage).sort())}`
+    );
+    assert(typeof usage.planType === "string" && usage.planType.length > 0, "the result names a plan type (the value the block renders as Gói)");
+    const windows = [usage.primary, usage.secondary].filter((w) => w !== null && w !== undefined);
+    assert(windows.length >= 1, "a signed-in account reports at least one rate-limit window");
+    assert(windows.some((w) => typeof w.usedPercent === "number"), "at least one window reports a numeric used percent");
+    assert(
+      windows.every((w) => (typeof w.limitWindowSeconds === "number" && w.limitWindowSeconds > 0) || w.limitWindowSeconds === null),
+      "every present window carries its own length (or an explicit null)"
+    );
+    assert(
+      (usage.credits === null || (typeof usage.credits === "object" && usage.credits.hasCredits === true)),
+      "credits are either an explicit null or a summary for an account that has them"
+    );
+
+    // The reply may never carry a credential or an account identity — the
+    // whole reason the host maps the backend payload down to six keys.
+    const serialized = JSON.stringify(reply);
+    assert(!/(access_token|refresh_token|id_token|accessToken|refreshToken|idToken)/.test(serialized), "no token field appears anywhere in the reply");
+    assert(!/Bearer\s/.test(serialized), "no authorization value appears anywhere in the reply");
+    for (const identity of ["user_id", "account_id", "email"]) {
+      assert(!serialized.includes(`"${identity}"`), `the reply carries no "${identity}" field`);
+    }
+    const knownEmail = profile.chatgptAccount && profile.chatgptAccount.email;
+    if (knownEmail) assert(!serialized.includes(knownEmail), "the reply does not contain the signed-in account's email");
   });
 
   const failed = results.filter((r) => !r.ok);

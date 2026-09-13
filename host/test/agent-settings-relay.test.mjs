@@ -81,7 +81,7 @@ function agentSettingsEnvelope(op, payload = {}, { v = PROTOCOL_VERSION, request
  * exercised end-to-end. `sdk` stays fake/injectable so run-lifecycle tests
  * (credential revocation cancelling an active run) never spawn a real
  * Claude Code CLI process. */
-function buildRealSettingsCore({ sdk, chatgptAuthProvider } = {}) {
+function buildRealSettingsCore({ sdk, chatgptAuthProvider, chatgptUsageReader } = {}) {
   const store = new TranscriptStore();
   const lease = new BrowserLease();
   const approvals = new ApprovalRegistry();
@@ -103,7 +103,11 @@ function buildRealSettingsCore({ sdk, chatgptAuthProvider } = {}) {
     // undefined for every test above (they never send a ChatGPT op, so the
     // auth module is never imported); only the ChatGPT op tests below inject
     // a fake, so no test here ever binds port 1455 or touches a real OS store.
-    ...(chatgptAuthProvider ? { chatgptAuthProvider } : {})
+    ...(chatgptAuthProvider ? { chatgptAuthProvider } : {}),
+    // Same injection rule for the account-usage read: only the tests that
+    // send `chatgpt_usage` inject a fake reader, so nothing here ever makes a
+    // network call to ChatGPT's usage endpoint.
+    ...(chatgptUsageReader ? { chatgptUsageReader } : {})
   });
 }
 
@@ -280,7 +284,7 @@ await test("a missing protocol version on agent_settings also fails closed", asy
 
 // --- ChatGPT subscription provider ops (Batch E1 host protocol) -----------
 //
-// These drive the six new agent_settings ops through CompanionCore's real
+// These drive the ChatGPT agent_settings ops through CompanionCore's real
 // _handleAgentSettings() dispatcher, with the REAL settings/profile.js (so
 // set_provider_type/chatgpt_sign_out persist and reload for real) and an
 // INJECTED chatgptAuthProvider double (so no op here ever binds port 1455 or
@@ -482,6 +486,99 @@ await test("chatgpt_sign_out without a profileId is a PROTOCOL_ERROR and never c
   const reply = await core.handleEnvelope(agentSettingsEnvelope("chatgpt_sign_out", {}));
   assert(reply.ok === false && reply.error.code === "PROTOCOL_ERROR");
   assert(!auth._calls.some((c) => c[0] === "signOut"));
+});
+
+// --- ChatGPT account usage op (add-chatgpt-usage-check) -------------------
+//
+// One more op in the same ChatGPT family: `chatgpt_usage` reads the signed-in
+// account's rate limit through host/agent/chatgpt/usage.js, whose own
+// behaviour (endpoint, headers, 401 refresh-once rule, every failure code) is
+// independently covered by chatgpt-usage.test.mjs. These checks are about the
+// PROTOCOL layer only: the reader is resolved lazily and injectable, the
+// success result crosses with exactly the six documented keys, input
+// validation happens before the reader is touched, and a failing read is a
+// structured `{ok:false,error:{code}}` in the settings envelope — never a
+// thrown error into the protocol.
+
+/** A configurable fake of usage.js's `{ readUsage(profileId) }` surface,
+ * recording every profileId it was called with. */
+function makeFakeUsageReader(outcomes) {
+  const calls = [];
+  const queue = Array.isArray(outcomes) ? outcomes : [outcomes];
+  let index = 0;
+  return {
+    _calls: calls,
+    async readUsage(profileId) {
+      calls.push(profileId);
+      const outcome = queue[Math.min(index, queue.length - 1)];
+      index += 1;
+      if (typeof outcome === "function") return outcome(profileId);
+      if (outcome instanceof Error) throw outcome;
+      return outcome;
+    }
+  };
+}
+
+const USAGE_RESULT = {
+  planType: "plus",
+  allowed: true,
+  limitReached: false,
+  primary: { usedPercent: 41, limitWindowSeconds: 18000, resetAfterSeconds: 9000, resetAt: 1760000000000 },
+  secondary: { usedPercent: 88, limitWindowSeconds: 604800, resetAfterSeconds: 200000, resetAt: 1760000000000 },
+  credits: null
+};
+
+await test("chatgpt_usage forwards the reader's structured success result with ONLY the six documented keys", async () => {
+  const reader = makeFakeUsageReader({ ok: true, result: USAGE_RESULT });
+  const core = buildRealSettingsCore({ chatgptUsageReader: reader });
+  const reply = await core.handleEnvelope(agentSettingsEnvelope("chatgpt_usage", { profileId: PROFILE_ID }));
+
+  assert(reply.type === AGENT_MESSAGE_TYPES.AGENT_SETTINGS, "the reply is the settings envelope background.js's relay settles on");
+  assert(reply.ok === true, `chatgpt_usage must succeed: ${JSON.stringify(reply.error)}`);
+  assert(
+    JSON.stringify(Object.keys(reply.result).sort()) === JSON.stringify(["allowed", "credits", "limitReached", "planType", "primary", "secondary"]),
+    `the success result must carry exactly the six usage keys, got ${JSON.stringify(Object.keys(reply.result))}`
+  );
+  assert(JSON.stringify(reply.result) === JSON.stringify(USAGE_RESULT), "the reader's result crosses unchanged (no re-shaping at the protocol layer)");
+  assert(reader._calls.length === 1 && reader._calls[0] === PROFILE_ID, "the reader got the requested profileId, once");
+  assert(!/access_token|refresh_token|id_token|account_id|user_id|"email"/i.test(JSON.stringify(reply)), "no token or account identity anywhere in the reply");
+});
+
+await test("chatgpt_usage answers a failing read as {ok:false,error:{code,message}} in the envelope — never a throw", async () => {
+  for (const code of ["SESSION_EXPIRED", "NO_CREDENTIAL", "RATE_LIMIT_ERROR", "AUTH_ERROR", "NETWORK_ERROR", "TIMEOUT_ERROR", "USAGE_UNAVAILABLE"]) {
+    const reader = makeFakeUsageReader({ ok: false, error: { code, message: `read failed: ${code}` } });
+    const core = buildRealSettingsCore({ chatgptUsageReader: reader });
+    const reply = await core.handleEnvelope(agentSettingsEnvelope("chatgpt_usage", { profileId: PROFILE_ID }));
+    assert(reply.ok === false, `${code} must be a failure, not a fabricated success`);
+    assert(reply.error.code === code, `expected error code ${code}, got ${JSON.stringify(reply.error)}`);
+    assert(typeof reply.error.message === "string" && reply.error.message.length > 0, "the structured failure carries its message");
+  }
+});
+
+await test("chatgpt_usage without a profileId is a PROTOCOL_ERROR before the reader is ever resolved", async () => {
+  const reader = makeFakeUsageReader({ ok: true, result: USAGE_RESULT });
+  const core = buildRealSettingsCore({ chatgptUsageReader: reader });
+  const reply = await core.handleEnvelope(agentSettingsEnvelope("chatgpt_usage", {}));
+  assert(reply.ok === false && reply.error.code === "PROTOCOL_ERROR", `expected PROTOCOL_ERROR, got ${JSON.stringify(reply.error)}`);
+  assert(reader._calls.length === 0, "a malformed request must not reach the usage reader");
+});
+
+await test("a reader that THREW (its documented never-throw contract violated) still settles the envelope, not the protocol", async () => {
+  const reader = makeFakeUsageReader(() => {
+    throw Object.assign(new Error("surprise"), { code: "USAGE_UNAVAILABLE" });
+  });
+  const core = buildRealSettingsCore({ chatgptUsageReader: reader });
+  const reply = await core.handleEnvelope(agentSettingsEnvelope("chatgpt_usage", { profileId: PROFILE_ID }));
+  assert(reply.type === AGENT_MESSAGE_TYPES.AGENT_SETTINGS && reply.ok === false, "a thrown reader is still answered, never propagated");
+  assert(reply.error.code === "USAGE_UNAVAILABLE", "the outer catch is a safety net that preserves a coded failure");
+});
+
+await test("a usage result that DID carry a token field fails closed (secret-free scan) rather than emit it", async () => {
+  const reader = makeFakeUsageReader({ ok: true, result: { ...USAGE_RESULT, accessToken: "SECRET-USAGE-TOKEN" } });
+  const core = buildRealSettingsCore({ chatgptUsageReader: reader });
+  const reply = await core.handleEnvelope(agentSettingsEnvelope("chatgpt_usage", { profileId: PROFILE_ID }));
+  assert(JSON.stringify(reply).indexOf("SECRET-USAGE-TOKEN") === -1, "an accessToken must never cross the wire");
+  assert(reply.ok === false && reply.error.code === "PROTOCOL_ERROR", "the scan fails the reply closed");
 });
 
 await test("a start reply that DID carry a token field fails closed (secret-free scan) rather than emit it", async () => {

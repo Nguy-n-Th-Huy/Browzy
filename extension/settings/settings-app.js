@@ -10,6 +10,7 @@ import { iconMarkup } from "../ui/icons.js";
 import { setThemeOverride } from "../ui/theme.js";
 import { createSettingsClient } from "./settings-client.js";
 import { SettingsController } from "./settings-controller.js";
+import { describeErrorCode } from "./errors-ui.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -143,6 +144,199 @@ function renderChatgptFields(state) {
   } else {
     $("chatgpt-account-line").textContent = "";
   }
+
+  // The usage block exists only for a signed-in profile (spec: "no usage block
+  // content ... and no usage read" otherwise), so it is gated by the same
+  // state that shows the account line above.
+  renderChatgptUsage(state, showSignedIn);
+}
+
+// --- ChatGPT usage block (add-chatgpt-usage-check design.md decision 6,
+// tasks.md 4.2) -----------------------------------------------------------
+//
+// Renders the controller's display-only `usage` state: the plan, one line per
+// rate-limit window the account actually has (percent used + a countdown to
+// the absolute reset moment the controller computed), a credits line only for
+// an account that has credits, the limit-reached line, and the loading/error
+// text (error copy comes from errors-ui.js by code — a companion that
+// predates the op reads as "update the companion", never as a network
+// failure). One setInterval drives every countdown in the block and is
+// cleared the moment the block is hidden: no network polling, and no timer
+// left ticking behind a hidden block.
+let chatgptUsageTimer = null;
+
+function stopChatgptUsageCountdown() {
+  if (chatgptUsageTimer !== null) {
+    clearInterval(chatgptUsageTimer);
+    chatgptUsageTimer = null;
+  }
+}
+
+/** A whole-label Vietnamese duration for a remaining span: seconds under a
+ * minute (so the countdown visibly ticks as a reset approaches), then
+ * minutes, hours, days, or weeks when it lands exactly on them. */
+function formatUsageDuration(msLeft) {
+  if (msLeft < 60000) return `${Math.max(1, Math.ceil(msLeft / 1000))} giây`;
+  const minutes = Math.ceil(msLeft / 60000);
+  if (minutes < 60) return `${minutes} phút`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) {
+    const remMinutes = minutes % 60;
+    return remMinutes ? `${hours} giờ ${remMinutes} phút` : `${hours} giờ`;
+  }
+  const days = Math.floor(hours / 24);
+  if (days < 7) {
+    const remHours = hours % 24;
+    return remHours ? `${days} ngày ${remHours} giờ` : `${days} ngày`;
+  }
+  const weeks = Math.floor(days / 7);
+  const remDays = days % 7;
+  return remDays ? `${weeks} tuần ${remDays} ngày` : `${weeks} tuần`;
+}
+
+/** The whole reset clause, so a moment that has already passed reads as a
+ * statement rather than as a broken "in -3 minutes" countdown. */
+function usageResetText(msLeft) {
+  return msLeft > 0 ? `đặt lại sau ${formatUsageDuration(msLeft)}` : "đã đến hạn đặt lại";
+}
+
+/** A window's own label, derived from its length — never from the plan. The
+ * plural is explicit because these are Vietnamese noun phrases, not a
+ * localized (plural-ruled) message catalogue. */
+function usageWindowLabel(limitWindowSeconds) {
+  if (typeof limitWindowSeconds !== "number" || limitWindowSeconds <= 0) return "Cửa sổ sử dụng";
+  if (limitWindowSeconds % 604800 === 0) {
+    const weeks = limitWindowSeconds / 604800;
+    return weeks === 1 ? "Cửa sổ 1 tuần" : `Cửa sổ ${weeks} tuần`;
+  }
+  if (limitWindowSeconds % 86400 === 0) return `Cửa sổ ${limitWindowSeconds / 86400} ngày`;
+  if (limitWindowSeconds % 3600 === 0) return `Cửa sổ ${limitWindowSeconds / 3600} giờ`;
+  return `Cửa sổ ${Math.round(limitWindowSeconds / 60)} phút`;
+}
+
+function renderChatgptUsage(state, visible) {
+  const block = $("chatgpt-usage-block");
+  block.hidden = !visible;
+
+  const planEl = $("chatgpt-usage-plan");
+  const liveEl = $("chatgpt-usage-live");
+  const windowsBox = $("chatgpt-usage-windows");
+  const creditsEl = $("chatgpt-usage-credits");
+  const limitEl = $("chatgpt-usage-limit");
+  const refreshBtn = $("btn-chatgpt-refresh-usage");
+
+  planEl.textContent = "";
+  liveEl.textContent = "";
+  windowsBox.innerHTML = "";
+  creditsEl.textContent = "";
+  creditsEl.hidden = true;
+  limitEl.textContent = "";
+  limitEl.hidden = true;
+
+  if (!visible) {
+    // Nothing in this block is visible: no countdown should keep ticking.
+    stopChatgptUsageCountdown();
+    return;
+  }
+
+  const usageState = state.usage || { status: "idle" };
+  const isLoading = usageState.status === "loading";
+  refreshBtn.disabled = isLoading;
+  refreshBtn.textContent = isLoading ? "Đang đọc…" : "Làm mới";
+
+  if (isLoading) {
+    // The one line a screen reader hears while a read is running; the refresh
+    // action above is disabled for exactly that span.
+    liveEl.textContent = "Đang đọc mức sử dụng của tài khoản ChatGPT…";
+    stopChatgptUsageCountdown();
+    return;
+  }
+
+  if (usageState.status === "error" && usageState.error) {
+    const copy = describeErrorCode(usageState.error.code, { op: "chatgpt_usage" });
+    liveEl.textContent = [copy.title, copy.message, copy.action].filter(Boolean).join(" ");
+    stopChatgptUsageCountdown();
+    return;
+  }
+
+  if (usageState.status !== "ready" || !usageState.usage) {
+    stopChatgptUsageCountdown();
+    return;
+  }
+
+  const usage = usageState.usage;
+  if (usage.planType) planEl.textContent = `Gói: ${usage.planType}`;
+
+  let hasCountdown = false;
+  for (const window of [usage.primary, usage.secondary]) {
+    if (!window) continue;
+    const row = document.createElement("p");
+    row.className = "field-hint chatgpt-usage-window";
+    const label = document.createElement("span");
+    label.className = "chatgpt-usage-window-label";
+    label.textContent = usageWindowLabel(window.limitWindowSeconds);
+    row.appendChild(label);
+    const percent = typeof window.usedPercent === "number" ? `${Math.round(window.usedPercent * 10) / 10}%` : "không rõ";
+    row.appendChild(document.createTextNode(` — đã dùng ${percent}`));
+    if (typeof window.resetAtMs === "number") {
+      const resetEl = document.createElement("span");
+      resetEl.className = "chatgpt-usage-reset";
+      resetEl.dataset.resetAt = String(window.resetAtMs);
+      resetEl.textContent = ` · ${usageResetText(window.resetAtMs - Date.now())}`;
+      row.appendChild(resetEl);
+      hasCountdown = true;
+    }
+    windowsBox.appendChild(row);
+  }
+
+  const credits = usage.credits;
+  if (credits && credits.hasCredits) {
+    const balance = credits.unlimited
+      ? "không giới hạn"
+      : credits.balance === null || credits.balance === undefined
+        ? "không rõ số dư"
+        : String(credits.balance);
+    creditsEl.textContent = `Credits: ${balance}.`;
+    creditsEl.hidden = false;
+  }
+
+  if (usage.limitReached) {
+    limitEl.textContent = "Tài khoản đã đạt giới hạn sử dụng — mốc đặt lại ở trên cho biết khi nào dùng lại được.";
+    limitEl.hidden = false;
+  } else if (usage.allowed === false) {
+    limitEl.textContent = "Tài khoản hiện không thể gửi yêu cầu.";
+    limitEl.hidden = false;
+  }
+
+  if (hasCountdown) {
+    tickChatgptUsageCountdown();
+    startChatgptUsageCountdown();
+  } else {
+    stopChatgptUsageCountdown();
+  }
+}
+
+function tickChatgptUsageCountdown() {
+  for (const el of document.querySelectorAll("#chatgpt-usage-windows .chatgpt-usage-reset[data-reset-at]")) {
+    el.textContent = ` · ${usageResetText(Number(el.dataset.resetAt) - Date.now())}`;
+  }
+}
+
+/** Idempotent: re-renders reuse the one running interval rather than stacking
+ * a second one on top of it. */
+function startChatgptUsageCountdown() {
+  if (chatgptUsageTimer !== null) return;
+  chatgptUsageTimer = setInterval(tickChatgptUsageCountdown, 1000);
+}
+
+/** Called when the page becomes visible again — a no-op unless the block is
+ * actually showing a countdown, so a hidden page can never resurrect one. */
+function resumeChatgptUsageCountdown() {
+  const block = $("chatgpt-usage-block");
+  if (!block || block.hidden) return;
+  if (!document.querySelector("#chatgpt-usage-windows [data-reset-at]")) return;
+  tickChatgptUsageCountdown();
+  startChatgptUsageCountdown();
 }
 
 function iconEl(name, opts) {
@@ -353,7 +547,13 @@ function renderProvider(state) {
   if (isChatgpt) {
     renderChatgptFields(state);
   } else {
+    // Neither countdown may keep ticking behind a hidden ChatGPT section, and
+    // the usage block is emptied rather than merely covered — leaving a
+    // previous profile's windows in the DOM would let the page's own
+    // visibilitychange resume a countdown for values that are no longer
+    // displayed (renderChatgptUsage(state, false) stops the interval too).
     stopChatgptCountdown();
+    renderChatgptUsage(state, false);
   }
 
   const urlInput = $("base-url");
@@ -555,15 +755,30 @@ function wireEvents() {
     }
   });
 
+  // Usage refresh (add-chatgpt-usage-check tasks.md 4.2): the explicit,
+  // user-activated read — the only usage read besides the one a signed-in
+  // profile's load already performs. Never a timer.
+  $("btn-chatgpt-refresh-usage").addEventListener("click", () => controller.refreshUsage());
+
   // Status polling stops while this page is hidden/unloaded and resumes when
   // it becomes visible again (tasks.md 5.3's "stop ... when the page is
   // hidden/unloaded"; see settings-controller.js's pauseSignInPolling()/
-  // resumeSignInPolling() doc comments).
+  // resumeSignInPolling() doc comments). The usage block's countdown is a
+  // purely local timer with no network call behind it, but it is stopped the
+  // same way — a hidden page has nothing to count down to.
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden) controller.pauseSignInPolling();
-    else controller.resumeSignInPolling();
+    if (document.hidden) {
+      controller.pauseSignInPolling();
+      stopChatgptUsageCountdown();
+    } else {
+      controller.resumeSignInPolling();
+      resumeChatgptUsageCountdown();
+    }
   });
-  window.addEventListener("pagehide", () => controller.pauseSignInPolling());
+  window.addEventListener("pagehide", () => {
+    controller.pauseSignInPolling();
+    stopChatgptUsageCountdown();
+  });
 
   $("base-url").addEventListener("input", (e) => controller.setBaseUrlDraft(e.target.value));
   $("base-url").addEventListener("blur", () => controller.validateBaseUrlField());

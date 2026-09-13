@@ -682,6 +682,12 @@ function createAgentSettingsRelay(opts) {
     "chatgpt_sign_in_status",
     "chatgpt_sign_in_cancel",
     "chatgpt_sign_out",
+    // ChatGPT account-usage read (add-chatgpt-usage-check task 3.2). A
+    // read-only op: it changes no profile field, so it is allowlisted here
+    // and deliberately has NO branch in applyProfileCacheWrite below — the
+    // profile-cache mirror would gain nothing from re-writing the profile a
+    // usage read never touched.
+    "chatgpt_usage",
     // Permission modes + remembered-site management
     // (add-permission-modes-and-threat-signals, task 7.1): the sidepanel's
     // mode badge and the settings > permissions page ride these ops over

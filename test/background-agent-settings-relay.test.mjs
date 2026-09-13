@@ -146,6 +146,28 @@ async function main() {
     ok(responses.every((r) => r.ok === true), "none of the six resolved with the local PROTOCOL_ERROR rejection");
   }
 
+  console.log("== the ChatGPT account-usage read is allowlisted too ==");
+  {
+    // add-chatgpt-usage-check task 3.4. The usage op rides the same relay; an
+    // omission here would make every Settings usage block fail with a local
+    // PROTOCOL_ERROR that no companion version could fix — and, unlike the
+    // sign-in ops, this one is sent on ordinary page loads, so the block would
+    // simply never show a value.
+    const { relay, posted } = makeHarness();
+    const p = relay.handleRequest({ type: "agent_settings", op: "chatgpt_usage", profileId: "default" });
+    ok(posted.length === 1 && posted[0].op === "chatgpt_usage" && posted[0].profileId === "default",
+      `chatgpt_usage is forwarded with its profileId — got ${JSON.stringify(posted[0] && { op: posted[0].op, profileId: posted[0].profileId })}`);
+    relay.handleReply({
+      v: 1,
+      type: "agent_settings",
+      requestId: posted[0].requestId,
+      ok: true,
+      result: { planType: "plus", allowed: true, limitReached: false, primary: null, secondary: null, credits: null }
+    });
+    const res = await p;
+    ok(res.ok === true && res.result && res.result.planType === "plus", "the display-shaped reply resolves back to its caller");
+  }
+
   console.log("== every permission-family op is allowlisted (sidepanel badge + settings > permissions page) ==");
   {
     // add-permission-modes-and-threat-signals task 7.1: these ops arrived

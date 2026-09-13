@@ -13,13 +13,20 @@
 // ChatGPT sign-in support, not that the endpoint itself is incompatible
 // (which is what PROTOCOL_ERROR means for every pre-existing op). See
 // describeErrorCode()'s PROTOCOL_ERROR case below.
+//
+// `chatgpt_usage` (add-chatgpt-usage-check task 3.3) belongs here for the
+// same reason: a companion built before that op answers with its own
+// unknown-op PROTOCOL_ERROR, which is a "your companion is older than this
+// page" condition, not an endpoint incompatibility — so the usage block says
+// to update the companion rather than blaming the network or the provider.
 const CHATGPT_OPS = new Set([
   "set_provider_type",
   "chatgpt_sign_in_start",
   "chatgpt_device_start",
   "chatgpt_sign_in_status",
   "chatgpt_sign_in_cancel",
-  "chatgpt_sign_out"
+  "chatgpt_sign_out",
+  "chatgpt_usage"
 ]);
 
 /**
@@ -199,6 +206,17 @@ export function describeErrorCode(code, opts = {}) {
         title: "Bị ChatGPT từ chối",
         message: "Backend ChatGPT (không chính thức) đã từ chối yêu cầu từ ứng dụng này.",
         action: "Thử lại sau. Nếu vẫn lỗi, backend không chính thức này có thể đã thay đổi hoặc ngừng hoạt động."
+      };
+    // add-chatgpt-usage-check: a 200 from the usage endpoint whose body is not
+    // the shape this page renders. Its own code (rather than PROTOCOL_ERROR,
+    // which reads as "update the companion", or NETWORK_ERROR, which blames
+    // the connection) is what makes the message actionable: the read ran and
+    // answered, the backend just answered something else.
+    case "USAGE_UNAVAILABLE":
+      return {
+        title: "Không đọc được mức sử dụng",
+        message: "Backend ChatGPT trả về dữ liệu mức sử dụng không đúng dạng mà trang này đọc được.",
+        action: "Bấm \"Làm mới\" để thử lại. Nếu vẫn lỗi, backend không chính thức này có thể đã thay đổi — phần còn lại của trang vẫn dùng bình thường."
       };
 
     // Skills catalog codes (host/agent/skills/errors.js — task 7.3).

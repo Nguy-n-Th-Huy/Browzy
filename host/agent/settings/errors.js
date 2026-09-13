@@ -28,7 +28,8 @@ export const PROVIDER_ERROR_CODES = /** @type {const} */ ([
   "SESSION_EXPIRED", // a ChatGPT refresh was rejected (invalid_grant/refresh_token_reused) — sign-in required again
   "SECRET_TOO_LARGE", // the credential does not fit the OS secret store's size limit and was NOT truncated
   "USAGE_LIMIT_REACHED", // upstream reported the signed-in ChatGPT account's usage limit
-  "UPSTREAM_REJECTED_CLIENT" // upstream 403/400 whose message names the client/originator/instructions
+  "UPSTREAM_REJECTED_CLIENT", // upstream 403/400 whose message names the client/originator/instructions
+  "USAGE_UNAVAILABLE" // a 200 usage body that is not the expected shape — distinct from PROTOCOL_ERROR, which the settings page reads as "update the companion"
 ]);
 
 export class ProviderError extends Error {

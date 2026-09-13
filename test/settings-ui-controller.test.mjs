@@ -641,5 +641,201 @@ console.log("== ChatGPT sign-out clears the mirrored account and credential stat
   ok(s.models.length === 1, "the manual model list survives sign-out");
 }
 
+console.log("== ChatGPT usage: a signed-in profile reads once on load, with absolute reset moments ==");
+{
+  // The whole point of the injectable `now`: a reply carries a RELATIVE
+  // `resetAfterSeconds`, and the countdown the DOM layer runs must be anchored
+  // to an absolute moment this test can pin exactly.
+  const FIXED_NOW = 1_700_000_000_000;
+  const companion = createScriptedCompanion(chatgptProfile({ chatgptSessionState: "signed_in", hasCredential: true }));
+  companion.scripts.chatgptUsage = () => ({
+    planType: "plus",
+    allowed: true,
+    limitReached: false,
+    // Deliberately a DIFFERENT moment from the reply's own resetAt, so which
+    // source the controller used is observable.
+    primary: { usedPercent: 3, limitWindowSeconds: 2592000, resetAfterSeconds: 1209600, resetAt: FIXED_NOW + 999_000 },
+    // No relative value at all: the backend's own epoch-ms resetAt is the only
+    // usable moment for this window.
+    secondary: { usedPercent: 41, limitWindowSeconds: 18000, resetAfterSeconds: null, resetAt: FIXED_NOW + 123_456 },
+    credits: null
+  });
+  const c = new SettingsController(companion.client, { now: () => FIXED_NOW });
+  await c.init();
+
+  const reads = companion.calls.filter((x) => x.op === "chatgpt_usage");
+  ok(reads.length === 1 && reads[0].profileId === "default",
+    `loading a signed-in chatgpt profile issues exactly one read, for its own profileId — got ${JSON.stringify(reads)}`);
+  const s = c.getState();
+  ok(s.usage.status === "ready" && s.usage.error === null, "the read's outcome is a ready usage state with no error");
+  ok(s.usage.usage && s.usage.usage.planType === "plus", "the account's plan reaches the page");
+  ok(s.usage.usage.primary.resetAtMs === FIXED_NOW + 1209600 * 1000,
+    "the primary window's absolute reset moment is now + resetAfterSeconds, not the reply's own resetAt");
+  ok(s.usage.usage.secondary.resetAtMs === FIXED_NOW + 123_456,
+    "a window with no resetAfterSeconds falls back to the backend's epoch-ms resetAt");
+  ok(!/\b(accessToken|refreshToken|idToken|refresh_token|access_token|id_token)\b/.test(JSON.stringify(s.usage)),
+    "the usage state carries no token-shaped field");
+  ok(!/account_id|accountId|user_id|userId|email/i.test(JSON.stringify(s.usage)),
+    "the usage state carries no account identity (the reply never had one)");
+}
+
+console.log("== ChatGPT usage: no read at all for an anthropic profile, a signed-out profile, or an expired session ==");
+{
+  const cases = [
+    ["an anthropic profile", { providerType: "anthropic", chatgptAccount: null, chatgptSessionState: "signed_out" }],
+    ["a signed-out chatgpt profile", { chatgptSessionState: "signed_out" }],
+    ["a session-expired chatgpt profile", { chatgptSessionState: "session_expired", hasCredential: false }]
+  ];
+  for (const [label, overrides] of cases) {
+    const companion = createScriptedCompanion(chatgptProfile(overrides));
+    const c = new SettingsController(companion.client);
+    await c.init();
+    ok(!companion.calls.some((x) => x.op === "chatgpt_usage"), `${label}: loading it sends no chatgpt_usage request`);
+    const res = await c.refreshUsage();
+    ok(res.ok === false, `${label}: an explicit refresh is refused rather than issued`);
+    ok(!companion.calls.some((x) => x.op === "chatgpt_usage"), `${label}: still zero chatgpt_usage requests after the refused refresh`);
+    ok(c.getState().usage.status === "idle", `${label}: the usage block stays idle — nothing to show and nothing read`);
+  }
+}
+
+console.log("== ChatGPT usage: explicit refresh issues a second read and replaces the displayed values ==");
+{
+  const companion = createScriptedCompanion(chatgptProfile({ chatgptSessionState: "signed_in", hasCredential: true }));
+  const snapshots = [];
+  const c = new SettingsController(companion.client);
+  c.onChange = (snapshot) => snapshots.push(snapshot);
+  await c.init();
+  const first = c.getState().usage.usage;
+  ok(first && first.primary.usedPercent === 3, "the load read showed the companion's first reply");
+
+  companion.scripts.chatgptUsage = () => ({
+    planType: "plus",
+    allowed: false,
+    limitReached: true,
+    primary: { usedPercent: 100, limitWindowSeconds: 18000, resetAfterSeconds: 60, resetAt: null },
+    secondary: null,
+    credits: { hasCredits: true, unlimited: false, balance: 12.5 }
+  });
+  const res = await c.refreshUsage();
+  ok(res.ok === true, "the explicit refresh resolves");
+  ok(companion.calls.filter((x) => x.op === "chatgpt_usage").length === 2, "it is a second, real read — never a cached value");
+  const s = c.getState();
+  ok(s.usage.status === "ready" && s.usage.usage.primary.usedPercent === 100 && s.usage.usage.limitReached === true,
+    "the displayed values are the refresh's result, replacing the previous ones");
+  ok(s.usage.usage.credits && s.usage.usage.credits.balance === 12.5, "the credits summary survives into state for a paying account");
+  ok(snapshots.some((snap) => snap.usage.status === "loading" && snap.usage.usage === null),
+    "a loading state was published, with the previous values cleared, before the reply landed");
+}
+
+console.log("== ChatGPT usage: a failed read lands in usage.error and leaves the account, plan and models untouched ==");
+{
+  const { ProviderErrorLike } = await import("../extension/settings/settings-client.js");
+  const companion = createScriptedCompanion(chatgptProfile({ chatgptSessionState: "signed_in", hasCredential: true }));
+  const c = new SettingsController(companion.client);
+  await c.init();
+  const before = c.getState();
+  companion.scripts.chatgptUsage = () => { throw new ProviderErrorLike("NETWORK_ERROR", "the usage endpoint could not be reached"); };
+  const res = await c.refreshUsage();
+  const after = c.getState();
+  ok(res.ok === false && res.code === "NETWORK_ERROR", "the failure is returned to the caller with its code");
+  ok(after.usage.status === "error" && after.usage.error && after.usage.error.code === "NETWORK_ERROR",
+    "the block's own error state carries the companion's code");
+  ok(after.usage.usage === null, "no stale usage values are left behind by a failed read");
+  ok(JSON.stringify(after.chatgptAccount) === JSON.stringify(before.chatgptAccount), "the signed-in account is untouched");
+  ok(JSON.stringify(after.models) === JSON.stringify(before.models) && after.defaultModelId === before.defaultModelId,
+    "the model list and its default are untouched");
+  ok(after.banner === null, "a failed usage read does not hijack the page banner (the block shows the copy)");
+  const again = await c.refreshUsage();
+  ok(again.ok === false, "refresh stays available for another attempt");
+  ok(companion.calls.filter((x) => x.op === "chatgpt_usage").length === 3, "each attempt is a fresh read");
+}
+
+console.log("== ChatGPT usage: a read that discovers an expired session shows the page's own session-expired state ==");
+{
+  const { ProviderErrorLike } = await import("../extension/settings/settings-client.js");
+  const companion = createScriptedCompanion(chatgptProfile({ chatgptSessionState: "signed_in", hasCredential: true }));
+  const c = new SettingsController(companion.client);
+  await c.init();
+  companion.scripts.chatgptUsage = () => { throw new ProviderErrorLike("SESSION_EXPIRED", "the ChatGPT session has expired"); };
+  await c.refreshUsage();
+  const s = c.getState();
+  ok(s.usage.status === "error" && s.usage.error.code === "SESSION_EXPIRED", "the block records the session-expired failure");
+  ok(s.chatgptSessionState === "session_expired", "the page mirrors the transition the companion just recorded");
+  ok(s.banner && s.banner.code === "SESSION_EXPIRED" && /hết hạn/.test(s.banner.title || ""),
+    "the page's usual SESSION_EXPIRED banner (and its sign-in action) is what the user sees");
+  ok(s.chatgptAccount && s.chatgptAccount.email === "user@example.com", "the account mirror itself is left as it was");
+  ok(s.models.length === 1, "the model list is untouched");
+  const readsBefore = companion.calls.filter((x) => x.op === "chatgpt_usage").length;
+  const res = await c.refreshUsage();
+  ok(res.ok === false, "an expired session refuses a further read instead of retrying it");
+  ok(companion.calls.filter((x) => x.op === "chatgpt_usage").length === readsBefore, "and issues none (no read is ever sent for a session-expired profile)");
+}
+
+console.log("== ChatGPT usage: a late response for a previous profile is discarded, never landed ==");
+{
+  const companion = createScriptedCompanion(chatgptProfile({ chatgptSessionState: "signed_in", hasCredential: true }));
+  const pending = deferred();
+  companion.scripts.chatgptUsage = () => pending.promise;
+  const c = new SettingsController(companion.client);
+  await c.init();
+  ok(c.getState().usage.status === "loading", "the read is in flight while the profile is open");
+
+  await c.switchProfile("other");
+  ok(c.getState().profileId === "other" && c.getState().usage.status === "idle", "switching profiles resets the usage block");
+
+  pending.resolve({
+    planType: "free",
+    allowed: true,
+    limitReached: false,
+    primary: { usedPercent: 77, limitWindowSeconds: 2592000, resetAfterSeconds: 10, resetAt: null },
+    secondary: null,
+    credits: null
+  });
+  await pending.promise;
+  await new Promise((resolve) => setImmediate(resolve));
+  const s = c.getState();
+  ok(s.profileId === "other" && s.usage.status === "idle" && s.usage.usage === null,
+    "the previous profile's late reply is discarded instead of landing on the new profile's page");
+}
+
+console.log("== ChatGPT usage: nothing on a timer — a load read and an explicit refresh are the only reads ==");
+{
+  const timers = fakePollTimers();
+  const companion = createScriptedCompanion(chatgptProfile({ chatgptSessionState: "signed_in", hasCredential: true }));
+  const c = new SettingsController(companion.client, { setIntervalFn: timers.setIntervalFn, clearIntervalFn: timers.clearIntervalFn });
+  await c.init();
+  ok(timers.active() === 0, "a signed-in profile's usage read registers NO interval (no polling, ever)");
+  ok(companion.calls.filter((x) => x.op === "chatgpt_usage").length === 1, "exactly one read came from the load");
+  await timers.tick();
+  ok(companion.calls.filter((x) => x.op === "chatgpt_usage").length === 1, "no tick can produce another read — there is no timer to tick");
+  await c.refreshUsage();
+  ok(companion.calls.filter((x) => x.op === "chatgpt_usage").length === 2, "the explicit refresh is what issues the second read");
+  ok(timers.active() === 0, "still no interval after a refresh");
+}
+
+console.log("== ChatGPT usage: a companion that predates the op reads as 'update the companion', not as a network failure ==");
+{
+  const { ProviderErrorLike } = await import("../extension/settings/settings-client.js");
+  const { describeErrorCode } = await import("../extension/settings/errors-ui.js");
+  const stale = describeErrorCode("PROTOCOL_ERROR", { op: "chatgpt_usage" });
+  const nonChatgpt = describeErrorCode("PROTOCOL_ERROR");
+  ok(/cập nhật companion/i.test(stale.title || ""), `chatgpt_usage is in CHATGPT_OPS, so an unknown op means "update the companion" — got ${JSON.stringify(stale)}`);
+  ok(stale.title !== nonChatgpt.title, "and it is NOT the Anthropic-endpoint incompatibility copy");
+  const unavailable = describeErrorCode("USAGE_UNAVAILABLE", { op: "chatgpt_usage" });
+  ok(unavailable.title && unavailable.title !== "Lỗi không xác định" && unavailable.message && unavailable.action,
+    `USAGE_UNAVAILABLE has its own actionable copy — got ${JSON.stringify(unavailable)}`);
+
+  const companion = createScriptedCompanion(chatgptProfile({ chatgptSessionState: "signed_in", hasCredential: true }));
+  const c = new SettingsController(companion.client);
+  await c.init();
+  companion.scripts.chatgptUsage = () => { throw new ProviderErrorLike("PROTOCOL_ERROR", "unknown agent_settings op \"chatgpt_usage\""); };
+  await c.refreshUsage();
+  const s = c.getState();
+  ok(s.usage.status === "error" && s.usage.error.code === "PROTOCOL_ERROR",
+    "the stale-companion failure is recorded on the block with its own code");
+  ok(/cập nhật companion/i.test(describeErrorCode(s.usage.error.code, { op: "chatgpt_usage" }).title || ""),
+    "and the block renders it as an update instruction");
+}
+
 console.log(fail === 0 ? "\nALL SETTINGS-UI CONTROLLER TESTS PASSED" : `\n${fail} FAILED`);
 process.exit(fail ? 1 : 0);

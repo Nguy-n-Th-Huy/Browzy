@@ -95,6 +95,41 @@ console.log("== runtime: a full ChatGPT sign-in flow never puts a token-shaped v
     "no token-shaped field crossed the wire during the whole sign-in flow");
 }
 
+console.log("== runtime: the ChatGPT usage block carries no token and no account identity ==");
+{
+  // add-chatgpt-usage-check task 4.5: the usage read is the newest thing the
+  // settings page renders, so its state slice and its wire calls get the same
+  // treatment as the sign-in flow above. The companion's reply is already
+  // display-shaped (six keys, no identity fields) and the host asserts that
+  // before it answers; what this proves is the EXTENSION's half — the block
+  // holds nothing token-shaped, and the outgoing request is the bare
+  // { type, op, profileId } with no credential and no account id.
+  const companion = createScriptedCompanion({
+    profileId: "default", baseUrl: "https://api.anthropic.com", models: [{ id: "gpt-5.5", label: "gpt-5.5" }],
+    defaultModelId: "gpt-5.5", hasCredential: true, memoryOnlyCredential: false, secretBackend: "windows-credential-manager",
+    revision: 2, credentialRevision: 1, providerType: "chatgpt",
+    chatgptAccount: { email: "user@example.com", planType: "plus" }, chatgptSessionState: "signed_in"
+  });
+  const snapshots = [];
+  // The usage read is not on a timer (the controller registers no interval for
+  // it at all), so the timer doubles below only ever hold the sign-in poll.
+  const c = new SettingsController(companion.client, { setIntervalFn: () => 1, clearIntervalFn: () => {} });
+  c.onChange = (s) => snapshots.push(s);
+  await c.init();
+  await c.refreshUsage();
+
+  const serialized = snapshots.map((s) => JSON.stringify(s)).join("\n");
+  ok(!/\b(access_token|refresh_token|id_token|accessToken|refreshToken|idToken)\b/.test(serialized),
+    "no token field ever appears in an emitted state snapshot of the usage flow");
+  ok(!/Bearer\s/.test(serialized), "no Bearer authorization value ever appears in a usage-flow snapshot");
+  ok(!/account_id|accountId|user_id|userId|email/i.test(JSON.stringify(c.getState().usage)),
+    "the usage block's own state carries no account id, user id, or email");
+  const usageCalls = companion.calls.filter((x) => x.op === "chatgpt_usage");
+  ok(usageCalls.length === 2, `the flow issued both a load read and an explicit refresh, so the scan covers real traffic (${usageCalls.length}/2)`);
+  ok(usageCalls.every((x) => Object.keys(x).sort().join(",") === "op,profileId"),
+    `every usage request is { op, profileId } ONLY — got ${JSON.stringify(usageCalls)}`);
+}
+
 console.log("== runtime: a real save+test+remove flow never exposes the sentinel key in any state snapshot ==");
 {
   const companion = createScriptedCompanion(null);

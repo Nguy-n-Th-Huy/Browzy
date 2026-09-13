@@ -43,8 +43,27 @@
 //   op: "chatgpt_sign_out"       payload: { profileId }
 //                                 -> result: the updated secret-free profile
 //                                 (same result shape as "save_profile")
+//   op: "chatgpt_usage"          payload: { profileId }
+//                                 -> result: { planType, allowed, limitReached,
+//                                    primary, secondary, credits }
+//                                 `planType` is the backend's plan string;
+//                                 `allowed`/`limitReached` are booleans;
+//                                 `primary`/`secondary` are each either null or
+//                                 { usedPercent, limitWindowSeconds,
+//                                   resetAfterSeconds, resetAt } (resetAt is
+//                                 epoch-ms or null); `credits` is either null
+//                                 or { hasCredits, unlimited, balance } — only
+//                                 when the account has credits. A read-only
+//                                 op: it changes no profile field, so the
+//                                 companion's reply is never mirrored, and a
+//                                 body the backend did not shape as expected
+//                                 comes back as the USAGE_UNAVAILABLE code
+//                                 rather than as PROTOCOL_ERROR.
 // No ChatGPT op ever carries a token/credential value in either direction —
 // the companion resolves and stores those itself (host/agent/chatgpt/auth.js).
+// The usage reply additionally carries no account identity at all: no account
+// id, no user id, and no email — the page already shows the profile's own
+// email and plan, so every extra identity field would be a leak surface.
 //
 // IMPORTANT — scope note: design.md decision 1 says the real transport for
 // agent traffic is a native-messaging port relay owned by
@@ -145,6 +164,12 @@ export function createSettingsClient(opts = {}) {
     chatgptDeviceStart: (profileId, options) => call("chatgpt_device_start", { profileId, ...(options || {}) }),
     chatgptSignInStatus: (signInId) => call("chatgpt_sign_in_status", { signInId }),
     chatgptSignInCancel: (signInId) => call("chatgpt_sign_in_cancel", { signInId }),
-    chatgptSignOut: (profileId) => call("chatgpt_sign_out", { profileId })
+    chatgptSignOut: (profileId) => call("chatgpt_sign_out", { profileId }),
+    // Account-usage read (add-chatgpt-usage-check): display-shaped reply only
+    // — the plan, the limit flags, each window's percent/reset timing, and a
+    // credits summary when the account has one. Sends nothing but the
+    // profileId; the companion resolves the credential (see the wire-contract
+    // block above for the exact reply shape).
+    chatgptUsage: (profileId) => call("chatgpt_usage", { profileId })
   };
 }

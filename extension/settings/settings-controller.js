@@ -89,6 +89,14 @@ function emptyState(profileId) {
     switchingProviderType: false,
     signingOut: false,
     signIn: emptySignInState(),
+    // ChatGPT account usage (add-chatgpt-usage-check design.md decision 6).
+    // Display-only: `usage` is the companion's display-shaped result (the
+    // exact six-key reply — see settings-client.js's wire contract) and is
+    // never written back to the profile, to extension storage, or to a
+    // mirror. `status` drives the block's loading/ready/error rendering; a
+    // profile that is not signed in never leaves "idle" because no read is
+    // ever issued for it (see refreshUsage()).
+    usage: { status: "idle", usage: null, error: null },
 
     saving: false,
     testing: false,
@@ -118,16 +126,27 @@ export class SettingsController {
    * profile state. */
   #pendingSignInFlow = null;
 
+  /** Monotonic tag for the newest ChatGPT usage read (add-chatgpt-usage-check).
+   * A response whose tag is no longer current — a newer read replaced it, or
+   * `init()` reset the page — is discarded rather than written into state.
+   * Private for the same reason as the fields above: transient bookkeeping,
+   * never part of the state snapshot. */
+  #usageReadTag = 0;
+
   /**
    * @param {ReturnType<import("./settings-client.js").createSettingsClient>} client
    * @param {{ profileId?: string, onChange?: (state: object) => void,
-   *   setIntervalFn?: Function, clearIntervalFn?: Function, pollIntervalMs?: number }} [opts]
+   *   setIntervalFn?: Function, clearIntervalFn?: Function, pollIntervalMs?: number,
+   *   now?: () => number }} [opts]
    *   `setIntervalFn`/`clearIntervalFn` default to the real timer globals —
    *   overridable so a test can drive the ChatGPT sign-in poll deterministically
    *   without a real 1-second wait (this module has no `document`/`chrome`
    *   reference; see file header — timers are the one platform primitive it
    *   does need, so they are injectable the same way host/agent/chatgpt/auth.js
-   *   injects its own clock/network dependencies).
+   *   injects its own clock/network dependencies). `now` serves the same
+   *   purpose for the usage block: it turns a reply's relative
+   *   `resetAfterSeconds` into the absolute reset moment the DOM layer counts
+   *   down to, so that moment is deterministic under test.
    */
   constructor(client, opts = {}) {
     this.client = client;
@@ -138,6 +157,9 @@ export class SettingsController {
     this._clearIntervalFn = opts.clearIntervalFn || ((id) => clearInterval(id));
     this._pollIntervalMs = opts.pollIntervalMs || CHATGPT_SIGNIN_POLL_MS;
     this._pollTimer = null;
+    this._now = opts.now || (() => Date.now());
+    // The one usage read currently in flight, or null — see refreshUsage().
+    this._usageInFlight = null;
   }
 
   getState() {
@@ -185,6 +207,19 @@ export class SettingsController {
     // configured profile (custom endpoint, no key/model yet) is still
     // first-run onboarding, not a "returning user" state.
     s.isFirstRun = !s.hasCredential && s.models.length === 0;
+
+    // ChatGPT usage (add-chatgpt-usage-check design.md decision 6): a
+    // signed-in `chatgpt` profile starts one read; every other state clears
+    // the block instead, because no read is ever issued for it (specs
+    // "ChatGPT usage display" — not signed in / expired reads nothing). The
+    // read happens once per profile application, never on a timer;
+    // refreshUsage() de-duplicates against a read already in flight, so a
+    // profile application arriving mid-read does not double the request.
+    if (s.providerType === "chatgpt" && s.chatgptSessionState === "signed_in") {
+      this.refreshUsage();
+    } else {
+      s.usage = { status: "idle", usage: null, error: null };
+    }
   }
 
   /** Load (or reload) the profile from the companion. Also used for the
@@ -201,6 +236,11 @@ export class SettingsController {
     }
     this.#pendingSecretForRetry = null;
     this.#pendingSignInFlow = null;
+    // Any read issued for the state being replaced is now stale — its tag no
+    // longer matches, so whatever it resolves with is discarded rather than
+    // landing on this page (see _usageStale()).
+    this.#usageReadTag += 1;
+    this._usageInFlight = null;
     this._notify();
     try {
       const profile = await this.client.getProfile(this.state.profileId);
@@ -454,6 +494,124 @@ export class SettingsController {
       this._notify();
       return { ok: false, error: err.message, code: err.code };
     }
+  }
+
+  // --- ChatGPT account usage (add-chatgpt-usage-check) --------------------
+  //
+  // Read-only and display-only: nothing here is written back to the profile,
+  // to extension storage, or to a mirror, and nothing polls on a timer. A
+  // read happens for exactly two reasons — a signed-in `chatgpt` profile just
+  // loaded (see _applyProfile()), or the user activated refresh. `state.usage`
+  // holds the companion's display-shaped result (the six-key reply documented
+  // in settings-client.js's wire contract — never a token, never an account
+  // identity) plus this block's own loading/error state.
+
+  /** True for the one state that has a usage block to read: a signed-in
+   * `chatgpt` profile. An `anthropic` profile, a signed-out one, and a
+   * session-expired one all read nothing (specs "ChatGPT usage display"). */
+  _usageReadable() {
+    return this.state.providerType === "chatgpt" && this.state.chatgptSessionState === "signed_in";
+  }
+
+  /**
+   * Read the account's usage through the companion and land it in
+   * `state.usage`.
+   *
+   * Returns the in-flight read's own promise when one is already running for
+   * the displayed profile, so a load-time read and an immediate explicit
+   * refresh cost exactly one request between them. A read issued for a
+   * profile that is no longer displayed (a late response after a profile
+   * switch, or after `init()` reset the page) is discarded rather than
+   * written into state.
+   *
+   * @returns {Promise<{ ok: boolean, usage?: object, code?: string,
+   *   error?: string, stale?: boolean }>} never rejects.
+   */
+  refreshUsage() {
+    if (!this._usageReadable()) {
+      return Promise.resolve({ ok: false, error: "usage is only read for a signed-in ChatGPT profile" });
+    }
+    const profileId = this.state.profileId;
+    // De-duplicate only while the block is genuinely mid-read: once an
+    // outcome has landed (ready or error), a new call is a new read — which
+    // is what makes an explicit refresh after a failure re-attempt, and keeps
+    // a second read from racing the first.
+    if (
+      this.state.usage.status === "loading" &&
+      this._usageInFlight &&
+      this._usageInFlight.profileId === profileId
+    ) {
+      return this._usageInFlight.promise;
+    }
+    const tag = ++this.#usageReadTag;
+    const entry = { profileId, promise: null };
+    this.state.usage = { status: "loading", usage: null, error: null };
+    this._notify();
+    entry.promise = this._readUsage(profileId, tag).finally(() => {
+      if (this._usageInFlight === entry) this._usageInFlight = null;
+    });
+    this._usageInFlight = entry;
+    return entry.promise;
+  }
+
+  /** One usage read's outcome -> state transition. Never throws: every
+   * failure becomes the block's own `error` state. A SESSION_EXPIRED failure
+   * additionally mirrors the profile transition the companion just recorded
+   * (the same one the gateway records for an expired session), so the page
+   * shows its usual session-expired state and sign-in action rather than a
+   * usage block it can no longer read; the account mirror itself is left as
+   * it was. */
+  async _readUsage(profileId, tag) {
+    try {
+      const result = await this.client.chatgptUsage(profileId);
+      if (this._usageStale(profileId, tag)) return { ok: false, stale: true };
+      this.state.usage = { status: "ready", usage: this._withResetMoments(result), error: null };
+      this._notify();
+      return { ok: true, usage: this.state.usage.usage };
+    } catch (err) {
+      if (this._usageStale(profileId, tag)) return { ok: false, stale: true };
+      const code = err.code || "NETWORK_ERROR";
+      this.state.usage = { status: "error", usage: null, error: { code, message: err.message } };
+      if (code === "SESSION_EXPIRED") {
+        this.state.chatgptSessionState = "session_expired";
+        this.state.banner = { kind: "error", code, ...describeErrorCode(code) };
+      }
+      this._notify();
+      return { ok: false, error: err.message, code };
+    }
+  }
+
+  /** A response is stale — and therefore discarded — when a newer read (or a
+   * profile reset) has taken its place, or when the displayed profile is no
+   * longer the one the read was issued for. Same guard as the capability
+   * result's. */
+  _usageStale(profileId, tag) {
+    return tag !== this.#usageReadTag || this.state.profileId !== profileId;
+  }
+
+  /** Give each present window the ABSOLUTE reset moment the DOM layer counts
+   * down to (design.md decision 6), so the countdown needs no controller
+   * ticking and stays deterministic under test. The moment is
+   * `now() + resetAfterSeconds * 1000`; the backend's own `resetAt` is used
+   * only when the window carries no relative value at all (an unusable
+   * `resetAt` then yields null, and the block shows the percent without a
+   * countdown rather than a wrong clock time). Windows are copied, never
+   * mutated in place — the reply object the client resolved with is left
+   * untouched — and no other reply field is altered. */
+  _withResetMoments(result) {
+    if (!result || typeof result !== "object") return result;
+    const fetchedAt = this._now();
+    const project = (window) => {
+      if (!window || typeof window !== "object") return null;
+      const resetAfterSeconds = typeof window.resetAfterSeconds === "number" ? window.resetAfterSeconds : null;
+      const resetAtMs = resetAfterSeconds !== null
+        ? fetchedAt + resetAfterSeconds * 1000
+        : typeof window.resetAt === "number"
+          ? window.resetAt
+          : null;
+      return { ...window, resetAtMs };
+    };
+    return { ...result, primary: project(result.primary), secondary: project(result.secondary) };
   }
 
   // --- Base URL -----------------------------------------------------------

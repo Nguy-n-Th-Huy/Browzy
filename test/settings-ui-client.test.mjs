@@ -47,7 +47,7 @@ console.log("== outgoing message shape ==");
   ok(calls[6].op === "export_profile", "exportProfile op");
 }
 
-console.log("== outgoing message shape: the six ChatGPT subscription ops ==");
+console.log("== outgoing message shape: the ChatGPT subscription ops ==");
 {
   const calls = [];
   const client = createSettingsClient({ sendMessage: async (msg) => { calls.push(msg); return { ok: true, result: {} }; } });
@@ -93,6 +93,51 @@ console.log("== outgoing message shape: the six ChatGPT subscription ops ==");
     const offending = Object.keys(msg).filter((k) => SECRET_SHAPED.test(k));
     ok(offending.length === 0, `no secret-shaped field on ${msg.op}: ${offending.length ? offending.join(",") : "none"}`);
   }
+}
+
+console.log("== outgoing message shape: the ChatGPT account-usage read ==");
+{
+  // add-chatgpt-usage-check task 3.4: the usage op is a plain { profileId }
+  // request — the companion resolves the credential, and the reply is the
+  // display-shaped result the settings page renders. This pins the request
+  // shape (nothing else may ride along) and the minimal reply's pass-through.
+  const calls = [];
+  const usage = {
+    planType: "plus",
+    allowed: true,
+    limitReached: false,
+    primary: { usedPercent: 3, limitWindowSeconds: 2592000, resetAfterSeconds: 1209600, resetAt: 1767264000000 },
+    secondary: null,
+    credits: null
+  };
+  const client = createSettingsClient({
+    sendMessage: async (msg) => {
+      calls.push(msg);
+      return { ok: true, result: usage };
+    }
+  });
+
+  const result = await client.chatgptUsage("default");
+  ok(calls.length === 1, "one message per call");
+  ok(calls[0].type === "agent_settings" && calls[0].op === "chatgpt_usage" && calls[0].profileId === "default",
+    `chatgptUsage sends { type: "agent_settings", op: "chatgpt_usage", profileId } — got ${JSON.stringify(calls[0])}`);
+  ok(Object.keys(calls[0]).length === 3,
+    `and NOTHING else rides along (no token, no account id, no model id) — got ${JSON.stringify(Object.keys(calls[0]))}`);
+  ok(JSON.stringify(result) === JSON.stringify(usage), "the display-shaped reply passes through unwrapped and unmodified");
+
+  // A failing read is a structured envelope error like every other op: the
+  // block's own copy keys off this code (USAGE_UNAVAILABLE is the new one).
+  const failing = createSettingsClient({
+    sendMessage: async () => ({ ok: false, error: { code: "USAGE_UNAVAILABLE", message: "the usage body was not the expected shape" } })
+  });
+  let caught = null;
+  try {
+    await failing.chatgptUsage("default");
+  } catch (err) {
+    caught = err;
+  }
+  ok(caught instanceof ProviderErrorLike && caught.code === "USAGE_UNAVAILABLE",
+    "USAGE_UNAVAILABLE arrives as a typed ProviderErrorLike with its code intact");
 }
 
 console.log("== success response translation ==");

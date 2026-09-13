@@ -381,6 +381,17 @@ automatic: the profile stays on the Anthropic type until you switch it.
    stored credential is deleted, any run using it is cancelled, and in-flight
    requests through it stop being served.
 
+**Seeing current usage.** Settings shows the signed-in account's current usage
+and limits: for each rate-limit window the account reports (a plan may report
+one or two), the percent of that window already used and a live countdown to
+its reset, plus a **Làm mới** ("Refresh") action that reads it again on demand.
+The values come from the same signed-in account the profile runs on — read when
+the page loads a signed-in profile and when you activate refresh, never on a
+timer — and reading them does **not** count against your model quota, unlike
+Test connection above. It is the same undocumented backend as the run path, so
+if that endpoint changes or closes, the failure stays inside the usage block
+and the rest of Settings keeps working.
+
 **Usage limits.** A ChatGPT subscription is metered, and this provider does not
 work around that. When the account hits its limit, the request fails and the
 panel reports the limit and its reset time, and nothing is retried behind your
@@ -447,6 +458,14 @@ search/filter/export/privacy surface added later by
 `openspec/changes/optimize-chat-history` is covered by that change's
 `reports/implementation-evidence.md` rather than by new screenshots — plus
 composer prompt enhancement (the "Cải thiện prompt" control next to Send).
+
+**Live answer and thinking.** While a run is in flight the panel shows the
+assistant's answer text as it is produced into the same response being
+assembled, and the model's reasoning in a collapsible "Suy luận" block inside
+that turn — not only once the message completes. Both are display-only: what
+streams is never written to the conversation's stored history, and the
+completed message is reconciled with what was already shown so no text appears
+twice.
 
 **Documents the agent creates.** When a run produces something that is a
 document in its own right — a report, an audit, a data table, a set of slides —

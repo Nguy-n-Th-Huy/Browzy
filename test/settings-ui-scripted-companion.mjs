@@ -5,9 +5,10 @@
 // (getProfile/saveProfile/setCredential/removeCredential/testCapability/
 // discoverModels/exportProfile, plus the six ChatGPT subscription ops
 // setProviderType/chatgptSignInStart/chatgptDeviceStart/chatgptSignInStatus/
-// chatgptSignInCancel/chatgptSignOut), so SettingsController never knows the
-// difference — the same class this test drives is the one settings-app.js
-// instantiates in production.
+// chatgptSignInCancel/chatgptSignOut and the account-usage read
+// chatgptUsage), so SettingsController never knows the difference — the same
+// class this test drives is the one settings-app.js instantiates in
+// production.
 //
 // This is intentionally SEPARATE from
 // test/settings-ui-real-companion-harness.mjs (which wraps the real,
@@ -40,7 +41,12 @@ export function createScriptedCompanion(initialProfile = null) {
     chatgptDeviceStart: null, // (profileId, opts) => { signInId, userCode, verificationUrl, expiresAt } | throws
     chatgptSignInStatus: null, // (signInId) => { state, ... } | throws
     chatgptSignInCancel: null, // (signInId) => { cancelled: true } | throws
-    chatgptSignOut: null // (profileId) => updated profile | throws
+    chatgptSignOut: null, // (profileId) => updated profile | throws
+    // ChatGPT account-usage read (add-chatgpt-usage-check). Override to script
+    // the six-key display result — or any of the reader's failure codes
+    // (SESSION_EXPIRED / NO_CREDENTIAL / RATE_LIMIT_ERROR / AUTH_ERROR /
+    // NETWORK_ERROR / TIMEOUT_ERROR / USAGE_UNAVAILABLE) — without a network.
+    chatgptUsage: null // (profileId) => usage result | throws
   };
 
   function requireProfile(profileId) {
@@ -174,6 +180,25 @@ export function createScriptedCompanion(initialProfile = null) {
         credentialRevision: (profile.credentialRevision || 0) + 1
       };
       return { ...profile, models: profile.models.map((m) => ({ ...m })) };
+    },
+
+    // --- ChatGPT account-usage read (add-chatgpt-usage-check) -------------
+    // Reply shape is the six-key display result settings-client.js's wire
+    // contract documents and host/agent/chatgpt/usage.js produces: the plan,
+    // the limit flags, each window's percent/reset timing, and credits only
+    // when the account has them. Never a token, account id, user id, or email.
+    async chatgptUsage(profileId) {
+      calls.push({ op: "chatgpt_usage", profileId });
+      requireProfile(profileId);
+      if (scripts.chatgptUsage) return scripts.chatgptUsage(profileId);
+      return {
+        planType: "plus",
+        allowed: true,
+        limitReached: false,
+        primary: { usedPercent: 3, limitWindowSeconds: 2592000, resetAfterSeconds: 1209600, resetAt: null },
+        secondary: null,
+        credits: null
+      };
     }
   };
 

@@ -60,6 +60,28 @@
   .provider-type-option { display: inline-flex; align-items: center; gap: var(--space-1); font-size: var(--font-size-small); cursor: pointer; }
   .provider-type-option input[type="radio"] { accent-color: var(--color-accent); }
   #chatgpt-fields > * + * { margin-top: var(--space-2); }
+  /* ChatGPT usage block (add-chatgpt-usage-check tasks.md 4.3): a compact,
+     read-only summary — plan, one line per window the account actually has,
+     credits only when it has them. Sunken surface so it reads as information
+     rather than as another field to fill in. */
+  .chatgpt-usage-block {
+    background: var(--color-surface-sunken);
+    border-radius: var(--radius-sm);
+    padding: var(--space-3);
+  }
+  /* A div with a class-based background but no display declaration: the
+     native [hidden] rule is enough — see the .btn[hidden] note below for the
+     case where it is not. */
+  .chatgpt-usage-head { align-items: center; flex-wrap: wrap; gap: var(--space-2); }
+  .chatgpt-usage-head .field-label { flex: 1; min-width: 140px; }
+  #chatgpt-usage-plan:empty,
+  #chatgpt-usage-live:empty,
+  #chatgpt-usage-credits:empty,
+  #chatgpt-usage-limit:empty { display: none; }
+  .chatgpt-usage-window { margin: 0; }
+  .chatgpt-usage-window + .chatgpt-usage-window { margin-top: var(--space-1); }
+  .chatgpt-usage-window-label { color: var(--color-text); font-weight: 600; }
+  .chatgpt-usage-limit { color: var(--color-status-danger); }
   .chatgpt-device-code-input {
     font-family: var(--font-mono);
     font-size: 1.3em;
@@ -268,6 +290,24 @@
           <div class="field-row-actions">
             <button class="btn btn-ghost btn-sm" type="button" id="btn-chatgpt-signout">Đăng xuất</button>
           </div>
+        </div>
+
+        <!-- ChatGPT account usage (add-chatgpt-usage-check tasks.md 4.3).
+             Rendered only for a signed-in profile; every value comes from the
+             companion's display-shaped usage reply (plan, each window's used
+             percent and reset countdown, credits when the account has them).
+             Nothing in this block is user-selectable state and no credential
+             or account identity is rendered in it. -->
+        <div id="chatgpt-usage-block" class="chatgpt-usage-block" role="group" aria-labelledby="chatgpt-usage-title" hidden>
+          <div class="field-row chatgpt-usage-head">
+            <span class="field-label" id="chatgpt-usage-title">Mức sử dụng của tài khoản</span>
+            <button class="btn btn-secondary btn-sm" type="button" id="btn-chatgpt-refresh-usage">Làm mới</button>
+          </div>
+          <p class="field-hint" id="chatgpt-usage-plan"></p>
+          <p class="field-hint" id="chatgpt-usage-live" role="status" aria-live="polite"></p>
+          <div id="chatgpt-usage-windows"></div>
+          <p class="field-hint" id="chatgpt-usage-credits" hidden></p>
+          <p class="field-hint chatgpt-usage-limit" id="chatgpt-usage-limit" hidden></p>
         </div>
 
         <div id="chatgpt-session-expired-actions" hidden>
