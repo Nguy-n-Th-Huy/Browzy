@@ -4,7 +4,7 @@
   <em>Official Claude in Chrome gives you 58 blocked domains and two browsers.<br/>
   <strong>Browzy gives you the whole web.</strong></em>
   <br/>
-  <sub>Clean-room reimplementation of Anthropic's browser extension. No blocklist. Any Chromium browser. A 28-tool registry (26 preserved baseline + 2 experimental WebMCP page-tool operations), with the specified flows tested against a real benchmark — not a guarantee of every proprietary feature (see <a href="#what-this-is-not">What this is not</a>).</sub>
+  <sub>Clean-room reimplementation of Anthropic's browser extension. No blocklist. Any Chromium browser. A 30-tool registry (25 preserved baseline + 5 post-baseline additions, with 1 removal recorded), with the specified flows tested against a real benchmark — not a guarantee of every proprietary feature (see <a href="#what-this-is-not">What this is not</a>).</sub>
   <br/>
   <sub><em>Independent project. Not affiliated with, endorsed by, or sponsored by Anthropic.</em></sub>
 </p>
@@ -20,7 +20,7 @@
 
 ---
 
-The official [Claude in Chrome](https://code.claude.com/docs/en/chrome) extension gives Claude Code full browser automation — as long as you stay within Anthropic's allowlist of "safe" sites. Browzy is a clean-room reimplementation that strips the restrictions, with a 28-tool browser registry (26 preserved baseline + 2 experimental WebMCP page-tool operations; verified programmatically — see [Available Tools](#available-tools)) and turn/latency performance that a benchmark below found statistically indistinguishable from the official extension on the tested task set — not a guarantee of matching every proprietary feature (see [What this is not](#what-this-is-not)).
+The official [Claude in Chrome](https://code.claude.com/docs/en/chrome) extension gives Claude Code full browser automation — as long as you stay within Anthropic's allowlist of "safe" sites. Browzy is a clean-room reimplementation that strips the restrictions, with a 30-tool browser registry (25 preserved baseline + 5 post-baseline additions, with 1 removal recorded; verified programmatically — see [Available Tools](#available-tools)) and turn/latency performance that a benchmark below found statistically indistinguishable from the official extension on the tested task set — not a guarantee of matching every proprietary feature (see [What this is not](#what-this-is-not)).
 
 **Two ways to run it.** A **built-in browser side panel**, driven by the official [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk) through a local native companion — no Claude account, no terminal, no Claude Code client, just your own Anthropic-compatible Base URL/API key/model, configured once in Settings. Or the original **external MCP** entry point, unchanged and fully supported, for driving the same extension from a Claude Code session. Both share the one browser extension and one native companion; see [Quick start](#quick-start-two-ways-to-run-it) below. The side panel is the newer, actively-developing path — some of its screens (see [Side panel status](#side-panel-status) below) are still catching up to the external-MCP path's tool coverage.
 
@@ -31,7 +31,7 @@ The official [Claude in Chrome](https://code.claude.com/docs/en/chrome) extensio
 | **Domain blocklist** | 58 blocked domains across 11 categories | No blocklist. Navigate anywhere. |
 | **Browser support** | Chrome and Edge only | Any Chromium browser (Chrome, Edge, Brave, Arc, Opera, Vivaldi, etc.) |
 | **Source code** | Closed source | Open source (MIT) |
-| **Tools** | ~21 MCP tools (Anthropic's own count; not independently verified here) | 28 registry tools (verified: `test/registry-baseline.test.mjs`) — the 26-tool preserved baseline (19 with a named official equivalent, 3 of those currently unimplemented stubs, see [Available Tools](#available-tools); 7 with no official equivalent) plus 2 experimental WebMCP page-tool operations with no official equivalent (`webmcp_list_tools`, `webmcp_call_tool`, see [WebMCP page tools](#webmcp-page-tools-experimental)), plus `execute_code` and the recording channel outside the core registry |
+| **Tools** | ~21 MCP tools (Anthropic's own count; not independently verified here) | 30 registry tools (verified: `test/registry-baseline.test.mjs`) — the 25-tool preserved baseline (19 with a named official equivalent, all implemented, see [Available Tools](#available-tools); 6 with no official equivalent) plus 5 post-baseline additions (`browser_batch`, `list_connected_browsers` and `select_browser` with official equivalents, and 2 experimental WebMCP page-tool operations with no official equivalent — `webmcp_list_tools`, `webmcp_call_tool`, see [WebMCP page tools](#webmcp-page-tools-experimental)), with `switch_browser` removed in favour of `select_browser` (recorded in the baseline's removals set), plus `execute_code` and the recording channel outside the core registry |
 | **Account required** | Claude account/subscription | Side panel: none — bring your own Anthropic-compatible API key. External MCP: a Claude Code session (its own auth, unrelated to this extension) |
 | **Performance** | Baseline | Statistically indistinguishable on the tested benchmark (external-MCP path, both cold — see below); the side panel has not been separately benchmarked |
 
@@ -49,10 +49,10 @@ here. In particular:
   or reproduced by the side panel — it is a separate implementation using
   your own Anthropic-compatible API credential (see [Quick
   start](#quick-start-two-ways-to-run-it)).
-- Three tools (`gif_creator`, `shortcuts_list`, `shortcuts_execute`) exist in
-  the registry with full schemas but are **currently unimplemented stubs**
-  that return a fixed "not supported" result regardless of arguments — see
-  [Available Tools](#available-tools). They are not silently claimed to work.
+- Three tools (`gif_creator`, `shortcuts_list`, `shortcuts_execute`) used to
+  exist in the registry as unimplemented stubs; they are now real
+  implementations (GIF export, workflow-backed shortcuts) — see [Available
+  Tools](#available-tools).
 - The benchmark below covers the external-MCP path on one 12-task suite
   against one model; it is evidence for that specific comparison, not a
   general performance guarantee, and its own caveats (task-set saturation,
@@ -129,7 +129,7 @@ you talk to them.
 | Setup, once | Load the extension, run the installer, open Settings and enter your provider credential | Load the extension, run the installer, `claude mcp add ...` |
 | Where to go | [SDK-first: browser side panel](#sdk-first-browser-side-panel-no-claude-account) | [External MCP: Claude Code (legacy)](#external-mcp-claude-code-legacy) |
 
-Both share the same 28-tool browser registry (26 preserved + 2 experimental WebMCP page-tool operations), the same stable extension
+Both share the same 30-tool browser registry (25 preserved + 5 post-baseline additions, with 1 removal recorded), the same stable extension
 identity, and the same one-time installer. Neither disables or removes the
 other — running the installer sets both up, and which one you use day to day
 is just a matter of what you open (the browser's side panel, or a Claude Code
@@ -157,7 +157,7 @@ Side panel <--extension messaging--> background.js <--native messaging--> native
                                                                      Anthropic-compatible endpoint
                                                                                 |
                                                                     in-process SDK MCP server
-                                                                     (the same 28-tool registry)
+                                                                     (the same 30-tool registry)
                                                                                 |
                                                                     native-host.js <--native messaging--> Extension <--> Browser
 ```
@@ -192,7 +192,7 @@ Claude Code <--stdio MCP--> server-{codemode,hybrid}.js
 ```
 
 Components:
-1. **Extension** — Manifest V3 with CDP-based browser automation (28 registry tools: 26 preserved + 2 experimental WebMCP page-tool operations), plus a side panel and settings UI
+1. **Extension** — Manifest V3 with CDP-based browser automation (30 registry tools: 25 preserved + 5 post-baseline additions, with 1 removal recorded), plus a side panel and settings UI
 2. **Native Messaging Host** (`host/native-host.js`) — bridges the extension to either the SDK companion or an external MCP server, and arbitrates the one shared browser lease between them
 3. **SDK companion** (`host/agent/`) — runs the Claude Agent SDK against your configured provider, exposing the same browser registry as in-process SDK tools; started automatically, supervised, no user-run MCP server
 4. **MCP Server** (`host/mcp-server.js`, external-MCP path) — Node.js process started by Claude Code, exposes the same tools via MCP
@@ -234,7 +234,7 @@ npm install --prefix host/codemode/worker
 ```
 
 `--legacy-peer-deps` is required: the pinned Claude Agent SDK declares a
-`zod@^4` peer, while this project's existing 28-tool registry depends on
+`zod@^4` peer, while this project's existing 30-tool registry depends on
 `zod@^3` (via `zod-to-json-schema`, which reads zod v3's internal shape) —
 bumping the shared `zod` to v4 would break that registry. The installed
 zod v3 release already implements the interface the SDK actually calls, so
@@ -419,7 +419,7 @@ required before recording, on either path:
 
 ### Add the server to Claude Code
 
-The **hybrid** server exposes everything: all 28 tools directly (26 preserved + 2 experimental WebMCP page-tool operations), `execute_code`
+The **hybrid** server exposes everything: all 30 tools directly (25 preserved + 5 post-baseline additions), `execute_code`
 alongside (the model picks per call), and the recording channel.
 
 ```bash
@@ -639,12 +639,12 @@ Code](#add-the-server-to-claude-code) is the superset and the one the install
 steps assume. Two leaner variants exist if you want them, and they can
 coexist — register more than one.
 
-**Default** — the 28 tools, nothing else:
+**Default** — the 30 tools, nothing else:
 ```bash
 claude mcp add browzy-in-chrome -- node /absolute/path/to/host/mcp-server.js
 ```
 
-**Code mode** — three tools: `execute_code`, `screenshot`, `zoom`. The model writes JS that calls `chrome.*` (the typed API for all 28 tools) in a sandboxed Cloudflare Worker, collapsing multi-step flows into one round trip:
+**Code mode** — three tools: `execute_code`, `screenshot`, `zoom`. The model writes JS that calls `chrome.*` (the typed API for all 30 tools) in a sandboxed Cloudflare Worker, collapsing multi-step flows into one round trip:
 ```bash
 claude mcp add browzy-in-chrome-codemode -- node /absolute/path/to/host/codemode/server-codemode.js
 ```
@@ -785,19 +785,22 @@ If the model still uses direct tools on the second submission, that's a signal t
 
 ## Available Tools
 
-The core browser registry (`host/tool-definitions.js`) has **28** entries,
+The core browser registry (`host/tool-definitions.js`) has **30** entries,
 verified programmatically (`test/registry-baseline.test.mjs`,
-`reports/06-registry-baseline.md`) — the **26** preserved-baseline entries
-below (every table row through `switch_browser` plus `update_plan` through
-`debug_timings`) plus the **2** experimental WebMCP page-tool operations,
-`webmcp_list_tools` and `webmcp_call_tool` (see [WebMCP page
-tools](#webmcp-page-tools-experimental) below — they are tracked as a
-separate, explicitly-enumerated addition on top of the 26-tool baseline, not
-folded into that count, so a future regression there is never indistinguishable
-from an intentional addition). `execute_code` (codemode/hybrid servers) and
+`reports/06-registry-baseline.md`) — the **25** preserved-baseline entries
+below (every table row through `select_browser` plus `update_plan` through
+`debug_timings`) plus the **5** post-baseline additions,
+`webmcp_list_tools`, `webmcp_call_tool` (see [WebMCP page
+tools](#webmcp-page-tools-experimental) below), `browser_batch`, and
+`list_connected_browsers` plus `select_browser` — each tracked as an
+explicitly-enumerated addition on top of the 25-tool baseline, never folded
+into that count, so a future regression there is never indistinguishable
+from an intentional addition. `switch_browser` was removed in favour of
+`select_browser` and is recorded in the baseline's removals set for the same
+reason. `execute_code` (codemode/hybrid servers) and
 `recording_ack` (the recording channel) sit outside that core registry and are
 listed here for completeness. Both the side panel and external MCP dispatch
-against the same 28-tool registry; the side panel does not yet expose
+against the same 30-tool registry; the side panel does not yet expose
 `execute_code` or `recording_ack` (those are external-MCP-only, see [Server
 variants](#server-variants)).
 
@@ -808,7 +811,7 @@ not](#what-this-is-not)):
 
 - **✓** — matches a named official tool's interface (same arguments, same
   kind of result) and is fully implemented here
-- **✗** — present but diverges (a stub, or a capability gap — see the notes
+- **✗** — present but diverges (a capability gap — see the notes
   below the table)
 - *(blank)* — a tool this project adds with no official equivalent
 
@@ -828,11 +831,12 @@ not](#what-this-is-not)):
 | `read_network_requests` | Network activity | ✓ |
 | `resize_window` | Resize browser window | ✓ |
 | `file_upload` | Attach local file(s) to a file input (by ref) | ✓ |
-| `upload_image` | Attach a captured screenshot to a file input (by ref) | ✗ |
-| `gif_creator` | GIF recording | ✗ |
-| `shortcuts_list` | List shortcuts | ✗ |
-| `shortcuts_execute` | Run a shortcut | ✗ |
-| `switch_browser` | Hand off automation to another Chromium browser | ✗ |
+| `upload_image` | Attach a captured screenshot to a file input (by ref) or drop it at a coordinate | ✓ |
+| `gif_creator` | GIF recording and export | ✓ |
+| `shortcuts_list` | List shortcuts | ✓ |
+| `shortcuts_execute` | Run a shortcut | ✓ |
+| `list_connected_browsers` | Enumerate attached browsers, marking the driver | ✓ |
+| `select_browser` | Transfer automation to a named attached browser | ✓ |
 | `execute_code` | Run sandboxed JS that drives every tool via `chrome.*` | |
 | `update_plan` | Present a plan for approval | |
 | `set_tab_focus` | Surface a tab: select it, optionally raise its window | |
@@ -848,12 +852,7 @@ not](#what-this-is-not)):
 Notes on the divergences (✗):
 
 - `file_upload` matches Claude in Chrome's interface (`paths`, `ref`, `tabId`) but does **not** restrict sources to session-shared paths — any absolute path on this machine is accepted.
-- `upload_image` is file-input-only (target it by `ref`); Claude in Chrome additionally supports dropping an image at a `coordinate` (e.g. Google Docs).
-- `gif_creator`, `shortcuts_list`, and `shortcuts_execute` are **currently
-  unimplemented stubs**: their input schemas are fully declared and validated,
-  but their handlers return a fixed "not yet implemented"/"not supported"
-  text result regardless of arguments (`reports/06-registry-baseline.md`).
-- `switch_browser` releases the shared runtime for ~15s so another browser can take over, in place of Claude in Chrome's `list_connected_browsers` / `select_browser` pair.
+- `select_browser` transfers automation through a directed, confirmed handoff between attached browsers rather than any timed release window.
 
 ### WebMCP page tools (experimental)
 
@@ -1045,9 +1044,106 @@ which is why the recorder's own image track is not replaced by it.
 ### Claude in Chrome tools not yet supported in Browzy in Chrome
 
 - `browser_batch` — run several tool calls in one round trip. Browzy in Chrome instead offers `execute_code`, which runs arbitrary JS driving the same tools in one call.
-- `list_connected_browsers` — enumerate attached browsers.
-- `select_browser` — pick which browser drives automation.
-- `upload_image` drop-at-coordinate — Browzy in Chrome's `upload_image` attaches to a file input by `ref` only.
+
+## Permission modes and protected actions
+
+Every mutating action the agent attempts — clicking, typing, submitting a
+form, a side-effecting navigation, and so on — is classified and decided
+against a permission mode before it dispatches. A read-only action (reading
+page text, taking a screenshot, listing tabs) is never gated by any mode. An
+action the classifier cannot place into a known class is treated as
+protected rather than as freely allowed, so a tool added without a
+classification entry asks first instead of slipping through ungated.
+
+### The three modes
+
+- **Auto** *(default)* — asks before a send/submit-class action (the same
+  narrow set gated before this feature existed) and lets every other
+  mutating action proceed with no decision required. An unconfigured
+  install behaves exactly as it always did.
+- **Manual** — asks before every mutating action, not only send/submit-class
+  ones.
+- **Skip** — asks about nothing except a protected action (below).
+
+The mode is a local, per-profile setting, or an administrator-pinned one
+(see below) — it never syncs across machines or profiles. Changing it
+mid-run only governs actions dispatched after the change: a decision already
+pending when the mode changes is invalidated rather than silently
+reinterpreted under the new mode, and an action already dispatched is never
+retroactively re-decided.
+
+**Remembering a decision.** For any decision the active mode allows to be
+remembered, asking for it to be remembered scopes it to that site's origin
+and that action's class; a later matching action on the same origin then
+proceeds without asking again, in any mode. A remembered decision never
+crosses to a different origin or a different action class, page content can
+never create or extend one, and it can be revoked individually or all at
+once.
+
+**Where to change it.** The chat panel shows the current mode as a badge you
+can open to switch it directly (it shows a lock instead when an
+administrator has pinned the mode, and offers no menu in that case). Settings
+> "Quyền & trang đã ghi nhớ" (Permissions & remembered sites) has the same
+mode control plus the list of remembered per-site decisions, each revocable
+individually or all at once.
+
+### Protected actions
+
+Some actions always require a fresh, explicit decision — under every mode
+including Skip, regardless of any remembered per-site grant, and regardless
+of administrator policy. Nothing bypasses this:
+
+- writing or downloading a file to disk,
+- entering credentials or payment details into a page,
+- granting a browser permission on the page's behalf.
+
+A protected decision is one-shot: it is never written to the per-site store,
+and an existing remembered entry for that site is never consulted for it —
+an identical protected action asks again next time.
+
+The extension holds the browser's `downloads` permission for exactly this:
+observing that a download started so it can pause it pending your decision
+— never to start, redirect, or read a download itself. See [Chính sách
+quyền riêng tư](docs/privacy-policy.md#quyền-downloads) for that permission's
+exact scope.
+
+The gate only applies to a download that starts while an agent run currently
+holds the browser — a download you start yourself, outside of a run, is
+never paused or asked about. When a download does start during a run, the
+extension pauses it and asks; your answer resumes or cancels it. This has
+one honest limit: a download the browser finishes before the extension can
+pause it is reported to the conversation rather than gated — it is not
+pretended to have been caught.
+
+### Administrator-managed policy
+
+An administrator can set policy for the extension through
+`chrome.storage.managed`. A managed value overrides the equivalent local
+setting for as long as it is present, cannot be edited locally, and reverts
+to whatever the user had locally the moment it is withdrawn — nothing an
+administrator sets is ever persisted as if the user had chosen it.
+
+The recognized shape:
+
+```js
+{
+  mode?: "manual" | "auto" | "skip",            // pins the mode; the local control cannot override it
+  requireProtectedConfirm?: boolean,             // validated, but currently has nothing left to add:
+                                                  // a protected action already requires a decision under
+                                                  // every mode, so this key can only ever add a
+                                                  // confirmation that is already required — it can never
+                                                  // remove one
+  sites?: [{ origin, actionClass: "mutating" | "send", decision: "allow" | "deny" }]
+}
+```
+
+A policy value that fails to match this shape is never treated as if no
+policy were set — it is reported as an unreadable administrator policy, and
+the runtime falls back to local settings until a valid policy (or none) is
+pushed again. Administrator policy has no field that can weaken or remove a
+protected action's decision requirement; see
+`host/agent/policy/permission-modes.js` for the exact validation this
+document intentionally doesn't restate.
 
 ## Updating After Code Changes
 

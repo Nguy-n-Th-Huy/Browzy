@@ -447,11 +447,11 @@ await test("a session started before the browser reconnects when it appears", as
 });
 
 await test("a waiting host takes over promptly when the owner releases", async (pipe) => {
-  // This is the switch_browser hand-off. background.js drops the outgoing
-  // browser's host and suspends reconnect for SWITCH_RELEASE_MS (15s); the
-  // incoming browser only gets the bridge if it probes inside that window. A
-  // host that backed off to a 15s retry on its first EADDRINUSE would land
-  // there by luck, so the reclaim has to be well inside the window.
+  // This is the directed select_browser hand-off. The outgoing browser's
+  // host yields the pipe and waits for the target's confirmation file; the
+  // incoming browser claims on its accept loop. A host that backed off to
+  // a 15s retry on its first EADDRINUSE would land there by luck, so the
+  // reclaim has to be well inside the window.
   const owner = fakeExtension();
   await waitFor(
     async () => /owns the bridge at/.test(owner.stderrText()),

@@ -39,6 +39,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { TOOLS, toolInputJsonSchema } from "../host/tool-definitions.js";
 import { extractMethod, BACKGROUND } from "./_extract.mjs";
+import { _mutationClassificationCoverage } from "../host/agent/tools/mapping.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SNAPSHOT_PATH = path.join(__dirname, "fixtures", "registry-baseline.json");
@@ -147,26 +148,47 @@ const DESIGN_DOC_TOOL_LIST = [
 // genuine future regression — a preserved tool quietly dropped —
 // indistinguishable from an intentional addition). Added by
 // openspec/changes/consume-webmcp-page-tools (see that change's design.md
-// decision 5) and openspec/changes/add-browser-batch-tool; NOT part of the
-// 26-operation preservation baseline — openspec/specs/agent-browser-runtime's
-// "Preserve the browser capability baseline" requirement is what calls for
-// tracking additions this way.
-const POST_BASELINE_ADDITIONS = ["webmcp_list_tools", "webmcp_call_tool", "browser_batch"];
+// decision 5), openspec/changes/add-browser-batch-tool, and
+// openspec/changes/implement-stubbed-browser-tools (list_connected_browsers
+// plus select_browser); NOT part of the 26-operation preservation baseline —
+// openspec/specs/agent-browser-runtime's "Preserve the browser capability
+// baseline" requirement is what calls for tracking additions this way.
+const POST_BASELINE_ADDITIONS = [
+  "webmcp_list_tools",
+  "webmcp_call_tool",
+  "browser_batch",
+  "list_connected_browsers",
+  "select_browser"
+];
+
+// Operations removed from the baseline, each naming its replacement, so a
+// removal stays distinguishable from a loss. Added by
+// openspec/changes/implement-stubbed-browser-tools (switch_browser's blind
+// timed release replaced by select_browser's confirmed handoff).
+const REMOVED_BASELINE_OPERATIONS = [{ name: "switch_browser", replacedBy: "select_browser" }];
+const removedNames = new Set(REMOVED_BASELINE_OPERATIONS.map((r) => r.name));
 
 const missingFromLive = DESIGN_DOC_TOOL_LIST.filter((n) => !liveNames.includes(n));
 const extraInLive = liveNames.filter((n) => !DESIGN_DOC_TOOL_LIST.includes(n));
+const unexplainedMissing = missingFromLive.filter((n) => !removedNames.has(n));
 
 ok(
-  TOOLS.length === DESIGN_DOC_TOOL_LIST.length + POST_BASELINE_ADDITIONS.length,
-  `live registry has exactly ${DESIGN_DOC_TOOL_LIST.length} preserved-baseline + ${POST_BASELINE_ADDITIONS.length} post-baseline ` +
-    `entries (${DESIGN_DOC_TOOL_LIST.length + POST_BASELINE_ADDITIONS.length} total) — actual: ${TOOLS.length}`
+  TOOLS.length === DESIGN_DOC_TOOL_LIST.length + POST_BASELINE_ADDITIONS.length - REMOVED_BASELINE_OPERATIONS.length,
+  `live registry has exactly ${DESIGN_DOC_TOOL_LIST.length} preserved-baseline + ${POST_BASELINE_ADDITIONS.length} post-baseline - ${REMOVED_BASELINE_OPERATIONS.length} removed ` +
+    `entries (${DESIGN_DOC_TOOL_LIST.length + POST_BASELINE_ADDITIONS.length - REMOVED_BASELINE_OPERATIONS.length} total) — actual: ${TOOLS.length}`
 );
 ok(
-  missingFromLive.length === 0,
-  missingFromLive.length === 0
-    ? "every tool design.md lists is present in the live registry"
-    : `DISCREPANCY: design.md lists tools missing from the live registry: ${missingFromLive.join(", ")}`
+  unexplainedMissing.length === 0,
+  unexplainedMissing.length === 0
+    ? "every tool design.md lists is present in the live registry or named in the removals set"
+    : `DISCREPANCY: design.md lists tools missing from the live registry: ${unexplainedMissing.join(", ")}`
 );
+for (const r of REMOVED_BASELINE_OPERATIONS) {
+  ok(
+    !liveNames.includes(r.name) && liveNames.includes(r.replacedBy),
+    `removal recorded: '${r.name}' is absent and its replacement '${r.replacedBy}' is present`
+  );
+}
 // extraInLive must equal POST_BASELINE_ADDITIONS EXACTLY, in both
 // directions — not merely "extras are permitted". An unaccounted-for extra
 // (a tool nobody documented) and a documented addition gone missing (a
@@ -205,11 +227,50 @@ ok(namesSet.size === liveNames.length, "no duplicate tool names in the live regi
 // the same pass — it now names both the 26-preserved and 2-added counts, so
 // this is a resolved-history note, not a live discrepancy: verified below.
 ok(
-  TOOLS.length === DESIGN_DOC_TOOL_LIST.length + POST_BASELINE_ADDITIONS.length,
-  TOOLS.length === DESIGN_DOC_TOOL_LIST.length + POST_BASELINE_ADDITIONS.length
-    ? `host/tool-definitions.js's header count (${DESIGN_DOC_TOOL_LIST.length} preserved + ${POST_BASELINE_ADDITIONS.length} post-baseline) now matches the live array`
-    : `DISCREPANCY: host/tool-definitions.js's header claims ${DESIGN_DOC_TOOL_LIST.length} preserved + ${POST_BASELINE_ADDITIONS.length} post-baseline entries but the live array has ${TOOLS.length}`
+  TOOLS.length === DESIGN_DOC_TOOL_LIST.length + POST_BASELINE_ADDITIONS.length - REMOVED_BASELINE_OPERATIONS.length,
+  TOOLS.length === DESIGN_DOC_TOOL_LIST.length + POST_BASELINE_ADDITIONS.length - REMOVED_BASELINE_OPERATIONS.length
+    ? `host/tool-definitions.js's header count (${DESIGN_DOC_TOOL_LIST.length} preserved + ${POST_BASELINE_ADDITIONS.length} post-baseline - ${REMOVED_BASELINE_OPERATIONS.length} removed) now matches the live array`
+    : `DISCREPANCY: host/tool-definitions.js's header claims ${DESIGN_DOC_TOOL_LIST.length} preserved + ${POST_BASELINE_ADDITIONS.length} post-baseline - ${REMOVED_BASELINE_OPERATIONS.length} removed entries but the live array has ${TOOLS.length}`
 );
+
+// =============================================================================
+// 1b. Read-only/mutating classification coverage (add-permission-modes-and-
+//     threat-signals task 1.5)
+// =============================================================================
+//
+// mapping.js's isMutatingCall() fail-safe-defaults an unrecognized tool name
+// to MUTATING rather than throwing or reporting a gap — the right behavior
+// for a caller that just wants a conservative answer, but it means a tool
+// appended to TOOLS without a matching READ_ONLY_LEGACY_TOOLS/
+// MUTATING_LEGACY_TOOLS entry classifies silently (as mutating) instead of
+// failing loudly. host/test/permission-modes.test.mjs already proves the
+// CURRENT two sets have no gap against the CURRENT registry; it cannot catch
+// a FUTURE registry addition landing with no matching classification entry,
+// because nothing there re-runs when tool-definitions.js changes without
+// mapping.js also changing. This suite already re-imports TOOLS live on
+// every run (see the registry enumeration above), so it is the right place
+// to close that gap: assert every live tool name is accounted for by
+// EXACTLY one of the two classification sets, or is "computer" (classified
+// per-action, not by name, per mapping.js's own comment on
+// _mutationClassificationCoverage()).
+console.log("== read-only/mutating classification coverage (mapping.js) ==");
+{
+  const { readOnly, mutating } = _mutationClassificationCoverage();
+  const unclassified = liveNames.filter((n) => n !== "computer" && !readOnly.has(n) && !mutating.has(n));
+  const doubleClassified = liveNames.filter((n) => readOnly.has(n) && mutating.has(n));
+  ok(
+    unclassified.length === 0,
+    unclassified.length === 0
+      ? `every one of the live registry's ${liveNames.length} tools is covered by READ_ONLY_LEGACY_TOOLS, MUTATING_LEGACY_TOOLS, or is "computer"`
+      : `DISCREPANCY: tool(s) added to the registry with no read-only/mutating classification entry in host/agent/tools/mapping.js: ${unclassified.join(", ")}`
+  );
+  ok(
+    doubleClassified.length === 0,
+    doubleClassified.length === 0
+      ? "no tool is listed in both the read-only and mutating classification sets"
+      : `DISCREPANCY: tool(s) listed in BOTH classification sets (ambiguous): ${doubleClassified.join(", ")}`
+  );
+}
 
 // =============================================================================
 // 2 & 4. Table-driven baseline snapshot: current contract for every entry
@@ -300,14 +361,29 @@ ok(
   handlerProducesImage("upload_image") === false,
   "upload_image handler does not itself emit image content (it consumes a previously captured screenshot — baseline fact, not a defect)"
 );
+// openspec/changes/implement-stubbed-browser-tools implemented the three
+// operations the snapshot used to record as stubs. The assertions below pin
+// the real contracts; the "no registered-but-inert operation" check after
+// them is what fails loudly if any baseline operation is ever re-stubbed.
 ok(
-  handlerIsStub("gif_creator") === true,
-  "gif_creator is currently an unimplemented stub in this build (baseline must record this truthfully, not assume real GIF export)"
+  handlerIsStub("gif_creator") === false,
+  "gif_creator is a real implementation (returns GIF image data, not a placeholder)"
 );
 ok(
-  handlerIsStub("shortcuts_list") === true && handlerIsStub("shortcuts_execute") === true,
-  "shortcuts_list/shortcuts_execute are currently unimplemented stubs in this build"
+  handlerProducesImage("gif_creator") === true,
+  "gif_creator handler declares MCP image content (the exported GIF)"
 );
+ok(
+  handlerIsStub("shortcuts_list") === false && handlerIsStub("shortcuts_execute") === false,
+  "shortcuts_list/shortcuts_execute are real implementations (backed by the companion's workflow registry)"
+);
+for (const name of DESIGN_DOC_TOOL_LIST) {
+  if (removedNames.has(name) || !liveNames.includes(name)) continue;
+  ok(
+    handlerIsStub(name) === false,
+    `baseline operation '${name}' performs its contracted effect (registered-but-inert operations fail here)`
+  );
+}
 
 // get_config/set_config expose browser configuration keys only — never a
 // provider-credential key (ANTHROPIC_API_KEY, base URL, bearer token, etc).

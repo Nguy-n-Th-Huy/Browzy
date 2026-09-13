@@ -41,10 +41,14 @@ const IDLE_ACTION_LABEL = "Đang nghĩ…";
 const POINTER_ACTION_TYPES = { click: true, hover: true, scroll: true, drag: true };
 const CURSOR_ACTION_LABELS = { click: "click", hover: "di chuột", scroll: "cuộn", drag: "kéo" };
 const CURSOR_IDLE_LABEL = "đang nghĩ";
+// Task 7.7: same real values as the shipped RISK_LABELS/DEFAULT_RISK_CATEGORY.
+const RISK_LABELS = { uncategorized: "Chưa phân loại", low: "Rủi ro thấp", elevated: "Rủi ro cao" };
+const DEFAULT_RISK_CATEGORY = "uncategorized";
 const computeRenderModelDeps = {
   HEARTBEAT_MAX_AGE_MS: 2700,
   CLICK_RING_DURATION_MS: 350,
-  ACTION_LABELS, IDLE_ACTION_LABEL, POINTER_ACTION_TYPES, CURSOR_ACTION_LABELS, CURSOR_IDLE_LABEL
+  ACTION_LABELS, IDLE_ACTION_LABEL, POINTER_ACTION_TYPES, CURSOR_ACTION_LABELS, CURSOR_IDLE_LABEL,
+  RISK_LABELS, DEFAULT_RISK_CATEGORY
 };
 
 // =============================================================================
@@ -240,6 +244,48 @@ console.log("\n== reduceOverlayState: never fabricates, only reflects real dispa
      "teardown preserves the step count/start time it already had (nothing left to show once inactive, but nothing corrupted either)");
 }
 
+console.log("\n== reduceOverlayState: task 7.7 riskUpdate — a real signal, never a fabricated category ==");
+{
+  const reduceOverlayState = compile(
+    [extract("resolveViewportPoint"), extract("reduceOverlayState")].join("\n\n"),
+    {},
+    "reduceOverlayState"
+  );
+  const initial = {
+    lastEventAt: null, cursor: null, clickAt: null, dragHeld: false,
+    runId: null, conversationId: null, tabId: null, lastActionType: null,
+    stepCount: 0, startedAt: null, pendingApproval: null, actionInFlight: false, riskCategory: null
+  };
+  const low = reduceOverlayState(initial, { kind: "riskUpdate", tabId: 7, category: "low" }, 1000);
+  ok(low.riskCategory === "low", "a real riskUpdate event records the reported category");
+  ok(low.lastEventAt === 1000, "a riskUpdate refreshes liveness — it is proof the run is alive");
+  ok(low.tabId === 7, "...and it can carry the tabId along with it");
+
+  const elevated = reduceOverlayState(low, { kind: "riskUpdate", tabId: 7, category: "elevated" }, 1100);
+  ok(elevated.riskCategory === "elevated", "a later riskUpdate overwrites the category with the new one");
+
+  const backToUncategorized = reduceOverlayState(elevated, { kind: "riskUpdate", tabId: 7, category: "uncategorized" }, 1200);
+  ok(backToUncategorized.riskCategory === "uncategorized",
+     "a navigation-driven reset back to uncategorized is accepted like any other real value — not treated as an error state");
+
+  const bogus = reduceOverlayState(elevated, { kind: "riskUpdate", tabId: 7, category: "not_a_real_category" }, 1300);
+  ok(bogus.riskCategory === "elevated", "an unrecognized category value is dropped, never accepted verbatim — the previous real value stands");
+
+  // A riskUpdate must never touch anything an ordinary dispatched action or
+  // approval owns.
+  const dispatchState = reduceOverlayState(initial, { kind: "start", runId: "r1", tabId: 7, action: { type: "click" } }, 500);
+  const withRisk = reduceOverlayState(dispatchState, { kind: "riskUpdate", tabId: 7, category: "low" }, 600);
+  ok(withRisk.cursor === dispatchState.cursor && withRisk.stepCount === dispatchState.stepCount && withRisk.actionInFlight === dispatchState.actionInFlight,
+     "a riskUpdate never touches cursor/step count/actionInFlight — it is state about the page, not a dispatched action");
+
+  // An ordinary dispatched action never clears or invents a risk category.
+  const afterAction = reduceOverlayState(withRisk, { kind: "complete", runId: "r1", tabId: 7, action: { type: "click" }, pointer: null }, 700);
+  ok(afterAction.riskCategory === "low", "an ordinary action event passes the risk category through unchanged");
+
+  const afterTeardown = reduceOverlayState(withRisk, { kind: "teardown" }, 800);
+  ok(afterTeardown.riskCategory === "low", "teardown preserves the last known risk category — it is a fact about the page, not the run that just ended");
+}
+
 // =============================================================================
 // 4. computeRenderModel: active/inactive derivation, click-ring fade window,
 //    cursor label per action.type (including the non-pointer fallback), the
@@ -267,6 +313,31 @@ console.log("\n== computeRenderModel: active is DERIVED from recency, not a stor
      "once the heartbeat window has elapsed with NO new event, computeRenderModel reports fully inactive — this is what makes a disconnected host stop showing a misleading badge");
   ok(stale.approval === null && stale.barState === "idle",
      "an inactive render model never surfaces a pending approval either — it shares the same heartbeat-driven clearing as everything else");
+}
+
+console.log("\n== computeRenderModel: task 7.7 risk chip — uncategorized distinguishable from low, never fabricated ==");
+{
+  const computeRenderModel = compile(
+    [extract("isHeartbeatExpired"), extract("computeRenderModel")].join("\n\n"),
+    computeRenderModelDeps,
+    "computeRenderModel"
+  );
+  const base = { lastEventAt: 1000, cursor: null, clickAt: null, dragHeld: false, lastActionType: null, stepCount: 0, startedAt: null, pendingApproval: null, actionInFlight: false };
+
+  const never = computeRenderModel({ ...base, riskCategory: null }, 1050, 3000);
+  ok(never.riskCategory === "uncategorized" && never.riskLabel === RISK_LABELS.uncategorized,
+     "no riskUpdate ever seen -> the render model defaults to uncategorized, never fabricating low/elevated");
+
+  const low = computeRenderModel({ ...base, riskCategory: "low" }, 1050, 3000);
+  ok(low.riskCategory === "low" && low.riskLabel === RISK_LABELS.low && low.riskLabel !== never.riskLabel,
+     "a real 'low' category renders its OWN distinct label — never collapsed into uncategorized's wording (spec: distinguishable)");
+
+  const elevated = computeRenderModel({ ...base, riskCategory: "elevated" }, 1050, 3000);
+  ok(elevated.riskCategory === "elevated" && elevated.riskLabel === RISK_LABELS.elevated, "elevated renders its own distinct label too");
+
+  const inactive = computeRenderModel({ ...base, riskCategory: "elevated" }, 9000, 3000);
+  ok(inactive.active === false && inactive.riskCategory === null && inactive.riskLabel === "",
+     "once the heartbeat has expired, the risk chip shows nothing — same fate as every other field once the run is gone");
 }
 
 console.log("\n== computeRenderModel: cursor label per action.type, including the non-pointer fallback ==");
@@ -622,6 +693,20 @@ console.log("\n== wiring: state is updated the instant an event is handled, pain
   ok(W.refs.badgeEl.attrs["data-state"] === "running", "and the bar as 'running'");
   ok(W.refs.stopButtonEl.hidden === false, "...with the Stop control visible");
   ok(W.refs.openPanelButtonEl.hidden === true, "...and the Open-panel control hidden while running");
+
+  // Task 7.7: the risk chip through the FULL wiring (handleOverlayEvent ->
+  // reduceOverlayState -> computeRenderModel -> paintOverlay), not just the
+  // pure functions in isolation.
+  ok(W.refs.riskEl && W.refs.riskEl.tag === "span", "the risk chip is a plain <span> — not a button, not any interactive element");
+  ok(Object.keys(W.refs.riskEl.listeners).length === 0, "...and it has NO event listener of any kind — nothing to click, nothing to acknowledge, nothing to dismiss");
+  ok(W.refs.riskEl.attrs["data-level"] === "uncategorized" && W.refs.riskEl.textContent === RISK_LABELS.uncategorized,
+     "before any real riskUpdate arrives, the chip shows uncategorized — never fabricated as low");
+  W.handleOverlayEvent({ kind: "riskUpdate", tabId: 42, category: "elevated" });
+  settle();
+  ok(W.refs.riskEl.attrs["data-level"] === "elevated" && W.refs.riskEl.textContent === RISK_LABELS.elevated,
+     "a real riskUpdate paints the chip's level and label");
+  ok(W.state.pendingApproval === null && W.refs.badgeEl.attrs["data-state"] !== "waiting",
+     "a risk-category update never raises a decision — no approval is pending, the bar state is untouched by it");
 
   // design.md D8/task 7.5: while the agent's own action is genuinely in
   // flight (no `complete`/`error` has settled this click yet), a trusted
@@ -982,7 +1067,8 @@ console.log("\n== structural: every overlay message is acknowledged ==");
   const body = SRC.slice(at, SRC.indexOf("\n  };", at));
   const MATCH = 'if (msg.type === "';
   const branches = body.split(MATCH).slice(1);
-  ok(branches.length === 4, `all four overlay message types are handled (found ${branches.length})`);
+  // Task 7.7 added a fifth: browzyOverlayRisk (the risk-category relay).
+  ok(branches.length === 5, `all five overlay message types are handled (found ${branches.length})`);
   for (const b of branches) {
     ok(b.includes("sendResponse("), `${b.slice(0, b.indexOf('"'))} is acknowledged before its branch returns`);
   }

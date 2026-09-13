@@ -273,7 +273,7 @@ let companionMissing = false;
 // same extension gets its own id for free — and never comes from a model or
 // a page. `connectionId` is fresh per native-messaging connection, so the
 // companion/native-host can tell "the same browser reconnected" apart from
-// "a different browser instance is now attached" across a switch_browser
+// "a different browser instance is now attached" across a select_browser
 // hand-off.
 let installationId = null;
 async function ensureInstallationId() {
@@ -316,6 +316,285 @@ async function sendAgentHello() {
     });
   } catch {
     // Port disconnected; onDisconnect will retry the whole connection.
+  }
+}
+
+// --- Managed-policy relay (group 4 / task "extension owns pushing
+// managed_policy_snapshot") --------------------------------------------
+//
+// The host process has no browser access at all, so it cannot read
+// chrome.storage.managed itself (see design.md decision 7 / reports/
+// wave1-contracts.md's "Notes for the extension wave"). This extension is
+// the only side that can, so it pushes a snapshot on every completed hello
+// handshake and again on every chrome.storage.onChanged for the "managed"
+// area — the host takes whatever it is sent, validates it, and applies it;
+// it has no polling loop of its own. The wire shape (its own top-level
+// message type, not an agent_settings op) is exactly wave1-contracts.md's:
+//   { v, type: "managed_policy_snapshot", policy: object|null, readError?: string }
+//
+// `extension/managed-schema.json` (referenced from manifest.json's
+// `storage.managed_schema`) is what makes chrome.storage.managed populate at
+// all — without a declared schema, Chrome accepts no administrator policy
+// for this extension and chrome.storage.managed.get() always resolves empty.
+async function readManagedPolicyForPush() {
+  try {
+    const stored = await chrome.storage.managed.get(null);
+    // An administrator who has never touched this extension's policy and one
+    // who explicitly cleared it are indistinguishable through this API
+    // (both resolve `{}`) — chrome.storage.managed has no separate signal
+    // for "policy present but empty" vs "no policy at all". Treating an
+    // empty result as absent is the conservative, honest reading: an
+    // unmanaged install must behave exactly like one (spec "When no managed
+    // policy is present the runtime SHALL behave exactly as an unmanaged
+    // install").
+    if (!stored || Object.keys(stored).length === 0) return { policy: null };
+    return { policy: stored };
+  } catch (err) {
+    // chrome.storage.managed can throw when the schema/policy provider is
+    // unavailable — report it as unreadable rather than silently treating it
+    // as absent (spec "Malformed managed policy" / design.md decision 7).
+    return { policy: null, readError: (err && err.message) || "không đọc được chrome.storage.managed" };
+  }
+}
+
+async function pushManagedPolicySnapshot() {
+  // Gated behind a completed hello (reports/wave1-contracts.md): pushing
+  // before the companion has a connection identity for this browser instance
+  // has nowhere valid to land.
+  if (!nativePort || agentHandshakeState !== "ok") return;
+  const { policy, readError } = await readManagedPolicyForPush();
+  const envelope = { v: AGENT_PROTOCOL_VERSION, type: "managed_policy_snapshot", policy: policy ?? null, ts: Date.now() };
+  if (readError) envelope.readError = readError;
+  try {
+    nativePort.postMessage({ type: "agent_msg", envelope });
+  } catch {
+    // Port disconnected mid-push; the next completed hello pushes again.
+  }
+}
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "managed") pushManagedPolicySnapshot().catch(() => {});
+});
+
+// --- Download protection gate (task 2.4) -----------------------------------
+//
+// chrome.downloads.onCreated fires for EVERY download the browser starts,
+// agent-caused or not. This gate only pauses a download created WHILE at
+// least one agent run currently holds the browser (design.md decision 3:
+// "used only to observe download creation for the protected-action class —
+// not to start, redirect, or read downloads"). It is deliberately a fully
+// LOCAL decision surface, never routed through host/agent/policy/
+// can-use-tool.js's approval-token machinery: chrome.downloads.DownloadItem
+// carries no tabId, so there is nothing for that machinery's per-call
+// domain/document/nonce binding to verify against, and a download is a
+// passive browser event, not a dispatched tool call.
+//
+// `activeAgentRuns` (runId -> conversationId) is populated/cleared at the
+// SAME two points overlayRunTabs already is (run_started / the existing
+// OVERLAY_TEARDOWN_RUN_EVENTS set) — see handleAgentMessage() below — kept
+// as its own map rather than reused from overlayRunTabs because a freshly
+// started, not-yet-tab-scoped run (tabScope:"any", RC1) has nothing in
+// overlayRunTabs yet but is still very much an active run for this gate's
+// purpose.
+const activeAgentRuns = new Map(); // runId -> conversationId
+// requestId -> { downloadId, runId, conversationId } — `runId`/`conversationId`
+// are the run that was active when this download was paused (see
+// mostRecentActiveRun() below), captured so a later run-teardown/mode-change
+// can find and invalidate exactly the decisions that belong to it (see
+// invalidateDownloadDecisionsForRun()/invalidateAllDownloadDecisions() below).
+const pendingDownloadDecisions = new Map();
+
+function isAgentRunActive() {
+  return activeAgentRuns.size > 0;
+}
+
+function mostRecentActiveRun() {
+  let last = null;
+  for (const entry of activeAgentRuns) last = entry; // Map iteration is insertion order
+  return last; // [runId, conversationId] | null
+}
+
+function broadcastToAgentPorts(msg) {
+  for (const port of agentPorts) {
+    try {
+      port.postMessage(msg);
+    } catch {
+      // Port gone; its own onDisconnect handler removes it from agentPorts.
+    }
+  }
+}
+
+/** A download background.js could not pause in time — reported honestly
+ * rather than pretended to have been gated (this task's own stated limit). */
+function reportDownloadNotice(item, detail) {
+  const active = mostRecentActiveRun();
+  broadcastToAgentPorts({
+    type: "agent_msg",
+    envelope: {
+      v: AGENT_PROTOCOL_VERSION,
+      type: "download_notice",
+      conversationId: active ? active[1] : null,
+      filename: item.filename || null,
+      url: item.url || null,
+      outcome: "completed_before_pause",
+      detail: detail || null,
+      ts: Date.now()
+    }
+  });
+}
+
+/** The chrome.downloads.onCreated handler body, factored into its own named
+ * function (rather than an inline listener) so it is independently
+ * extractable/testable the way this file's other handlers already are. */
+function handleDownloadCreated(item) {
+  if (!isAgentRunActive()) return; // a user's own manual download is never gated
+  if (item.state === "complete") {
+    // Too fast to observe before it finished — nothing left to pause.
+    reportDownloadNotice(item, "already complete when observed");
+    return;
+  }
+  chrome.downloads.pause(item.id, () => {
+    const err = chrome.runtime.lastError;
+    if (err) {
+      // Finished/errored/already non-pausable by the time this ran.
+      reportDownloadNotice(item, err.message);
+      return;
+    }
+    const requestId = crypto.randomUUID();
+    const active = mostRecentActiveRun();
+    const runId = active ? active[0] : null;
+    const conversationId = active ? active[1] : null;
+    pendingDownloadDecisions.set(requestId, {
+      downloadId: item.id,
+      runId,
+      conversationId,
+      filename: item.filename || null,
+      url: item.url || null
+    });
+    broadcastToAgentPorts({
+      type: "agent_msg",
+      envelope: {
+        v: AGENT_PROTOCOL_VERSION,
+        type: "download_protected_decision",
+        requestId,
+        runId,
+        conversationId,
+        category: "download",
+        rememberable: false,
+        filename: item.filename || null,
+        url: item.url || null,
+        ts: Date.now()
+      }
+    });
+  });
+}
+
+if (chrome.downloads && chrome.downloads.onCreated) {
+  chrome.downloads.onCreated.addListener(handleDownloadCreated);
+}
+
+/** Handles the panel's LOCAL reply to a download_protected_decision — see
+ * extension/sidepanel/protocol-client.js's downloadDecision() header for why
+ * this is intercepted here rather than ever reaching nativePort. An
+ * unknown/already-settled requestId is dropped, never silently treated as a
+ * decision on some other download — this is also what makes a late answer to
+ * an INVALIDATED decision (see invalidateDownloadDecisionsForRun()/
+ * invalidateAllDownloadDecisions() below, which delete the entry up front) a
+ * silent no-op rather than a resume/cancel applied after the fact. */
+function handleDownloadDecision(envelope) {
+  const pending = pendingDownloadDecisions.get(envelope && envelope.requestId);
+  if (!pending) return;
+  pendingDownloadDecisions.delete(envelope.requestId);
+  if (envelope.decision === "allow") {
+    chrome.downloads.resume(pending.downloadId, () => void chrome.runtime.lastError);
+  } else {
+    chrome.downloads.cancel(pending.downloadId, () => void chrome.runtime.lastError);
+  }
+  // Task 2.4 durable half: this protected decision is otherwise invisible to
+  // the conversation record once the panel session ends (chrome.downloads has
+  // no tabId, so it never goes through can-use-tool.js's approval-token
+  // machinery the way every other protected decision's OUTCOME does end up
+  // durably recorded). Fire-and-forget straight to the native host/companion
+  // — never gated on this decision's own success, since the resume/cancel
+  // above already happened regardless of whether the record lands. Silently
+  // dropped when there is no native connection or no conversationId to
+  // attribute it to (the same honesty rule reportDownloadNotice() already
+  // follows: never pretend a fact was recorded that was not).
+  if (nativePort && pending.conversationId) {
+    try {
+      nativePort.postMessage({
+        type: "agent_msg",
+        envelope: {
+          v: AGENT_PROTOCOL_VERSION,
+          type: "download_decision_recorded",
+          conversationId: pending.conversationId,
+          requestId: envelope.requestId,
+          decision: envelope.decision === "allow" ? "allow" : "deny",
+          category: "download",
+          filename: pending.filename,
+          url: pending.url,
+          ts: Date.now()
+        }
+      });
+    } catch {
+      // Native connection gone mid-decision: the resume/cancel above already
+      // happened; only the durable record is missed, exactly like any other
+      // best-effort relay in this file.
+    }
+  }
+}
+
+/** Task 2.4: a run that has ended, or a browser/tab scope change tied to it,
+ * can no longer be the reason a LATE answer resumes or cancels a download —
+ * see the panel spec's "An outstanding card SHALL be invalidated... on Stop,
+ * on a browser or tab scope change, on a permission mode change". Deletes
+ * every pending decision this run created (never resuming/cancelling the
+ * underlying download itself — there is no fresh decision to apply, so it is
+ * left exactly as paused as it already is) and tells every connected panel to
+ * drop its own card for it. */
+function invalidateDownloadDecisionsForRun(runId, reason) {
+  for (const [requestId, pending] of pendingDownloadDecisions) {
+    if (pending.runId !== runId) continue;
+    pendingDownloadDecisions.delete(requestId);
+    broadcastToAgentPorts({
+      type: "agent_msg",
+      envelope: {
+        v: AGENT_PROTOCOL_VERSION,
+        type: "download_decision_invalidated",
+        requestId,
+        runId,
+        conversationId: pending.conversationId,
+        reason: reason || "invalidated",
+        ts: Date.now()
+      }
+    });
+  }
+}
+
+/** Task 2.4: the panel's own successful permission-mode-change request
+ * (extension/sidepanel/panel-controller.js's invalidateAllPendingApprovals(),
+ * the same trigger that already invalidates every outstanding ordinary
+ * approval card) has no run boundary to key off — it must invalidate every
+ * outstanding download decision, company-process-wide, not just the current
+ * run's. background.js cannot observe a mode change on its own (that round
+ * trip lives entirely in the panel/companion), so the panel tells it to via a
+ * dedicated LOCAL-only message (see the port listener below) — never routed
+ * through nativePort, exactly like download_decision itself. */
+function invalidateAllDownloadDecisions(reason) {
+  for (const [requestId, pending] of pendingDownloadDecisions) {
+    pendingDownloadDecisions.delete(requestId);
+    broadcastToAgentPorts({
+      type: "agent_msg",
+      envelope: {
+        v: AGENT_PROTOCOL_VERSION,
+        type: "download_decision_invalidated",
+        requestId,
+        runId: pending.runId,
+        conversationId: pending.conversationId,
+        reason: reason || "invalidated",
+        ts: Date.now()
+      }
+    });
   }
 }
 
@@ -562,6 +841,10 @@ function handleAgentMessage(envelope) {
   if (envelope.type === "hello_ack") {
     agentHandshakeState = "ok";
     agentHandshakeDetail = null;
+    // Managed-policy relay: push the current snapshot on every completed
+    // hello, exactly once per connection (see pushManagedPolicySnapshot()'s
+    // own header) — the host holds no policy across a reconnect on its own.
+    pushManagedPolicySnapshot().catch(() => {});
   } else if (envelope.type === "version_mismatch") {
     // Fail closed: never guess a compatible shape and keep talking.
     agentHandshakeState = "version_mismatch";
@@ -578,12 +861,28 @@ function handleAgentMessage(envelope) {
   // to agentPorts below, which still happens verbatim exactly as before.
   if (envelope.type === "stream_event" && envelope.event && envelope.runId && OVERLAY_TEARDOWN_RUN_EVENTS.has(envelope.event.type)) {
     teardownOverlayForRun(envelope.runId, envelope.event.type);
+    // Task 2.4's download gate: a run that has ended can no longer be the
+    // reason a download gets paused.
+    activeAgentRuns.delete(envelope.runId);
+    // Task 2.4 (panel spec "invalidated... on Stop"): the SAME run ending is
+    // exactly when a download decision it raised must stop being answerable
+    // — a late Allow/Deny for it must be rejected, never applied. This run's
+    // fixed tabScope also means a "browser/tab scope change" for its own
+    // pending decisions is never observable except through the run itself
+    // ending (tabScope is chosen once at Send and never changes mid-run), so
+    // this one hook covers Stop, run_done, run_error, and
+    // run_interrupted_by_restart alike — every case OVERLAY_TEARDOWN_RUN_EVENTS
+    // already names.
+    invalidateDownloadDecisionsForRun(envelope.runId, `run ${envelope.event.type}`);
   }
   // The other end of the same lifecycle, observed the same way: a run that has
   // just taken the browser lease gets its overlay raised on the tabs it holds,
   // instead of the page staying unmarked until the first tool that names one.
   if (envelope.type === "stream_event" && envelope.event && envelope.runId && envelope.event.type === "run_started") {
     startOverlayForRun(envelope.runId, envelope.event.tabScope).catch(() => {});
+    // Task 2.4's download gate: this run now holds the browser lease, so a
+    // download created from here on (until it ends) is agent-caused.
+    activeAgentRuns.set(envelope.runId, envelope.conversationId || null);
   }
   // Overlay approval bridge (design.md D5 / redesign-remote-control-overlay
   // task 5.1): the same observe-only pattern as the teardown hook above, on
@@ -608,6 +907,17 @@ function handleAgentMessage(envelope) {
       phase: "resolved",
       requestId: envelope.requestId
     });
+  }
+  // Overlay risk bridge (task 7.7 follow-up, reports/wave2h-events.md): the
+  // same observe-only pattern as the teardown/approval hooks above, over the
+  // SAME sendOverlayMessage path — no second channel. `tab_risk_update`
+  // arrives wrapped as a stream_event, exactly like `approval_request`, and
+  // already names the exact tab it is about, so this routes straight there
+  // (see forwardRiskUpdateToOverlay below) rather than through overlayRunTabs
+  // or the currently active tab. Never changes what gets relayed to
+  // agentPorts below.
+  if (envelope.type === "stream_event" && envelope.event && envelope.event.type === "tab_risk_update") {
+    forwardRiskUpdateToOverlay(envelope.event);
   }
   // Relay verbatim to every connected agent-channel port (the sidepanel,
   // once extension/sidepanel/** exists) — background.js does not interpret
@@ -640,6 +950,23 @@ chrome.runtime.onConnect.addListener((port) => {
   }
   port.onMessage.addListener((msg) => {
     if (!msg || msg.type !== "agent_msg" || !msg.envelope) return;
+    // Task 2.4: a LOCAL-only reply — never forwarded to nativePort, handled
+    // (and available) regardless of whether the native host is connected at
+    // all, since it never involved the host in the first place. See
+    // extension/sidepanel/protocol-client.js's downloadDecision() header.
+    if (msg.envelope.type === "download_decision") {
+      handleDownloadDecision(msg.envelope);
+      return;
+    }
+    // Task 2.4: the panel's own trigger for "invalidate every outstanding
+    // download decision" (permission-mode change today — see
+    // PanelController.invalidateAllPendingApprovals()) — a LOCAL-only
+    // message, never forwarded to nativePort, same rule as download_decision
+    // above.
+    if (msg.envelope.type === "download_decisions_invalidate") {
+      invalidateAllDownloadDecisions(msg.envelope.reason);
+      return;
+    }
     if (!nativePort) {
       try {
         port.postMessage({
@@ -682,6 +1009,30 @@ const networkRequests = new Map(); // tabId -> [{url, method, status, type, time
 // created by requestWillBeSent instead of recording each request twice.
 const networkByRequestId = new Map();
 const screenshotStore = new Map(); // imageId -> base64
+// --- GIF capture (screencast) state -------------------------------------------
+// One capture slot per tab, bounded by the caller's start/stop/export/clear
+// calls on gif_creator. Frames arrive via Page.screencastFrame (see the
+// chrome.debugger.onEvent branch); clicks, drag samples, and action labels
+// arrive via the action-event bus (collectGifCaptureInput, subscribed once at
+// module scope below). The two are joined only at export, through
+// correlateClicksToFrames() — never by mutating the page or the stream.
+const GIF_MAX_FRAMES = 240; // auto-stop past this; frames are ~640px JPEGs
+const GIF_SCREENCAST_MAX_WIDTH = 640;
+// tabId -> { frames: [{data,t}], clicksByAction: Map(actionId->{t,x,y}),
+//   paths: [{t,x,y}], actionLog: [{t,summary}], startedAt, stopAt, active,
+//   endedEarly: null | "frame limit" | "tab closed" }
+const gifCaptures = new Map();
+// Hard ceiling for an encoded GIF, in bytes. Past this the handler reports the
+// limit and the achieved size and returns no image.
+const GIF_MAX_BYTES = 5000000;
+// What the export path will put in front of the MODEL. Far below the ceiling
+// above on purpose: an animated GIF carries every frame as a full image, so a
+// multi-megabyte one costs a large share of the turn to send and read. The
+// encoder walks its width/stride ladder until the file fits this, and the
+// result says so when it had to. Saving to disk is unaffected — the file the
+// model sees and the file on disk are the same bytes, just not the maximum
+// bytes the encoder could have produced.
+const GIF_MODEL_MAX_BYTES = 1000000;
 const screenshotSaves = new Map(); // reqId -> { resolve, reject } for save_to_disk
 
 // --- Panel attachment byte store (in-memory only) --------------------------
@@ -759,11 +1110,6 @@ function human(speed, seed) {
 
 let heartbeatTimer = null;
 
-// switch_browser releases this browser's hold on the shared runtime by
-// dropping the native port; this window keeps us from immediately re-grabbing
-// it so a target browser (extension enabled) can become primary.
-let suspendReconnectUntil = 0;
-const SWITCH_RELEASE_MS = 15000;
 
 async function detectBrowser() {
   try {
@@ -868,12 +1214,6 @@ function scheduleNativeReconnect() {
 
 function connectNativeHost() {
   if (nativePort) return;
-  // Honor a switch_browser release window: stay disconnected so another
-  // browser can take the primary connection, then resume.
-  if (Date.now() < suspendReconnectUntil) {
-    setTimeout(connectNativeHost, 500);
-    return;
-  }
   try {
     nativePort = chrome.runtime.connectNative(NATIVE_HOST_NAME);
 
@@ -963,6 +1303,15 @@ function connectNativeHost() {
     // installed companion is still completing its handshake.
     setCompanionMissing(false, null);
     startHeartbeat();
+    // Identify this browser to the companion: the host files one heartbeat
+    // per browser for list_connected_browsers, and directs select_browser
+    // handoffs by these names. Fire-and-forget — tool dispatch never waits
+    // for it, and a missed hello is repaired on the next reconnect.
+    detectBrowser().then((who) => {
+      try {
+        if (nativePort && who) nativePort.postMessage({ type: "hello", browser: who });
+      } catch {}
+    }).catch(() => {});
     // Version handshake for the SDK companion channel (design.md decision 1:
     // "hello/version... Unknown versions fail closed."). Ordinary tool
     // dispatch does not depend on this succeeding; it only gates the
@@ -1450,7 +1799,7 @@ const overlayRunTabs = new Map();
  * animation"). */
 function forwardActionEventToOverlay(event) {
   if (event.tabId === null || event.tabId === undefined) {
-    // A tool that names no tab (tabs_create_mcp, update_plan, switch_browser,
+    // A tool that names no tab (tabs_create_mcp, update_plan, select_browser,
     // ...) still happens DURING the run, and the operator is still being
     // driven. Dropping it left the page with no signal for the whole step and,
     // worse, no keepalive — long enough and the overlay expired mid-run and the
@@ -1651,6 +2000,28 @@ function forwardApprovalToOverlay(runId, message) {
   for (const tabId of tabs) {
     sendOverlayMessage(tabId, message).catch(() => {});
   }
+}
+
+/** Deliver the controlled tab's current risk category (task 7.7 follow-up)
+ * to the overlay on the EXACT tab `tab_risk_update` named — never a run's
+ * other known tabs (`overlayRunTabs`), and never whatever tab happens to be
+ * active. The host (reports/wave2h-events.md) emits this only on a real
+ * category transition, including back down to "uncategorized" right after a
+ * navigation reset, so this is a verbatim pass-through of that fact, never a
+ * synthesized or defaulted category — the overlay itself already defaults
+ * to "uncategorized" on its own until a real riskUpdate like this one
+ * arrives. Only `category` is forwarded: `signals[].matchedText` is
+ * page-authored quoted data the chip has no use for, so it is never sent
+ * here at all, not even inertly. Fire-and-forget, exactly like every other
+ * overlay message — a relay failure (no overlay mounted, tab gone) must
+ * never disturb the run that produced this event. */
+function forwardRiskUpdateToOverlay(event) {
+  if (!event || typeof event.tabId !== "number") return;
+  sendOverlayMessage(event.tabId, {
+    type: "browzyOverlayRisk",
+    tabId: event.tabId,
+    category: event.category
+  }).catch(() => {});
 }
 
 /** Every tab currently believed to be showing an active overlay, across
@@ -2529,6 +2900,31 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       status: (existing && existing.status) || 0,
       timestamp: (existing && existing.timestamp) || Date.now(),
     }));
+  }
+  // GIF capture frames. Buffer the JPEG bytes with a receipt timestamp (the
+  // same clock the action-event stream uses, so correlation is by interval
+  // containment, never equality). Every frame is acknowledged, captured or
+  // not: an unacknowledged screencast stalls the target's compositor. The
+  // ack bypasses cdp() so high-rate frames never flood the debug ring.
+  if (method === "Page.screencastFrame" && params) {
+    const cap = gifCaptures.get(tabId);
+    if (cap && cap.active && typeof params.data === "string") {
+      cap.frames.push({ data: params.data, t: Date.now() });
+      if (cap.frames.length >= GIF_MAX_FRAMES) {
+        cap.active = false;
+        cap.stopAt = Date.now();
+        cap.endedEarly = "frame limit";
+        gifStopScreencast(tabId).catch(() => {});
+      }
+    }
+    if (params.sessionId !== undefined) {
+      try {
+        const r = chrome.debugger.sendCommand({ tabId }, "Page.screencastFrameAck", {
+          sessionId: params.sessionId
+        });
+        if (r && typeof r.catch === "function") r.catch(() => {});
+      } catch {}
+    }
   }
 });
 
@@ -3923,6 +4319,15 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 });
 chrome.tabs.onRemoved.addListener((tabId) => {
   webmcpTabTools.delete(tabId);
+  // A capture whose tab is gone keeps its frames for export (the spec's
+  // early-stop scenario), but must never stay "active": no more frames can
+  // arrive, and a later start on a recycled tab id must not inherit it.
+  const cap = gifCaptures.get(tabId);
+  if (cap && cap.active) {
+    cap.active = false;
+    cap.stopAt = Date.now();
+    cap.endedEarly = "tab closed";
+  }
 });
 
 // relay-isolated.js's unsolicited inventory pushes land here. Fire-and-
@@ -4095,6 +4500,280 @@ function formatBatchResult(items, total, stop) {
     }
   }
   return { content };
+}
+// --- GIF frame/click correlation ----------------------------------------------
+// Map timestamped viewport points (clicks, drag samples) onto capture frames
+// by interval containment: frame i covers [t_i, t_{i+1}), the last frame
+// covers [t_last, windowEnd). Points outside every interval are dropped,
+// never snapped to the nearest frame — a marker the runtime cannot place is
+// omitted, not invented. Pure: exercised under plain Node through
+// test/_extract.mjs (see test/gif-capture.test.mjs).
+function correlateClicksToFrames(frameTimes, points, windowEnd) {
+  const per = frameTimes.map(() => []);
+  if (!frameTimes.length) return per;
+  const end = typeof windowEnd === "number" ? windowEnd : Infinity;
+  for (const p of points || []) {
+    if (!p || typeof p.t !== "number" || typeof p.x !== "number" || typeof p.y !== "number") continue;
+    for (let i = 0; i < frameTimes.length; i++) {
+      const start = frameTimes[i];
+      const stop = i + 1 < frameTimes.length ? frameTimes[i + 1] : end;
+      if (p.t >= start && p.t < stop) {
+        per[i].push({ x: p.x, y: p.y });
+        break;
+      }
+    }
+  }
+  return per;
+}
+
+// Pull viewport points out of an action event's pointer payload, whatever
+// shape it takes (a batched points array or a single point). Anything
+// without numeric x/y is not a position and is dropped here.
+function gifPointsFromPointer(pointer) {
+  if (!pointer) return [];
+  const list = Array.isArray(pointer.points) ? pointer.points : [pointer];
+  const out = [];
+  for (const p of list) {
+    if (p && typeof p.x === "number" && typeof p.y === "number") out.push(p);
+  }
+  return out;
+}
+
+// Action-event subscriber feeding open GIF captures. One marker per
+// dispatched click action (deduped by actionId: a click emits several
+// progress events for one landing point, and each must not become its own
+// marker). Drag samples accumulate as a path. Action summaries accumulate
+// as candidate frame labels (summaries are redaction-safe by construction —
+// see extension/events/action-events.js). Never touches the stream itself.
+function collectGifCaptureInput(event) {
+  if (!event || event.tabId === null || event.tabId === undefined) return;
+  const cap = gifCaptures.get(event.tabId);
+  if (!cap || !cap.active) return;
+  const action = event.action || {};
+  if (event.kind === "complete" || event.kind === "error") {
+    if (cap.actionLog.length < 50 && event.summary) {
+      cap.actionLog.push({ t: Date.now(), summary: String(event.summary).slice(0, 120) });
+    }
+    if (action.type !== "click" && action.type !== "drag") return;
+  } else if (event.kind !== "progress") {
+    return;
+  } else if (action.type !== "click" && action.type !== "drag") {
+    return;
+  }
+  const pts = gifPointsFromPointer(event.pointer);
+  if (!pts.length) return;
+  if (action.type === "click") {
+    // The landing point: the last down/up sample, else the last point.
+    let pick = pts[pts.length - 1];
+    for (let k = pts.length - 1; k >= 0; k--) {
+      if (pts[k].phase === "down" || pts[k].phase === "up") {
+        pick = pts[k];
+        break;
+      }
+    }
+    cap.clicksByAction.set(event.actionId, {
+      t: typeof pick.t === "number" ? pick.t : Date.now(),
+      x: pick.x,
+      y: pick.y
+    });
+  } else {
+    for (const p of pts) {
+      const t = typeof p.t === "number" ? p.t : Date.now();
+      const last = cap.paths[cap.paths.length - 1];
+      if (!last || last.t !== t || last.x !== p.x || last.y !== p.y) {
+        if (cap.paths.length < 2000) cap.paths.push({ t, x: p.x, y: p.y });
+      }
+    }
+  }
+}
+// Coordinate-drop delivery for upload_image: stage the stored image as a
+// real temp file (the same staging the file-input path uses), then dispatch
+// a trusted drag (dragEnter + drop) carrying that file at the viewport
+// position. Trusted is the whole point: the editors this exists for reject
+// untrusted content-script-dispatched drops, which is why a DOM DataTransfer
+// was never an option. A coordinate with no node under it is refused before
+// anything is dispatched; a dispatch-level failure is reported as one. The
+// caller converts screenshot pixels to CSS pixels first, through the same
+// mapping clicks use.
+async function uploadImageAtCoordinate(tabId, imageId, coordinate, filename, base64) {
+  const rx = coordinate[0];
+  const ry = coordinate[1];
+  if (!Number.isFinite(rx) || !Number.isFinite(ry)) {
+    return { content: [{ type: "text", text: "upload_image coordinate must be [x, y] numbers." }] };
+  }
+  const css = screenshotToCssCoordinate(tabId, [rx, ry]);
+  const x = css[0];
+  const y = css[1];
+  let tempPath;
+  try {
+    tempPath = await nativeRequest({ type: "write_temp_file", dataUrl: base64, filename });
+  } catch (e) {
+    return { content: [{ type: "text", text: `Failed to stage temp file for ${imageId}: ${String((e && e.message) || e)}` }] };
+  }
+  if (!tempPath) {
+    return { content: [{ type: "text", text: `Failed to stage temp file for ${imageId}.` }] };
+  }
+  let node;
+  try {
+    node = await cdp(tabId, "DOM.getNodeForLocation", { x, y });
+  } catch (e) {
+    return { content: [{ type: "text", text: `Could not inspect the drop target at (${x}, ${y}): ${String((e && e.message) || e)}` }] };
+  }
+  if (!node || !node.backendNodeId) {
+    return { content: [{ type: "text", text: `No droppable target at (${x}, ${y}). The drop was not attempted.` }] };
+  }
+  const dragData = { items: [], files: [tempPath], dragOperationsMask: 1 };
+  try {
+    await cdp(tabId, "Input.dispatchDragEvent", { type: "dragEnter", x, y, data: dragData });
+    await cdp(tabId, "Input.dispatchDragEvent", { type: "drop", x, y, data: dragData });
+  } catch (e) {
+    return { content: [{ type: "text", text: `The drop at (${x}, ${y}) failed: ${String((e && e.message) || e)}. The target did not accept the image.` }] };
+  }
+  return { content: [{ type: "text", text: `Dropped ${filename} (${imageId}) at (${x}, ${y}).` }] };
+}
+// --- Shortcuts (extension side) -------------------------------------------------
+// Mirror of the companion's validateShortcutsExecuteCompat() contract
+// (host/agent/skills/workflows-mcp.js): same fields, same messages. The
+// extension rejects locally before spending a native round trip; the host
+// re-validates on receipt, so the two can never disagree silently. Pure:
+// exercised under plain Node (see test/shortcut-handlers.test.mjs).
+function validateShortcutsExecuteArgs(args) {
+  if (!args || typeof args !== "object" || Array.isArray(args)) {
+    return { ok: false, message: "shortcuts_execute requires an arguments object with tabId" };
+  }
+  const { tabId, shortcutId, command } = args;
+  if (typeof tabId !== "number" || !Number.isFinite(tabId)) {
+    return { ok: false, message: "shortcuts_execute requires a numeric tabId" };
+  }
+  if (shortcutId !== undefined && (typeof shortcutId !== "string" || !shortcutId.trim())) {
+    return { ok: false, message: "shortcutId, when given, must be a nonempty string" };
+  }
+  if (command !== undefined && (typeof command !== "string" || !command.trim())) {
+    return { ok: false, message: "command, when given, must be a nonempty string" };
+  }
+  const target = (shortcutId || "").trim() || (command || "").trim();
+  if (!target) {
+    return { ok: false, message: "shortcuts_execute requires shortcutId or command" };
+  }
+  return {
+    ok: true,
+    tabId,
+    shortcutId: (shortcutId || "").trim() || null,
+    command: (command || "").trim() || null,
+    target
+  };
+}
+
+// Registry tools whose args may carry the run's tab. A workflow step that
+// omits tabId inherits the tab the shortcut was addressed to; a step that
+// names one keeps it, and the callee's own scope check still applies. Mirrors
+// host/agent/tools/mapping.js's TAB_TARGET_ARG_KEYS without importing it.
+const SHORTCUT_TAB_SCOPED_TOOLS = new Set([
+  "navigate",
+  "computer",
+  "find",
+  "form_input",
+  "get_page_text",
+  "javascript_tool",
+  "read_console_messages",
+  "read_network_requests",
+  "read_page",
+  "resize_window",
+  "set_tab_focus",
+  "upload_image",
+  "file_upload",
+  "shortcuts_list",
+  "gif_creator",
+  "tabs_close_mcp",
+  "webmcp_list_tools",
+  "webmcp_call_tool"
+]);
+
+// Run a resolved workflow's tool-kind steps in order through this
+// extension's own handlers, inside the calling run's tab scope (the dispatch
+// below happens synchronously within the shortcuts_execute call, so
+// currentToolMeta still names that run). Stops at the first failure.
+// Skill/message steps are refused outright: skills resolve through the
+// companion's adapter and messages are prompts, neither is runnable here —
+// saying so beats pretending. Nested execution (a step naming
+// shortcuts_execute or browser_batch) is refused for the same reason.
+async function runShortcutToolSteps(definition, tabId) {
+  const lines = [];
+  for (let k = 0; k < definition.steps.length; k++) {
+    const step = definition.steps[k];
+    if (!step || step.kind !== "tool") {
+      const kind = step && typeof step.kind === "string" ? step.kind : "malformed";
+      return {
+        ok: false,
+        lines,
+        error: `Shortcut "${definition.id}" declares a ${kind} step (step ${k + 1}); this executor runs tool steps only. Nothing ran.`
+      };
+    }
+    if (step.ref === "shortcuts_execute" || step.ref === "browser_batch") {
+      return {
+        ok: false,
+        lines,
+        error: `Shortcut "${definition.id}" nests "${step.ref}" (step ${k + 1}); nested execution is refused. Nothing ran.`
+      };
+    }
+    const handler = toolHandlers[step.ref];
+    if (typeof handler !== "function") {
+      return {
+        ok: false,
+        lines,
+        error: `Shortcut "${definition.id}" names unknown tool "${step.ref}" (step ${k + 1}). Nothing ran.`
+      };
+    }
+    const stepArgs = { ...((step.args && typeof step.args === "object") ? step.args : {}) };
+    if (SHORTCUT_TAB_SCOPED_TOOLS.has(step.ref) && stepArgs.tabId === undefined) stepArgs.tabId = tabId;
+    try {
+      const res = await handler(stepArgs);
+      const first = res && Array.isArray(res.content) ? res.content[0] : null;
+      const note = first
+        ? (typeof first.text === "string" && first.text ? first.text.split("\n")[0].slice(0, 160)
+          : first.type === "image" ? "image returned" : "")
+        : "";
+      lines.push(`step ${k + 1} (${step.ref}): ok${note ? ` — ${note}` : ""}`);
+    } catch (e) {
+      lines.push(`step ${k + 1} (${step.ref}): failed — ${String((e && e.message) || e).slice(0, 300)}`);
+      return { ok: false, lines, error: `Shortcut "${definition.id}" failed at step ${k + 1} (${step.ref}).` };
+    }
+  }
+  return { ok: true, lines };
+}
+actionEvents.onActionEvent(collectGifCaptureInput);
+
+// Start a compositor-driven screencast on the tab. Frames arrive with their
+// own cadence through Page.screencastFrame (see the onEvent branch); polling
+// screenshots on a timer would sample unrelated to what the page did and
+// smear the click correlation. A screencast is exclusive per target: when
+// another consumer holds one, CDP refuses and the caller gets that reason,
+// never a silent downgrade.
+async function gifStartScreencast(tabId) {
+  await ensureAttached(tabId);
+  try {
+    await ensureDomain(tabId, "Page");
+  } catch {}
+  try {
+    await cdp(tabId, "Page.startScreencast", {
+      format: "jpeg",
+      quality: 60,
+      maxWidth: GIF_SCREENCAST_MAX_WIDTH,
+      everyNthFrame: 10
+    });
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    if (/already|in progress|active|screencast/i.test(msg)) {
+      throw new Error(`screencast already in progress for tab ${tabId} (held by another consumer)`);
+    }
+    throw e;
+  }
+}
+
+async function gifStopScreencast(tabId) {
+  try {
+    await cdp(tabId, "Page.stopScreencast", {});
+  } catch {}
 }
 
 const toolHandlers = {
@@ -5522,10 +6201,15 @@ const toolHandlers = {
   },
 
   async upload_image(args) {
-    const { imageId, tabId, ref, filename = "image.png" } = args;
+    const { imageId, tabId, ref, coordinate, filename = "image.png" } = args;
     if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
-    if (!ref) {
-      return { content: [{ type: "text", text: "upload_image requires 'ref' (element reference from read_page/find) identifying the target <input type=file>." }] };
+    const hasRef = typeof ref === "string" && ref.length > 0;
+    const hasCoord = Array.isArray(coordinate) && coordinate.length >= 2;
+    if (!hasRef && !hasCoord) {
+      return { content: [{ type: "text", text: "upload_image needs a target: either 'ref' (an <input type=file> from read_page/find) or 'coordinate' ([x, y] in the last screenshot's pixels) for a drop at a viewport position. Supply one of them." }] };
+    }
+    if (hasRef && hasCoord) {
+      return { content: [{ type: "text", text: "upload_image accepts either 'ref' or 'coordinate', not both. The two paths never mix." }] };
     }
 
     const base64 = screenshotStore.get(imageId);
@@ -5536,6 +6220,8 @@ const toolHandlers = {
     await ensureAttached(tabId);
     await ensureDomain(tabId, "DOM");
 
+    if (hasCoord) return uploadImageAtCoordinate(tabId, imageId, coordinate, filename, base64);
+
     // 1) Resolve the ref through the content-script channel (isolated world,
     //    where resolveRef lives), stamping a DOM attribute CDP can find. A
     //    main-world Runtime.evaluate can't see the isolated-world globals.
@@ -5545,7 +6231,7 @@ const toolHandlers = {
     }
     if (!mark.isFileInput) {
       await sendContentMessage(tabId, { type: "unmarkElementForUpload" }).catch(() => {});
-      return { content: [{ type: "text", text: `Target ref=${ref} is a <${mark.tag}>, not a file input.` }] };
+      return { content: [{ type: "text", text: `Target ref=${ref} is a <${mark.tag}>, not a file input. Supply a coordinate to drop the image at a viewport position instead.` }] };
     }
 
     // 2) Stage the screenshot bytes as a real temp file via the native host.
@@ -5666,42 +6352,273 @@ const toolHandlers = {
   },
 
   async gif_creator(args) {
-    return { content: [{ type: "text", text: "GIF recording is not yet implemented in this extension." }] };
+    const { action, tabId, download = false, filename, options = {} } = args;
+    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    if (action === "start_recording") {
+      const existing = gifCaptures.get(tabId);
+      if (existing && existing.active) {
+        return { content: [{ type: "text", text: `Tab ${tabId} is already recording. Stop it before starting another.` }] };
+      }
+      try {
+        await chrome.tabs.get(tabId);
+      } catch {
+        return { content: [{ type: "text", text: `Tab ${tabId} does not exist.` }] };
+      }
+      // Viewport size maps screencast pixels back to the CSS pixels click
+      // positions are recorded in. Best-effort: without it markers assume 1:1.
+      let view = null;
+      try {
+        const r = await cdp(tabId, "Runtime.evaluate", { expression: "({w: window.innerWidth, h: window.innerHeight})" });
+        const v = r && r.result && r.result.value;
+        if (v && typeof v.w === "number" && typeof v.h === "number" && v.w > 0) view = v;
+      } catch {}
+      const cap = {
+        frames: [],
+        clicksByAction: new Map(),
+        paths: [],
+        actionLog: [],
+        startedAt: Date.now(),
+        stopAt: null,
+        active: true,
+        endedEarly: null,
+        view
+      };
+      gifCaptures.set(tabId, cap);
+      try {
+        await gifStartScreencast(tabId);
+      } catch (e) {
+        gifCaptures.delete(tabId);
+        return { content: [{ type: "text", text: `Could not start recording tab ${tabId}: ${String((e && e.message) || e)}` }] };
+      }
+      return { content: [{ type: "text", text: `Recording started on tab ${tabId}. Act with the usual tools, then stop_recording.` }] };
+    }
+    if (action === "stop_recording") {
+      const cap = gifCaptures.get(tabId);
+      if (!cap) return { content: [{ type: "text", text: `Tab ${tabId} has no recording. Start one with start_recording first.` }] };
+      if (!cap.active) {
+        return { content: [{ type: "text", text: `Recording on tab ${tabId} is already stopped with ${cap.frames.length} frame(s). Export it or clear it.` }] };
+      }
+      try {
+        await chrome.tabs.get(tabId);
+      } catch {
+        cap.endedEarly = cap.endedEarly || "tab closed";
+      }
+      cap.active = false;
+      cap.stopAt = Date.now();
+      await gifStopScreencast(tabId);
+      const secs = Math.round((cap.stopAt - cap.startedAt) / 100) / 10;
+      const early = cap.endedEarly ? ` Capture ended early (${cap.endedEarly}).` : "";
+      return { content: [{ type: "text", text: `Recording stopped on tab ${tabId}: ${cap.frames.length} frame(s) over ${secs}s.${early} Export it or clear it.` }] };
+    }
+    if (action === "export") {
+      const cap = gifCaptures.get(tabId);
+      if (!cap) return { content: [{ type: "text", text: `Tab ${tabId} has no recording. Start one with start_recording first.` }] };
+      if (cap.active) {
+        // Stopping implicitly keeps one round trip from standing between the
+        // caller and the GIF; the result states that it did.
+        cap.active = false;
+        cap.stopAt = Date.now();
+        await gifStopScreencast(tabId);
+      }
+      try {
+        await chrome.tabs.get(tabId);
+      } catch {
+        cap.endedEarly = cap.endedEarly || "tab closed";
+      }
+      if (!cap.frames.length) {
+        return { content: [{ type: "text", text: `Tab ${tabId} recorded no frames. The capture window held nothing encodable.` }] };
+      }
+      const windowEnd = cap.stopAt || Date.now();
+      const frameTimes = cap.frames.map((f) => f.t);
+      const clicks = correlateClicksToFrames(frameTimes, [...cap.clicksByAction.values()], windowEnd);
+      const paths = correlateClicksToFrames(frameTimes, cap.paths, windowEnd);
+      const labels = frameTimes.map((t) => {
+        let label = null;
+        for (const a of cap.actionLog) {
+          if (a.t <= t) label = a.summary;
+          else break;
+        }
+        return label;
+      });
+      const delaysCs = frameTimes.map((t, k) => {
+        const next = k + 1 < frameTimes.length ? frameTimes[k + 1] : windowEnd;
+        const cs = Math.round((next - t) / 10);
+        return Math.max(2, Math.min(300, cs || 50));
+      });
+      const opts = options || {};
+      const encodeOpts = {
+        quality: opts.quality,
+        showClickIndicators: opts.showClickIndicators !== false,
+        showDragPaths: opts.showDragPaths !== false,
+        showActionLabels: opts.showActionLabels !== false,
+        showProgressBar: opts.showProgressBar !== false,
+        showWatermark: opts.showWatermark !== false
+      };
+      await ensureOffscreen();
+      const key = `gif_${Date.now()}`;
+      try {
+        for (let s = 0; s < cap.frames.length; s += 50) {
+          const chunk = cap.frames.slice(s, s + 50).map((f, j) => ({
+            dataUrl: `data:image/jpeg;base64,${f.data}`,
+            clicks: clicks[s + j] || [],
+            paths: paths[s + j] || [],
+            label: labels[s + j]
+          }));
+          const appended = await chrome.runtime.sendMessage({ __ocic_offscreen: true, cmd: "gif_append", key, frames: chunk });
+          if (!appended || !appended.ok) throw new Error((appended && appended.error) || "frame transfer failed");
+        }
+        var gifRes = await chrome.runtime.sendMessage({
+          __ocic_offscreen: true,
+          cmd: "gif_encode",
+          key,
+          delaysCs,
+          viewW: cap.view ? cap.view.w : 0,
+          viewH: cap.view ? cap.view.h : 0,
+          maxBytes: GIF_MODEL_MAX_BYTES,
+          ...encodeOpts
+        });
+      } catch (e) {
+        return { content: [{ type: "text", text: `GIF encoding failed for tab ${tabId}: ${String((e && e.message) || e)}` }] };
+      }
+      if (!gifRes || !gifRes.ok) {
+        return { content: [{ type: "text", text: `GIF encoding failed for tab ${tabId}: ${String((gifRes && gifRes.error) || "unknown error")}` }] };
+      }
+      const byteSize = gifRes.bytes || Math.floor((gifRes.base64.length * 3) / 4);
+      if (byteSize > GIF_MAX_BYTES) {
+        const mb = (n) => `${Math.round((n / 1048576) * 10) / 10} MB`;
+        return { content: [{ type: "text", text: `Encoded GIF is ${mb(byteSize)}, over the ${mb(GIF_MAX_BYTES)} image data limit. Shorten the capture window and export again. No image returned.` }] };
+      }
+      const secs = Math.round((windowEnd - cap.startedAt) / 100) / 10;
+      let text = `GIF ready: ${gifRes.frames} frame(s) over ${secs}s, ${gifRes.width}x${gifRes.height}, ${Math.round(byteSize / 1024)} KB.`;
+      // Say what was given up to fit, rather than quietly handing back a
+      // thinner recording than the capture actually held.
+      if (gifRes.reduced) {
+        const r = gifRes.reduced;
+        text += ` Reduced to fit the ${Math.round(GIF_MODEL_MAX_BYTES / 1024)} KB budget for an image in the conversation:`
+          + ` narrowed to ${r.width}px`
+          + (r.stride > 1 ? `, keeping ${r.keptFrames} of ${r.ofFrames} frames (every ${r.stride}${r.stride === 2 ? "nd" : r.stride === 3 ? "rd" : "th"}); the animation still spans the full capture window.` : `.`);
+      }
+      if (cap.endedEarly) text += ` Capture ended early (${cap.endedEarly}); the requested duration was not achieved.`;
+      else text += ` The capture ran to its stop.`;
+      if (download) {
+        const safe = String(filename || `recording-${Date.now()}.gif`).replace(/[^\w.\-]/g, "_");
+        const finalName = safe.toLowerCase().endsWith(".gif") ? safe : `${safe}.gif`;
+        let savedPath = null;
+        try {
+          savedPath = await nativeRequest({
+            type: "save_gif_to_disk",
+            dataUrl: `data:image/gif;base64,${gifRes.base64}`,
+            filename: finalName
+          });
+        } catch (e) {
+          return { content: [{ type: "text", text: `GIF encoded (${Math.round(byteSize / 1024)} KB) but saving it failed: ${String((e && e.message) || e)}. No image returned; export again without download to receive it.` }] };
+        }
+        if (!savedPath) {
+          return { content: [{ type: "text", text: `GIF encoded (${Math.round(byteSize / 1024)} KB) but saving it failed. No image returned; export again without download to receive it.` }] };
+        }
+        text += ` Saved to ${savedPath}.`;
+      }
+      return {
+        content: [
+          { type: "text", text },
+          { type: "image", data: gifRes.base64, mimeType: "image/gif" }
+        ]
+      };
+    }
+    if (action === "clear") {
+      const cap = gifCaptures.get(tabId);
+      if (cap && cap.active) await gifStopScreencast(tabId);
+      gifCaptures.delete(tabId);
+      return { content: [{ type: "text", text: cap ? `Recording on tab ${tabId} discarded (${cap.frames.length} frame(s) dropped).` : `Tab ${tabId} has no recording to discard.` }] };
+    }
+    return { content: [{ type: "text", text: `Unknown gif_creator action: ${String(action)}. Use start_recording, stop_recording, export, or clear.` }] };
   },
 
   async shortcuts_list(args) {
-    return { content: [{ type: "text", text: "No shortcuts available. Shortcuts are not supported in this extension." }] };
+    const { tabId } = args;
+    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    let url = null;
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (tab && typeof tab.url === "string") url = tab.url;
+    } catch {}
+    let res;
+    try {
+      res = await nativeRequest({ type: "shortcuts_list", tabId, url });
+    } catch (e) {
+      return { content: [{ type: "text", text: `Could not list shortcuts: ${String((e && e.message) || e)}` }] };
+    }
+    const shortcuts = res && Array.isArray(res.shortcuts) ? res.shortcuts : [];
+    if (!shortcuts.length) return { content: [{ type: "text", text: "No shortcuts available for this tab." }] };
+    const lines = shortcuts.map((s) => `- ${s.shortcutId}: ${(s.description || s.name || "").slice(0, 160)} (workflow)`);
+    return { content: [{ type: "text", text: `Shortcuts available for this tab:\n${lines.join("\n")}\nRun one with shortcuts_execute.` }] };
   },
 
   async shortcuts_execute(args) {
-    return { content: [{ type: "text", text: "Shortcuts are not supported in this extension." }] };
+    const v = validateShortcutsExecuteArgs(args);
+    if (!v.ok) return { content: [{ type: "text", text: v.message }] };
+    if (!(await isInGroup(v.tabId))) return { content: [{ type: "text", text: `Tab ${v.tabId} is not in the MCP group.` }] };
+    let url = null;
+    try {
+      const tab = await chrome.tabs.get(v.tabId);
+      if (tab && typeof tab.url === "string") url = tab.url;
+    } catch {}
+    let res;
+    try {
+      res = await nativeRequest({ type: "shortcuts_execute", tabId: v.tabId, shortcutId: v.shortcutId, command: v.command, url });
+    } catch (e) {
+      return { content: [{ type: "text", text: `Could not execute shortcut "${v.target}": ${String((e && e.message) || e)}. Nothing ran.` }] };
+    }
+    if (!res || res.ok !== true) {
+      const code = res && res.code ? res.code : "UNKNOWN";
+      if (code === "SHORTCUT_NOT_FOUND") {
+        return { content: [{ type: "text", text: `Unknown shortcut "${v.target}". List available shortcuts with shortcuts_list. Nothing ran.` }] };
+      }
+      return { content: [{ type: "text", text: `Shortcut "${v.target}" was refused (${code}): ${(res && res.message) || "no reason given"}. Nothing ran.` }] };
+    }
+    const def = res.definition;
+    if (!def || !Array.isArray(def.steps) || !def.steps.length) {
+      return { content: [{ type: "text", text: `Shortcut "${v.target}" resolved to an empty definition. Nothing ran.` }] };
+    }
+    const run = await runShortcutToolSteps(def, v.tabId);
+    const head = run.ok
+      ? `Shortcut "${def.id}" finished: ${run.lines.length} step(s) ran.`
+      : `${run.error} ${run.lines.length} step(s) completed before the failure.`;
+    return { content: [{ type: "text", text: `${head}\n${run.lines.join("\n")}` }] };
   },
 
-  async switch_browser(args) {
-    const current = await detectBrowser();
-    // Release AFTER this reply is delivered — it goes out over the very native
-    // port we are about to drop. Suspending reconnect lets a target browser
-    // whose extension is enabled bind the shared runtime and become primary;
-    // if none takes over, this browser reconnects when the window elapses.
-    setTimeout(() => {
-      suspendReconnectUntil = Date.now() + SWITCH_RELEASE_MS;
-      if (nativePort) {
-        try { nativePort.disconnect(); } catch (e) {}
-        nativePort = null;
-        stopHeartbeat();
-      }
-    }, 300);
-    return {
-      content: [{
-        type: "text",
-        text:
-          `Releasing the connection from ${current}. Enable this extension in the ` +
-          `target browser (no restart needed) — for the next ~${SWITCH_RELEASE_MS / 1000}s it can take over ` +
-          `the shared runtime automatically. Only one browser drives automation at a ` +
-          `time. If nothing takes over, ${current} reconnects when the window elapses. ` +
-          `Re-run tabs_context_mcp after a few seconds to confirm the active browser.`,
-      }],
-    };
+  async list_connected_browsers(args) {
+    let res;
+    try {
+      res = await nativeRequest({ type: "list_browsers" });
+    } catch (e) {
+      return { content: [{ type: "text", text: `Could not list connected browsers: ${String((e && e.message) || e)}` }] };
+    }
+    const browsers = res && Array.isArray(res.browsers) ? res.browsers : [];
+    if (!browsers.length) return { content: [{ type: "text", text: "No browsers are currently attached to the companion." }] };
+    const lines = browsers.map((b) => `- ${b.browser}${b.driving ? " (driving automation)" : ""}`);
+    return { content: [{ type: "text", text: `Connected browsers:\n${lines.join("\n")}\nTransfer automation with select_browser.` }] };
+  },
+
+  async select_browser(args) {
+    const name = args && typeof args.browser === "string" ? args.browser.trim() : "";
+    if (!name) {
+      return { content: [{ type: "text", text: "select_browser requires 'browser' (a name from list_connected_browsers)." }] };
+    }
+    let res;
+    try {
+      res = await nativeRequest({ type: "select_browser", browser: name });
+    } catch (e) {
+      return { content: [{ type: "text", text: `Could not select browser "${name}": ${String((e && e.message) || e)}. Automation stays where it was.` }] };
+    }
+    if (!res || res.ok !== true) {
+      const still = res && res.stillDriving ? ` ${res.stillDriving} is still driving automation.` : "";
+      return { content: [{ type: "text", text: `Could not select browser "${name}": ${(res && res.error) || "unknown error"}.${still}` }] };
+    }
+    if (res.noTransfer) {
+      return { content: [{ type: "text", text: `${res.driver} is already driving automation. No transfer was needed.` }] };
+    }
+    return { content: [{ type: "text", text: `Automation transferred to ${res.newDriver}.` }] };
   },
 
   async update_plan(args) {

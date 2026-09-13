@@ -23,6 +23,13 @@
           <span class="connection-dot"></span>
           <span id="connection-label">Đang kết nối</span>
         </span>
+        <ui-menu id="mode-menu-wrap">
+          <button slot="trigger" class="model-select-trigger" type="button" id="mode-trigger" aria-haspopup="menu" aria-label="Chế độ cấp quyền">
+            <span id="mode-trigger-icon"></span>
+            <span id="mode-trigger-label">Auto</span>
+          </button>
+          <div slot="menu" class="menu" role="menu" id="mode-menu"></div>
+        </ui-menu>
         <button class="btn-icon" id="btn-new-chat" aria-label="Trò chuyện mới, không gắn trang nào"></button>
         <button class="btn-icon" id="btn-history" aria-label="Lịch sử trò chuyện và bản ghi"></button>
         <button class="btn-icon" id="btn-settings" aria-label="Cài đặt"></button>
@@ -45,6 +52,7 @@
     <div class="panel-composer-wrap" id="composer-wrap">
       <div id="setup-banner-slot"></div>
       <div id="permission-slot"></div>
+      <div id="download-decision-slot"></div>
       <div id="question-slot"></div>
       <div class="context-chip-row" id="context-chip-row"></div>
       <div id="attachment-strip" class="attachment-strip" hidden aria-label="Tệp đính kèm"></div>

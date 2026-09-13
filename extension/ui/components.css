@@ -401,6 +401,96 @@
   justify-content: flex-end;
 }
 
+/* Task 7.6: risk CONTEXT block on a decision card — informational only, no
+   control of its own lives inside it (the card's own .permission-card-actions
+   above remains the sole set of controls). Deliberately reuses the warning
+   color token, never the accent/primary button colors, so it never reads as
+   a third, competing action. */
+.permission-card-risk-context {
+  border: 1px solid var(--color-status-warning);
+  border-radius: var(--radius-sm);
+  padding: var(--space-2) var(--space-3);
+  background: color-mix(in srgb, var(--color-status-warning) 10%, transparent);
+}
+.permission-card-risk-title {
+  margin: 0;
+  font-weight: 600;
+  font-size: var(--font-size-small);
+  color: var(--color-status-warning);
+}
+.permission-card-risk-signals {
+  margin: var(--space-1) 0 0;
+  padding-left: var(--space-4);
+  font-size: var(--font-size-small);
+  color: var(--color-text-secondary);
+}
+
+/* ============================= Threat warnings (findings / tab risk) ============================= */
+/*
+ * Tasks 7.4/7.5: injection findings, probe failures, and tab-risk updates,
+ * rendered as WARNINGS — never a decision card. This block intentionally
+ * shares NO class and NO structural pattern with .permission-card above: no
+ * head+actions layout, no button anywhere, `role="status"` (not
+ * "alertdialog") on the row itself. Acknowledging/dismissing one of these is
+ * not even a gesture this UI offers, let alone one that authorizes anything.
+ */
+.threat-warning-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: var(--space-2) 0;
+}
+.threat-warning {
+  display: flex;
+  gap: var(--space-2);
+  align-items: flex-start;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-sunken);
+  font-size: var(--font-size-small);
+}
+.threat-warning.is-elevated {
+  border-color: var(--color-status-warning);
+  background: color-mix(in srgb, var(--color-status-warning) 10%, transparent);
+}
+.threat-warning-icon {
+  flex: none;
+  color: var(--color-status-warning);
+  display: flex;
+  align-items: center;
+}
+.threat-warning-body {
+  min-width: 0;
+}
+.threat-warning-title {
+  margin: 0;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.threat-warning-quote {
+  margin-top: var(--space-1);
+}
+/* The quoted text itself: literally what a web page said (see
+   extension/ui/threat-labels.js's header) — a plain, non-clickable, monospace
+   block. `white-space:pre-wrap` keeps it readable without ever interpreting
+   its content as markup. */
+.threat-warning-quote code {
+  display: block;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: var(--font-mono);
+  color: var(--color-text-secondary);
+  background: var(--color-surface);
+  border-radius: var(--radius-sm);
+  padding: var(--space-1) var(--space-2);
+}
+.threat-warning-signals {
+  margin: var(--space-1) 0 0;
+  padding-left: var(--space-4);
+  color: var(--color-text-secondary);
+}
+
 /* ============================= Tool activity timeline ============================= */
 
 .tool-timeline {

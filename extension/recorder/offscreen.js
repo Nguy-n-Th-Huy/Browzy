@@ -536,6 +536,217 @@ function copyText(text) {
     return { ok: false, error: String(e && e.message) };
   }
 }
+// ---- GIF export (gif_creator path) -------------------------------------------
+// Frames arrive as JPEG dataURLs in batches (one runtime message per batch;
+// a long capture would make a single message unreasonably large), then a
+// final gif_encode call draws overlays, quantizes, and encodes. All canvas
+// work runs here because the service worker has no DOM. The pure pieces —
+// palette, quantization, marker raster, LZW, file assembly — live in
+// gif-encoder.js (loaded as a classic script by offscreen.html, read off
+// globalThis) so they stay unit-testable under plain Node.
+const gifSessions = new Map(); // key -> { frames: [{dataUrl,clicks,paths,label}] }
+const GIF_SESSION_FRAME_CAP = 240; // mirrors the SW-side capture cap
+
+function loadFrameImage(dataUrl) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error("gif frame decode failed"));
+    img.src = dataUrl;
+  });
+}
+
+function gifBytesToBase64(bytes) {
+  let s = "";
+  for (let i = 0; i < bytes.length; i += 32768) {
+    s += String.fromCharCode.apply(null, bytes.subarray(i, i + 32768));
+  }
+  return btoa(s);
+}
+
+async function gifAppend(msg) {
+  const key = String(msg.key || "");
+  if (!key) return { ok: false, error: "gif session key is required" };
+  let session = gifSessions.get(key);
+  if (!session) {
+    session = { frames: [] };
+    gifSessions.set(key, session);
+  }
+  const incoming = Array.isArray(msg.frames) ? msg.frames : [];
+  if (session.frames.length + incoming.length > GIF_SESSION_FRAME_CAP) {
+    return { ok: false, error: `gif session frame cap (${GIF_SESSION_FRAME_CAP}) exceeded` };
+  }
+  for (const f of incoming) {
+    session.frames.push({
+      dataUrl: f.dataUrl,
+      clicks: Array.isArray(f.clicks) ? f.clicks : [],
+      paths: Array.isArray(f.paths) ? f.paths : [],
+      label: typeof f.label === "string" ? f.label : null
+    });
+  }
+  return { ok: true, frames: session.frames.length };
+}
+
+// Quality tier from the schema's 1-30 scale (lower = better there): it buys
+// output width, since GIF itself has no quality knob. Documented in the SW
+// handler that maps the caller's option to this tier.
+function gifTierWidth(quality) {
+  const q = typeof quality === "number" ? quality : 10;
+  if (q <= 10) return 640;
+  if (q <= 20) return 480;
+  return 320;
+}
+
+// One render+encode pass at a chosen width and frame stride. `stride` > 1
+// keeps every Nth frame and multiplies the kept frames' delays by the number
+// of frames they stand in for, so dropping frames shortens the FILE without
+// misreporting how long the capture actually took.
+async function gifRenderPass(session, msg, targetW, stride) {
+  const E = globalThis;
+  const showClicks = msg.showClickIndicators !== false;
+  const showPaths = msg.showDragPaths !== false;
+  const showLabels = msg.showActionLabels !== false;
+  const showBar = msg.showProgressBar !== false;
+  const showMark = msg.showWatermark !== false;
+  const delays = Array.isArray(msg.delaysCs) ? msg.delaysCs : [];
+  const viewW = typeof msg.viewW === "number" && msg.viewW > 0 ? msg.viewW : 0;
+  const frames = [];
+  const step = stride > 1 ? Math.floor(stride) : 1;
+  const kept = [];
+  for (let i = 0; i < session.frames.length; i += step) kept.push(i);
+  try {
+    for (let ki = 0; ki < kept.length; ki++) {
+      const fi = kept[ki];
+      const f = session.frames[fi];
+      const img = await loadFrameImage(f.dataUrl);
+      const scale0 = Math.min(1, targetW / (img.naturalWidth || targetW));
+      const w = Math.max(1, Math.round(img.naturalWidth * scale0));
+      const h = Math.max(1, Math.round(img.naturalHeight * scale0));
+      // Viewport CSS pixels -> canvas pixels. Falls back to 1:1 when the
+      // SW could not read the viewport (background tab, evaluation refused).
+      const s = viewW > 0 ? w / viewW : 1;
+      const c = document.createElement("canvas");
+      c.width = w;
+      c.height = h;
+      const ctx = c.getContext("2d");
+      ctx.drawImage(img, 0, 0, w, h);
+      if (showPaths && f.paths.length > 1) {
+        ctx.strokeStyle = "#ff0000";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        f.paths.forEach((p, k) => {
+          const x = p.x * s;
+          const y = p.y * s;
+          if (k === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+      }
+      if (showLabels && f.label) {
+        ctx.font = "14px sans-serif";
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = "rgba(255,255,255,0.85)";
+        ctx.fillStyle = "#111111";
+        const label = f.label.slice(0, 80);
+        ctx.strokeText(label, 8, 20);
+        ctx.fillText(label, 8, 20);
+      }
+      if (showBar) {
+        const bw = Math.round((w * (ki + 1)) / kept.length);
+        ctx.fillStyle = "#ff8c00";
+        ctx.fillRect(0, h - 6, bw, 6);
+      }
+      if (showMark) {
+        ctx.font = "12px sans-serif";
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = "rgba(0,0,0,0.6)";
+        ctx.fillStyle = "rgba(255,255,255,0.75)";
+        ctx.strokeText("Browzy", w - 58, h - 12);
+        ctx.fillText("Browzy", w - 58, h - 12);
+      }
+      const imageData = ctx.getImageData(0, 0, w, h);
+      if (showClicks) {
+        for (const click of f.clicks) {
+          E.gifDrawMarker(imageData.data, w, h, click.x * s, click.y * s);
+        }
+      }
+      // A kept frame stands in for the frames the stride skipped, so it holds
+      // their time too — the animation still spans the real capture window.
+      let delayCs = 0;
+      const upto = ki + 1 < kept.length ? kept[ki + 1] : session.frames.length;
+      for (let j = fi; j < upto; j++) delayCs += delays[j] || 50;
+      frames.push({ indices: E.gifQuantizeFrame(imageData.data, w, h), delayCs, w, h });
+    }
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
+  // All frames share one canvas size: the first frame's. A mid-capture
+  // viewport resize would otherwise produce a corrupt file.
+  const w0 = frames[0].w;
+  const h0 = frames[0].h;
+  for (const f of frames) {
+    if (f.w !== w0 || f.h !== h0) {
+      return { ok: false, error: "capture changed size mid-recording; re-record without resizing" };
+    }
+  }
+  const bytes = E.gifEncodeGif(
+    w0,
+    h0,
+    frames.map((f) => ({ indices: f.indices, delayCs: f.delayCs })),
+    0
+  );
+  return { ok: true, bytes, width: w0, height: h0, frames: frames.length };
+}
+
+// Width/stride ladder walked until the encoded file fits the caller's budget.
+// Width shrinks before frames are dropped: a narrower frame still shows every
+// moment of the capture, while a dropped frame is a moment nobody can see.
+function gifLadder(baseW) {
+  const w = (m) => Math.max(160, Math.round(baseW * m));
+  return [
+    { w: baseW, stride: 1 },
+    { w: w(0.75), stride: 1 },
+    { w: w(0.5), stride: 1 },
+    { w: w(0.5), stride: 2 },
+    { w: w(0.4), stride: 3 },
+    { w: w(0.3), stride: 4 }
+  ];
+}
+
+async function gifEncode(msg) {
+  const key = String(msg.key || "");
+  const session = gifSessions.get(key);
+  gifSessions.delete(key);
+  if (!session || !session.frames.length) return { ok: false, error: "gif session has no frames" };
+  const E = globalThis;
+  if (typeof E.gifEncodeGif !== "function" || typeof E.gifQuantizeFrame !== "function" || typeof E.gifDrawMarker !== "function") {
+    return { ok: false, error: "gif encoder unavailable in the offscreen document" };
+  }
+  const baseW = gifTierWidth(msg.quality);
+  const budget = typeof msg.maxBytes === "number" && msg.maxBytes > 0 ? msg.maxBytes : 0;
+  const ladder = gifLadder(baseW);
+  let pass = null;
+  let usedStep = ladder[0];
+  for (const step of ladder) {
+    pass = await gifRenderPass(session, msg, step.w, step.stride);
+    if (!pass.ok) return pass;
+    usedStep = step;
+    if (!budget || pass.bytes.length <= budget) break;
+  }
+  const reduced = usedStep === ladder[0]
+    ? null
+    : { width: usedStep.w, stride: usedStep.stride, keptFrames: pass.frames, ofFrames: session.frames.length };
+  return {
+    ok: true,
+    base64: gifBytesToBase64(pass.bytes),
+    bytes: pass.bytes.length,
+    width: pass.width,
+    height: pass.height,
+    frames: pass.frames,
+    overBudget: budget > 0 && pass.bytes.length > budget,
+    reduced
+  };
+}
 
 // ---- message bridge with the service worker -------------------------------
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -551,7 +762,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       else if (msg.cmd === "audio_slice") sendResponse(await audioSlice(msg));
       else if (msg.cmd === "transcribe") sendResponse(await transcribeRecording());
       else if (msg.cmd === "retranscribe") sendResponse(await retranscribe(msg.recording_id, msg.apiKey));
-      else if (msg.cmd === "copy") sendResponse(copyText(msg.text));
+      else if (msg.cmd === "gif_append") sendResponse(await gifAppend(msg));
+      else if (msg.cmd === "gif_encode") sendResponse(await gifEncode(msg));
       else if (msg.cmd === "set_path") {
         db = db || (await openDb());
         await patchSession(msg.recording_id, { path: msg.path });

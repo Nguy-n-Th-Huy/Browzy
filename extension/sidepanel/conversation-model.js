@@ -80,13 +80,36 @@ export class ConversationModel {
     this.items = []; // ordered: {kind:"user"|"assistant_turn"|"recording"}
     this.lastSeq = 0;
     this.meta = null;
-    this.pendingApproval = null; // {action, target, requestId, ts}
+    this.pendingApproval = null; // {action, target, requestId, protectedCategory, rememberable, ts}
+    // Task 2.4: a LOCAL-only protected decision raised by background.js's
+    // chrome.downloads.onCreated gate — never part of the host transcript,
+    // never replayed from a snapshot (a download is a point-in-time browser
+    // event, not conversation history), and never rememberable (downloads
+    // are always the "download" protected category — spec "A protected
+    // decision is not remembered"). Kept as its own field rather than
+    // reusing pendingApproval so a real host-issued approval_request and a
+    // local download pause can never be confused with each other (a
+    // approval_decision reply for one must never be mistaken for the other).
+    this.pendingDownloadDecision = null; // {requestId, runId, category, filename, url, ts}
     // Task 9.7: pending question — the user's choice resolves via
     // panel-controller.js's respondQuestion() with the matching requestId.
     // Mirror of pendingApproval, persisted and restored via the same
     // sequenced-event/replay mechanism.
     this.pendingQuestion = null; // {question, header, options, requestId, multiSelect, ts}
     this.connectionError = null; // {reason, detail} — conversation-scoped errors (run_error)
+    // Tasks 7.4/7.6: the LATEST known risk category + contributing signals
+    // for each tab this conversation's runs have controlled, keyed by tabId.
+    // Populated only from real `tab_risk_update` events (host/agent/threat/
+    // tab-risk.js's TabRiskRegistry) — never inferred locally. Used to show
+    // risk CONTEXT on a decision card for the same tab (see getTabRisk());
+    // the discrete finding/category events themselves are ALSO recorded as
+    // turn-anchored warnings below, so the transcript shows them in place
+    // (spec: "Findings and risk are surfaced as warnings, never as
+    // decisions"). Survives a full applySnapshot() rebuild like every other
+    // piece of state derived purely from replayed events — no separate
+    // dedup needed (design decision 3 above: the rebuild replaces rather
+    // than merges).
+    this.tabRisk = new Map();
     this._turnsByRunId = new Map(); // runId -> item (assistant_turn)
     this._pendingUserIndex = null; // index of a just-sent, not-yet-bound user item
     this._localPrompts = new Map(); // runId -> original prompt text (this session's own echo cache)
@@ -190,6 +213,15 @@ export class ConversationModel {
         kind: "assistant_turn",
         runId,
         toolRows: [],
+        // Tasks 7.4/7.5: turn-anchored warnings — `injection_finding`,
+        // `injection_probe_failed`, and `tab_risk_update` events recorded
+        // while this turn's run was active. Purely informational (spec: "A
+        // warning SHALL NOT present allow/deny controls... SHALL NOT be
+        // resolvable as an approval") — nothing here is ever consumed by
+        // approve/deny code, and nothing here ever clears on its own the way
+        // pendingApproval/pendingQuestion do, because acknowledging a
+        // warning is not a thing this model models at all.
+        warnings: [],
         text: "",
         // Mid-turn answers to ask-user questions, in answer order:
         // {text, afterToolCount, ts}. Rendered right after the tool timeline
@@ -264,12 +296,14 @@ export class ConversationModel {
         for (const row of turn.toolRows) {
           if (row.status === "running") row.status = "cancelled";
         }
+        this._invalidatePendingDownloadDecisionForRun(event.runId);
         break;
       }
       case "run_done": {
         const turn = this._turnFor(event.runId, { createIfMissing: true, ts: event.ts });
         turn.lifecycle = "done";
         turn.complete = true;
+        this._invalidatePendingDownloadDecisionForRun(event.runId);
         break;
       }
       case "run_error": {
@@ -277,6 +311,7 @@ export class ConversationModel {
         turn.lifecycle = "error";
         turn.complete = false;
         turn.errorInfo = { reason: event.reason || "run_error", detail: event.detail };
+        this._invalidatePendingDownloadDecisionForRun(event.runId);
         break;
       }
       case "run_interrupted_by_restart": {
@@ -286,6 +321,7 @@ export class ConversationModel {
         for (const row of turn.toolRows) {
           if (row.status === "running") row.status = "unknown";
         }
+        this._invalidatePendingDownloadDecisionForRun(event.runId);
         break;
       }
       case "tool_rejected": {
@@ -325,12 +361,90 @@ export class ConversationModel {
       case "stream_message":
         this._applyStreamMessage(event.runId, event.message, event.ts);
         break;
+      // Tasks 7.4/7.5: an injection probe finding — a FACT about content a
+      // tool already returned (the content was delivered unchanged; see
+      // reports/wave2h-events.md), never a request. Recorded as a
+      // turn-anchored warning so it appears in the transcript roughly where
+      // the tool call that surfaced it ran. `matchedText` is carried through
+      // completely verbatim here — it is QUOTED DATA (literally what a web
+      // page said) and MUST be rendered inert by every consumer (never as
+      // HTML/markdown/a link); see extension/ui/threat-labels.js's own
+      // header for the rendering rule this model does not enforce itself
+      // (a pure state model has no rendering to get wrong).
+      case "injection_finding": {
+        const turn = this._turnFor(event.runId, { createIfMissing: true, ts: event.ts });
+        if (!Array.isArray(turn.warnings)) turn.warnings = [];
+        turn.warnings.push({
+          key: nextKey("warn"),
+          kind: "injection_finding",
+          tool: event.tool,
+          tabId: event.tabId != null ? event.tabId : null,
+          field: event.field,
+          patternId: event.patternId,
+          matchedText: event.matchedText,
+          location: event.location || null,
+          ts: event.ts || Date.now()
+        });
+        break;
+      }
+      // A probe failure is diagnostic, not a finding — distinguishable from
+      // "scanned this and found nothing" (spec "Probe failure": "the probe's
+      // failure is recorded distinguishably from a clean result"). Recorded,
+      // never silently dropped, but gets no special decision-relevant
+      // treatment (reports/wave2h-events.md: "not user-facing copy").
+      case "injection_probe_failed": {
+        const turn = this._turnFor(event.runId, { createIfMissing: true, ts: event.ts });
+        if (!Array.isArray(turn.warnings)) turn.warnings = [];
+        turn.warnings.push({
+          key: nextKey("warn"),
+          kind: "injection_probe_failed",
+          tool: event.tool,
+          tabId: event.tabId != null ? event.tabId : null,
+          error: event.error,
+          ts: event.ts || Date.now()
+        });
+        break;
+      }
+      // Task 6's per-tab risk category, advisory-only end to end (never
+      // gates, never consulted by the permission resolver — see
+      // reports/wave2h-events.md). Kept in TWO places on purpose: `tabRisk`
+      // (below) is the LATEST-known state per tab, read by the decision-card
+      // renderer for context (task 7.6); the SAME event is also recorded as
+      // a turn-anchored warning (above pattern) so a category change is
+      // visible in the transcript itself (spec "tab risk categories" are
+      // warnings too, exactly like a finding), not only as ambient card
+      // context.
+      case "tab_risk_update": {
+        const turn = this._turnFor(event.runId, { createIfMissing: true, ts: event.ts });
+        if (!Array.isArray(turn.warnings)) turn.warnings = [];
+        const signals = Array.isArray(event.signals) ? event.signals : [];
+        turn.warnings.push({
+          key: nextKey("warn"),
+          kind: "tab_risk_update",
+          tabId: event.tabId,
+          category: event.category,
+          signals,
+          ts: event.ts || Date.now()
+        });
+        if (event.tabId != null) {
+          this.tabRisk.set(event.tabId, { category: event.category, signals, ts: event.ts || Date.now() });
+        }
+        break;
+      }
       case "approval_request":
         this.pendingApproval = {
           runId: event.runId,
           action: event.action,
           target: event.target,
           requestId: event.requestId,
+          // Task 7.3: which protected category applies (null for an
+          // ordinary mode/mutating/send-class decision) and whether this
+          // decision may be offered a "remember" option at all — both
+          // already emitted by host/agent/policy/can-use-tool.js's
+          // approval_request event (see reports/wave1-contracts.md's Notes
+          // section). A protected decision is never rememberable, per spec.
+          protectedCategory: event.protectedCategory != null ? event.protectedCategory : null,
+          rememberable: event.rememberable === true,
           ts: Date.now()
         };
         break;
@@ -388,6 +502,21 @@ export class ConversationModel {
           ts: Date.now()
         });
         break;
+      // Task 2.4 durable half: this conversation's own transcript replaying
+      // back the durable record host/agent/session/manager.js's
+      // recordDownloadDecision() appended (see
+      // host/agent/companion.js's _handleDownloadDecisionRecorded()) — on a
+      // reconnect/resume snapshot, or a second connected panel. Never
+      // arrives as a LIVE stream_event (the decision is made entirely
+      // outside any Run, so there is no run.emit() to carry it) — the LIVE
+      // half of this same record is recordDownloadDecision() below, called
+      // directly from respondDownloadDecision() the instant the user
+      // answers. Both paths funnel through _pushDownloadDecisionItem(),
+      // deduplicated by requestId, so neither can ever double the item the
+      // other already added.
+      case "download_decision_recorded":
+        this._pushDownloadDecisionItem(event);
+        break;
       default:
         // Unknown event types are ignored, not fatal — protocol.js's own
         // "unknown_message_type" convention for envelopes; a future event
@@ -400,6 +529,83 @@ export class ConversationModel {
    * on stop/scope-change per design.md's approval-token invalidation). */
   clearPendingApproval() {
     this.pendingApproval = null;
+  }
+
+  /** Task 7.6: the latest known `{category, signals, ts}` for a tab, or
+   * `null` when this conversation has never seen a `tab_risk_update` for it
+   * (including "no run has ever controlled this tab" and "insufficient
+   * signals were ever observed" — both legitimately return null/uncategorized
+   * from the host side too; this method never fabricates a category the host
+   * did not report). Read by the decision-card renderer to show risk as
+   * CONTEXT alongside a pending approval for the same tab — never consulted
+   * to change whether a decision is required. */
+  getTabRisk(tabId) {
+    if (tabId == null) return null;
+    return this.tabRisk.get(tabId) || null;
+  }
+
+  /** Task 2.4: background.js paused a download and is asking for a fresh,
+   * non-rememberable protected decision. Never overwrites/merges with
+   * pendingApproval — see that field's own comment for why the two are kept
+   * distinct. */
+  setPendingDownloadDecision(info) {
+    this.pendingDownloadDecision = info;
+  }
+
+  clearPendingDownloadDecision() {
+    this.pendingDownloadDecision = null;
+  }
+
+  /** Task 2.4 (panel spec "An outstanding card SHALL be invalidated... on
+   * Stop"): this run just ended (run_stopped/run_done/run_error/
+   * run_interrupted_by_restart, applied from applyEvent() above) — a download
+   * decision it raised can no longer be answered. Observes the SAME
+   * run-teardown stream_event background.js's own OVERLAY_TEARDOWN_RUN_EVENTS
+   * hook does, independently: this only clears the PANEL's own view of the
+   * card; background.js clears its map entry from the identical event on its
+   * own side (invalidateDownloadDecisionsForRun()), so neither side depends
+   * on a round trip through the other for this specific case. A no-op when
+   * there is no pending decision, or it belongs to a different run. */
+  _invalidatePendingDownloadDecisionForRun(runId) {
+    if (this.pendingDownloadDecision && this.pendingDownloadDecision.runId === runId) {
+      this.pendingDownloadDecision = null;
+    }
+  }
+
+  /** Task 2.4: an honest record for a download that finished (or otherwise
+   * became ungateable) before background.js could pause it — reported, not
+   * pretended to have been blocked. A plain transcript item, not a decision:
+   * there is nothing left to allow or deny. */
+  recordDownloadNotice({ filename, url, outcome, detail, ts }) {
+    this.items.push({ kind: "download_notice", filename, url, outcome, detail: detail || null, ts: ts || Date.now() });
+  }
+
+  /** Shared by the LIVE path (recordDownloadDecision() below, called the
+   * instant the user answers) and the REPLAY path (applyEvent()'s
+   * "download_decision_recorded" case, for a reconnect/second panel).
+   * Deduplicates by requestId so whichever path arrives second is a no-op. */
+  _pushDownloadDecisionItem({ requestId, decision, category, filename, url, ts }) {
+    if (this.items.some((i) => i.kind === "download_decision" && i.requestId === requestId)) return;
+    this.items.push({
+      kind: "download_decision",
+      requestId,
+      decision,
+      category: category || "download",
+      filename: filename || null,
+      url: url || null,
+      ts: ts || Date.now()
+    });
+  }
+
+  /** Task 2.4: the panel's own LIVE record of a download decision the instant
+   * the user answers (panel-controller.js's respondDownloadDecision()) — the
+   * durable host-side half (host/agent/session/manager.js's
+   * recordDownloadDecision()) is a fire-and-forget best-effort report that
+   * only becomes visible again on a later reconnect/resume replay, so this
+   * keeps the CURRENT session's own timeline honest without waiting on that
+   * round trip. */
+  recordDownloadDecision({ requestId, decision, category, filename, url }) {
+    this._pushDownloadDecisionItem({ requestId, decision, category, filename, url, ts: Date.now() });
   }
 
   /** Task 9.7: clears a resolved/expired question (after the user answered,
@@ -480,7 +686,11 @@ export class ConversationModel {
   derivePhase({ connectionStatus, hasProfile } = {}) {
     if (connectionStatus === "version_mismatch" || connectionStatus === "error") return RUN_PHASE.ERROR;
     if (connectionStatus !== "ok") return RUN_PHASE.CONNECTING;
-    if (this.pendingApproval) return RUN_PHASE.WAITING_FOR_PERMISSION;
+    // Task 2.4: a paused download suspends the SAME way a host-issued
+    // approval does, from the operator's point of view — something is
+    // waiting on their decision — even though nothing here is a host
+    // request.
+    if (this.pendingApproval || this.pendingDownloadDecision) return RUN_PHASE.WAITING_FOR_PERMISSION;
     // Task 9.7: a pending question also suspends the run, so the phase is
     // STREAMING (the model is waiting on tool result). Using the same
     // "waiting-for-permission" phase would mislead the user into thinking
@@ -545,7 +755,7 @@ export class ConversationModel {
   //   - never shown for empty/connecting/ready/waiting-for-permission/
   //     stopping/stopped/interrupted/completed/error
   isBusy() {
-    if (this.pendingApproval || this.pendingQuestion) return false;
+    if (this.pendingApproval || this.pendingQuestion || this.pendingDownloadDecision) return false;
     const turn = this._latestTurn();
     if (!turn) return false;
     if (turn.lifecycle === "queued") return true;

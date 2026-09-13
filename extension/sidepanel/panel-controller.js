@@ -547,7 +547,14 @@ export class PanelController {
     this.protocol.stop({ conversationId: this.currentConversationId, reason });
   }
 
-  respondApproval(decision) {
+  /**
+   * @param {"approve"|"deny"} decision
+   * @param {{remember?: boolean}} [opts] - Task 7.3: `remember` is forwarded
+   *   to the wire ONLY when true, and only ever offered by the panel for a
+   *   card whose `rememberable` field said so (never for a protected
+   *   decision — see sidepanel.js's renderPermission()).
+   */
+  respondApproval(decision, { remember = false } = {}) {
     const model = this.currentModel();
     if (!model || !model.pendingApproval) return;
     const { action, target, requestId } = model.pendingApproval;
@@ -560,9 +567,60 @@ export class PanelController {
       decision,
       action,
       target,
-      requestId
+      requestId,
+      ...(remember === true ? { remember: true } : {})
     });
     model.clearPendingApproval();
+    this._notify();
+  }
+
+  /** Task 2.4: the panel's answer to a LOCAL download-pause decision — see
+   * protocol-client.js's downloadDecision() for why this never touches the
+   * host's approval-token machinery. */
+  respondDownloadDecision(decision) {
+    const model = this.currentModel();
+    if (!model || !model.pendingDownloadDecision) return;
+    const { requestId, category, filename, url } = model.pendingDownloadDecision;
+    this.protocol.downloadDecision({ requestId, decision });
+    // Task 2.4: record it in THIS conversation's own timeline immediately —
+    // the durable host-side half (background.js's fire-and-forget
+    // download_decision_recorded relay) only becomes visible again on a
+    // later reconnect/resume, and must not be the only place this decision
+    // is ever shown.
+    model.recordDownloadDecision({ requestId, decision, category, filename, url });
+    model.clearPendingDownloadDecision();
+    this._notify();
+  }
+
+  /**
+   * Task 7.2: mirror the host's own "invalidate every outstanding decision
+   * when the EFFECTIVE mode changes" behavior (host/agent/companion.js calls
+   * `this._pendingApprovals.rejectAll(...)`, which resolves every suspended
+   * canUseTool call `deny` — see reports/wave1-contracts.md). That denial
+   * eventually reaches the panel as an ordinary tool_result on the SDK
+   * stream, but only after a round trip; this clears the card from view
+   * immediately on the panel's OWN successful mode-change request instead of
+   * waiting for it. Clearing here also closes the race respondApproval()
+   * would otherwise have: once cleared, `!model.pendingApproval` makes a
+   * stale click a no-op rather than sending a decision for a request the
+   * host has already forgotten. Applied across every conversation this
+   * panel currently holds a model for — a mode change is companion-process-
+   * wide, not scoped to whichever conversation is showing.
+   */
+  invalidateAllPendingApprovals() {
+    for (const model of this.models.values()) model.clearPendingApproval();
+    // Task 2.4: a permission-mode change must invalidate an outstanding
+    // download decision exactly like it invalidates an ordinary approval
+    // card — chrome.downloads has no tabId, so background.js tracks these
+    // entirely on its own (never through the host's approval-token
+    // machinery this method's own rejectAll() half already covers), which
+    // means clearing this panel's OWN view of the card is not enough: a
+    // stale background.js entry would still let a late Allow/Deny resume or
+    // cancel the download for real. Tell it to forget every pending
+    // decision too, so a late reply becomes the same silent no-op an
+    // already-cleared pendingApproval already is.
+    for (const model of this.models.values()) model.clearPendingDownloadDecision();
+    this.protocol.invalidateDownloadDecisions("the permission mode changed; this decision was invalidated");
     this._notify();
   }
 
@@ -754,6 +812,58 @@ export class PanelController {
           if (model) model.connectionError = { reason: env.reason, detail: env.detail };
         } else if (env.reason === "unknown_conversation") {
           this._handleUnknownConversationError(env);
+        }
+        this._notify();
+        break;
+      }
+      // Task 2.4: LOCAL-only envelope types background.js synthesizes for
+      // the chrome.downloads pause/decision gate — never emitted by
+      // host/agent/protocol.js (see protocol-client.js's downloadDecision()
+      // header for why). Routed by `env.conversationId`, which
+      // background.js stamps from its own runId->conversationId tracking;
+      // falling back to the currently-open conversation on the rare
+      // occasion a run had not yet reported one covers a decision honestly
+      // rather than dropping it silently.
+      case "download_protected_decision": {
+        const model = this._getOrCreateModel(env.conversationId || this.currentConversationId);
+        if (model) {
+          model.setPendingDownloadDecision({
+            requestId: env.requestId,
+            // The run this decision was raised for (background.js's
+            // mostRecentActiveRun() at pause time) — kept so a later
+            // run-teardown stream_event for THIS SAME run can clear it (see
+            // ConversationModel.applyEvent()'s run_stopped/run_done/
+            // run_error/run_interrupted_by_restart cases), independently of
+            // background.js's own parallel invalidation of its map.
+            runId: env.runId || null,
+            category: env.category || "download",
+            filename: env.filename,
+            url: env.url,
+            ts: env.ts || Date.now()
+          });
+        }
+        this._notify();
+        break;
+      }
+      case "download_notice": {
+        const model = env.conversationId ? this.models.get(env.conversationId) : this.currentModel();
+        if (model) {
+          model.recordDownloadNotice({ filename: env.filename, url: env.url, outcome: env.outcome, detail: env.detail, ts: env.ts });
+        }
+        this._notify();
+        break;
+      }
+      // Task 2.4: background.js's own invalidation of a download decision it
+      // no longer considers answerable (the run it belonged to ended, or the
+      // permission mode changed) — clears this panel's card too, so a stale
+      // Allow/Deny click here is a no-op exactly like a naturally-resolved
+      // one already is. Matched by requestId (never blindly cleared by
+      // conversationId alone) so an unrelated later decision for the same
+      // conversation is never dropped by mistake.
+      case "download_decision_invalidated": {
+        const model = env.conversationId ? this.models.get(env.conversationId) : this.currentModel();
+        if (model && model.pendingDownloadDecision && model.pendingDownloadDecision.requestId === env.requestId) {
+          model.clearPendingDownloadDecision();
         }
         this._notify();
         break;

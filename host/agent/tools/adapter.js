@@ -34,6 +34,8 @@ import {
   normalizeApprovalArgs,
   fingerprintNormalizedArgs
 } from "./mapping.js";
+import { TabRiskRegistry } from "../threat/tab-risk.js";
+import { observeToolResult } from "../threat/observe.js";
 
 export const SDK_MCP_SERVER_NAME = "browzy-in-chrome-browser";
 
@@ -227,15 +229,43 @@ const SDK_DESCRIPTIONS = new Map(sdkFacingToolDefs().map((t) => [t.legacyName, t
  */
 function runHostSideChecks({ run, legacyToolName, args, sendClassTool }) {
   try {
-    authorizeToolCall({
+    const authz = authorizeToolCall({
       toolName: legacyToolName,
       args,
       runState: run.state,
       leaseHeldByThisRun: run.leaseHeldByThisRun(),
       tabScope: run.tabScope,
       uploadAllowlist: run.uploadAllowlist,
-      knownToolNames: KNOWN_TOOL_NAMES
+      knownToolNames: KNOWN_TOOL_NAMES,
+      targetHint: args?.targetHint && typeof args.targetHint === "object" ? args.targetHint : null
     });
+    // Protected-action backstop (task 2.1): a protected call dispatches
+    // only under a fresh decision — a consumed single-use grant (a card the
+    // user just approved) or a gate verdict the mode resolver recorded for
+    // this exact call. No mode, remembered decision, or preapproval reaches
+    // past this point: the resolver never returns "proceed" for protected
+    // calls, so neither artifact legitimately exists without a decision.
+    // Send-class tools peek instead of consuming (verifyPreDispatchApproval
+    // below spends the artifact); every other tool spends it here, since
+    // nothing later will.
+    if (authz.protectedCategory) {
+      const fingerprint = fingerprintNormalizedArgs(normalizeApprovalArgs(legacyToolName, args));
+      let covered = false;
+      if (sendClassTool) {
+        covered =
+          (typeof run.hasApprovalGrant === "function" && run.hasApprovalGrant(fingerprint)) ||
+          (typeof run.hasGateVerdict === "function" && run.hasGateVerdict(fingerprint));
+      } else if (typeof run.consumeApprovalGrant === "function") {
+        covered = run.consumeApprovalGrant(fingerprint).ok;
+        if (!covered && typeof run.consumeGateVerdict === "function") {
+          covered = run.consumeGateVerdict(fingerprint).ok;
+        }
+      }
+      if (!covered) {
+        run.recordRejectedDispatch?.(legacyToolName, args, { reason: "protected_requires_decision", detail: { protectedCategory: authz.protectedCategory } });
+        return { ok: false, result: staleApprovalErrorResult(`protected:${authz.protectedCategory} requires a fresh decision`) };
+      }
+    }
     // Second, additive gate (design.md 5b): even a call authorizeToolCall
     // above already approved (in-scope, run active, lease held) can still be a
     // mutation against a borrowed tab, which needs its own explicit
@@ -346,7 +376,24 @@ function checkBrowserBatchHostSide({ run, args }) {
   return { ok: true };
 }
 
-export function buildSdkTools({ toolBridge, coerceArgs, run }) {
+export function buildSdkTools({ toolBridge, coerceArgs, run, tabRiskRegistry }) {
+  // add-permission-modes-and-threat-signals (tasks.md groups 5/6): one
+  // risk-tracking instance shared by every browser tool closure built here,
+  // since they all observe the same controlled tabs. Never read by anything
+  // in host/agent/policy/ (that is the property
+  // host/test/threat-advisory-only.test.mjs proves); it exists solely to
+  // feed the two warning-only event types this module emits.
+  //
+  // PRODUCTION callers must pass their own `tabRiskRegistry` that outlives a
+  // single run — host/agent/companion.js holds one per conversationId (see
+  // its own `_tabRiskRegistryFor()`) and passes it into every run of that
+  // conversation, so a tab's category/signals survive across turns instead
+  // of resetting on every new run (a CRITICAL fix: this default used to be
+  // built fresh, empty, on every call — silently discarding an earlier
+  // turn's findings for a tab that never navigated). The default below
+  // exists ONLY for a caller with no run-spanning session of its own (a
+  // standalone test, an ad hoc script) — never rely on it in production.
+  const threatRegistry = tabRiskRegistry ?? new TabRiskRegistry();
   return TOOLS.map((t) =>
     tool(t.name, SDK_DESCRIPTIONS.get(t.name) ?? t.description, t.paramShape, async (args) => {
       const coerced = coerceArgs({ ...(args ?? {}) });
@@ -365,6 +412,25 @@ export function buildSdkTools({ toolBridge, coerceArgs, run }) {
       const meta = run.describeRequestForWire();
       const { result, resultUnknown } = await toolBridge.call(t.name, coerced, meta);
       if (resultUnknown) run.recordResultUnknown?.(t.name, coerced, meta);
+      // add-permission-modes-and-threat-signals (tasks.md 5.1): probe
+      // returned web content BEFORE it is available for the agent to act on
+      // — i.e. before this handler returns `result` below — and update the
+      // dispatching tab's advisory risk category. `result` itself is never
+      // touched: whatever this call observes, the exact same `result` is
+      // returned to the agent afterward (tasks.md 5.2). A lost-response
+      // ("result unknown") dispatch carries no real content to probe.
+      if (!resultUnknown) {
+        try {
+          observeToolResult({ run, legacyToolName: t.name, args: coerced, result, tabRiskRegistry: threatRegistry });
+        } catch {
+          // Never let an observation failure affect the agent's own call —
+          // the probe/category machinery is advisory-only and must not be
+          // able to break dispatch. A failure INSIDE the probe's own scan is
+          // already caught and reported as a distinct event by
+          // probeToolResult/observeToolResult; this is only the outer
+          // belt-and-suspenders guard for a bug in the observer itself.
+        }
+      }
       // tabs_create_mcp's own new tab is agent-created, never borrowed —
       // recorded from the real result text rather than a new wire field
       // (see mapping.js's extractCreatedTabId). Best-effort: a shape change

@@ -708,6 +708,32 @@ export class SessionManager {
   }
 
   /**
+   * Task 2.4 durable half: append background.js's chrome.downloads pause
+   * decision to this conversation's transcript, exactly like every other
+   * durable, non-live-streamed fact this module records (mirrors
+   * _appendRecordingToConversation's idempotent-append shape above). The
+   * decision itself was made entirely LOCALLY by the extension/panel — this
+   * call happens AFTER the download was already resumed/cancelled, so its
+   * only job is making that outcome as durable as every other protected
+   * decision's outcome already is.
+   *
+   * Idempotent on requestId so a retried/duplicate send never double-records
+   * the same decision. Returns false (and records nothing) for an unknown or
+   * already-deleted conversation, exactly like `recordActionEvents`'s own
+   * caller-side `hasConversation` guard in companion.js.
+   */
+  recordDownloadDecision(conversationId, record) {
+    if (!this.store.loadMeta(conversationId) || this._deletedConversations.has(conversationId)) return false;
+    const alreadyRecorded = this.store
+      .eventsAfter(conversationId, 0)
+      .some((e) => e.type === "download_decision_recorded" && e.requestId === record.requestId);
+    if (!alreadyRecorded) {
+      this.store.appendEvent(conversationId, { type: "download_decision_recorded", ...record });
+    }
+    return true;
+  }
+
+  /**
    * Persist a batch of raw wire action-timeline events (task 5.10's host
    * half; design.md decision 5c) into this conversation's own transcript,
    * as `{type: "action_event", event}` entries — reusing the SAME durable,

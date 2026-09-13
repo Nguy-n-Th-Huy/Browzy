@@ -28,6 +28,20 @@ import {
   makeEnvelope,
   AGENT_MESSAGE_TYPES
 } from "./agent/protocol.js";
+import { listWorkflows, getWorkflow } from "./agent/skills/workflows-store.js";
+import { matchWorkflowToContext, hostOfUrl } from "./agent/skills/workflows-match.js";
+import { validateShortcutsExecuteCompat } from "./agent/skills/workflows-mcp.js";
+import {
+  HEARTBEAT_TTL_MS,
+  HANDOFF_TIMEOUT_MS,
+  writeHeartbeat,
+  heartbeatPath,
+  readBrowsers,
+  findBrowser,
+  readHandoff,
+  writeHandoff,
+  clearHandoff
+} from "./browser-registry.js";
 
 // --- Native messaging protocol (Chrome <-> this process) ---
 
@@ -264,16 +278,16 @@ function onIncomingConnection(socket) {
 
 const pipeServer = net.createServer(onIncomingConnection);
 
-// How long we keep probing quickly before settling into the slow lane. This has
-// to comfortably exceed background.js's SWITCH_RELEASE_MS (15s): switch_browser
-// hands over by having the outgoing browser drop its host and suspend reconnect
-// for that window, and the incoming browser only gets the bridge if it happens
-// to probe while the window is open. Backing off to 15s immediately would make
-// a hand-off land inside the window mostly by luck.
+// How long we keep probing quickly before settling into the slow lane. Prompt
+// probing also keeps directed handoffs (select_browser) snappy for a browser
+// started moments ago; backing off to 15s immediately would make any
+// ownership change land mostly by luck.
 const FAST_CLAIM_WINDOW_MS = 40_000;
 const claimingSince = Date.now();
-
 async function claimPipe() {
+  // A directed handoff manages the pipe explicitly; background retries must
+  // not rebind mid-handoff (the select flow restores the posture after).
+  if (handoffActive) return;
   ensureSocketDir();
   await clearStaleSocket(PIPE_PATH);
   const onErr = (err) => {
@@ -281,10 +295,12 @@ async function claimPipe() {
       // Another browser's host holds the bridge for this user. Probe often at
       // first so a hand-off is picked up promptly, then drop to the slow lane
       // so two idle browsers are not polling each other forever.
+      setOwnsBridge(false);
       const fast = Date.now() - claimingSince < FAST_CLAIM_WINDOW_MS;
       setTimeout(claimPipe, fast ? RETRY_MS : REJECTED_RETRY_MS);
       return;
     }
+    if (err.code === "ERR_SERVER_ALREADY_LISTEN") return; // this host holds it
     process.stderr.write(`Bridge listen failed: ${err.message}\n`);
     setTimeout(claimPipe, RETRY_MS);
   };
@@ -292,6 +308,7 @@ async function claimPipe() {
   pipeServer.listen(PIPE_PATH, () => {
     pipeServer.removeListener("error", onErr);
     process.stderr.write(`Native host owns the bridge at ${PIPE_PATH}\n`);
+    setOwnsBridge(true);
     // Initialize the companion and its local catalogs now, on ordinary
     // browser startup — not deferred to the first agent hello — per
     // design.md decision 2: "extension startup calls native messaging, which
@@ -596,10 +613,356 @@ function handleWriteTempFile(msg) {
     reply({ ok: false, error: String(e && e.message) });
   }
 }
+// --- Shortcuts (extension-side handlers' companion contract) ---
+// The registry's shortcuts_list/shortcuts_execute operations run their
+// handlers in the extension, but the shortcut inventory lives here, beside
+// the workflow registry that owns it. These two requests resolve and
+// describe; execution of tool-kind steps happens in the extension against
+// the run's own tab scope (see background.js). Replies use result envelopes
+// ({ ok }) rather than transport errors, so the extension can distinguish
+// "unknown shortcut" from "the companion is unreachable".
+function shortcutPublicForm(w) {
+  return {
+    shortcutId: w.id,
+    command: w.id,
+    name: w.name || w.id,
+    description: w.description || "",
+    version: w.version,
+    isWorkflow: true
+  };
+}
+
+function handleShortcutsList(msg) {
+  const reply = (payload) => writeNativeMessage({ id: msg.id, type: "shortcuts_listed", ...payload });
+  try {
+    const host = typeof msg.url === "string" && msg.url ? hostOfUrl(msg.url) : null;
+    const found = [];
+    for (const w of listWorkflows({ enabledOnly: true })) {
+      const m = matchWorkflowToContext(w, host ? { host } : {});
+      if (m.match) found.push(shortcutPublicForm(w));
+    }
+    reply({ ok: true, result: { shortcuts: found } });
+  } catch (e) {
+    reply({ ok: false, error: String(e && e.message) });
+  }
+}
+
+function handleShortcutsExecute(msg) {
+  const reply = (payload) => writeNativeMessage({ id: msg.id, type: "shortcut_executed", ...payload });
+  const decision = validateShortcutsExecuteCompat({ tabId: msg.tabId, shortcutId: msg.shortcutId, command: msg.command });
+  if (!decision.ok) {
+    reply({ ok: true, result: { ok: false, code: decision.code, message: decision.message } });
+    return;
+  }
+  try {
+    const host = typeof msg.url === "string" && msg.url ? hostOfUrl(msg.url) : null;
+    const candidates = listWorkflows({ enabledOnly: true });
+    let workflow =
+      (decision.shortcutId && candidates.find((w) => w.id === decision.shortcutId)) ||
+      (decision.command && candidates.find((w) => w.id === decision.command)) ||
+      null;
+    if (!workflow && decision.shortcutId) {
+      // Fall back to any version, enabled or not, so a disabled workflow
+      // reports "disabled" rather than "not found".
+      workflow = getWorkflow(decision.shortcutId) || (decision.command ? getWorkflow(decision.command) : null);
+    }
+    if (!workflow) {
+      reply({
+        ok: true,
+        result: { ok: false, code: "SHORTCUT_NOT_FOUND", message: `Unknown shortcut "${decision.target}". List available shortcuts with shortcuts_list.` }
+      });
+      return;
+    }
+    if (workflow.enabled === false) {
+      reply({
+        ok: true,
+        result: { ok: false, code: "SHORTCUT_DISABLED", message: `Shortcut "${workflow.id}" is disabled.` }
+      });
+      return;
+    }
+    const m = matchWorkflowToContext(workflow, host ? { host } : {});
+    if (!m.match) {
+      reply({
+        ok: true,
+        result: { ok: false, code: "SHORTCUT_CONTEXT_MISMATCH", message: `Shortcut "${workflow.id}" does not apply here (${m.reason}).` }
+      });
+      return;
+    }
+    reply({
+      ok: true,
+      result: {
+        ok: true,
+        definition: {
+          id: workflow.id,
+          version: workflow.version,
+          name: workflow.name || workflow.id,
+          description: workflow.description || "",
+          steps: Array.isArray(workflow.steps) ? workflow.steps : []
+        }
+      }
+    });
+  } catch (e) {
+    reply({ ok: false, error: String(e && e.message) });
+  }
+}
+
+// Save an encoded GIF to the same stable, user-visible tree screenshots use
+// (~/.config/browzy-in-chrome/screenshots/<name>.gif) so the agent can open
+// the absolute path. Reply is keyed by msg.id for nativeRequest().
+function handleSaveGifToDisk(msg) {
+  const reply = (payload) => writeNativeMessage({ id: msg.id, type: "gif_saved", ...payload });
+  try {
+    const dir = path.join(os.homedir(), ".config", "browzy-in-chrome", "screenshots");
+    fs.mkdirSync(dir, { recursive: true });
+    const name = String(msg.filename || `recording-${Date.now()}.gif`).replace(/[^\w.\-]/g, "_");
+    const finalName = name.toLowerCase().endsWith(".gif") ? name : `${name}.gif`;
+    const b64 = String(msg.dataUrl || "").replace(/^data:image\/\w+;base64,/, "");
+    if (!b64 || !/^[A-Za-z0-9+/]+={0,2}$/.test(b64)) throw new Error("empty or malformed image data");
+    const file = path.join(dir, finalName);
+    fs.writeFileSync(file, Buffer.from(b64, "base64"));
+    reply({ ok: true, result: file });
+  } catch (e) {
+    reply({ ok: false, error: String(e && e.message) });
+  }
+}
 
 // --- Main: bridge stdin (from extension) <-> the attached MCP clients ---
 
 let stdinBuffer = Buffer.alloc(0);
+// --- Attached-browser registry (list_connected_browsers / select_browser) ---
+// Each browser runs its own host process, so this process knows exactly one
+// browser: the one whose extension said hello. It publishes a heartbeat file
+// (see host/browser-registry.js); enumeration reads every live heartbeat.
+// A directed handoff moves pipe ownership — the thing MCP traffic follows —
+// from this host to the target's: this side yields and waits for the
+// target's confirmation file, the target's accept loop (below) claims and
+// confirms. No fixed waiting period stands in for the outcome anywhere.
+let myBrowser = null;
+let ownsBridge = false;
+let handoffActive = false;
+
+function refreshOwnHeartbeat() {
+  if (!myBrowser) return;
+  try {
+    writeHeartbeat(myBrowser, process.pid, ownsBridge);
+  } catch {}
+}
+
+function setOwnsBridge(v) {
+  ownsBridge = !!v;
+  refreshOwnHeartbeat();
+}
+
+function setBrowserIdentity(name) {
+  myBrowser = String(name).trim().slice(0, 64) || null;
+  refreshOwnHeartbeat();
+}
+
+// Standing claim posture after a handoff ends: if this process holds the
+// pipe, nothing needs doing; otherwise re-enter the ordinary claim loop so
+// background probing resumes (a future handoff back depends on it).
+function restoreClaimPosture() {
+  try {
+    if (!pipeServer.listening) claimPipe();
+  } catch {}
+}
+
+// One-shot bridge claim for the handoff paths. Unlike claimPipe() it reports
+// instead of rescheduling, and it never consults handoffActive — both the
+// yielding side (reclaim) and the accepting side call it while active.
+function tryClaimBridge() {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (v) => {
+      if (!settled) {
+        settled = true;
+        resolve(v);
+      }
+    };
+    try {
+      ensureSocketDir();
+    } catch {
+      done(false);
+      return;
+    }
+    clearStaleSocket(PIPE_PATH).then(() => {
+      const onErr = () => {
+        pipeServer.removeListener("error", onErr);
+        pipeServer.removeListener("listening", onListen);
+        setOwnsBridge(false);
+        done(false);
+      };
+      const onListen = () => {
+        pipeServer.removeListener("error", onErr);
+        pipeServer.removeListener("listening", onListen);
+        setOwnsBridge(true);
+        try {
+          startCompanion();
+        } catch {}
+        done(true);
+      };
+      pipeServer.once("error", onErr);
+      pipeServer.once("listening", onListen);
+      try {
+        pipeServer.listen(PIPE_PATH);
+      } catch {
+        pipeServer.removeListener("error", onErr);
+        pipeServer.removeListener("listening", onListen);
+        done(false);
+      }
+    }).catch(() => done(false));
+  });
+}
+
+function closePipeServer() {
+  return new Promise((resolve) => {
+    try {
+      if (!pipeServer.listening) {
+        resolve();
+        return;
+      }
+      const timer = setTimeout(resolve, 2000);
+      pipeServer.close(() => {
+        clearTimeout(timer);
+        resolve();
+      });
+    } catch {
+      resolve();
+    }
+  });
+}
+
+function destroyClientSockets() {
+  for (const socket of clients.values()) {
+    try {
+      socket.destroy();
+    } catch {}
+  }
+}
+
+function waitForHandoffDone(pollMs, timeoutMs) {
+  return new Promise((resolve) => {
+    const deadline = Date.now() + timeoutMs;
+    const poll = () => {
+      let h = null;
+      try {
+        h = readHandoff();
+      } catch {}
+      if (h && (h.status === "done" || h.status === "failed")) {
+        resolve(h);
+        return;
+      }
+      if (Date.now() >= deadline) {
+        resolve(null);
+        return;
+      }
+      setTimeout(poll, pollMs);
+    };
+    poll();
+  });
+}
+
+function handleListBrowsers(msg) {
+  const reply = (payload) => writeNativeMessage({ id: msg.id, type: "browsers_listed", ...payload });
+  try {
+    reply({ ok: true, result: { browsers: readBrowsers() } });
+  } catch (e) {
+    reply({ ok: false, error: String(e && e.message) });
+  }
+}
+
+async function handleSelectBrowser(msg) {
+  const reply = (payload) => writeNativeMessage({ id: msg.id, type: "browser_selected", ...payload });
+  const fail = (error) => reply({ ok: true, result: { ok: false, error, stillDriving: myBrowser } });
+  const target = String((msg && msg.browser) || "").trim();
+  if (!target) {
+    fail("select_browser requires 'browser' (a name from list_connected_browsers).");
+    return;
+  }
+  let browsers = [];
+  try {
+    browsers = readBrowsers();
+  } catch (e) {
+    fail(`could not read attached browsers: ${String(e && e.message)}`);
+    return;
+  }
+  const hit = findBrowser(browsers, target);
+  if (!hit) {
+    const names = browsers.map((b) => b.browser).join(", ") || "none";
+    fail(`Unknown browser "${target}". Attached: ${names}.`);
+    return;
+  }
+  if (myBrowser && hit.browser.toLowerCase() === myBrowser.toLowerCase()) {
+    reply({ ok: true, result: { ok: true, noTransfer: true, driver: myBrowser } });
+    return;
+  }
+  // Directed handoff: publish the request, yield the pipe, and wait for the
+  // target's confirmation — reporting only what actually happened.
+  handoffActive = true;
+  try {
+    writeHandoff({ target: hit.browser, from: myBrowser, status: "requested" });
+    setOwnsBridge(false);
+    await closePipeServer();
+    destroyClientSockets();
+    const done = await waitForHandoffDone(500, HANDOFF_TIMEOUT_MS);
+    if (done && done.status === "done") {
+      clearHandoff();
+      reply({ ok: true, result: { ok: true, newDriver: done.newDriver || hit.browser } });
+      return;
+    }
+    const problem = (done && done.error) || "the selected browser did not take over in time";
+    try {
+      writeHandoff({ target: hit.browser, from: myBrowser, status: "expired" });
+    } catch {}
+    await tryClaimBridge();
+    fail(`${problem}. ${myBrowser || "This browser"} is still driving automation.`);
+  } finally {
+    handoffActive = false;
+    restoreClaimPosture();
+  }
+}
+
+// Accept loop: pick up handoff requests addressed to this browser and claim
+// the bridge for them, confirming through the handoff file. Stands down the
+// moment the request leaves the requested state (the requester moved on).
+setInterval(async () => {
+  if (!myBrowser || handoffActive) return;
+  let h = null;
+  try {
+    h = readHandoff();
+  } catch {
+    return;
+  }
+  if (!h || h.status !== "requested" || !h.target) return;
+  if (String(h.target).toLowerCase() !== myBrowser.toLowerCase()) return;
+  handoffActive = true;
+  try {
+    const deadline = Date.now() + 12_000;
+    let acquired = false;
+    while (Date.now() < deadline) {
+      let current = null;
+      try {
+        current = readHandoff();
+      } catch {}
+      if (!current || current.status !== "requested") break;
+      if (await tryClaimBridge()) {
+        acquired = true;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+    if (acquired) {
+      writeHandoff({ target: h.target, from: h.from || null, status: "done", newDriver: myBrowser });
+    } else if (current && current.status === "requested") {
+      try {
+        writeHandoff({ target: h.target, from: h.from || null, status: "failed", error: "the selected browser did not take over in time" });
+      } catch {}
+    }
+  } finally {
+    handoffActive = false;
+    restoreClaimPosture();
+  }
+}, 1500).unref();
 
 process.stdin.on("data", (chunk) => {
   lastExtensionTraffic = Date.now();
@@ -633,6 +996,30 @@ process.stdin.on("data", (chunk) => {
       handleWriteTempFile(msg);
       continue;
     }
+    if (msg && msg.type === "shortcuts_list") {
+      handleShortcutsList(msg);
+      continue;
+    }
+    if (msg && msg.type === "shortcuts_execute") {
+      handleShortcutsExecute(msg);
+      continue;
+    }
+    if (msg && msg.type === "hello" && typeof msg.browser === "string" && msg.browser) {
+      setBrowserIdentity(msg.browser);
+      continue;
+    }
+    if (msg && msg.type === "list_browsers") {
+      handleListBrowsers(msg);
+      continue;
+    }
+    if (msg && msg.type === "select_browser") {
+      handleSelectBrowser(msg);
+      continue;
+    }
+    if (msg && msg.type === "save_gif_to_disk") {
+      handleSaveGifToDisk(msg);
+      continue;
+    }
     if (msg && msg.type === "agent_msg") {
       const envelope = unwrapAgentMessage(msg);
       if (envelope) handleAgentMessageFromExtension(envelope);
@@ -645,6 +1032,12 @@ process.stdin.on("data", (chunk) => {
 
 process.stdin.on("end", () => {
   recordExit(`extension disconnected (clients: ${clients.size})`);
+  // This browser is gone: drop its heartbeat so the next enumeration does
+  // not list it (stale files are pruned on read anyway — this just avoids
+  // the ghost window).
+  try {
+    if (myBrowser) fs.unlinkSync(heartbeatPath(myBrowser, process.pid));
+  } catch {}
   // Extension disconnected. Drop the bridge immediately rather than lingering:
   // with no extension there is no browser link to own, and holding the pipe
   // would stop the host Chrome spawns next from claiming it.
@@ -697,6 +1090,7 @@ function recordExit(reason) {
 }
 
 setInterval(() => {
+  refreshOwnHeartbeat();
   if (heartbeatsSeen < 2) return; // never saw a heartbeat: not our signal to use
   const silentFor = Date.now() - lastExtensionTraffic;
   if (silentFor < SILENCE_LIMIT_MS) return;

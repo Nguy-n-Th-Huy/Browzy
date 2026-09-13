@@ -900,10 +900,13 @@ export function fingerprintNormalizedArgs(normalized) {
 
 // --- Mutating vs. read-only classification, by legacy tool name -----------
 //
-// A closed, exhaustive classification of all 29 registry tools — the 26
-// preserved-baseline entries plus the 3 post-baseline additions (the 2 WebMCP
-// page-tool operations from openspec/changes/consume-webmcp-page-tools and
-// browser_batch from openspec/changes/add-browser-batch-tool; `computer`
+// A closed, exhaustive classification of all 30 registry tools — the 25
+// preserved-baseline entries plus the 5 post-baseline additions (the 2 WebMCP
+// page-tool operations from openspec/changes/consume-webmcp-page-tools,
+// browser_batch from openspec/changes/add-browser-batch-tool, and
+// list_connected_browsers plus select_browser from
+// openspec/changes/implement-stubbed-browser-tools, which also removed
+// switch_browser; `computer`
 // is classified per-action instead of as a whole, since a single call can be
 // a screenshot or a click). A registry-baseline-style test asserts this
 // classification's two sets plus "computer" account for every TOOLS entry,
@@ -921,7 +924,7 @@ const READ_ONLY_LEGACY_TOOLS = new Set([
   "get_config",
   "shortcuts_list",
   "retranscribe_recording",
-  "switch_browser",
+  "list_connected_browsers",
   "update_plan",
   // Reads the passively-maintained per-tab page-tool table
   // (extension/background.js) only — no page or browser side effect.
@@ -941,6 +944,10 @@ const MUTATING_LEGACY_TOOLS = new Set([
   "resize_window",
   "set_tab_focus",
   "set_config",
+  // Moves automation between browsers: no page mutation, but it changes
+  // which browser subsequent calls drive, so it is never treated as safe
+  // against a borrowed tab — fail safe, same as browser_batch below.
+  "select_browser",
   // Invokes a PAGE-DEFINED callback with arbitrary, unknowable-in-advance
   // side effects — the same risk class as javascript_tool, and classified
   // the same conservative way for the same reason.

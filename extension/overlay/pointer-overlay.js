@@ -166,6 +166,24 @@
   };
   var IDLE_ACTION_LABEL = "Đang nghĩ…";
 
+  // Task 7.7 (openspec/changes/add-permission-modes-and-threat-signals): the
+  // controlled tab's current risk category, straight from the host's
+  // `tab_risk_update` event (reports/wave2h-events.md), forwarded here the
+  // same way an approval signal already is — a `{kind:"riskUpdate", tabId,
+  // category}` synthetic event (see reduceOverlayState's own comment on it).
+  // This chip is advisory-only, exactly like the category itself is on the
+  // host: it never gates anything, never blocks the Stop/Open-panel
+  // controls, and offers no acknowledge/dismiss action of its own. Per spec
+  // ("uncategorized... distinguishable from a category of low risk") the
+  // three categories get three DISTINCT labels — "uncategorized" is never
+  // collapsed into "low" here.
+  var RISK_LABELS = {
+    uncategorized: "Chưa phân loại",
+    low: "Rủi ro thấp",
+    elevated: "Rủi ro cao"
+  };
+  var DEFAULT_RISK_CATEGORY = "uncategorized";
+
   // The action types that may legitimately carry a pointer position (mirrors
   // action-events.js's own POINTER_ACTION_TYPES). Only these get a cursor
   // label naming the action (design.md D1 "Consequence" / task 2.5) — a
@@ -348,6 +366,24 @@
       }
       return withApproval;
     }
+    if (event && event.kind === "riskUpdate") {
+      // Task 7.7: the controlled tab's risk category, per the host's
+      // `tab_risk_update` (relayed the same way an approval signal is —
+      // see this function's own header). State about the PAGE, not a
+      // dispatched action: refreshes liveness like `keepalive`/`approval`
+      // (a real signal proves the run is alive), never touches cursor/
+      // click/drag/step/start. An unrecognized category value is dropped
+      // rather than accepted verbatim — this module must never render a
+      // category the host did not actually report.
+      var withRisk = {};
+      for (var rk in state) if (Object.prototype.hasOwnProperty.call(state, rk)) withRisk[rk] = state[rk];
+      withRisk.lastEventAt = nowMs;
+      if (event.tabId !== undefined) withRisk.tabId = event.tabId;
+      if (event.category === "uncategorized" || event.category === "low" || event.category === "elevated") {
+        withRisk.riskCategory = event.category;
+      }
+      return withRisk;
+    }
     if (!event || event.kind === "teardown") {
       // Hard, immediate clear — used for the explicit signals
       // extension/background.js can detect right away (run_stopped,
@@ -368,7 +404,13 @@
         stepCount: state.stepCount,
         startedAt: state.startedAt,
         pendingApproval: null,
-        actionInFlight: false
+        actionInFlight: false,
+        // Task 7.7: the risk category is a fact about the PAGE, not the run
+        // — teardown clears run-scoped state (pendingApproval, motion) but a
+        // real navigation-driven reset arrives as its own `riskUpdate` event
+        // (host: "uncategorized right after a navigation"), never inferred
+        // here from a run ending.
+        riskCategory: state.riskCategory
       };
     }
     var next = {
@@ -387,7 +429,10 @@
         ? ((event.timing && typeof event.timing.startedAt === "number") ? event.timing.startedAt : nowMs)
         : state.startedAt,
       pendingApproval: state.pendingApproval || null,
-      actionInFlight: state.actionInFlight || false
+      actionInFlight: state.actionInFlight || false,
+      // Task 7.7: an ordinary dispatched action never carries or changes a
+      // risk category — only a real `riskUpdate` event (handled above) does.
+      riskCategory: state.riskCategory
     };
     if (event.kind === "start") {
       next.stepCount = (state.stepCount || 0) + 1;
@@ -466,7 +511,12 @@
         actionLabel: IDLE_ACTION_LABEL,
         approval: null,
         stepCount: 0,
-        elapsedLabel: ""
+        elapsedLabel: "",
+        // Task 7.7: nothing is shown while inactive — same reasoning as
+        // every other field in this branch (an expired heartbeat means
+        // nothing here should claim to reflect the live page any more).
+        riskCategory: null,
+        riskLabel: ""
       };
     }
     var clickRing = state.clickAt !== null && state.clickAt !== undefined && (nowMs - state.clickAt) < CLICK_RING_DURATION_MS;
@@ -517,6 +567,17 @@
     // locked whether or not it happens to be mid-dispatch right now.
     var locked = !!state.runId && !state.pendingApproval;
 
+    // Task 7.7: the controlled tab's current risk category. Defaults to
+    // "uncategorized" (never fabricated as "low") whenever this attach has
+    // not yet seen a real `riskUpdate` — the SAME distinction the host's own
+    // TabRiskRegistry makes (spec: "uncategorized... distinguishable from a
+    // category of low risk"), and the same honest default this legitimately
+    // shows right after a navigation, before any new content has been read.
+    var riskCategory = (state.riskCategory === "low" || state.riskCategory === "elevated")
+      ? state.riskCategory
+      : DEFAULT_RISK_CATEGORY;
+    var riskLabel = RISK_LABELS[riskCategory];
+
     return {
       active: true,
       visible: !capturedHidden,
@@ -535,7 +596,9 @@
       actionLabel: actionLabel,
       approval: approval,
       stepCount: state.stepCount || 0,
-      elapsedLabel: elapsedLabel
+      elapsedLabel: elapsedLabel,
+      riskCategory: riskCategory,
+      riskLabel: riskLabel
     };
   }
 
@@ -681,6 +744,16 @@
     ".browzy-badge-name{font-family:'JetBrains Mono',ui-monospace,Consolas,monospace;" +
     "font-size:11px;font-weight:700;letter-spacing:.16em;color:#e8e6f2;flex:none;}" +
     ".browzy-badge[data-state='idle'] .browzy-badge-name{color:#8d8aa0;}" +
+    // Task 7.7: the risk chip — a plain label, never interactive
+    // (pointer-events already off on the whole badge except its two real
+    // buttons), colored by data-level so "uncategorized"/"low"/"elevated"
+    // are visually distinct, never collapsed into one look.
+    ".browzy-risk{font-family:'JetBrains Mono',ui-monospace,Consolas,monospace;" +
+    "font-size:10.5px;font-weight:600;letter-spacing:.04em;white-space:nowrap;" +
+    "padding:2px 8px;border-radius:999px;border:1px solid #35354a;color:#8d8aa0;}" +
+    ".browzy-risk[data-level='low']{border-color:color-mix(in oklch,var(--browzy-cyan) 45%,transparent);color:#bfe9e6;}" +
+    ".browzy-risk[data-level='elevated']{border-color:oklch(0.74 0.15 85 / .7);color:oklch(0.86 0.13 85);" +
+    "background:color-mix(in oklch,oklch(0.74 0.15 85) 14%,transparent);}" +
     ".browzy-badge-sep{width:1px;height:16px;margin:0 14px;background:#24242e;flex:none;}" +
     ".browzy-badge-text{font-size:13.5px;color:#b9b6c8;white-space:nowrap;}" +
     ".browzy-badge[data-state='waiting'] .browzy-badge-text{color:#e8e2c8;}" +
@@ -874,6 +947,17 @@
     nameEl.className = "browzy-badge-name";
     nameEl.textContent = "BROWZY";
 
+    // Task 7.7: the controlled tab's risk category chip — advisory only, no
+    // acknowledge/dismiss control of any kind (see this file's header note
+    // on RISK_LABELS for why). Sits right after the brand name so it is
+    // visible for the whole time the badge itself is, independent of the
+    // running/waiting/idle bar state below.
+    var riskSepEl = doc.createElement("span");
+    riskSepEl.className = "browzy-badge-sep";
+    var riskEl = doc.createElement("span");
+    riskEl.className = "browzy-risk";
+    riskEl.setAttribute("data-level", "uncategorized");
+
     var sep1El = doc.createElement("span");
     sep1El.className = "browzy-badge-sep";
 
@@ -915,6 +999,8 @@
 
     badgeEl.appendChild(dotWrapEl);
     badgeEl.appendChild(nameEl);
+    badgeEl.appendChild(riskSepEl);
+    badgeEl.appendChild(riskEl);
     badgeEl.appendChild(sep1El);
     badgeEl.appendChild(textEl);
     badgeEl.appendChild(traceEl);
@@ -942,6 +1028,7 @@
       cursorActionEl: cursorActionEl,
       ringEl: ringEl,
       badgeEl: badgeEl,
+      riskEl: riskEl,
       textEl: textEl,
       traceEl: traceEl,
       sep2El: sep2El,
@@ -1004,6 +1091,13 @@
     refs.badgeEl.setAttribute("data-state", renderModel.barState);
     refs.badgeEl.setAttribute("data-locked", renderModel.locked ? "1" : "0");
 
+    // Task 7.7: the risk chip — always reflects renderModel.riskCategory
+    // (never a control, never hidden independently of the badge itself).
+    if (refs.riskEl) {
+      refs.riskEl.setAttribute("data-level", renderModel.riskCategory || "uncategorized");
+      refs.riskEl.textContent = renderModel.riskLabel || "";
+    }
+
     if (refs.textEl) {
       // design.md D10 / task 8.3: the lock is stated in words too, not only
       // via the system cursor — but never while "waiting", which already
@@ -1062,7 +1156,8 @@
     stepCount: 0,
     startedAt: null,
     pendingApproval: null,
-    actionInFlight: false
+    actionInFlight: false,
+    riskCategory: null
   };
   var refs = null;
   // design.md D3: the capture lease this layer currently honours, if any.
@@ -1468,6 +1563,19 @@
         action: msg.action,
         target: msg.target
       });
+      sendResponse({ ok: true });
+      return;
+    }
+    if (msg.type === "browzyOverlayRisk") {
+      // Task 7.7: the SAME relay shape as browzyOverlayApproval above — a
+      // future extension/background.js bridge forwards the host's
+      // `tab_risk_update` (reports/wave2h-events.md) through this one
+      // additional message type, over the SAME sendOverlayMessage path as
+      // every other overlay message. This file's own job stops at handling
+      // it once it arrives; wiring background.js to actually send it is
+      // tracked separately (that file is out of this change's file scope
+      // for this wave).
+      handleOverlayEvent({ kind: "riskUpdate", tabId: msg.tabId, category: msg.category });
       sendResponse({ ok: true });
       return;
     }

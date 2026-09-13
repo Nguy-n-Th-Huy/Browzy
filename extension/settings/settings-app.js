@@ -39,6 +39,8 @@ $("ic-mic").innerHTML = iconMarkup("mic", { size: 18 });
 $("ic-chevr").innerHTML = iconMarkup("chevronRight", { size: 16 });
 $("ic-skills").innerHTML = iconMarkup("skills", { size: 18 });
 $("ic-chevr-skills").innerHTML = iconMarkup("chevronRight", { size: 16 });
+$("ic-permissions").innerHTML = iconMarkup("lock", { size: 18 });
+$("ic-chevr-permissions").innerHTML = iconMarkup("chevronRight", { size: 16 });
 
 function iconEl(name, opts) {
   const span = document.createElement("span");
@@ -458,6 +460,9 @@ function wireEvents() {
 
   $("nav-recorder").addEventListener("click", () => {
     window.location.href = "../recorder/options.html";
+  });
+  $("nav-permissions").addEventListener("click", () => {
+    window.location.href = "./permissions.html";
   });
   $("nav-skills").addEventListener("click", () => {
     window.location.href = "./skills.html";

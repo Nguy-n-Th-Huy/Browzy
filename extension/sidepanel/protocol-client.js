@@ -229,11 +229,54 @@ export class ProtocolClient {
     this._send(envelope(MSG.STOP, { conversationId, reason }));
   }
 
-  approvalDecision({ conversationId, decision, action, target, requestId, ttlMs }) {
+  /**
+   * @param {boolean} [remember] - Task 7.3: "remember this decision" — sent
+   *   ONLY when the user explicitly asked for it (omitted, never `false`,
+   *   otherwise). host/agent/policy/can-use-tool.js's own gating
+   *   (`decision.remember === true && modeDecision.rememberable === true`)
+   *   is the actual authority on whether it takes effect — this is never
+   *   offered by the panel for a protected decision in the first place (see
+   *   sidepanel.js's renderPermission()), but the wire itself carries no
+   *   assumption either way.
+   */
+  approvalDecision({ conversationId, decision, action, target, requestId, ttlMs, remember }) {
     // Task 9.6: include requestId so the companion correlates the reply with
     // the original approval_request. An unknown/mismatched requestId is
     // rejected by the companion, not silently applied.
-    this._send(envelope(MSG.APPROVAL_DECISION, { conversationId, decision, action, target, requestId, ttlMs }));
+    const payload = { conversationId, decision, action, target, requestId, ttlMs };
+    if (remember === true) payload.remember = true;
+    this._send(envelope(MSG.APPROVAL_DECISION, payload));
+  }
+
+  /**
+   * Task 2.4: the panel's answer to a LOCAL, background.js-synthesized
+   * "download_protected_decision" envelope — never a
+   * host/agent/protocol.js message. chrome.downloads carries no tabId, so
+   * there is nothing for the host's per-call approval-token binding
+   * (host/agent/policy/approvals.js) to verify against; background.js
+   * pauses the download itself and intercepts this reply BEFORE it ever
+   * reaches nativePort (see background.js's "ocic-agent" port.onMessage
+   * handler), resuming or cancelling the download locally. `download_decision`
+   * is deliberately NOT one of host/agent/protocol.js's AGENT_MESSAGE_TYPES
+   * and must never be added there — see this file's own header note about
+   * not inventing a second protocol on the wire that reaches the companion.
+   */
+  downloadDecision({ requestId, decision }) {
+    this._send(envelope("download_decision", { requestId, decision }));
+  }
+
+  /**
+   * Task 2.4: tell background.js to invalidate every outstanding download
+   * decision it is tracking — the panel's own trigger today is a successful
+   * permission-mode change (PanelController.invalidateAllPendingApprovals()),
+   * the exact same event that already clears every ordinary `pendingApproval`
+   * card. Same LOCAL-only rule as downloadDecision() above: this type is
+   * deliberately not one of host/agent/protocol.js's AGENT_MESSAGE_TYPES and
+   * never reaches nativePort — background.js intercepts it in its
+   * "ocic-agent" port.onMessage handler.
+   */
+  invalidateDownloadDecisions(reason) {
+    this._send(envelope("download_decisions_invalidate", { reason }));
   }
 
   // Task 9.7 (design.md section 8): the panel's answer to a question_request.

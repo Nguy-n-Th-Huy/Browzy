@@ -164,6 +164,8 @@
 
 import { sdkQualifiedToolNames, legacyToolNameFromSdkName, SDK_MCP_SERVER_NAME } from "./adapter.js";
 import { createWebFetchPreToolUseHook } from "../policy/webfetch-url-guard.js";
+import { createPermissionModeGateHook } from "../policy/can-use-tool.js";
+import { _mutationClassificationCoverage } from "./mapping.js";
 
 // Filesystem writes and arbitrary command execution stay disabled by
 // default — that is this project's own non-negotiable, unchanged by the
@@ -580,6 +582,18 @@ export async function resolveProfileSnapshot({ profileId, modelId, profileProvid
  *   in-flight overrun of several multiples was observed — and the figure is
  *   a cost-table estimate per `costBasis`, not a billing statement). The
  *   panel MUST label it as such; see extension/sidepanel/usage-ledger-view.js.
+ * @param {Function} [params.resolveHint] - add-permission-modes-and-threat-signals:
+ *   the SAME `resolveHint` bridge resolver passed to
+ *   `createCanUseTool` (host/agent/policy/can-use-tool.js), forwarded here
+ *   unchanged so the PreToolUse gate hook (see `createPermissionModeGateHook`)
+ *   can classify a call with resolved target evidence — without it, a
+ *   credential-field `form_input` call cannot be told apart from an ordinary
+ *   one and the hook falls back to the conservative unknown-hint path.
+ * @param {Function} [params.policySnapshot] - the SAME `policySnapshot`
+ *   passed to `createCanUseTool`, forwarded here so the gate hook reads the
+ *   live mode/managed-policy the identical way `canUseTool` itself does —
+ *   never a second, independently-cached source of truth. Absent means an
+ *   unconfigured install: Auto mode, identical to today.
  * @param {string[]} [params.browserToolNames] - the legacy names of every
  *   browser tool actually registered on `mcpServer`. Defaults to
  *   `sdkQualifiedToolNames()`'s own default (host/agent/tools/adapter.js's
@@ -607,7 +621,9 @@ export function buildIsolatedOptions({
   effort = null,
   resume,
   maxTurns = null,
-  maxBudgetUsd = null
+  maxBudgetUsd = null,
+  resolveHint = null,
+  policySnapshot = null
 }) {
   if (!mcpServer) throw new Error("buildIsolatedOptions requires mcpServer");
   if (!serverName) throw new Error("buildIsolatedOptions requires serverName");
@@ -742,6 +758,42 @@ export function buildIsolatedOptions({
   // let a batch carry a submit past the gate entirely. Excluding it routes
   // every batch through `canUseTool`, which walks the items and classifies
   // each with the same classifier a standalone call uses.
+  //
+  // add-permission-modes-and-threat-signals: this set stays exactly the three
+  // send/submit-capable tools, and is deliberately NOT widened to every
+  // mutating tool or to every protected-capable tool (form_input,
+  // gif_creator). Task 9.1's own test
+  // (host/test/agent-tool-permission-preapproval.test.mjs) fixes the
+  // contract that every OTHER registered tool stays preapproved via
+  // `allowedTools`, unconditionally, under the default/Auto path — Auto mode
+  // MUST "reproduce today's behavior exactly" (design.md Goal 1), and that
+  // contract is pinned byte-for-byte by that test's exact-count assertions.
+  //
+  // Manual mode's "every mutating action requires a decision" and the
+  // protected class's "always requires a decision, under every mode" are
+  // NOT satisfiable by ever shrinking this static, per-query()-construction
+  // list — `form_input` and `gif_creator` are each safe to preapprove for
+  // their ordinary calls and must gate only their protected-shaped ones
+  // (a secret-field value, a persisted export), which `allowedTools`'
+  // whole-tool granularity cannot express, and Manual's mode can change
+  // mid-run while this list is fixed for the life of the `query()` call.
+  // Both requirements are instead satisfied by the PreToolUse gate hook
+  // wired into `hooks` below (`createPermissionModeGateHook`,
+  // host/agent/policy/can-use-tool.js) — the SDK's own documented
+  // alternative to shrinking `allowedTools` ("canUseTool will not be invoked
+  // for [bare allowedTools entries] ... To gate every tool call, use a
+  // PreToolUse hook; or remove the bare names from allowedTools"). It reads
+  // the live mode/managed policy and this project's own classification on
+  // every call and forces `permissionDecision: "ask"` — which the SDK
+  // documents as surfacing through the identical `can_use_tool`
+  // control_request `canUseTool` answers for a never-preapproved tool —
+  // precisely for a protected call (any mode) or a mutating call under
+  // Manual, and is a no-op for everything this 27-tool allowlist already
+  // covers. See that hook's own docstring for the full reasoning.
+  //
+  // `_mutationClassificationCoverage` stays imported for callers/tests that
+  // want the raw read-only/mutating split directly.
+  void _mutationClassificationCoverage;
   const ALLOWED_TOOL_EXCLUDE = new Set(["computer", "javascript_tool", "browser_batch"]);
   const autoApprovedBrowserToolNames = qualifiedBrowserToolNames.filter(
     (qname) => !ALLOWED_TOOL_EXCLUDE.has(legacyToolNameFromSdkName(qname))
@@ -820,8 +872,26 @@ export function buildIsolatedOptions({
     // hook deny "applies even in bypassPermissions mode", so this one keeps
     // holding even if either of those conditions is edited away later.
     // The matcher is the bare tool name, which the SDK matches exactly.
+    //
+    // A second, unmatched (fires for every tool call) PreToolUse entry closes
+    // the gap this file's header now documents at length: `allowedTools`
+    // (below) bare-lists every non-send-class browser tool exactly as task
+    // 9.1 fixed it, including `form_input` and `gif_creator` — both capable
+    // of a protected call under the identical tool name (a credential field,
+    // a persisted export) that must never be silently auto-approved just
+    // because the ordinary case is safe to preapprove. `createCanUseTool`
+    // itself would never see such a call (that is precisely what "bare
+    // allowedTools entries auto-approve the whole tool before the callback is
+    // consulted" means, per the SDK's own runtime warning). This hook is the
+    // SDK-documented alternative to shrinking `allowedTools` — see
+    // `createPermissionModeGateHook`'s own docstring in can-use-tool.js for
+    // the full reasoning and why `allowedTools` itself is deliberately left
+    // untouched by this change.
     hooks: {
-      PreToolUse: [{ matcher: "WebFetch", hooks: [createWebFetchPreToolUseHook({ log: (line) => console.error(line) })] }]
+      PreToolUse: [
+        { matcher: "WebFetch", hooks: [createWebFetchPreToolUseHook({ log: (line) => console.error(line) })] },
+        { hooks: [createPermissionModeGateHook({ policySnapshot, resolveHint })] }
+      ]
     },
     skills: Array.isArray(skills.allowedSkillNames) ? [...skills.allowedSkillNames] : [],
     skillOverrides: { ...(skills.skillOverrides || {}) },

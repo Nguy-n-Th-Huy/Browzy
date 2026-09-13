@@ -14,6 +14,7 @@
 // run or a real browser.
 
 import { isTabInScope } from "../broker/browser-lease.js";
+import { detectProtectedCategory } from "./permission-modes.js";
 
 export class AuthorizationError extends Error {
   constructor(reason, detail = {}) {
@@ -139,7 +140,16 @@ export function authorizeToolCall(ctx) {
     // to allowlist here beyond the tab scope check above.
   }
 
-  return { ok: true };
+  // Protected-action detection on the unconditional path (task 2.1): the
+  // category travels with the authorization result so the dispatch wrapper
+  // can demand a fresh decision for it. Detection here is evidence-only —
+  // enforcement (grant-or-verdict coverage) lives in the adapter, which owns
+  // the single-use grant lifecycle. A hint the caller resolved is honored
+  // when supplied; without one only hintless-detectable categories
+  // (file-write flags, permission-granting script source) can fire.
+  const protectedCategory = detectProtectedCategory(toolName, args, ctx.targetHint ?? null);
+
+  return { ok: true, protectedCategory };
 }
 
 // A tiny absolute-path check that works for both POSIX ("/...") and Windows

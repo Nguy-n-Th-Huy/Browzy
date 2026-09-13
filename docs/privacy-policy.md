@@ -1,6 +1,6 @@
 # Chính sách quyền riêng tư — Browzy
 
-*Cập nhật lần cuối: 07/09/2026*
+*Cập nhật lần cuối: 13/09/2026*
 
 ## Tóm tắt
 
@@ -46,6 +46,25 @@ Chrome hiện cảnh báo *"Browzy started debugging this browser"* suốt thờ
 Trợ lý cần tạo được cú nhấp và phím gõ **thật** — thứ mà trang web chấp nhận. Sự kiện do JavaScript tạo mang cờ `isTrusted=false` và bị phần lớn trang web bỏ qua, đúng ở những chỗ quan trọng nhất như biểu mẫu đăng nhập hay trình soạn thảo. Chỉ giao thức DevTools mới tạo được input ở tầng trình duyệt, và `debugger` là đường duy nhất để tiện ích chạm tới nó.
 
 Nó chỉ dùng cho hai việc: gửi thao tác chuột/bàn phím, và chụp màn hình — trên đúng những tab bạn đã cho phép trong phiên đang chạy. Không gắn vào tab bạn không chỉ định. Không đọc lưu lượng mạng của bạn.
+
+## Quyền downloads
+
+Tiện ích có quyền `downloads` để việc "trợ lý khiến một trang bắt đầu tải
+file xuống" luôn là một hành động được hỏi trước — cùng nhóm với ghi file,
+nhập thông tin đăng nhập/thanh toán, và cấp quyền trình duyệt thay bạn (xem
+[Permission modes and protected
+actions](../README.md#permission-modes-and-protected-actions) trong README).
+
+Quyền này chỉ dùng cho đúng một việc: **nhận biết** khi một lượt tải xuống bắt
+đầu, để tạm dừng nó, hỏi bạn, rồi tiếp tục hoặc huỷ theo câu trả lời. Nó không
+bao giờ được dùng để tự bắt đầu một lượt tải, chuyển hướng nó, hay đọc nội
+dung file đã tải.
+
+Việc tạm dừng chỉ áp dụng cho một lượt tải bắt đầu trong lúc trợ lý đang chạy
+một phiên; một lượt tải bạn tự bắt đầu ngoài lúc đó không bao giờ bị tạm dừng
+hay hỏi lại. Giới hạn cần biết: nếu trình duyệt tải xong file trước khi tiện
+ích kịp tạm dừng nó, việc đó chỉ được báo lại trong hội thoại chứ không bị
+chặn — tiện ích không giả vờ đã chặn được một lượt tải mà thực ra đã lọt qua.
 
 ## Chúng tôi không làm gì
 

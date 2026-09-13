@@ -25,6 +25,50 @@ import {
 } from "./paths.js";
 import { initConversationMetadataEnvelope } from "./conversation-metadata.js";
 
+// The SDK hands each message to us with its tool results in two places: the
+// `tool_result` blocks inside `message.content`, and a flat `tool_use_result`
+// mirror alongside them. For a turn carrying a screenshot or a GIF that means
+// the identical base64 is written to the log twice, and image bytes dwarf
+// everything else in it — one 2.7 MB GIF export produced a 7.3 MB log, of
+// which 99.8% was those two copies.
+//
+// Nothing in this project reads `tool_use_result`; the panel renders images
+// out of `message.content`. So the mirror is persisted WITHOUT the payloads
+// that are provably already stored in `content` (compared by value, not
+// assumed), each replaced by a marker naming where the bytes live. A payload
+// that is NOT found in `content` is left exactly as it is — that one is not a
+// duplicate, and dropping it would lose data.
+//
+// This rewrites only what is written to disk. The event handed back to the
+// caller, and therefore what the live panel receives, is untouched.
+export function dedupeMirroredImageData(event) {
+  const message = event && event.message && event.message.message;
+  const mirror = event && event.message && event.message.tool_use_result;
+  if (!Array.isArray(mirror) || !message || !Array.isArray(message.content)) return event;
+
+  const inContent = new Set();
+  for (const block of message.content) {
+    const inner = block && block.content;
+    if (!Array.isArray(inner)) continue;
+    for (const part of inner) {
+      const data = part && part.source && part.source.data;
+      if (typeof data === "string" && data) inContent.add(data);
+    }
+  }
+  if (!inContent.size) return event;
+
+  let changed = false;
+  const slimMirror = mirror.map((entry) => {
+    const data = entry && entry.source && entry.source.data;
+    if (typeof data !== "string" || !inContent.has(data)) return entry;
+    changed = true;
+    const { data: _omitted, ...source } = entry.source;
+    return { ...entry, source: { ...source, data_in: "message.content" } };
+  });
+  if (!changed) return event;
+  return { ...event, message: { ...event.message, tool_use_result: slimMirror } };
+}
+
 function atomicWriteJson(file, obj) {
   ensureDir(path.dirname(file));
   const tmp = `${file}.tmp-${process.pid}-${Date.now()}`;
@@ -116,7 +160,10 @@ export class TranscriptStore {
     const meta = this.loadMeta(conversationId) || this.createConversation(conversationId);
     const seq = (meta.lastSeq || 0) + 1;
     const stored = { seq, ts: Date.now(), ...event };
-    fs.appendFileSync(conversationEventsFile(conversationId), JSON.stringify(stored) + "\n");
+    fs.appendFileSync(
+      conversationEventsFile(conversationId),
+      JSON.stringify(dedupeMirroredImageData(stored)) + "\n"
+    );
     this.updateMeta(conversationId, { lastSeq: seq });
     return stored;
   }

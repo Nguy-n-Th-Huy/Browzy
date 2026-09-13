@@ -203,7 +203,7 @@ Nguồn yêu cầu: `openspec/changes/redesign-remote-control-overlay`, `extensi
 
 ## 4. Browser tools thực tế (TC-TOOL)
 
-Registry lõi 26 tool (`host/tool-definitions.js`). Bảng dưới là các ca bắt buộc; mỗi tool nên có thêm 1 ca âm (đối số sai) trước khi phát hành.
+Registry lõi 30 tool (`host/tool-definitions.js`: 25 preserved + 5 post-baseline, 1 removal). Bảng dưới là các ca bắt buộc; mỗi tool nên có thêm 1 ca âm (đối số sai) trước khi phát hành.
 
 | ID | Ưu tiên | Tool | Các bước | Kết quả kỳ vọng |
 |---|:--:|---|---|---|
@@ -225,8 +225,11 @@ Registry lõi 26 tool (`host/tool-definitions.js`). Bảng dưới là các ca b
 | TC-TOOL-16 | P2 | `read_network_requests` | Sau khi tải trang có XHR | Liệt kê được request; không rò header nhạy cảm |
 | TC-TOOL-17 | P2 | `resize_window` | Đổi kích thước cửa sổ | Viewport đổi đúng; `innerWidth/innerHeight` khớp |
 | TC-TOOL-18 | P1 | `file_upload` | Đính file vào input theo `ref` | File được gắn; `input.files.length > 0` |
-| TC-TOOL-19 | P2 | `upload_image` | Đính ảnh chụp theo `ref` | Hoạt động theo ref. Với `coordinate` phải báo **không hỗ trợ** (khác biệt đã biết so với Claude in Chrome) |
-| TC-TOOL-20 | P2 | `gif_creator`, `shortcuts_list`, `shortcuts_execute` | Gọi thử | Trả thông báo *chưa hỗ trợ* rõ ràng, **không** giả vờ thành công (stub đã biết) |
+| TC-TOOL-19 | P1 | `upload_image` | Đính ảnh chụp theo `ref` vào file input; drop ảnh tại `coordinate` vào rich-text editor không có file input (vd. Google Docs) | Theo ref: gắn file như cũ. Theo coordinate: editor nhận đúng ảnh tại đúng vị trí; ref trỏ non-file-input thì báo mismatch và chỉ đường coordinate, không đoán vị trí |
+| TC-TOOL-26 | P1 | `gif_creator` | start → click vài control → stop → export | Trả GIF animated xem được, marker cam ở đúng vị trí click; export kèm `download:true` lưu file xuống đĩa và báo đúng path |
+| TC-TOOL-27 | P1 | `gif_creator` | export khi tab đóng giữa chừng; export GIF quá giới hạn | Tab đóng: trả frame đã có + câu nói rõ dừng sớm. Quá giới hạn: báo lỗi nêu limit + size đạt được, không trả ảnh dở |
+| TC-TOOL-28 | P1 | `shortcuts_list` / `shortcuts_execute` | List rồi execute một workflow có sẵn | List liệt kê đúng; execute chạy các step và báo kết quả từng step; id lạ báo not-found phân biệt với chạy-lỗi |
+| TC-TOOL-29 | P1 | `list_connected_browsers` / `select_browser` | Mở 2 browser (vd. Brave + Edge) đều gắn extension, list rồi select qua lại | List đủ 2, đúng 1 driver. Select chuyển thật (tab mới mở bên browser đích); select browser lạ không rớt kết nối hiện tại |
 | TC-TOOL-21 | P1 | `set_config` / `get_config` | Đặt config toàn cục và theo tab | `get_config` phản ánh đúng lớp ưu tiên per-tab > global; catalog mô tả đầy đủ |
 | TC-TOOL-22 | P1 | `update_plan` | Yêu cầu kế hoạch trước khi làm | Panel hiện thẻ kế hoạch chờ duyệt; không thao tác gì trước khi được duyệt |
 | TC-TOOL-23 | P2 | `debug` / `debug_timings` | Sau một run nhiều bước | Trả lại được chi tiết mà kết quả tool đã lược bỏ; timing theo từng call |

@@ -55,19 +55,22 @@ const SNAPSHOT_PATH = path.join(__dirname, "fixtures", "registry-baseline.json")
 const BASELINE = JSON.parse(fs.readFileSync(SNAPSHOT_PATH, "utf8"));
 
 // openspec/changes/consume-webmcp-page-tools appended 2 post-baseline
-// entries (webmcp_list_tools, webmcp_call_tool) and
-// openspec/changes/add-browser-batch-tool appended 1 more (browser_batch) to
-// the same registry this suite's BASELINE snapshot now includes — see
+// entries (webmcp_list_tools, webmcp_call_tool),
+// openspec/changes/add-browser-batch-tool appended 1 more (browser_batch),
+// and openspec/changes/implement-stubbed-browser-tools appended 2 more
+// (list_connected_browsers, select_browser) while removing switch_browser
+// (recorded in the baseline's removals set) — see
 // test/registry-baseline.test.mjs's DESIGN_DOC_TOOL_LIST/
-// POST_BASELINE_ADDITIONS split, which is this repo's canonical source for
-// the two counts. This file cannot import that constant directly (that
-// script calls process.exit() at module scope, so importing it would run
-// the whole other suite and exit this process), so the counts are mirrored
-// here instead — every bare "26" this suite asserted before those changes is
-// replaced with LEGACY_BASELINE_COUNT + POST_BASELINE_ADDITIONS_COUNT below.
+// POST_BASELINE_ADDITIONS / REMOVED_BASELINE_OPERATIONS split, which is this
+// repo's canonical source for the three counts. This file cannot import those
+// constants directly (that script calls process.exit() at module scope, so
+// importing it would run the whole other suite and exit this process), so the
+// counts are mirrored here instead — every bare "26" this suite asserted
+// before those changes is replaced with the arithmetic below.
 const LEGACY_BASELINE_COUNT = 26;
-const POST_BASELINE_ADDITIONS_COUNT = 3;
-const TOTAL_REGISTRY_COUNT = LEGACY_BASELINE_COUNT + POST_BASELINE_ADDITIONS_COUNT;
+const POST_BASELINE_ADDITIONS_COUNT = 5;
+const REMOVED_BASELINE_COUNT = 1;
+const TOTAL_REGISTRY_COUNT = LEGACY_BASELINE_COUNT + POST_BASELINE_ADDITIONS_COUNT - REMOVED_BASELINE_COUNT;
 
 const results = [];
 async function test(name, fn) {

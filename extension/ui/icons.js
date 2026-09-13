@@ -74,6 +74,11 @@ const PATHS = {
   // between adjacent points.
   spark:
     '<path d="M12,2.5 Q12.84,9.97 16.24,7.76 Q14.03,11.16 21.5,12 Q14.03,12.84 16.24,16.24 Q12.84,14.03 12,21.5 Q11.16,14.03 7.76,16.24 Q9.97,12.84 2.5,12 Q9.97,11.16 7.76,7.76 Q11.16,9.97 12,2.5 Z" fill="currentColor" stroke="none" />',
+  // Administrator-controlled marker (permission mode / approved-sites pages
+  // — add-permission-modes-and-threat-signals task 7.1/7.8): a padlock.
+  lock: '<rect x="5" y="10.5" width="14" height="10" rx="2" /><path d="M8 10.5V7a4 4 0 0 1 8 0v3.5" />',
+  // Empty-state glyph for the approved-sites page (task 7.8).
+  shield: '<path d="M12 3l7 3v6c0 4.5-3 7.5-7 9c-4-1.5-7-4.5-7-9V6Z" /><path d="M9 12l2 2l4-4" />',
 };
 
 /**

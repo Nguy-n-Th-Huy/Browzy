@@ -1,9 +1,13 @@
-// The 29 browzy-in-chrome tool definitions (26 preserved-baseline operations
-// plus 3 post-baseline operations — the 2 WebMCP page tools added by
-// openspec/changes/consume-webmcp-page-tools and browser_batch added by
-// openspec/changes/add-browser-batch-tool; see test/registry-baseline.test.mjs's
-// DESIGN_DOC_TOOL_LIST/POST_BASELINE_ADDITIONS split, and the "Preserve the
-// browser capability baseline" requirement in
+// The 30 browzy-in-chrome tool definitions (25 preserved-baseline operations
+// plus 5 post-baseline operations — the 2 WebMCP page tools added by
+// openspec/changes/consume-webmcp-page-tools, browser_batch added by
+// openspec/changes/add-browser-batch-tool, and list_connected_browsers plus
+// select_browser added by openspec/changes/implement-stubbed-browser-tools;
+// that same change removed switch_browser, recorded in the baseline's
+// removals set naming select_browser as its replacement; see
+// test/registry-baseline.test.mjs's DESIGN_DOC_TOOL_LIST /
+// POST_BASELINE_ADDITIONS / REMOVED_BASELINE_OPERATIONS split, and the
+// "Preserve the browser capability baseline" requirement in
 // openspec/specs/agent-browser-runtime), extracted
 // as data so both the standard stdio MCP server (host/mcp-server.js) and the
 // codemode + hybrid servers can register them without duplicating the
@@ -495,10 +499,22 @@ export const TOOLS = [
     }
   },
   {
-    name: "switch_browser",
+    name: "list_connected_browsers",
     description:
-      "Hand off browser automation to a different Chromium browser (Chrome, Brave, Edge). One browser drives at a time. Calling this releases the current browser's hold on the shared runtime for ~15s so a target browser with this extension enabled can take over automatically (no restart). Tell the user to enable the extension in the target browser first. After calling, wait a few seconds and use tabs_context_mcp to confirm which browser is now active.",
+      "List the browsers currently attached to the local companion, marking which one drives automation. One browser drives at a time. Use select_browser to transfer automation to another attached browser.",
     paramShape: {}
+  },
+  {
+    name: "select_browser",
+    description:
+      "Transfer browser automation to a named browser from list_connected_browsers and report the outcome. The transfer completes only when the target takes over; selecting the already-driving browser, or a browser that is not attached, reports that outcome without dropping the current connection.",
+    paramShape: {
+      browser: z
+        .string()
+        .describe(
+          "The browser to transfer automation to, exactly as list_connected_browsers names it (e.g., 'Brave', 'Edge', 'Chrome')."
+        )
+    }
   },
   {
     name: "update_plan",
@@ -602,7 +618,7 @@ export const TOOLS = [
   {
     name: "upload_image",
     description:
-      "Upload a previously captured screenshot (from the computer tool's screenshot action) to a file input, by imageId. Identify the target with `ref` from read_page or find; it must be an <input type=\"file\">, including one hidden behind a styled button, which is what this tool is most useful for. Only images already captured in this session can be uploaded — it cannot read a file from the user's disk.",
+      "Upload a previously captured screenshot (from the computer tool's screenshot action) to a file input, by imageId. Identify the target with `ref` from read_page or find; it must be an <input type=\"file\">, including one hidden behind a styled button, which is what this tool is most useful for. Only images already captured in this session can be uploaded — it cannot read a file from the user's disk. Alternatively, supply `coordinate` ([x, y] in the last screenshot's pixels) to drop the image at a viewport position instead, for targets that expose no file input. Supply either `ref` or `coordinate`, not both.",
     paramShape: {
       imageId: z
         .string()
@@ -616,8 +632,17 @@ export const TOOLS = [
         ),
       ref: z
         .string()
+        .optional()
         .describe(
           'Element reference ID of the file input from read_page or find tools (e.g., "ref_1", "ref_2").'
+        ),
+      coordinate: z
+        .array(z.number())
+        .min(2)
+        .max(2)
+        .optional()
+        .describe(
+          "(x, y): viewport position to drop the image at, in the last screenshot's pixels. Alternative to `ref`, for targets that expose no file input."
         ),
       filename: z
         .string()

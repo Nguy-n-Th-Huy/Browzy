@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Quyền &amp; trang đã ghi nhớ — Browzy</title>
+<link rel="stylesheet" href="../ui/tokens.css" />
+<link rel="stylesheet" href="../ui/base.css" />
+<link rel="stylesheet" href="../ui/components.css" />
+<link rel="stylesheet" href="../ui/prose.css" />
+<script type="module" src="../ui/theme.js"></script>
+<script type="module" src="../ui/behaviors.js"></script>
+<style>
+  /* Page-local layout only — shared tokens/primitives in extension/ui/**
+     are not edited here, only reused (same note settings.html/skills.html
+     already carry). */
+  .panel-shell {
+    max-width: 640px;
+    margin: 0 auto;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    background: var(--color-canvas);
+  }
+  .panel-scroll {
+    flex: 1;
+    overflow-y: auto;
+    padding: var(--space-4) var(--panel-gutter) var(--space-8);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+  .mode-options { display: flex; flex-direction: column; gap: var(--space-2); }
+  .mode-option {
+    display: flex; align-items: center; gap: var(--space-3);
+    padding: var(--space-3); border-radius: var(--radius-md); border: 1px solid var(--color-border);
+    background: var(--color-surface); cursor: pointer; text-align: left; width: 100%;
+  }
+  .mode-option[aria-pressed="true"] { border-color: var(--color-accent); background: var(--color-accent-tint); }
+  .mode-option:disabled { cursor: not-allowed; opacity: 0.7; }
+  .mode-option-title { font-weight: 700; margin: 0; }
+  .mode-option-desc { font-size: var(--font-size-small); color: var(--color-text-secondary); margin: 2px 0 0; }
+  .managed-pill {
+    display: inline-flex; align-items: center; gap: 4px; font-size: var(--font-size-small);
+    padding: 2px 8px; border-radius: 999px; background: var(--color-surface-sunken); color: var(--color-text-secondary);
+  }
+  .site-row { display: flex; flex-direction: column; gap: 6px; padding: var(--space-3); border-radius: var(--radius-md); border: 1px solid var(--color-border); background: var(--color-surface); }
+  .site-row-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); flex-wrap: wrap; }
+  .site-row-origin { font-weight: 700; word-break: break-all; }
+  .site-row-meta { font-size: var(--font-size-small); color: var(--color-text-secondary); display: flex; gap: 8px; flex-wrap: wrap; }
+  .decision-allow { color: var(--color-status-success, #1a7f37); }
+  .decision-deny { color: var(--color-status-danger); }
+  .sites-empty {
+    display: flex; flex-direction: column; align-items: center; text-align: center; gap: var(--space-2);
+    padding: var(--space-8) var(--space-6); background: var(--color-surface); border: 1px dashed var(--color-border);
+    border-radius: var(--radius-md);
+  }
+  .sites-note { font-size: var(--font-size-small); color: var(--color-text-secondary); line-height: 1.55; }
+</style>
+</head>
+<body>
+<div class="panel-shell">
+  <header class="panel-header">
+    <button class="btn-icon" aria-label="Quay lại" id="btn-back"></button>
+    <span class="panel-header-title" style="font-size:var(--font-size-h2)">Quyền &amp; trang đã ghi nhớ</span>
+    <div class="panel-header-actions"></div>
+  </header>
+
+  <main class="panel-scroll">
+    <div id="banner-area"></div>
+
+    <p class="section-heading" id="mode-heading">Chế độ cấp quyền</p>
+    <div role="group" aria-labelledby="mode-heading" id="mode-managed-pill-slot"></div>
+    <div class="mode-options" role="radiogroup" aria-labelledby="mode-heading" id="mode-options"></div>
+
+    <p class="section-heading" id="sites-heading">Trang đã ghi nhớ</p>
+    <p class="sites-note">Các hành động luôn cần xác nhận (nhập thông tin đăng nhập/thanh toán, tải tệp xuống, cấp quyền trình duyệt) không bao giờ được ghi nhớ tại đây — chúng luôn hỏi lại mỗi lần.</p>
+    <div class="field-row-actions" style="justify-content:flex-end">
+      <button class="btn btn-ghost btn-sm" type="button" id="btn-revoke-all">Gỡ bỏ tất cả</button>
+    </div>
+    <div id="site-list" role="group" aria-labelledby="sites-heading" style="display:flex;flex-direction:column;gap:8px"></div>
+    <div class="sites-empty" id="sites-empty" hidden>
+      <span id="ic-empty"></span>
+      <p style="font-weight:700;margin:0">Chưa có trang nào được ghi nhớ</p>
+      <p style="font-size:var(--font-size-small);color:var(--color-text-secondary);margin:0;max-width:340px">Khi bạn cho phép hoặc từ chối một hành động và chọn "ghi nhớ", trang đó sẽ xuất hiện ở đây.</p>
+    </div>
+  </main>
+</div>
+
+<script type="module" src="./permissions-app.js"></script>
+</body>
+</html>

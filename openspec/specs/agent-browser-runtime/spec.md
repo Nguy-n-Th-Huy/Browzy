@@ -159,15 +159,35 @@ External MCP clients SHALL continue to control the browser through the existing 
 - **THEN** the browser bridge and external MCP connection remain usable independently, and any interrupted SDK action is not replayed
 
 ### Requirement: Send/submit-class actions gate at canUseTool
-The runtime SHALL classify each browser tool call attributable to `computer` or `javascript_tool` before executing it. A call classified as submitting a form, clicking a send/submit/pay/confirm control, or a comparably hard-to-reverse outward-facing action MUST suspend execution pending an explicit user decision; every other classified call, and every call to any other registered browser tool, MUST proceed automatically with no decision required. A tool name capable of producing a send/submit-class call MUST NOT be included in the SDK's auto-approval list; it MAY remain in the SDK's tool-availability list so the call still reaches this classification.
+The runtime SHALL classify each browser tool call before executing it, and SHALL resolve whether it requires a user decision from that classification together with the active permission mode, any remembered per-site decision for the call's origin and action class, and any administrator-managed policy. A call classified as protected MUST suspend execution pending an explicit user decision under every mode and regardless of any remembered decision. Under Auto, a call classified as submitting a form, clicking a send/submit/pay/confirm control, or a comparably hard-to-reverse outward-facing action MUST suspend execution pending an explicit user decision, and every other classified call MUST proceed automatically. Under Manual, every call classified as mutating MUST suspend. Under Skip, only protected calls and calls a managed policy requires confirmation for MUST suspend. A call classified as read-only MUST proceed automatically under every mode. A tool name capable of producing a call that can require a decision MUST NOT be included in the SDK's auto-approval list; it MAY remain in the SDK's tool-availability list so the call still reaches this classification.
 
 #### Scenario: Automatic action bypasses the gate
-- **WHEN** a call is classified outside the send/submit set — reading, extraction, screenshot, scroll, hover, navigation click, typing, form-field filling, opening/closing an agent-created tab, or in-scope script execution
-- **THEN** it executes without waiting for a user decision, exactly as before this gate existed
+- **WHEN** the mode is Auto and a call is classified outside the send/submit and protected sets — reading, extraction, screenshot, scroll, hover, navigation click, typing, form-field filling, opening/closing an agent-created tab, or in-scope script execution
+- **THEN** it executes without waiting for a user decision, exactly as before permission modes existed
 
 #### Scenario: Send/submit call suspends for a decision
-- **WHEN** a call is classified as submitting a form, clicking a send/submit/pay/confirm control, or an equivalently outward-facing action
+- **WHEN** the mode is Auto and a call is classified as submitting a form, clicking a send/submit/pay/confirm control, or an equivalently outward-facing action
 - **THEN** execution does not proceed until an explicit allow or deny decision resolves it, and a denial or timeout prevents that dispatch entirely
+
+#### Scenario: Manual mode suspends an ordinary mutating call
+- **WHEN** the mode is Manual and a call is classified as mutating but not send/submit-class
+- **THEN** execution does not proceed until an explicit decision resolves it
+
+#### Scenario: Skip mode does not suspend a send/submit call
+- **WHEN** the mode is Skip and a call is classified as send/submit-class, is not protected, and no managed policy requires confirmation for it
+- **THEN** it executes without waiting for a user decision
+
+#### Scenario: A protected call suspends under every mode
+- **WHEN** a call is classified as protected
+- **THEN** execution does not proceed until an explicit decision resolves it, whichever mode is active and whatever the per-site store holds
+
+#### Scenario: A remembered decision resolves the gate without asking
+- **WHEN** a call's origin and action class match a remembered allowance and the call is not protected
+- **THEN** it executes without waiting for a user decision, and the transcript records that a remembered decision resolved it rather than showing an unasked question
+
+#### Scenario: Reading is never gated
+- **WHEN** a call is classified as read-only
+- **THEN** it executes without waiting for a user decision under every mode
 
 ### Requirement: Approval tokens are bound, single-use, and never derivable from content
 An approval issued for a pending decision SHALL be bound to the exact run, action, and target it was issued for. It MUST be rejected if presented for a different run, a different action, or a different target, and it MUST be rejected as already used on a second presentation even within its validity window. It SHALL be invalidated on Stop, on a browser or tab scope change, and on replacement or deletion of the credential backing that run. No approval SHALL ever be derivable from webpage content, tool output, or skill instructions.

@@ -18,6 +18,9 @@ import { RUN_PHASE, PHASE_LABEL_VI, BUSY_LABEL_VI, phaseVisualClass } from "./ru
 import { renderMarkdownLite, escapeHtml } from "./markdown-lite.js";
 import { createPanelSkillsClient } from "./skills-client.js";
 import { buildPickerItems, filterPickerItems, parseSlashQuery, buildInvocationText } from "./skills-model.js";
+import { createPermissionsClient, PermissionsErrorLike } from "./permissions-client.js";
+import { PERMISSION_MODES, modeLabel, modeDescription, protectedCategoryLabel } from "../ui/permission-labels.js";
+import { viewWarning, viewRiskContext } from "../ui/threat-labels.js";
 import { FORMAT_LABELS as DOCUMENT_FORMAT_LABELS, EXTRACTED_PREVIEW_FORMATS, buildPreview, buildMarkdown } from "./document-viewer.js";
 
 const $ = (id) => document.getElementById(id);
@@ -33,7 +36,13 @@ const el = {
   phaseAnnouncer: $("phase-announcer"),
   setupBannerSlot: $("setup-banner-slot"),
   permissionSlot: $("permission-slot"),
+  downloadDecisionSlot: $("download-decision-slot"),
   questionSlot: $("question-slot"),
+  modeTrigger: $("mode-trigger"),
+  modeTriggerLabel: $("mode-trigger-label"),
+  modeTriggerIcon: $("mode-trigger-icon"),
+  modeMenu: $("mode-menu"),
+  modeMenuWrap: $("mode-menu-wrap"),
   contextChipRow: $("context-chip-row"),
   composerWrap: $("composer-wrap"),
   composerInput: $("composer-input"),
@@ -426,33 +435,209 @@ function renderContextChip() {
   el.contextChipRow.appendChild(clearBtn);
 }
 
+// ---- Permission mode badge (task 7.1: "visible wherever a run can act") --
+const permissionsClient = createPermissionsClient();
+let permissionMode = { mode: "auto", modeSource: "local", loaded: false, syncing: false };
+
+function renderModeMenu() {
+  const managed = permissionMode.modeSource === "managed";
+  el.modeTriggerLabel.textContent = modeLabel(permissionMode.mode);
+  el.modeTriggerIcon.innerHTML = managed ? iconMarkup("lock", { size: 14 }) : "";
+  el.modeTrigger.title = managed
+    ? "Chế độ đang bị quản trị viên cố định — không thể đổi trên máy này"
+    : modeDescription(permissionMode.mode);
+  // Administrator-pinned: the control shows the pinned mode and offers no
+  // local change (spec "Administrator-pinned mode") — disabling the trigger
+  // itself (rather than emptying the menu) means there is no affordance to
+  // even open a menu that could not do anything.
+  el.modeTrigger.disabled = managed;
+  el.modeTrigger.setAttribute("aria-disabled", String(managed));
+  el.modeMenu.innerHTML = "";
+  if (managed) return;
+  for (const mode of PERMISSION_MODES) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "menu-item";
+    btn.setAttribute("role", "menuitem");
+    btn.setAttribute("aria-selected", String(mode === permissionMode.mode));
+    btn.title = modeDescription(mode);
+    btn.textContent = modeLabel(mode);
+    btn.addEventListener("click", () => {
+      el.modeMenuWrap.close?.();
+      changePermissionMode(mode);
+    });
+    el.modeMenu.appendChild(btn);
+  }
+}
+
+async function changePermissionMode(mode) {
+  if (permissionMode.modeSource === "managed" || mode === permissionMode.mode) return;
+  const previousMode = permissionMode.mode;
+  try {
+    const result = await permissionsClient.setPermissionMode(mode);
+    permissionMode = { ...permissionMode, mode: result.mode, modeSource: "local" };
+    renderModeMenu();
+    // Task 7.2: the host invalidates every outstanding decision the instant
+    // the EFFECTIVE mode changes; the panel clears its own cards to match
+    // rather than waiting for that denial to round-trip back as a tool
+    // result (see PanelController.invalidateAllPendingApprovals()'s own
+    // comment).
+    if (result.mode !== previousMode) panel.invalidateAllPendingApprovals();
+  } catch (err) {
+    // Task 7.1: a MANAGED_POLICY_PINNED reply must never surface as a
+    // generic failure — administrator policy pinned the mode out from under
+    // this control (e.g. a policy applied after the panel last loaded it);
+    // re-sync to "managed" so the badge reflects reality instead of showing
+    // an error toast for what is actually expected behavior.
+    if (err instanceof PermissionsErrorLike && err.code === "MANAGED_POLICY_PINNED") {
+      permissionMode = { ...permissionMode, modeSource: "managed" };
+      renderModeMenu();
+      return;
+    }
+    // Any other failure (network/protocol): leave the badge showing the
+    // last-known mode rather than guessing; the next successful load()
+    // reconciles it.
+  }
+}
+
+async function loadPermissionMode() {
+  if (permissionMode.syncing) return;
+  permissionMode.syncing = true;
+  try {
+    const result = await permissionsClient.getPermissionState();
+    permissionMode = { mode: result.mode, modeSource: result.modeSource, loaded: true, syncing: false };
+  } catch {
+    permissionMode.syncing = false;
+    return;
+  }
+  renderModeMenu();
+}
+
+// Called from every render() tick (cheap: a no-op once loaded and connected,
+// mirroring how renderModelMenu() etc. are called unconditionally). Reloads
+// on every fresh "ok" handshake so a reconnect (or a mode change made from
+// the Settings > Approved sites page while this panel was open) is picked
+// up rather than showing a stale badge indefinitely.
+let permissionModeHandshakeSeen = false;
+function syncPermissionMode() {
+  const ok = panel.protocol.handshakeState() === "ok";
+  if (ok && !permissionModeHandshakeSeen) {
+    permissionModeHandshakeSeen = true;
+    loadPermissionMode();
+  } else if (!ok) {
+    permissionModeHandshakeSeen = false;
+  }
+}
+
+// Task 7.6: the risk-CONTEXT block for a decision card — a pure function of
+// the view model extension/ui/threat-labels.js's viewRiskContext() already
+// produced, so it is unit-testable in isolation exactly like
+// conversation-model.js's own pure functions (see
+// test/sidepanel-threat-warnings.test.mjs). Returns "" for `null` (nothing
+// to show). Never a control of its own: no button/checkbox/input appears
+// anywhere in the returned markup — the card's own Allow/Deny remain the
+// ONLY controls (spec "the decision controls remain those of the card").
+function permissionRiskContextHtml(riskContext) {
+  if (!riskContext) return "";
+  const signalsHtml = riskContext.signals.length
+    ? `<ul class="permission-card-risk-signals">${riskContext.signals
+        .map((s) => `<li>${escapeHtml(s.label || s.kind)}${s.quotedText ? `: <code>${escapeHtml(s.quotedText)}</code>` : ""}</li>`)
+        .join("")}</ul>`
+    : "";
+  return `<div class="permission-card-risk-context" role="note">
+         <p class="permission-card-risk-title">${escapeHtml(`Bối cảnh: tab này đang ở mức ${riskContext.categoryLabel}`)}</p>
+         ${signalsHtml}
+       </div>`;
+}
+
 function renderPermission() {
   el.permissionSlot.innerHTML = "";
   const model = panel.currentModel();
   if (!model || !model.pendingApproval) return;
-  const { action, target } = model.pendingApproval;
+  const { action, target, protectedCategory, rememberable } = model.pendingApproval;
   const card = document.createElement("div");
   card.className = "permission-card";
   card.setAttribute("role", "alertdialog");
   card.setAttribute("aria-label", "Yêu cầu cấp quyền");
+  // Task 7.3: a protected decision names its category and states it cannot
+  // be remembered (spec "A protected action names its category and cannot
+  // be remembered"); every other card offers a "remember" checkbox instead,
+  // scoped to the origin/action-class the mode already resolved this call
+  // against (host/agent/policy/can-use-tool.js only honors the flag when
+  // `rememberable` said so — see protocol-client.js's approvalDecision()).
+  const detailText = protectedCategory
+    ? `Hành động luôn cần xác nhận: ${protectedCategoryLabel(protectedCategory)}. Quyết định này KHÔNG được ghi nhớ — lần sau sẽ hỏi lại.`
+    : "Hành động này nằm ngoài phạm vi đã được cho phép của cuộc trò chuyện.";
+  // Task 7.6: risk CONTEXT for the tab this decision targets, if any — never
+  // a control of its own (no button/checkbox lives inside this block), and
+  // the card's own Allow/Deny below remain the ONLY controls on this card
+  // either way (spec "the decision controls remain those of the card").
+  const contextTabId = target && typeof target.tabId === "number" ? target.tabId : null;
+  const riskContext = contextTabId != null ? viewRiskContext(model.getTabRisk(contextTabId)) : null;
+  const riskContextHtml = permissionRiskContextHtml(riskContext);
   card.innerHTML = `
     <div class="permission-card-head">
       <span class="permission-card-icon">${iconMarkup("alertTriangle", { size: 18 })}</span>
       <div>
         <p class="permission-card-title">Cần cấp quyền: ${escapeHtml(action || "")}</p>
-        <p class="permission-card-detail">Hành động này nằm ngoài phạm vi đã được cho phép của cuộc trò chuyện.</p>
+        <p class="permission-card-detail">${escapeHtml(detailText)}</p>
       </div>
     </div>
     <div class="permission-card-target"></div>
+    ${riskContextHtml}
+    ${
+      !protectedCategory && rememberable
+        ? `<label class="permission-card-remember" style="display:flex;align-items:center;gap:6px;font-size:var(--font-size-small)">
+             <input type="checkbox" id="__remember" />
+             <span>Ghi nhớ quyết định này cho trang này</span>
+           </label>`
+        : ""
+    }
     <div class="permission-card-actions">
       <button class="btn btn-ghost btn-sm" type="button" id="__deny">Từ chối</button>
       <button class="btn btn-primary btn-sm" type="button" id="__allow">Cho phép</button>
     </div>
   `;
   card.querySelector(".permission-card-target").textContent = target ? JSON.stringify(target) : "(không có mục tiêu cụ thể)";
-  card.querySelector("#__allow").addEventListener("click", () => panel.respondApproval("approve"));
-  card.querySelector("#__deny").addEventListener("click", () => panel.respondApproval("deny"));
+  const rememberBox = card.querySelector("#__remember");
+  card.querySelector("#__allow").addEventListener("click", () => panel.respondApproval("approve", { remember: !!(rememberBox && rememberBox.checked) }));
+  card.querySelector("#__deny").addEventListener("click", () => panel.respondApproval("deny", { remember: !!(rememberBox && rememberBox.checked) }));
   el.permissionSlot.appendChild(card);
+}
+
+// Task 2.4: the LOCAL download-pause decision card — see conversation-model.js's
+// pendingDownloadDecision field comment for why this is a distinct piece of
+// state from pendingApproval. Always names the "download" protected category
+// and never offers a remember option (a download is always protected, never
+// rememberable — same rule renderPermission() applies for a protected
+// approval_request).
+function renderDownloadDecision() {
+  el.downloadDecisionSlot.innerHTML = "";
+  const model = panel.currentModel();
+  if (!model || !model.pendingDownloadDecision) return;
+  const { category, filename, url } = model.pendingDownloadDecision;
+  const card = document.createElement("div");
+  card.className = "permission-card";
+  card.setAttribute("role", "alertdialog");
+  card.setAttribute("aria-label", "Yêu cầu tải tệp xuống");
+  card.innerHTML = `
+    <div class="permission-card-head">
+      <span class="permission-card-icon">${iconMarkup("download", { size: 18 })}</span>
+      <div>
+        <p class="permission-card-title">Cần cấp quyền: ${escapeHtml(protectedCategoryLabel(category || "download"))}</p>
+        <p class="permission-card-detail">Trợ lý vừa gây ra một lượt tải tệp xuống máy. Đã tạm dừng tải cho đến khi bạn quyết định. Quyết định này KHÔNG được ghi nhớ — lần sau sẽ hỏi lại.</p>
+      </div>
+    </div>
+    <div class="permission-card-target"></div>
+    <div class="permission-card-actions">
+      <button class="btn btn-ghost btn-sm" type="button" id="__deny">Hủy tải</button>
+      <button class="btn btn-primary btn-sm" type="button" id="__allow">Tiếp tục tải</button>
+    </div>
+  `;
+  card.querySelector(".permission-card-target").textContent = filename || url || "(không rõ tệp)";
+  card.querySelector("#__allow").addEventListener("click", () => panel.respondDownloadDecision("allow"));
+  card.querySelector("#__deny").addEventListener("click", () => panel.respondDownloadDecision("deny"));
+  el.downloadDecisionSlot.appendChild(card);
 }
 
 // Task 9.7: ask-the-user question card. Mirror-image of renderPermission —
@@ -558,6 +743,46 @@ function toolRowHtml(row) {
     </ui-tool-row>`;
 }
 
+// Tasks 7.4/7.5: one turn-anchored warning (injection finding, probe
+// failure, or tab risk update) — see extension/ui/threat-labels.js's own
+// header for the QUOTED-DATA rule this function must honor. Deliberately no
+// `<button>`, no `role="alertdialog"`, and no class shared with
+// `.permission-card` anywhere below: a warning must be structurally and
+// visually distinguishable from a decision card, and acknowledging/
+// dismissing it (there is nothing to click here at all) must authorize
+// nothing (spec "A warning is not an approval").
+function warningRowHtml(warning) {
+  const view = viewWarning(warning);
+  let bodyHtml = "";
+  if (view.kind === "injection_finding") {
+    // `quotedText` is exactly what a web page said — escaped and inserted as
+    // plain text, NEVER passed through renderMarkdownLite (which would
+    // reinterpret its own `[..](..)`/`**..**` as real formatting/links).
+    bodyHtml = `<div class="threat-warning-quote"><code>${escapeHtml(view.quotedText)}</code></div>`;
+  } else if (view.kind === "injection_probe_failed") {
+    bodyHtml = view.quotedDetail ? `<div class="threat-warning-quote"><code>${escapeHtml(view.quotedDetail)}</code></div>` : "";
+  } else if (view.kind === "tab_risk_update") {
+    bodyHtml = view.signals.length
+      ? `<ul class="threat-warning-signals">${view.signals
+          .map((s) => `<li>${escapeHtml(s.label || s.kind)}${s.quotedText ? `: <code>${escapeHtml(s.quotedText)}</code>` : ""}</li>`)
+          .join("")}</ul>`
+      : "";
+  }
+  return `
+    <div class="threat-warning${view.isElevated ? " is-elevated" : ""}" role="status" data-warning-kind="${escapeHtml(view.kind)}">
+      <span class="threat-warning-icon">${iconMarkup("alertTriangle", { size: 14 })}</span>
+      <div class="threat-warning-body">
+        <p class="threat-warning-title">${escapeHtml(view.title)}</p>
+        ${bodyHtml}
+      </div>
+    </div>`;
+}
+
+function renderWarningsHtml(turn) {
+  if (!turn.warnings || !turn.warnings.length) return "";
+  return `<div class="threat-warning-list">${turn.warnings.map(warningRowHtml).join("")}</div>`;
+}
+
 function statusWordVi(status) {
   return { running: "Đang chạy", failed: "Lỗi", cancelled: "Đã hủy", unknown: "Không rõ kết quả" }[status] || status;
 }
@@ -614,6 +839,11 @@ function renderTurnHtml(turn, { isLatestStreaming, busy = false, elapsedVisible 
   // the row's visibility toggles (its DOM exists either way so the spec's
   // "expansion state does not alter the underlying record" held both ways).
   const timelineHtml = turn.toolRows.length ? renderTimelineCollapsed(turn) : "";
+  // Tasks 7.4/7.5: injection findings / probe failures / tab-risk updates
+  // recorded for this turn's run — plain informational warnings, positioned
+  // right after the tool timeline (roughly where the tool call that
+  // surfaced them ran), never mixed into the assistant's own prose.
+  const warningsHtml = renderWarningsHtml(turn);
   // Mid-turn ask-user answers anchored to this turn (see
   // recordQuestionAnswer): rendered as user bubbles between the tool timeline
   // and the prose, i.e. next to the tool call that asked for them. The prose
@@ -652,6 +882,7 @@ function renderTurnHtml(turn, { isLatestStreaming, busy = false, elapsedVisible 
     <div class="msg-row from-assistant">
       <div class="msg-assistant-body">
         ${timelineHtml}
+        ${warningsHtml}
         ${answersHtml}
         <div class="prose" style="margin-top:${turn.toolRows.length ? "12px" : "0"}">${renderMarkdownLite(turn.text)}${cursor}</div>
         ${citationHtml}
@@ -884,6 +1115,31 @@ function renderRecordingItemHtml(item) {
     <span class="list-item-sub">${issue ? "Tường thuật lỗi: " + escapeHtml(item.transcriptStatus) : escapeHtml(item.summary || "")}</span></span></div>`;
 }
 
+// Task 2.4: an honest record for a download background.js could not pause
+// in time — reported, never presented as if it had been gated. Rendered as
+// a plain transcript notice, not a decision card: there is nothing left to
+// allow or deny by the time this item exists.
+function renderDownloadNoticeItemHtml(item) {
+  const name = item.filename || item.url || "(không rõ tệp)";
+  return `<div class="list-item"><span class="list-item-icon">${iconMarkup("download", { size: 16 })}</span>
+    <span class="list-item-main"><span class="list-item-title">Tải tệp đã hoàn tất trước khi kịp tạm dừng: ${escapeHtml(name)}</span>
+    <span class="list-item-sub">Không thể chặn lượt tải này — được ghi nhận, không phải bị chặn.</span></span></div>`;
+}
+
+// Task 2.4: a permanent record of an already-answered download-pause
+// decision (ConversationModel's "download_decision" item — see
+// recordDownloadDecision()/applyEvent()'s "download_decision_recorded"
+// case), so the outcome stays visible in the timeline exactly like every
+// other decision's outcome, not just as a card that vanished the instant it
+// was answered.
+function renderDownloadDecisionItemHtml(item) {
+  const name = item.filename || item.url || "(không rõ tệp)";
+  const allowed = item.decision === "allow";
+  return `<div class="list-item"><span class="list-item-icon">${iconMarkup("download", { size: 16 })}</span>
+    <span class="list-item-main"><span class="list-item-title">${allowed ? "Đã cho phép" : "Đã từ chối"} tải tệp: ${escapeHtml(name)}</span>
+    <span class="list-item-sub">Quyết định được bảo vệ (${escapeHtml(item.category || "download")}) — không thể ghi nhớ.</span></span></div>`;
+}
+
 let wasNearBottom = true;
 function isNearBottom() {
   const s = el.panelScroll;
@@ -909,6 +1165,8 @@ function renderTranscript() {
     .map((item, idx) => {
       if (item.kind === "user") return renderUserItemHtml(item);
       if (item.kind === "recording") return renderRecordingItemHtml(item);
+      if (item.kind === "download_notice") return renderDownloadNoticeItemHtml(item);
+      if (item.kind === "download_decision") return renderDownloadDecisionItemHtml(item);
       const isLatest = idx === model.items.length - 1;
       return renderTurnHtml(item, {
         isLatestStreaming: isLatest && (item.lifecycle === "running" || item.lifecycle === "created"),
@@ -1154,7 +1412,9 @@ function render() {
   renderModelMenu();
   renderContextChip();
   renderPermission();
+  renderDownloadDecision();
   renderQuestion();
+  syncPermissionMode();
   renderTranscript();
   updateSendEnabled();
   const phase = panel.currentPhase();

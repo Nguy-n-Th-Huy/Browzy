@@ -1,0 +1,41 @@
+{
+  "type": "object",
+  "properties": {
+    "mode": {
+      "title": "Permission mode",
+      "description": "Pins the agent's permission mode for every browser instance this policy reaches. One of manual, auto, or skip. Omit to leave the mode locally changeable.",
+      "type": "string",
+      "enum": ["manual", "auto", "skip"]
+    },
+    "requireProtectedConfirm": {
+      "title": "Require confirmation for protected actions",
+      "description": "Reserved: protected actions (credentials, payment details, file writes/downloads, permission grants) always require an explicit decision regardless of this value — it cannot be used to remove that requirement.",
+      "type": "boolean"
+    },
+    "sites": {
+      "title": "Remembered site decisions",
+      "description": "Administrator-placed per-site allow/deny entries. Each entry is scoped to one origin and one non-protected action class.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "origin": {
+            "title": "Origin",
+            "description": "The exact origin this entry applies to, e.g. https://example.com.",
+            "type": "string"
+          },
+          "actionClass": {
+            "title": "Action class",
+            "type": "string",
+            "enum": ["mutating", "send"]
+          },
+          "decision": {
+            "title": "Decision",
+            "type": "string",
+            "enum": ["allow", "deny"]
+          }
+        }
+      }
+    }
+  }
+}

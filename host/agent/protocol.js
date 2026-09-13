@@ -166,6 +166,31 @@ export const AGENT_MESSAGE_TYPES = Object.freeze({
   // like every other envelope.
   RECORDING_COMPLETE: "recording_complete",
 
+  // Durable half of the download-pause protected decision
+  // (add-permission-modes-and-threat-signals task 2.4). background.js's
+  // chrome.downloads.onCreated gate and the panel's reply to it are
+  // DELIBERATELY LOCAL-only — chrome.downloads.DownloadItem carries no
+  // tabId, so there is nothing for can-use-tool.js's per-call approval-token
+  // binding to verify, and the whole exchange (background.js's
+  // download_protected_decision / the panel's download_decision reply) never
+  // reaches this protocol or the companion at all. Its OUTCOME still must
+  // not be invisible to the durable conversation record the way every other
+  // protected decision's outcome (a real tool_result/tool_rejected) already
+  // is: this message is background.js's fire-and-forget report of what was
+  // decided, sent AFTER it already resumed/cancelled the download locally
+  // (this message's own success or failure changes nothing about that
+  // outcome). Not gated on hello — same "conversation-scoped fact reported
+  // outside the strict start/resume flow" class as ACTION_EVENT above, since
+  // the conversationId is already known and carried explicitly, never
+  // inferred. Wire shape:
+  //   extension -> companion  {v, type:"download_decision_recorded",
+  //                             conversationId, requestId,
+  //                             decision:"allow"|"deny", category, filename,
+  //                             url}
+  //   companion -> extension  {v, type:"download_decision_recorded",
+  //                             conversationId, requestId, recorded:true}
+  DOWNLOAD_DECISION_RECORDED: "download_decision_recorded",
+
   // Composer prompt enhancement (openspec/changes/add-composer-enhance-prompt).
   // One additive request/reply pair reusing a single type name, exactly the
   // convention AGENT_SETTINGS/LIST_CONVERSATIONS/DELETE_CONVERSATION above
@@ -209,6 +234,29 @@ export const AGENT_MESSAGE_TYPES = Object.freeze({
   // tasks.md 6.3/6.6), not claimed here.
   RECORDING_ATTACH: "recording_attach",
 
+  // Administrator-managed permission policy channel
+  // (add-permission-modes-and-threat-signals, design.md decision 7 / task
+  // 4.1). The host cannot read `chrome.storage.managed` itself — the
+  // extension reads it and pushes the result here, on connect and again
+  // whenever managed storage changes, so the companion applies it fresh at
+  // every decision rather than caching a snapshot from run start. Gated
+  // behind hello like the browser-identity half of HELLO itself (this is a
+  // fact about the current browser connection, not about any one
+  // conversation). Wire shape:
+  //   extension -> companion  {v, type:"managed_policy_snapshot",
+  //                             policy: object|null, readError?: string}
+  //   companion -> extension  {v, type:"managed_policy_snapshot", ok:true}
+  // `policy: null` (no `readError`) means "no managed policy configured" —
+  // local settings apply, exactly like an unmanaged install. `readError`
+  // present means the extension could not read managed storage at all; the
+  // companion falls back to local settings for DECISIONS but still reports
+  // the condition as an unreadable administrator policy (never silently
+  // "absent") via the `agent_settings` `get_permission_state` op's
+  // `managedPolicy` field. A present-but-malformed `policy` object is
+  // validated host-side (permission-modes.js's `validateManagedPolicy`) and
+  // handled the same way: ignored for decisions, reported as unreadable.
+  MANAGED_POLICY_SNAPSHOT: "managed_policy_snapshot",
+
   ERROR: "error"
 });
 
@@ -217,6 +265,62 @@ const KNOWN_TYPES = new Set(Object.values(AGENT_MESSAGE_TYPES));
 export function isKnownMessageType(type) {
   return KNOWN_TYPES.has(type);
 }
+
+// --- Threat-observation event types (add-permission-modes-and-threat-signals,
+// design.md decisions 5/6) ---------------------------------------------
+//
+// These are inner `event.type` values carried inside an ordinary
+// STREAM_EVENT envelope (`{v, type:"stream_event", conversationId, runId,
+// event: {...}}`) — NOT new envelope/message types of their own, exactly
+// like "approval_request"/"run_error"/"tool_rejected" already are (see
+// host/agent/policy/can-use-tool.js and host/agent/session/run.js). Naming
+// them here, rather than as magic strings scattered across
+// host/agent/threat/*, gives the host and the (later) panel wave one shared
+// vocabulary. Every event carrying `event: {...}` here is forwarded live and
+// appended to the conversation's durable transcript the same way any other
+// `run.emit(...)` call is (see companion.js's run.emit wrapping in
+// runAsForkedChild) — there is no separate "outstanding request" registry
+// for these the way there is for approval_request/question_request, since a
+// finding or a category is a fact, never something waiting on a reply.
+//
+// Advisory only, structurally: nothing in host/agent/policy/can-use-tool.js
+// or permission-modes.js ever reads an event of these types, and
+// host/agent/threat/observe.js (the sole emitter) is never imported by
+// either — see host/test/threat-advisory-only.test.mjs for the proof that a
+// finding or an elevated category changes no decision outcome.
+export const THREAT_EVENT_TYPES = Object.freeze({
+  // Emitted once per matched pattern found in web content the agent read,
+  // BEFORE that content is available for the agent to act on (the probe
+  // runs on the dispatched result before it is returned from the tool
+  // handler). Payload (alongside the envelope's own runId/conversationId):
+  //   { tool: string, tabId: number|null, field: string, patternId: string,
+  //     matchedText: string, location: { start: number, end: number } }
+  // `matchedText` is the literal matched substring, carried as a plain data
+  // field — never spliced into a prose/template string — so it is quoted
+  // data everywhere it travels, including in the transcript, and never
+  // re-enters the model's context (tasks.md 5.3). A finding never changes
+  // whether the returning tool's content is delivered, and never changes a
+  // permission decision (tasks.md 5.5).
+  INJECTION_FINDING: "injection_finding",
+  // Emitted when the probe itself could not complete for one piece of
+  // returned content — distinguishable from a clean scan (tasks.md 5.4). The
+  // content was still delivered to the agent and the run was not blocked.
+  // Payload: { tool: string, tabId: number|null, error: string }.
+  INJECTION_PROBE_FAILED: "injection_probe_failed",
+  // Emitted whenever a controlled tab's risk category actually changes
+  // (never on every observation — only on a real transition, so a long read
+  // of an unremarkable page does not flood the stream). Payload:
+  //   { tabId: number, category: "uncategorized"|"low"|"elevated",
+  //     signals: Array<{kind, severity, label, ts, ...}> }
+  // `signals` names every observation that currently contributes to the
+  // category (tasks.md 6.1's "recording the contributing signals so they
+  // can be inspected"), including an "injection_finding" kind whenever a
+  // probe finding is what raised the category (tasks.md 6.4). Recomputed
+  // from scratch whenever the tab's document identity changes — see
+  // host/agent/threat/tab-risk.js — so a category never carries forward
+  // from a document the tab has since navigated away from.
+  TAB_RISK_UPDATE: "tab_risk_update"
+});
 
 // --- Chunked-transport sequence kinds -------------------------------------
 //

@@ -229,6 +229,18 @@ export class Run {
     entry.used = true;
     return { ok: true, info: entry };
   }
+  // Non-consuming presence checks for the protected-action backstop
+  // (adapter.js): dispatch must verify a decision covers a protected call
+  // without spending the single-use grant a later check consumes.
+  hasApprovalGrant(fingerprint) {
+    const entry = this._approvalGrants ? this._approvalGrants.get(fingerprint) : undefined;
+    return !!entry && entry.used === false;
+  }
+
+  hasGateVerdict(fingerprint) {
+    const entry = this._gateVerdicts ? this._gateVerdicts.get(fingerprint) : undefined;
+    return !!entry && entry.used === false;
+  }
 
   // A gate verdict that needed NO approval, recorded for the same reason a
   // grant is: so the dispatch-time check can tell "the gate decided this

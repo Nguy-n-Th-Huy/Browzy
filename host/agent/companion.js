@@ -70,10 +70,14 @@ import { BrowserLease } from "./broker/browser-lease.js";
 import { ToolBridge } from "./broker/tool-bridge.js";
 import { ApprovalRegistry } from "./policy/approvals.js";
 import { createCanUseTool, RequestIdTracker } from "./policy/can-use-tool.js";
+import { PERMISSION_MODES, REMEMBERABLE_CLASSES, validateManagedPolicy } from "./policy/permission-modes.js";
+import { readSiteStore, matchSiteEntry, revokeSiteEntry, revokeAllSiteEntries } from "./policy/site-store.js";
+import { readLocalMode, writeLocalMode } from "./policy/mode-store.js";
 import { SessionManager } from "./session/manager.js";
 import { RUN_STATES } from "./session/run.js";
 import { TokenBatcher } from "./session/token-batcher.js";
 import { createBrowserMcpServer, SDK_MCP_SERVER_NAME } from "./tools/adapter.js";
+import { TabRiskRegistry } from "./threat/tab-risk.js";
 import { createAskUserTool, ASK_USER_TOOL_NAME } from "./tools/ask-the-user.js";
 import { createCreateDocumentTool, CREATE_DOCUMENT_TOOL_NAME } from "./tools/create-document.js";
 import { DocumentStore } from "./documents/store.js";
@@ -316,6 +320,54 @@ export class CompanionCore {
     this._pendingApprovals = new RequestIdTracker();
     this._pendingQuestions = new RequestIdTracker();
 
+    // CRITICAL fix (add-permission-modes-and-threat-signals verification): a
+    // TabRiskRegistry must outlive one Run — buildSdkTools() (adapter.js)
+    // defaults to a brand-new, empty registry whenever its caller supplies
+    // none, and every startRun() built exactly that brand-new instance, so a
+    // tab an earlier turn's injection finding elevated silently read back as
+    // "uncategorized" on the very next turn of the SAME conversation, on the
+    // SAME still-open, non-navigated tab — the exact state the spec reserves
+    // for "no signal has ever been observed", indistinguishable from a real
+    // finding never having happened. The spec's "recompute on document
+    // identity change... never carry the previous document's category
+    // forward" only ever names navigation as the reset point; it does not say
+    // a NEW RUN resets it, and TabRiskRegistry.observeDocument() already is
+    // the sole mechanism that resets a tab's state (an explicit `navigate`,
+    // or an observed URL change) — so a registry that survives across this
+    // conversation's turns is what actually makes "no change yet" mean
+    // "carry the previous state forward", not "start over".
+    //
+    // Held here, one per conversationId (see _tabRiskRegistryFor() below),
+    // and handed to createBrowserMcpServer() at every _runQuery() call for
+    // that conversation instead of leaving it defaulted. Cleared on explicit
+    // conversation deletion (_handleDeleteConversation) so a long-lived
+    // companion does not accumulate one entry per conversation forever.
+    this._tabRiskByConversation = new Map(); // conversationId -> TabRiskRegistry
+
+    // Permission-mode/managed-policy state (add-permission-modes-and-threat-
+    // signals): a live source consulted at EVERY decision (createCanUseTool's
+    // and createPermissionModeGateHook's `policySnapshot` getters call
+    // `_permissionPolicySnapshot()` below fresh on every tool call — never a
+    // value captured once at run start), so a mode change or a managed-policy
+    // change applies to the very next call, never only to a future run.
+    //
+    // `_localPermissionMode` is a lazily-loaded, in-memory cache of the local
+    // mode file (host/agent/policy/mode-store.js) — this process is the only
+    // writer, so a cache updated on every write is equivalent to reading the
+    // file fresh every time, without paying a disk read on every tool call.
+    this._localPermissionMode = null;
+    // `_managedPolicy` is the latest VALIDATED administrator-managed policy
+    // snapshot the extension has pushed (see _handleManagedPolicySnapshot),
+    // held in memory ONLY — task 4.1/4.3: managed policy is never persisted,
+    // so a withdrawn or unreachable extension leaves no residue on disk and a
+    // fresh companion process always starts unmanaged until the extension
+    // reconnects and pushes one.
+    this._managedPolicy = null;
+    this._managedPolicyPresent = false;
+    this._managedPolicyReadable = true;
+    this._managedPolicyError = null;
+    this._managedPolicyReceivedAt = null;
+
     // Composer prompt enhancement (design.md decision 5): in-flight
     // AbortControllers for `enhance_prompt` `op:"generate"` calls, keyed by
     // requestId, so a same-requestId `op:"cancel"` can abort the exact call.
@@ -356,6 +408,8 @@ export class CompanionCore {
         return this._handleDeleteConversation(envelope);
       case AGENT_MESSAGE_TYPES.AGENT_SETTINGS:
         return this._handleAgentSettings(envelope);
+      case AGENT_MESSAGE_TYPES.MANAGED_POLICY_SNAPSHOT:
+        return this._handleManagedPolicySnapshot(envelope);
       case AGENT_MESSAGE_TYPES.ENHANCE_PROMPT:
         return this._handleEnhancePrompt(envelope);
       case AGENT_MESSAGE_TYPES.ACTION_EVENT:
@@ -370,6 +424,8 @@ export class CompanionCore {
       case AGENT_MESSAGE_TYPES.CHUNK_PART:
       case AGENT_MESSAGE_TYPES.CHUNK_END:
         return this._handleChunkEnvelope(envelope);
+      case AGENT_MESSAGE_TYPES.DOWNLOAD_DECISION_RECORDED:
+        return this._handleDownloadDecisionRecorded(envelope);
       default:
         return makeEnvelope(AGENT_MESSAGE_TYPES.ERROR, {
           reason: "unknown_message_type",
@@ -389,7 +445,7 @@ export class CompanionCore {
     // generates and persists installationId per browser profile and a fresh
     // connectionId per native-messaging connection — never a model-provided
     // display name. A changed installationId here means a genuinely
-    // different browser/profile just connected (e.g. after switch_browser),
+    // different browser/profile just connected (e.g. after select_browser),
     // which is exactly when the lease's identity must be refreshed rather
     // than silently kept.
     if (envelope.installationId && envelope.installationId !== this._browserIdentity?.installationId) {
@@ -464,10 +520,19 @@ export class CompanionCore {
     const entry = this._pendingApprovals.take(requestId);
     // The canUseTool-side token bound to this requestId is verified on consume
     // inside canUseTool's resolver; here we just forward the panel's decision.
+    // `remember` (task 7.3's host half): the reply's optional `remember:true`
+    // is forwarded as-is, verbatim from the wire — canUseTool.js is the ONLY
+    // place that acts on it, and only when its own `modeDecision.rememberable`
+    // agrees (never for a protected action, never when the mode/store already
+    // decided this call without asking). Anything but a literal `true` is
+    // treated as "do not remember" — page content, tool output, and skill
+    // instructions have no path to this field, only the user's own decision
+    // reply does.
     entry.resolver({
       decision: envelope.decision === "approve" ? "approve" : "deny",
       action: envelope.action,
-      target: envelope.target
+      target: envelope.target,
+      remember: envelope.remember === true
     });
     return makeEnvelope(AGENT_MESSAGE_TYPES.APPROVAL_DECISION, {
       conversationId: envelope.conversationId,
@@ -475,6 +540,192 @@ export class CompanionCore {
       requestId,
       acknowledged: true
     });
+  }
+
+  // --- Permission modes / managed policy (add-permission-modes-and-threat-
+  // signals) --------------------------------------------------------------
+  //
+  // Everything below is the live source `createCanUseTool` and
+  // `createPermissionModeGateHook` consult on EVERY decision — see the
+  // `policySnapshot` getters wired in `_runQuery` below. Nothing here is
+  // captured once at run start: a mode change or a managed-policy push
+  // changes what the very next call sees, mid-run, per design.md decision 7
+  // and the spec's "Mode changes during a run" scenario.
+
+  /** Lazily loads and caches the local mode file; this process is the only
+   * writer, so a cache updated on every write stays accurate without a disk
+   * read on every tool call. */
+  _currentLocalMode() {
+    if (this._localPermissionMode == null) {
+      this._localPermissionMode = readLocalMode();
+    }
+    return this._localPermissionMode;
+  }
+
+  /** The mode actually in effect: a managed pin always wins while present
+   * (task 4.3), otherwise the local choice (default "auto"). */
+  _effectivePermissionMode() {
+    return (this._managedPolicy && this._managedPolicy.mode) || this._currentLocalMode();
+  }
+
+  /** Does a MANAGED site entry cover this exact origin+actionClass? Used to
+   * refuse a local revoke of an administrator-placed entry (task 4.2's
+   * "place sites into or out of the per-site store" plus the
+   * `revoke_site_entry` contract's `MANAGED_ENTRY_LOCKED`). */
+  _managedSiteMatch(origin, actionClass) {
+    const sites = this._managedPolicy && Array.isArray(this._managedPolicy.sites) ? this._managedPolicy.sites : [];
+    if (!sites.length) return null;
+    return matchSiteEntry(
+      sites.map((s) => ({ ...s, source: "managed" })),
+      origin,
+      actionClass
+    );
+  }
+
+  /**
+   * The live snapshot `createCanUseTool`/`createPermissionModeGateHook`
+   * read on every call: `{ mode, managed, sites }` — the exact shape both
+   * already document and consume (see can-use-tool.js's own `policySnapshot`
+   * doc comment). `sites` is read fresh from disk every time (site-store.js
+   * is a small JSON file; this process is not the only writer of it in
+   * spirit — the panel's "remember" reply writes through the SAME store via
+   * canUseTool's own default `persistSiteEntry`, see can-use-tool.js — so a
+   * cache here would risk missing a write from earlier in the very same
+   * call chain).
+   */
+  _permissionPolicySnapshot() {
+    return {
+      mode: this._currentLocalMode(),
+      managed: this._managedPolicy,
+      sites: readSiteStore()
+    };
+  }
+
+  /**
+   * This conversation's own TabRiskRegistry, created lazily on first use and
+   * reused for every later run of the SAME conversation — see the
+   * `_tabRiskByConversation` field comment above for why per-run was wrong.
+   * Never per-run: TOOLS.buildSdkTools()'s own per-run default only ever
+   * applies to a caller (a standalone test, an ad hoc script) that supplies
+   * no registry of its own.
+   */
+  _tabRiskRegistryFor(conversationId) {
+    let registry = this._tabRiskByConversation.get(conversationId);
+    if (!registry) {
+      registry = new TabRiskRegistry();
+      this._tabRiskByConversation.set(conversationId, registry);
+    }
+    return registry;
+  }
+
+  /**
+   * Apply a newly-validated (or newly-absent) managed policy. Invalidates
+   * every outstanding approval when the EFFECTIVE mode changes as a result
+   * (task 7.2's managed-policy half of "mode change invalidates outstanding
+   * decisions") — a late answer to a decision made under the old effective
+   * mode is rejected rather than re-interpreted under the new one.
+   */
+  _applyManagedPolicy(newPolicy) {
+    const previousEffective = this._effectivePermissionMode();
+    this._managedPolicy = newPolicy;
+    const newEffective = this._effectivePermissionMode();
+    if (newEffective !== previousEffective) {
+      this._pendingApprovals.rejectAll({
+        reason: "administrator policy changed the permission mode; this decision was invalidated"
+      });
+    }
+  }
+
+  /**
+   * Wire-side handler for the extension's `managed_policy_snapshot` push
+   * (task 4.1/4.4/4.5). Three cases, per the spec:
+   *   - `readError` present: the extension could not read managed storage at
+   *     all. Reported as unreadable (never treated as absent); falls back to
+   *     local for decisions.
+   *   - `policy` is null/undefined (and no readError): managed policy was
+   *     withdrawn or was never configured. Local settings apply again
+   *     immediately, with no managed value left persisting anywhere.
+   *   - `policy` is a value: validated via `validateManagedPolicy`
+   *     (permission-modes.js). Malformed input is ignored for decisions and
+   *     reported as unreadable rather than silently treated as absent (task
+   *     4.4). `validateManagedPolicy` itself has no field capable of
+   *     removing a protected action's decision requirement (task 4.5) — the
+   *     resolver checks protected before it ever looks at managed policy
+   *     (design.md decision 2), so there is nothing further to reject here.
+   */
+  _handleManagedPolicySnapshot(envelope) {
+    if (!this._requireHello()) return this._notHandshaked(envelope);
+    const ackOk = () => makeEnvelope(AGENT_MESSAGE_TYPES.MANAGED_POLICY_SNAPSHOT, { ok: true });
+
+    if (typeof envelope.readError === "string" && envelope.readError) {
+      this._managedPolicyPresent = true;
+      this._managedPolicyReadable = false;
+      this._managedPolicyError = envelope.readError;
+      this._applyManagedPolicy(null);
+      return ackOk();
+    }
+
+    const snapshot = envelope.policy === undefined ? null : envelope.policy;
+    if (snapshot === null) {
+      this._managedPolicyPresent = false;
+      this._managedPolicyReadable = true;
+      this._managedPolicyError = null;
+      this._managedPolicyReceivedAt = null;
+      this._applyManagedPolicy(null);
+      return ackOk();
+    }
+
+    const { ok: valid, policy, errors } = validateManagedPolicy(snapshot);
+    this._managedPolicyPresent = true;
+    if (!valid) {
+      this._managedPolicyReadable = false;
+      this._managedPolicyError = errors.join("; ");
+      this._applyManagedPolicy(null);
+    } else {
+      this._managedPolicyReadable = true;
+      this._managedPolicyError = null;
+      this._managedPolicyReceivedAt = new Date().toISOString();
+      this._applyManagedPolicy(policy);
+    }
+    return ackOk();
+  }
+
+  /**
+   * `agent_settings` `get_permission_state` op's result — see this change's
+   * reports/wave1-contracts.md for the exact wire shape this implements.
+   */
+  _getPermissionStateSnapshot() {
+    const managed = this._managedPolicy;
+    const mode = this._effectivePermissionMode();
+    const modeSource = managed && managed.mode ? "managed" : "local";
+    const localSites = readSiteStore().map((e) => ({
+      origin: e.origin,
+      actionClass: e.actionClass,
+      decision: e.decision,
+      recordedAt: e.at,
+      source: "local"
+    }));
+    const managedSites = (managed && Array.isArray(managed.sites) ? managed.sites : []).map((s) => ({
+      origin: s.origin,
+      actionClass: s.actionClass,
+      decision: s.decision,
+      // Managed policy carries no per-entry timestamp of its own (it is a
+      // point-in-time admin-pushed snapshot, not a log) — the time this
+      // companion last received a VALID managed snapshot is the best
+      // available "recorded at" for a managed entry.
+      recordedAt: this._managedPolicyReceivedAt,
+      source: "managed"
+    }));
+    return {
+      mode,
+      modeSource,
+      sites: [...managedSites, ...localSites],
+      managedPolicy: {
+        present: this._managedPolicyPresent,
+        readable: this._managedPolicyReadable,
+        ...(this._managedPolicyError ? { error: this._managedPolicyError } : {})
+      }
+    };
   }
 
   /**
@@ -547,6 +798,10 @@ export class CompanionCore {
       return makeEnvelope(AGENT_MESSAGE_TYPES.ERROR, { reason: "unknown_conversation", conversationId });
     }
     const { hadActiveRun } = this.sessionManager.deleteConversation(conversationId);
+    // This conversation is gone — its TabRiskRegistry (see
+    // _tabRiskRegistryFor()) would otherwise linger in memory forever in a
+    // long-lived companion process.
+    this._tabRiskByConversation.delete(conversationId);
     return makeEnvelope(AGENT_MESSAGE_TYPES.DELETE_CONVERSATION, {
       conversationId,
       deleted: true,
@@ -585,6 +840,40 @@ export class CompanionCore {
     }
     const result = this.sessionManager.recordActionEvents(conversationId, events);
     return makeEnvelope(AGENT_MESSAGE_TYPES.ACTION_EVENT, { conversationId, ...result });
+  }
+
+  /**
+   * Task 2.4 durable half (see AGENT_MESSAGE_TYPES.DOWNLOAD_DECISION_RECORDED's
+   * own doc comment in protocol.js for why this exists at all): a
+   * fire-and-forget durable append, not a live tool dispatch — there is no
+   * SDK tool call or Run in flight to attach this to (the decision was made
+   * entirely by background.js/the panel, outside the SDK stream), so it is
+   * appended directly to the conversation's transcript via
+   * SessionManager.recordDownloadDecision(), the exact same
+   * "browser-bridge-level fact" pattern _handleRecordingComplete() above
+   * already uses. Gated the same way _handleActionEvent() above is
+   * (conversation-scoped, but not requiring a fresh hello on THIS
+   * connection) since the conversationId is already known and explicit.
+   */
+  _handleDownloadDecisionRecorded(envelope) {
+    if (!this._versionOk(envelope)) {
+      return versionMismatchEnvelope("unsupported_version", { requested: envelope.v, inReplyTo: envelope.type });
+    }
+    const { conversationId, requestId, decision } = envelope;
+    if (!conversationId || !requestId || (decision !== "allow" && decision !== "deny")) {
+      return makeEnvelope(AGENT_MESSAGE_TYPES.ERROR, { reason: "malformed_download_decision_recorded" });
+    }
+    if (!this.sessionManager.hasConversation(conversationId)) {
+      return makeEnvelope(AGENT_MESSAGE_TYPES.ERROR, { reason: "unknown_conversation", conversationId });
+    }
+    this.sessionManager.recordDownloadDecision(conversationId, {
+      requestId,
+      decision,
+      category: typeof envelope.category === "string" ? envelope.category : "download",
+      filename: typeof envelope.filename === "string" ? envelope.filename : null,
+      url: typeof envelope.url === "string" ? envelope.url : null
+    });
+    return makeEnvelope(AGENT_MESSAGE_TYPES.DOWNLOAD_DECISION_RECORDED, { conversationId, requestId, recorded: true });
   }
 
   /**
@@ -1109,6 +1398,60 @@ export class CompanionCore {
         case "get_advertised_commands": {
           const result = readAdvertisedCommands();
           return ok(result);
+        }
+        // Permission modes / per-site store (add-permission-modes-and-
+        // threat-signals): the settings/panel-facing surface over the same
+        // live state `_permissionPolicySnapshot()` feeds into every real
+        // decision — see this change's reports/wave1-contracts.md for the
+        // exact result/error shapes these ops implement.
+        case "get_permission_state": {
+          return ok(this._getPermissionStateSnapshot());
+        }
+        case "set_permission_mode": {
+          const requested = String(envelope.mode || "").toLowerCase();
+          if (!PERMISSION_MODES.includes(requested)) {
+            return fail("INVALID_MODE", `permission mode must be one of ${PERMISSION_MODES.join("/")}`);
+          }
+          if (this._managedPolicy && this._managedPolicy.mode) {
+            return fail("MANAGED_POLICY_PINNED", "administrator policy pins the permission mode; it cannot be changed locally");
+          }
+          const previousEffective = this._effectivePermissionMode();
+          writeLocalMode(requested);
+          this._localPermissionMode = requested;
+          const newEffective = this._effectivePermissionMode();
+          // Task 7.2: a mode change invalidates every outstanding decision —
+          // a late answer to a decision made under the old mode is rejected
+          // rather than re-interpreted under the new one.
+          if (newEffective !== previousEffective) {
+            this._pendingApprovals.rejectAll({ reason: "the permission mode changed; this decision was invalidated" });
+          }
+          return ok({ mode: newEffective });
+        }
+        case "revoke_site_entry": {
+          const { origin, actionClass } = envelope;
+          if (typeof origin !== "string" || !origin) {
+            return fail("PROTOCOL_ERROR", "revoke_site_entry requires an origin");
+          }
+          if (!REMEMBERABLE_CLASSES.includes(actionClass)) {
+            return fail("PROTOCOL_ERROR", `actionClass must be one of ${REMEMBERABLE_CLASSES.join("/")}`);
+          }
+          if (this._managedSiteMatch(origin, actionClass)) {
+            return fail("MANAGED_ENTRY_LOCKED", "this entry is administrator-controlled and cannot be revoked locally");
+          }
+          let removed;
+          try {
+            removed = revokeSiteEntry(origin, actionClass);
+          } catch (err) {
+            return fail("PROTOCOL_ERROR", `invalid origin: ${(err && err.message) || err}`);
+          }
+          if (!removed) {
+            return fail("NOT_FOUND", "no matching local entry for this origin and action class");
+          }
+          return ok({ revoked: true });
+        }
+        case "revoke_all_site_entries": {
+          const removed = revokeAllSiteEntries();
+          return ok({ removed });
         }
         default:
           return fail("PROTOCOL_ERROR", `unknown agent_settings op ${JSON.stringify(op)}`);
@@ -1681,7 +2024,18 @@ export class CompanionCore {
       conversationId,
       store: this.documentStore
     });
-    const mcpServer = createBrowserMcpServer({ toolBridge: this.toolBridge, coerceArgs: this.coerceArgs, run, extraTools: [askUserTool, createDocumentTool] });
+    const mcpServer = createBrowserMcpServer({
+      toolBridge: this.toolBridge,
+      coerceArgs: this.coerceArgs,
+      run,
+      extraTools: [askUserTool, createDocumentTool],
+      // CRITICAL fix: this conversation's OWN TabRiskRegistry (see
+      // _tabRiskRegistryFor()'s own comment), not the per-run default
+      // buildSdkTools() would otherwise construct — this is what makes a
+      // tab's category and signals survive across this conversation's turns
+      // instead of resetting to uncategorized every time a new run starts.
+      tabRiskRegistry: this._tabRiskRegistryFor(conversationId)
+    });
     // Task 9.2 (design.md section 8) + upgrade 3.2/3.3: build a canUseTool
     // callback bound to this run so the SDK routes `computer`/
     // `javascript_tool` calls (which are no longer in allowedTools per task
@@ -1720,8 +2074,20 @@ export class CompanionCore {
     // Read-only, best-effort, and off the page's critical path: `describe_ref`
     // is an internal handler the model cannot call, and any failure resolves to
     // null, which is the conservative unknown path the classifier already has.
+    //
+    // add-permission-modes-and-threat-signals: also resolved for `form_input`,
+    // not just `computer` — `describe_ref` itself is generic (tabId + ref,
+    // extension/background.js's handler has no notion of which tool asked),
+    // and `detectProtectedCategory`'s CREDENTIALS category for `form_input`
+    // (host/agent/policy/permission-modes.js) can only ever fire against a
+    // resolved `targetHint` (it never sniffs typed values). Gating this
+    // resolver to "computer" only left every `form_input` call — the ONLY
+    // way this tool's own schema identifies its target, by `ref` — permanently
+    // unresolved, so a credential-field `form_input` call could never be
+    // classified as protected in production: `hintIsSecretField(null)` is
+    // always false, so the category never fired no matter what the field was.
     const resolveHint = async (toolName, args) => {
-      if (toolName !== "computer" || !args || typeof args.ref !== "string") return null;
+      if ((toolName !== "computer" && toolName !== "form_input") || !args || typeof args.ref !== "string") return null;
       if (typeof args.tabId !== "number") return null;
       const { result } = await this.toolBridge.call(
         "describe_ref",
@@ -1745,7 +2111,20 @@ export class CompanionCore {
         ...(context?.hostname ? { domain: context.hostname } : {}),
         ...((context?.tabId != null || context?.url) ? { docIdentity: { ...(context.tabId != null ? { tabId: context.tabId } : {}), ...(context.url ? { url: context.url } : {}) } } : {}),
         ...(snapshot.credentialRevision != null ? { credentialRevision: snapshot.credentialRevision } : {})
-      }
+      },
+      // Live policy source (production wiring, add-permission-modes-and-
+      // threat-signals): a GETTER, not a value — called fresh on every tool
+      // call, so a mode change or managed-policy push made mid-run applies
+      // to the very next decision (design.md decision 7 / the spec's "Mode
+      // changes during a run" scenario), never only to a future run.
+      // `persistSiteEntry` is deliberately NOT passed here: createCanUseTool
+      // already defaults it to the site store's own real writer — see that
+      // parameter's doc comment in can-use-tool.js for why the write call
+      // lives there rather than in a wrapper supplied from here (the
+      // site-store test suite's import-graph guard restricts that writer's
+      // callers to that one file and tests; a companion-supplied wrapper
+      // would need to reference it by name and violate that for no benefit).
+      policySnapshot: () => this._permissionPolicySnapshot()
     });
     let options;
     try {
@@ -1757,6 +2136,20 @@ export class CompanionCore {
         skills,
         pageContext: context ?? null,
         canUseTool,
+        // add-permission-modes-and-threat-signals: the SAME resolver AND the
+        // SAME live `policySnapshot` getter just built above for
+        // `createCanUseTool`, forwarded to the PreToolUse gate hook (see
+        // query-options.js's `hooks` and can-use-tool.js's
+        // `createPermissionModeGateHook`) so a `form_input`/`computer` call's
+        // protected classification, and Manual mode's "every mutating call
+        // decides", agree between the two — never a second,
+        // independently-resolved answer. Passing the SAME closure (rather
+        // than two separately-built ones) is what guarantees that: both read
+        // `this._localPermissionMode`/`this._managedPolicy` at the moment
+        // each is called, so a mode change or managed-policy push mid-run is
+        // visible to both from the very next call onward.
+        policySnapshot: () => this._permissionPolicySnapshot(),
+        resolveHint,
         // Registered on the same server just above as an extraTool; named here
         // so the model can actually see and call it. The two must move
         // together — see buildIsolatedOptions' note on extraToolNames.
