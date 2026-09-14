@@ -10,6 +10,8 @@
 import crypto from "node:crypto";
 
 import { Run, RUN_STATES } from "./run.js";
+import { newRunId } from "../broker/browser-lease.js";
+import { QUEUE_LIMIT, QUEUE_ENTRY_STATES } from "../storage/transcript-store.js";
 import { PendingRecordingsStore } from "../storage/pending-recordings.js";
 import { UsageLedger } from "../storage/usage-ledger.js";
 import { RecordingAttachmentsStore, RECORDING_ATTACHMENT_STATES } from "../storage/recording-attachments.js";
@@ -81,6 +83,33 @@ export class SessionManager {
     // redelivered batch as new after a restart.
     this._actionEventCursors = new Map(); // conversationId -> PerStreamSeqTracker
     this._actionEventCursorsSeeded = new Set();
+
+    // Queued-message drain wiring (openspec/changes/add-message-queue-and-
+    // steering, design.md decision 4). This class owns the durable queue and
+    // every transition on it, but it deliberately knows nothing about the SDK
+    // or how a turn is actually run — starting a claimed message's turn needs
+    // the submission payload, the profile/model resolution and the skills
+    // binding, which all live in companion.js. So the drain itself is an
+    // injected callback (same injection shape as `releaseNativeLease` above):
+    // companion.js sets `onQueueDrain` to a function that claims the next
+    // message and launches its turn, and every terminal path here calls
+    // `_maybeDrainQueue()` once. Left null in tests that exercise the queue
+    // bookkeeping alone, in which case a drain check is simply a no-op.
+    this.onQueueDrain = null;
+
+    // Live-push hook for queue transitions (the queue's counterpart to the
+    // per-run event sink that companion.js's forked-child wiring installs on
+    // every Run). Set where that wiring lives; unset means "durable append
+    // only", which is all any test of the queue's own bookkeeping needs.
+    this.onConversationEvent = null;
+
+    // Per-conversation reentrancy guard for the drain (design.md decision 4:
+    // "Drain is serialized per conversation with an in-flight guard"). The
+    // callback is required to be SYNCHRONOUS about the decision — it claims
+    // and launches, then returns; it must never await the whole turn, or this
+    // guard would still be held when that turn's own terminal arrives and
+    // silently swallow the next drain.
+    this._drainsInFlight = new Set();
   }
 
   newConversation(meta = {}) {
@@ -205,6 +234,14 @@ export class SessionManager {
         runId: meta.activeRunId
       });
     }
+    // Second reconciliation site for the queue (design.md decision 2, tasks.md
+    // 5.1): the same repair recoverAfterRestart() runs must also fire here,
+    // because a conversation can be opened in a process that never lost its
+    // in-memory state (a panel reload, not a companion restart) while a
+    // previous companion process's claim was left `dispatching` on disk. A
+    // conversation that DOES have a live run in this process is skipped: its
+    // dispatching entry belongs to that run, not to a crash.
+    if (!this._activeRuns.has(conversationId)) this._reconcileMessageQueue(conversationId);
     return this.store.snapshot(conversationId, afterSeq);
   }
 
@@ -227,10 +264,17 @@ export class SessionManager {
   }
 
   /**
+   * @param {object} [opts]
+   * @param {Array<number>|'any'} [opts.tabScope]
+   * @param {string} [opts.runId] - a pre-generated run id. Only a queued
+   *   message's claim passes one: the claim writes it into the entry's
+   *   `claimedByRunId` BEFORE this call, so a crash between the two halves is
+   *   decidable from durable records alone (design.md decision 2). Every other
+   *   caller omits it and the Run mints its own.
    * @throws if the conversation already has an active run (spec: "prevent
    *   more than one active run per conversation").
    */
-  startRun(conversationId, { tabScope = "any" } = {}) {
+  startRun(conversationId, { tabScope = "any", runId } = {}) {
     if (!this.store.loadMeta(conversationId)) throw new Error(`unknown conversation: ${conversationId}`);
     if (this.hasActiveRun(conversationId)) {
       throw new Error(`conversation ${conversationId} already has an active run`);
@@ -240,6 +284,7 @@ export class SessionManager {
       lease: this.lease,
       approvals: this.approvals,
       tabScope,
+      runId,
       releaseNativeLease: this.releaseNativeLease,
       // Guarded against the explicit-delete race documented on
       // this._deletedConversations above: an event emitted after this
@@ -574,6 +619,22 @@ export class SessionManager {
     return matches;
   }
 
+  /**
+   * Stop the conversation's active run, and (for an operator stop) pause the
+   * message queue behind it.
+   *
+   * The pause is deliberately conditioned on the reason: `stopRun` is also
+   * this class's internal cancellation primitive for a deleted conversation
+   * and for a revoked credential, and neither of those is the operator
+   * intervening — auto-pausing the drain there would strand pending messages
+   * behind a resume action nobody asked for. Only "user_stop" (the wire
+   * STOP's own default reason) pauses, and only when there is something to
+   * pause (design.md decision 5 / tasks.md 3.4).
+   *
+   * @param {string} conversationId
+   * @param {string} [reason]
+   * @returns {boolean} whether a run was actually stopped
+   */
   stopRun(conversationId, reason = "user_stop") {
     const run = this._activeRuns.get(conversationId);
     if (!run) return false;
@@ -581,13 +642,34 @@ export class SessionManager {
     run.stop(reason);
     if (!this._deletedConversations.has(conversationId)) {
       this.store.updateMeta(conversationId, { activeRunId: null });
+      if (reason === "user_stop") this._pauseQueue(conversationId, "user_stop");
     }
+    // A terminal by any name is a drain trigger (design.md decision 4). The
+    // paused queue set just above makes this a no-op for an operator stop;
+    // for every other reason it is what lets the next pending turn start
+    // without waiting for the aborted SDK query's own unwind to reach
+    // finishRun().
+    this._maybeDrainQueue(conversationId);
     return true;
   }
 
-  finishRun(conversationId) {
-    const run = this._activeRuns.get(conversationId);
-    if (run) run.markDone();
+  /**
+   * Retire a finished run and clear this conversation's active-run slot.
+   *
+   * `finished` is the Run this call is about. It matters because an interrupt
+   * claims its successor the moment the interrupted run is stopped, so the
+   * interrupted run's ASYNCHRONOUS unwind can reach here after a DIFFERENT run
+   * already owns this conversation's slot; without it, that late call would
+   * mark the successor done, delete it from the active map, and clear its
+   * `activeRunId` — killing a live run from a dead one's bookkeeping. Callers
+   * that pass nothing keep the pre-existing behavior (the slot's current
+   * occupant is retired), which is correct for the one caller class that has
+   * no run object: nothing else reaches here without one.
+   */
+  finishRun(conversationId, finished = null) {
+    const current = this._activeRuns.get(conversationId);
+    if (finished && current && current !== finished) return; // superseded — see above
+    if (current) current.markDone();
     this._activeRuns.delete(conversationId);
     if (this._deletedConversations.has(conversationId)) {
       // Late-unwind sweep (tasks.md 2.3): deleteConversation() already
@@ -612,6 +694,562 @@ export class SessionManager {
       return;
     }
     this.store.updateMeta(conversationId, { activeRunId: null });
+    // Post-terminal drain (design.md decision 4): run_done, run_stopped and
+    // run_error all funnel through here, so this one call covers the whole
+    // terminal matrix — including the early returns above that finish a run
+    // without a query() ever running.
+    this._maybeDrainQueue(conversationId);
+  }
+
+  // --- Queued messages ------------------------------------------------
+  //
+  // openspec/changes/add-message-queue-and-steering: a message submitted
+  // while this conversation's run is active is accepted into a bounded,
+  // durable, per-conversation queue and runs as a subsequent turn in
+  // submission order (design.md decisions 1-9).
+  //
+  // Shape of the state, and why it is split the way it is:
+  //   - `meta.messageQueue` holds the LIVE entries only — `{messageId, mode,
+  //     state, claimedByRunId, idempotencyKey, enqueuedAt}` — bounded by
+  //     QUEUE_LIMIT and rewritten atomically with the rest of meta.json.
+  //   - The operator's text, its bound page context, its attachments and the
+  //     profile/model it was submitted under live in the message's own
+  //     `message_queued` event in the append-only log, and nowhere else. Meta
+  //     stays small and bounded no matter how long a message's text is, and no
+  //     restore path can render that text twice (design.md decisions 1/9).
+  //   - `messageId` is the seq of that event, so the two halves are joined by
+  //     a monotonic id the log itself assigned, not by anything in memory.
+  //
+  // A claim is the only transition that makes a message runnable, and it is
+  // two-phase and durable (design.md decision 2): the entry goes
+  // `dispatching` with a PRE-GENERATED `claimedByRunId`, `message_claimed` is
+  // appended, and only then is the run created with that same id. A crash
+  // between the phases is therefore decidable from disk alone — see
+  // `_reconcileMessageQueue()`.
+
+  /** Live entries for one conversation (never null). */
+  queueEntries(conversationId) {
+    const meta = this.store.loadMeta(conversationId);
+    return Array.isArray(meta && meta.messageQueue) ? meta.messageQueue : [];
+  }
+
+  /** Just the entries still waiting for a turn (`pending`), in FIFO order. */
+  pendingQueueEntries(conversationId) {
+    return this.queueEntries(conversationId).filter((entry) => entry.state === QUEUE_ENTRY_STATES.PENDING);
+  }
+
+  /** The entry a delivery with this idempotency key already created, or null.
+   * Backs R7's durable half: a retried send resolves to the SAME entry, not a
+   * second one, without depending on any in-memory memo surviving. */
+  findQueuedByIdempotencyKey(conversationId, idempotencyKey) {
+    if (!idempotencyKey) return null;
+    return this.queueEntries(conversationId).find((entry) => entry.idempotencyKey === idempotencyKey) || null;
+  }
+
+  /**
+   * The stored submission payload of one queued message — everything a turn
+   * needs that is NOT in the entry: the operator's text, the page-context
+   * snapshot captured at SUBMISSION time (design.md decision 8: a queued
+   * message's page context binds at submit and is never re-resolved when its
+   * turn starts), attachment refs, element record, effort, profile, model,
+   * session choice and tab scope.
+   *
+   * @returns {object|null} null when the message's own event is not in the
+   *   log (a torn tail, or a hand-edited meta) — the caller treats that as a
+   *   failed message rather than guessing at a turn.
+   */
+  queuedMessageSubmission(conversationId, messageId) {
+    const event = this.store
+      .allEvents(conversationId)
+      .find((e) => e.seq === messageId && e.type === "message_queued");
+    return (event && event.submission) || null;
+  }
+
+  /**
+   * Append one event to the conversation's log AND forward it to connected
+   * panels as it is stored (the live-push half of design.md decision 9: queue
+   * transitions must be visible even while NO run is active, when the run
+   * event sink that normally carries live traffic does not exist).
+   *
+   * `onQueueDrain`'s sibling, `onConversationEvent`, is what companion.js's
+   * forked-child wiring uses to push these; unset in tests, where the durable
+   * append is all that is being exercised. Tombstone-guarded exactly like
+   * every other write path on this class — a late queue write must never
+   * resurrect a deleted conversation.
+   */
+  _emitConversationEvent(conversationId, event) {
+    if (this._deletedConversations.has(conversationId)) return null;
+    const stored = this.store.appendEvent(conversationId, event);
+    try {
+      if (this.onConversationEvent) this.onConversationEvent(conversationId, stored);
+    } catch {
+      // A live-push failure must never break queue bookkeeping: the event is
+      // already durable by this point, and the panel rebuilds from the log.
+    }
+    return stored;
+  }
+
+  /**
+   * Accept one message into the queue: append its durable `message_queued`
+   * event (the ONLY home of its text and submission payload) and add the live
+   * entry that points at it.
+   *
+   * The bound is checked BEFORE anything is appended (tasks.md 2.2), so a
+   * refusal leaves no trace at all: no entry, no event, and the operator's
+   * draft is still theirs to edit. A submission that arrives while the queue
+   * is paused also re-arms it (design.md decision 5 — "resume on explicit
+   * resume or the next submission").
+   *
+   * @param {object} params
+   * @param {"queue"|"interrupt"} params.mode
+   * @param {string|null} [params.idempotencyKey]
+   * @param {object} params.submission - see queuedMessageSubmission()
+   * @returns {{ok: true, entry: object, idempotent?: boolean}
+   *          | {ok: false, reason: string, limit?: number}}
+   */
+  enqueueMessage(conversationId, { mode = "queue", idempotencyKey = null, submission }) {
+    if (this._deletedConversations.has(conversationId)) return { ok: false, reason: "conversation_deleted" };
+    const meta = this.store.loadMeta(conversationId);
+    if (!meta) return { ok: false, reason: "unknown_conversation" };
+    const queue = this.queueEntries(conversationId);
+
+    // R7: a retry carrying the same key resolves to the entry the first
+    // delivery created, and never appends a second message event.
+    const existing = idempotencyKey ? queue.find((entry) => entry.idempotencyKey === idempotencyKey) : null;
+    if (existing) return { ok: true, entry: existing, idempotent: true };
+
+    const pendingCount = queue.filter((entry) => entry.state === QUEUE_ENTRY_STATES.PENDING).length;
+    if (pendingCount >= QUEUE_LIMIT) return { ok: false, reason: "queue_full", limit: QUEUE_LIMIT };
+
+    // `messageId` is the seq this append is about to receive. Resolving it
+    // BEFORE the append is what lets the event itself carry the id every
+    // consumer (entry, ack, later claimed/consumed events) uses, without a
+    // second write to rewrite it in. Safe by construction: nothing here
+    // awaits, and `nextSeq()` seeds from the log, so no other append can
+    // interleave between this line and the one below.
+    const messageId = this.store.nextSeq(conversationId);
+    const stored = this._emitConversationEvent(conversationId, {
+      type: "message_queued",
+      messageId,
+      mode,
+      submission
+    });
+    const entry = {
+      messageId: stored.seq,
+      mode,
+      state: QUEUE_ENTRY_STATES.PENDING,
+      claimedByRunId: null,
+      idempotencyKey: idempotencyKey || null,
+      enqueuedAt: Date.now()
+    };
+    this.store.updateMeta(conversationId, { messageQueue: [...queue, entry] });
+    this.clearQueuePause(conversationId, "submission");
+    return { ok: true, entry };
+  }
+
+  /**
+   * The two-phase claim (design.md decision 2), for one conversation:
+   *   1. pick the next runnable entry — the designated interrupt successor
+   *      first if it is still pending, else the FIFO head;
+   *   2. write it `dispatching` with the pre-generated run id it will own and
+   *      append `message_claimed`;
+   *   3. create the run through the normal startRun() path with that id.
+   *
+   * Steps 1-3 are synchronous, so two concurrent triggers cannot both claim
+   * the same entry: the second one reads the state the first already wrote.
+   *
+   * @returns {{run: Run, entry: object, submission: object}|null} null when
+   *   there is nothing to claim.
+   */
+  claimNextQueuedMessage(conversationId) {
+    if (this._deletedConversations.has(conversationId)) return null;
+    const meta = this.store.loadMeta(conversationId);
+    if (!meta) return null;
+    const queue = this.queueEntries(conversationId);
+    const pending = queue.filter((entry) => entry.state === QUEUE_ENTRY_STATES.PENDING);
+    if (pending.length === 0) return null;
+    // R3's claim order: the designated interrupt successor first, everything
+    // else in FIFO order after it (design.md decision 7 — interrupt is the
+    // only jumper).
+    const successorId = meta.successorMessageId ?? null;
+    const ordered = successorId == null
+      ? pending
+      : [...pending.filter((entry) => entry.messageId === successorId), ...pending.filter((entry) => entry.messageId !== successorId)];
+
+    for (const entry of ordered) {
+      // A message whose own `message_queued` event is gone cannot be run
+      // honestly — there is no text to send and no submission-time context to
+      // bind. It is failed (a visible terminal outcome) and dropped rather
+      // than left at the head of the queue, where it would block every
+      // message behind it forever; the loop then tries the next one.
+      const submission = this.queuedMessageSubmission(conversationId, entry.messageId);
+      if (!submission) {
+        this._dropQueueEntry(conversationId, entry.messageId);
+        this._emitConversationEvent(conversationId, {
+          type: "message_failed",
+          messageId: entry.messageId,
+          reason: "submission_missing"
+        });
+        continue;
+      }
+
+      // R6: the interrupt that designated this successor is only claimed as an
+      // interrupt if the run it was meant to preempt actually reached its
+      // terminal via `run_stopped`/`user_interrupt`. When it did not (the
+      // companion died first, and restart recovery recorded
+      // `run_interrupted_by_restart` instead), the honest outcome is the
+      // fallback note — the message still runs next, it just cannot claim it
+      // preempted anything.
+      if (entry.messageId === successorId && !this._lastTerminalWasUserInterrupt(conversationId)) {
+        this._emitConversationEvent(conversationId, { type: "message_interrupt_fallback", messageId: entry.messageId });
+      }
+
+      const runId = newRunId();
+      const claimed = { ...entry, state: QUEUE_ENTRY_STATES.DISPATCHING, claimedByRunId: runId };
+      this._replaceQueueEntry(conversationId, entry.messageId, claimed);
+      this._emitConversationEvent(conversationId, { type: "message_claimed", messageId: entry.messageId, runId });
+
+      let run;
+      try {
+        run = this.startRun(conversationId, { tabScope: submission.tabScope || "any", runId });
+      } catch (err) {
+        // Defensive: the drain checks for an active run immediately before this
+        // call, so a refusal here means something claimed the conversation
+        // between the two — revert the entry to pending (it must not stay
+        // `dispatching` with no run) and let the next terminal drain try again.
+        this._requeueEntry(conversationId, entry.messageId, runId, "run_claim_failed");
+        return null;
+      }
+      return { run, entry: claimed, submission };
+    }
+    return null;
+  }
+
+  /**
+   * R3's consumption half, called by the companion once a claimed run's
+   * begin() succeeded (the lease was granted and the run actually started):
+   * append `message_consumed` and drop the entry. Idempotent and safe to call
+   * for a run that was never claimed by a message (an ordinary send), in
+   * which case it does nothing.
+   *
+   * @returns {boolean} whether an entry was consumed
+   */
+  consumeMessageForRun(conversationId, runId) {
+    const entry = this._claimedEntryForRun(conversationId, runId);
+    if (!entry) return false;
+    this._dropQueueEntry(conversationId, entry.messageId);
+    this._emitConversationEvent(conversationId, { type: "message_consumed", messageId: entry.messageId, runId });
+    return true;
+  }
+
+  /**
+   * R3's rollback half: a claimed run whose begin() returned false was
+   * stopped while it waited for the lease, so nothing ever ran and the
+   * message must return to `pending` — never lost, never left `dispatching`.
+   * The successor designation is kept: the operator's run-now intent survives
+   * the stop, and the message is claimed first once the drain re-arms.
+   */
+  requeueMessageForRun(conversationId, runId, reason) {
+    const entry = this._claimedEntryForRun(conversationId, runId);
+    if (!entry) return false;
+    this._requeueEntry(conversationId, entry.messageId, runId, reason);
+    return true;
+  }
+
+  /** The live entry a given run claimed, if any (state `dispatching`). */
+  _claimedEntryForRun(conversationId, runId) {
+    if (!runId) return null;
+    return (
+      this.queueEntries(conversationId).find(
+        (entry) => entry.state === QUEUE_ENTRY_STATES.DISPATCHING && entry.claimedByRunId === runId
+      ) || null
+    );
+  }
+
+  /**
+   * Cancel one still-pending message (spec: "Cancel a pending message").
+   * Once a turn has claimed it the request is REFUSED with the claimed state
+   * disclosed — the run's own Stop is the control at that point, and pretending
+   * otherwise would promise a cancellation the claim already made impossible.
+   *
+   * @returns {{ok: true, messageId: number}
+   *          | {ok: false, reason: string, state?: string}}
+   */
+  cancelQueuedMessage(conversationId, messageId) {
+    if (this._deletedConversations.has(conversationId)) return { ok: false, reason: "conversation_deleted" };
+    const meta = this.store.loadMeta(conversationId);
+    if (!meta) return { ok: false, reason: "unknown_message" };
+    const entry = this.queueEntries(conversationId).find((candidate) => candidate.messageId === messageId);
+    if (entry) {
+      if (entry.state !== QUEUE_ENTRY_STATES.PENDING) {
+        return { ok: false, reason: "already_claimed", state: entry.state };
+      }
+      this._dropQueueEntry(conversationId, messageId);
+      this._emitConversationEvent(conversationId, { type: "message_cancelled", messageId, reason: "user_cancel" });
+      return { ok: true, messageId };
+    }
+    // No live entry. Between a claim and its consumption the entry is still in
+    // the queue, but after a successful `begin()` it is gone — so a cancel
+    // that raced the claim would otherwise be told "unknown_message", which is
+    // false and invites the operator to believe nothing ever ran. The log
+    // decides: a claimed message is refused with its real lifecycle state.
+    const events = this.store.allEvents(conversationId);
+    const claimed = events.some((e) => e.type === "message_claimed" && e.messageId === messageId);
+    if (claimed) {
+      const consumed = events.some((e) => e.type === "message_consumed" && e.messageId === messageId);
+      return { ok: false, reason: "already_claimed", state: consumed ? "consumed" : QUEUE_ENTRY_STATES.DISPATCHING };
+    }
+    return { ok: false, reason: "unknown_message" };
+  }
+
+  /**
+   * Clear the durable pause flag. Returns whether it actually changed, so the
+   * caller can decide whether a `message_queue_resumed` event is warranted —
+   * the event records an operator-visible transition, not a routine no-op.
+   */
+  clearQueuePause(conversationId, reason) {
+    if (this._deletedConversations.has(conversationId)) return false;
+    const meta = this.store.loadMeta(conversationId);
+    if (!meta || !meta.queuePaused) return false;
+    this.store.updateMeta(conversationId, { queuePaused: false });
+    this._emitConversationEvent(conversationId, { type: "message_queue_resumed", reason });
+    return true;
+  }
+
+  /**
+   * R2's interrupt, in one place: designate `messageId` as the successor and
+   * try to preempt the active run through the EXISTING stop path. There is no
+   * second cancellation primitive — `stopRun` is the same call the wire STOP
+   * and the delete paths use, so blocking further dispatch, invalidating
+   * outstanding decisions and releasing the lease all come along unchanged.
+   *
+   * @returns {"no_active_run"|"interrupted"|"not_cancellable"} what actually
+   *   happened, for the caller's reply/telemetry. "not_cancellable" is the
+   *   honest failure the panel must disclose: the run reached a terminal
+   *   state before the stop could take effect, so the message stays an
+   *   ordinary queued turn (no jump) and carries the fallback note.
+   */
+  interruptWithSuccessor(conversationId, messageId) {
+    if (!this.hasActiveRun(conversationId)) return "no_active_run";
+    if (!this.store.loadMeta(conversationId)) return "no_active_run";
+    this.store.updateMeta(conversationId, { successorMessageId: messageId });
+    // The successor is already designated when this runs, so the drain it
+    // triggers claims the interrupt's message first (R3's claim order).
+    const stopped = this.stopRun(conversationId, "user_interrupt");
+    if (stopped) return "interrupted";
+    // Nothing was preempted, so nothing may be claimed as preempted: drop the
+    // designation and record the fallback on the message itself (R6). The
+    // message still runs next — it just does so as an ordinary queued turn.
+    this.store.updateMeta(conversationId, { successorMessageId: null });
+    this._emitConversationEvent(conversationId, { type: "message_interrupt_fallback", messageId });
+    return "not_cancellable";
+  }
+
+  /** Public drain trigger for the two explicit callers (a submission that
+   * found queued work, and the resume action). All the decisions live in
+   * `_maybeDrainQueue`'s preconditions. */
+  drainQueue(conversationId) {
+    this._maybeDrainQueue(conversationId);
+  }
+
+  /**
+   * The explicit resume action (`resume_queue`): clear the pause and drain in
+   * submission order. Also the operator's escape hatch if a drain was ever
+   * missed — the precondition checks in `_maybeDrainQueue()` make a resume
+   * with nothing to do a harmless no-op.
+   *
+   * @returns {{ok: true} | {ok: false, reason: string}}
+   */
+  resumeQueue(conversationId) {
+    if (this._deletedConversations.has(conversationId)) return { ok: false, reason: "conversation_deleted" };
+    if (!this.store.loadMeta(conversationId)) return { ok: false, reason: "unknown_conversation" };
+    this.clearQueuePause(conversationId, "resume");
+    this._maybeDrainQueue(conversationId);
+    return { ok: true };
+  }
+
+  /** Pause the drain because the operator stopped the run that was active. A
+   * `dispatching` entry counts as something to pause: it is about to return to
+   * `pending` (R3's rollback), and re-starting it the instant the operator
+   * pressed Stop would re-enter exactly the state they just interrupted. */
+  _pauseQueue(conversationId, reason) {
+    const meta = this.store.loadMeta(conversationId);
+    if (!meta || meta.queuePaused) return;
+    if (this.queueEntries(conversationId).length === 0) return;
+    this.store.updateMeta(conversationId, { queuePaused: true });
+    this._emitConversationEvent(conversationId, { type: "message_queue_paused", reason });
+  }
+
+  /**
+   * R4's single trigger point. Every terminal path in this class calls it,
+   * and the checks below are exactly the reasons NOT to drain: no callback
+   * wired, a drain already running for this conversation, a deleted
+   * conversation, a paused queue, a run that is still active, or nothing left
+   * to claim. The actual starting of a turn is delegated to `onQueueDrain`
+   * (see its field comment); a callback failure must never break run
+   * bookkeeping, so it is contained here.
+   */
+  _maybeDrainQueue(conversationId) {
+    if (this._deletedConversations.has(conversationId)) return;
+    if (this._drainsInFlight.has(conversationId)) return;
+    if (!this.onQueueDrain) return;
+    const meta = this.store.loadMeta(conversationId);
+    if (!meta || meta.queuePaused) return;
+    if (this.hasActiveRun(conversationId)) return;
+    if (this.pendingQueueEntries(conversationId).length === 0) return;
+    this._drainsInFlight.add(conversationId);
+    try {
+      this.onQueueDrain(conversationId);
+    } catch {
+      // see the method comment: queue state stays exactly as the last durable
+      // transition left it, and the resume action is still available.
+    } finally {
+      this._drainsInFlight.delete(conversationId);
+    }
+  }
+
+  /** Replace one live entry in place (by messageId), leaving the rest — and
+   * the successor designation — untouched. */
+  _replaceQueueEntry(conversationId, messageId, next) {
+    const queue = this.queueEntries(conversationId).map((entry) => (entry.messageId === messageId ? next : entry));
+    this.store.updateMeta(conversationId, { messageQueue: queue });
+  }
+
+  /** Remove one entry, clearing the successor designation when the removed
+   * message was the designated one (a cancelled/consumed successor must not
+   * leave meta pointing at an id no longer in the queue). */
+  _dropQueueEntry(conversationId, messageId) {
+    const meta = this.store.loadMeta(conversationId);
+    const queue = this.queueEntries(conversationId).filter((entry) => entry.messageId !== messageId);
+    this.store.updateMeta(conversationId, {
+      messageQueue: queue,
+      ...(meta && meta.successorMessageId === messageId ? { successorMessageId: null } : {})
+    });
+  }
+
+  /** R3's rollback: entry back to `pending`, `message_requeued` appended. */
+  _requeueEntry(conversationId, messageId, runId, reason) {
+    const entry = this.queueEntries(conversationId).find((candidate) => candidate.messageId === messageId);
+    if (!entry) return;
+    this._replaceQueueEntry(conversationId, messageId, {
+      ...entry,
+      state: QUEUE_ENTRY_STATES.PENDING,
+      claimedByRunId: null
+    });
+    this._emitConversationEvent(conversationId, { type: "message_requeued", messageId, reason });
+  }
+
+  /** Did this conversation's most recent run terminal record an operator
+   * interrupt? Read from the durable log, never from memory: the answer must
+   * survive the crash that makes the question worth asking (R6). */
+  _lastTerminalWasUserInterrupt(conversationId) {
+    const terminals = this.store
+      .allEvents(conversationId)
+      .filter(
+        (e) =>
+          e.type === "run_done" ||
+          e.type === "run_stopped" ||
+          e.type === "run_error" ||
+          e.type === "run_interrupted_by_restart"
+      );
+    if (terminals.length === 0) return false;
+    const last = terminals[terminals.length - 1];
+    return last.type === "run_stopped" && last.reason === "user_interrupt";
+  }
+
+  /**
+   * R8's recovery reconciliation, run from both sites that repair a
+   * conversation's interrupted state (recoverAfterRestart at companion
+   * startup, and resumeConversation's snapshot repair). For every entry left
+   * `dispatching` by a previous process:
+   *
+   *   - the log has `run_started` for its `claimedByRunId` → the run really
+   *     did start and is now interrupted: append `message_consumed` if it is
+   *     missing (so state and events never disagree) and drop the entry. The
+   *     message is NEVER replayed — "no automatic replay after dispatch" is
+   *     untouched by this change.
+   *   - the log has no `run_started` for it (including an unknown run id) →
+   *     nothing ran, so replay is safe and correct: back to `pending` with a
+   *     `message_requeued` naming the reason.
+   *
+   * `queuePaused` is deliberately NOT touched here: it persists across a
+   * restart, and nothing in this method drains (design.md decision 5 / R8 —
+   * no auto-drain at boot).
+   *
+   * @returns {boolean} whether anything was reconciled
+   */
+  _reconcileMessageQueue(conversationId) {
+    const meta = this.store.loadMeta(conversationId);
+    if (!meta) return false;
+    const queue = this.queueEntries(conversationId);
+    const dispatching = queue.filter((entry) => entry.state === QUEUE_ENTRY_STATES.DISPATCHING);
+    if (dispatching.length === 0) return false;
+
+    // One log read for the whole pass: the events this decides from are the
+    // complete log's, not a bounded window's (see allEvents()).
+    const events = this.store.allEvents(conversationId);
+    const runStarted = new Set(events.filter((e) => e.type === "run_started").map((e) => e.runId));
+    const consumed = new Set(
+      events.filter((e) => e.type === "message_consumed").map((e) => e.messageId)
+    );
+
+    let nextQueue = queue;
+    let successorMessageId = meta.successorMessageId ?? null;
+    for (const entry of dispatching) {
+      if (entry.claimedByRunId && runStarted.has(entry.claimedByRunId)) {
+        if (!consumed.has(entry.messageId)) {
+          this._emitConversationEvent(conversationId, {
+            type: "message_consumed",
+            messageId: entry.messageId,
+            runId: entry.claimedByRunId
+          });
+        }
+      } else {
+        this._emitConversationEvent(conversationId, {
+          type: "message_requeued",
+          messageId: entry.messageId,
+          reason: "restart_before_start"
+        });
+        nextQueue = nextQueue.map((candidate) =>
+          candidate.messageId === entry.messageId
+            ? { ...candidate, state: QUEUE_ENTRY_STATES.PENDING, claimedByRunId: null }
+            : candidate
+        );
+      }
+    }
+    const survivingIds = new Set(
+      nextQueue.filter((entry) => entry.state === QUEUE_ENTRY_STATES.PENDING).map((entry) => entry.messageId)
+    );
+    if (successorMessageId != null && !survivingIds.has(successorMessageId)) successorMessageId = null;
+    const finalQueue = nextQueue.filter((entry) => entry.state === QUEUE_ENTRY_STATES.PENDING);
+    this.store.updateMeta(conversationId, { messageQueue: finalQueue, successorMessageId });
+    return true;
+  }
+
+  /**
+   * Cancel every live message of a conversation being deleted.
+   *
+   * Called BEFORE the delete tombstone is set, on purpose: this is the one
+   * write that must happen while the conversation still exists, because after
+   * the tombstone every write path here is (correctly) a silent no-op and the
+   * log is about to be removed anyway. "No run starts into a deleted
+   * conversation" then follows from the tombstone plus the drain's own
+   * tombstone check — nothing here has to outlive the directory.
+   */
+  _cancelAllQueuedMessages(conversationId, reason) {
+    const meta = this.store.loadMeta(conversationId);
+    if (!meta) return;
+    const queue = this.queueEntries(conversationId);
+    if (queue.length === 0) return;
+    const remaining = [];
+    for (const entry of queue) {
+      if (entry.state !== QUEUE_ENTRY_STATES.PENDING) {
+        remaining.push(entry);
+        continue;
+      }
+      this._emitConversationEvent(conversationId, { type: "message_cancelled", messageId: entry.messageId, reason });
+    }
+    this.store.updateMeta(conversationId, { messageQueue: remaining, successorMessageId: null, queuePaused: false });
   }
 
   /**
@@ -671,6 +1309,13 @@ export class SessionManager {
    * @returns {{ hadActiveRun: boolean, onDiskRemoved: boolean }}
    */
   deleteConversation(conversationId) {
+    // The messages queued for this conversation are cancelled WITH it (R5,
+    // "Conversation deleted with messages pending"): no pending message may
+    // start a run into a conversation that is going away. This is the one
+    // queue write that happens BEFORE the tombstone, deliberately — see
+    // _cancelAllQueuedMessages()'s own comment. Nothing after the tombstone
+    // can write at all.
+    this._cancelAllQueuedMessages(conversationId, "conversation_deleted");
     this._deletedConversations.add(conversationId);
     const hadActiveRun = this.hasActiveRun(conversationId);
     this.stopRun(conversationId, "conversation_deleted");
@@ -717,6 +1362,7 @@ export class SessionManager {
     const ids = this.store.listConversations().map((meta) => meta.conversationId);
     let hadActiveRuns = 0;
     for (const conversationId of ids) {
+      this._cancelAllQueuedMessages(conversationId, "conversation_deleted"); // see deleteConversation()'s comment
       this._deletedConversations.add(conversationId);
       if (this.hasActiveRun(conversationId)) hadActiveRuns += 1;
       this.stopRun(conversationId, "conversation_deleted");
@@ -923,6 +1569,14 @@ export class SessionManager {
         });
         recovered.push(meta.conversationId);
       }
+      // R8's reconciliation, at the site that repairs a conversation whose
+      // process died: a message left `dispatching` by that process is either
+      // returned to `pending` (its run never emitted run_started — nothing
+      // ran, replay is safe) or recorded as consumed by the interrupted run
+      // (it did start; it is NEVER replayed). Runs after the active-runId
+      // repair above so `run_interrupted_by_restart` is already in the log
+      // when the claim-time interrupt check reads it.
+      this._reconcileMessageQueue(meta.conversationId);
     }
     return recovered;
   }

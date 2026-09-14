@@ -17,7 +17,7 @@ import { HistoryListView, historyErrorText } from "./history-view.js";
 import { HistoryPrivacyControls } from "./history-privacy.js";
 import { normalizeExportFormat } from "./history-export.js";
 import { toolRowDisplay } from "./conversation-model.js";
-import { RUN_PHASE, PHASE_LABEL_VI, BUSY_LABEL_VI, phaseVisualClass } from "./run-states.js";
+import { RUN_PHASE, PHASE_LABEL_VI, BUSY_LABEL_VI, phaseVisualClass, MESSAGE_QUEUE_LABEL_VI, QUEUE_FALLBACK_NOTE_VI, QUEUE_PAUSED_NOTE_VI } from "./run-states.js";
 import { renderMarkdownLite, escapeHtml } from "./markdown-lite.js";
 import { createPanelSkillsClient } from "./skills-client.js";
 import { buildPickerItems, filterPickerItems, parseSlashQuery, buildInvocationText } from "./skills-model.js";
@@ -104,6 +104,100 @@ if (el.btnDesignMode) el.btnDesignMode.innerHTML = iconMarkup("click", { size: 1
 el.btnEnhance.innerHTML = iconMarkup("spark", { size: 18, title: "Cải thiện prompt" });
 el.modelChevron.innerHTML = iconMarkup("chevronDown", { size: 14 });
 el.iconMicRow.innerHTML = iconMarkup("mic", { size: 18 });
+
+// ---- message queue + steering controls (openspec/changes/
+// add-message-queue-and-steering, tasks.md 6.1/6.2) ------------------------
+//
+// Built here rather than added to sidepanel.html/sidepanel.css, which this
+// change does not own: the panel's markup and stylesheet are shared surfaces,
+// while the behaviour this change adds is the panel's own. Everything below
+// reuses primitives that already exist — `.btn-icon`/`.is-danger-solid` and
+// `.btn.btn-sm.btn-secondary` from extension/ui/components.css,
+// `.active-control-banner` from sidepanel.css — so no new visual vocabulary
+// enters the panel.
+//
+// #btn-stop exists because Stop can no longer live on #btn-send: submitting
+// now QUEUES behind the active run (panel spec "Composer remains usable while
+// a run is active"), so the Send control keeps sending and the run's own
+// control gets its own button (panel spec "the run's Stop remains the
+// available control"). #btn-run-now is the explicit interrupt choice — the
+// design deliberately leaves its placement to the implementation, and it sits
+// beside Send because it is the same action, only now instead of after this
+// turn. Both are hidden while no run is active, where they would mean nothing
+// (an idle Send already runs immediately).
+//
+// A named function rather than straight-line module code so the construction
+// is drivable in a plain-Node test against test/_fake-dom.mjs, the same way
+// history-view.js's own element construction is (see that file's TESTABILITY
+// note). It builds with createElement/textContent/setAttribute only — no
+// innerHTML and no querySelector — which is exactly what that harness
+// implements.
+//
+// Visibility is toggled through `style.display`, NOT the `hidden` attribute:
+// `.btn-icon`, `.btn` and `.active-control-banner` each declare their own
+// `display`, and an author class rule beats the UA's `[hidden]{display:none}`.
+// The repository's convention is a matching `X[hidden]` rule per element (see
+// `.attachment-error[hidden]`, `.slash-picker[hidden]` in
+// extension/ui/components.css), and sidepanel.css is not this change's file —
+// so the three controls carry their visibility in an inline style instead of
+// depending on a rule that cannot be added here. Assigning `""` restores
+// whatever the class declares (inline-flex for the buttons, flex for the
+// banner).
+function installQueueControls() {
+  const btnStop = document.createElement("button");
+  btnStop.setAttribute("type", "button");
+  btnStop.setAttribute("id", "btn-stop");
+  btnStop.className = "btn-icon is-danger-solid";
+  btnStop.setAttribute("aria-label", "Dừng");
+  btnStop.setAttribute("title", "Dừng lượt đang chạy");
+  btnStop.innerHTML = iconMarkup("stop", { size: 16 });
+  btnStop.style.display = "none";
+
+  const btnRunNow = document.createElement("button");
+  btnRunNow.setAttribute("type", "button");
+  btnRunNow.setAttribute("id", "btn-run-now");
+  btnRunNow.className = "btn btn-sm btn-secondary";
+  btnRunNow.textContent = "Chạy ngay";
+  btnRunNow.setAttribute("aria-label", "Chạy ngay: dừng lượt hiện tại và gửi tin nhắn này ngay");
+  btnRunNow.setAttribute("title", "Dừng lượt hiện tại và gửi tin nhắn này ngay (Ctrl+Enter)");
+  btnRunNow.style.display = "none";
+
+  const actions = el.btnSend.parentNode;
+  actions.insertBefore(btnStop, el.btnSend);
+  actions.insertBefore(btnRunNow, btnStop);
+
+  // The paused-drain banner (design.md decision 5): shown while the host's
+  // durable `queuePaused` says the drain is stopped, carrying the ONE control
+  // that clears it. Sits directly above the composer, beside the other
+  // composer-scoped notices, because it is a statement about what pressing Send
+  // will do next.
+  const banner = document.createElement("div");
+  banner.className = "active-control-banner";
+  banner.setAttribute("id", "queue-paused-banner");
+  banner.setAttribute("role", "status");
+  banner.style.display = "none";
+  const note = document.createElement("span");
+  note.textContent = QUEUE_PAUSED_NOTE_VI;
+  const resume = document.createElement("button");
+  resume.setAttribute("type", "button");
+  resume.setAttribute("id", "btn-resume-queue");
+  resume.className = "btn btn-sm btn-secondary";
+  resume.textContent = "Tiếp tục";
+  resume.setAttribute("title", "Chạy các tin nhắn đang chờ theo thứ tự đã gửi");
+  banner.appendChild(note);
+  banner.appendChild(resume);
+  el.composerWrap.insertBefore(banner, el.composerInput.parentNode);
+
+  return { btnStop, btnRunNow, banner, resumeButton: resume };
+}
+
+{
+  const queueControls = installQueueControls();
+  el.btnStop = queueControls.btnStop;
+  el.btnRunNow = queueControls.btnRunNow;
+  el.queuePausedBanner = queueControls.banner;
+  el.btnResumeQueue = queueControls.resumeButton;
+}
 
 // `anchor`, when given, is an element id ALREADY present in
 // extension/settings/settings.html (e.g. "btn-test-connection") — a plain
@@ -1071,9 +1165,20 @@ function renderTurnHtml(turn, opts) {
   const durationHtml = durationLabel
     ? `<span class="turn-duration">${escapeHtml(durationLabel)}</span>`
     : "";
-  const copyHtml = turn.text
-    ? `<div class="turn-actions"><button class="btn btn-secondary btn-sm turn-copy-btn" type="button" data-run-id="${escapeHtml(String(turn.runId ?? ""))}" title="Sao chép phản hồi" aria-label="Sao chép phản hồi">${iconMarkup("copy", { size: 14 })}</button>${durationHtml}</div>`
+  // "Lưu thành workflow" (this change) rides the EXISTING copy/time footer row
+  // rather than adding a second one, and only on the run the visibility rule
+  // named (see workflowAffordanceRunId) — quiet by construction: a ghost
+  // button, secondary text weight, no accent.
+  const saveWorkflowHtml = opts.workflowAffordance
+    ? `<button class="btn btn-ghost btn-sm turn-workflow-btn" type="button" data-run-id="${escapeHtml(String(turn.runId ?? ""))}" title="${escapeHtml(WORKFLOW_COPY.saveHint)}" aria-label="${escapeHtml(WORKFLOW_COPY.saveLabel)}">${iconMarkup("skills", { size: 14 })}<span>${escapeHtml(WORKFLOW_COPY.saveLabel)}</span></button>`
     : "";
+  const copyHtml = turn.text
+    ? `<button class="btn btn-secondary btn-sm turn-copy-btn" type="button" data-run-id="${escapeHtml(String(turn.runId ?? ""))}" title="Sao chép phản hồi" aria-label="Sao chép phản hồi">${iconMarkup("copy", { size: 14 })}</button>`
+    : "";
+  const actionsHtml =
+    copyHtml || saveWorkflowHtml
+      ? `<div class="turn-actions">${copyHtml}${saveWorkflowHtml}${durationHtml}</div>`
+      : "";
   return `
     <div class="msg-row from-assistant">
       <div class="msg-assistant-body">
@@ -1086,7 +1191,7 @@ function renderTurnHtml(turn, opts) {
         ${documentsHtml}
         ${busyHtml}
         ${note ? `<div class="turn-status-note ${note.cls}">${note.text}</div>` : ""}
-        ${copyHtml}
+        ${actionsHtml}
       </div>
     </div>`;
 }
@@ -1115,10 +1220,7 @@ function renderAnswerSourceCitation(turn) {
     if (!url) continue; // URL is the floor; captured timestamp is best-effort
     let hostname = "";
     try { hostname = new URL(url).hostname; } catch { hostname = ""; }
-    let timeStr = "";
-    if (captured) {
-      try { timeStr = new Date(captured).toLocaleTimeString("vi-VN", { hour: "2-digit", minute: "2-digit" }); } catch { timeStr = ""; }
-    }
+    const timeStr = captured ? formatClockVi(captured) : "";
     const citationLabel = hostname || url;
     const citationTime = timeStr ? ` · đọc lúc ${timeStr}` : "";
     // The <a> links to the source URL so a screen-reader user (or any user)
@@ -1220,7 +1322,64 @@ function renderUserItemHtml(item) {
           )
           .join("")}</div>`
       : "";
-  return `<div class="msg-row from-user"><div class="msg-user-bubble${item.isPlaceholder ? " is-placeholder" : ""}">${escapeHtml(item.text)}</div>${attachments}</div>`;
+  return `<div class="msg-row from-user"><div class="msg-user-bubble${item.isPlaceholder ? " is-placeholder" : ""}">${escapeHtml(item.text)}</div>${attachments}${renderUserQueueStateHtml(item)}</div>`;
+}
+
+// A queued/steered message's own state, rendered with the message it describes
+// (tasks.md 6.2, design.md decision 11). The chip vocabulary comes from
+// run-states.js's MESSAGE_QUEUE_LABEL_VI — message-scoped, deliberately
+// distinct from the run-scoped header pill — and everything here uses the
+// shared `.chip` primitive from extension/ui/components.css.
+//
+// The cancel control appears ONLY while the message is still `pending`: once
+// the next turn has claimed it there is nothing left to cancel, and the run's
+// own Stop (the header-adjacent control) is what remains (panel spec "Cancel
+// affordance follows the claim"). The interrupt-fallback note is disclosed on
+// the message because that is where the difference is observable — the message
+// still runs, just as the next turn rather than immediately (design.md
+// decision 3's honesty rule).
+const QUEUE_STATE_ICONS = { pending: "clock", dispatching: "circleDot", cancelled: "slashCircle", failed: "xCircle" };
+
+function renderUserQueueStateHtml(item) {
+  const label = item.queueState ? MESSAGE_QUEUE_LABEL_VI[item.queueState] : null;
+  const detail = label ? queueStateDetail(item) : "";
+  const parts = [];
+  if (label) {
+    const icon = QUEUE_STATE_ICONS[item.queueState] || "circle";
+    parts.push(
+      `<span class="chip"${detail ? ` title="${escapeHtml(detail)}"` : ""}>` +
+        `<span class="chip-icon">${iconMarkup(icon, { size: 14 })}</span>` +
+        `<span class="chip-label">${escapeHtml(label)}</span></span>`
+    );
+  }
+  if (item.queueState === "pending" && item.messageId != null) {
+    parts.push(
+      `<button type="button" class="btn btn-sm btn-ghost msg-user-queue-cancel" ` +
+        `data-cancel-message-id="${escapeHtml(String(item.messageId))}" ` +
+        `aria-label="Hủy tin nhắn đang chờ">Hủy</button>`
+    );
+  }
+  if (item.interruptFellBack) parts.push(`<span class="msg-user-queue-note">${escapeHtml(QUEUE_FALLBACK_NOTE_VI)}</span>`);
+  if (!parts.length) return "";
+  return `<div class="msg-user-queue">${parts.join("")}</div>`;
+}
+
+/** The detail line behind a message's chip, shown as its tooltip: the host's
+ * own reason for a cancelled/failed message, and — for a message the operator
+ * submitted with run-now — the recorded intent, which is what makes the panel
+ * "reflect the interrupt attempt" even when it succeeded (panel spec "Run-now
+ * while the run streams"). The failed attempt discloses itself visibly on top
+ * of this, through QUEUE_FALLBACK_NOTE_VI. */
+function queueStateDetail(item) {
+  const parts = [];
+  if (item.queueMode === "interrupt") parts.push("Bạn đã chọn Chạy ngay cho tin nhắn này");
+  if (item.queueState === "cancelled") parts.push(item.queueError === "user_cancelled" ? "Bạn đã hủy tin nhắn này" : "Tin nhắn đã bị hủy");
+  else if (item.queueState === "failed") {
+    if (item.queueError === "queue_full") parts.push("Hàng đợi đã đầy");
+    else if (item.queueError === "host_unavailable") parts.push("Mất kết nối với companion");
+    else parts.push(item.queueError ? `Không chạy được: ${item.queueError}` : "Không chạy được");
+  }
+  return parts.join(" — ");
 }
 
 function renderBusyIndicator(model, { elapsedVisible } = {}) {
@@ -1335,6 +1494,749 @@ function renderDownloadDecisionItemHtml(item) {
   return `<div class="list-item"><span class="list-item-icon">${iconMarkup("download", { size: 16 })}</span>
     <span class="list-item-main"><span class="list-item-title">${allowed ? "Đã cho phép" : "Đã từ chối"} tải tệp: ${escapeHtml(name)}</span>
     <span class="list-item-sub">Quyết định được bảo vệ (${escapeHtml(item.category || "download")}) — không thể ghi nhớ.</span></span></div>`;
+}
+
+// ===========================================================================
+// Rerunnable workflows + self-healing (openspec/changes/
+// add-workflow-materialization-and-heal) — panel surfaces
+// ---------------------------------------------------------------------------
+// Three transcript surfaces, all built from the change's frozen contract:
+//
+//   • the turn footer's quiet "Lưu thành workflow" affordance, on the LATEST
+//     COMPLETED run only (hidden while a run is active, while a derivation is
+//     in flight, and once that run already has a draft card);
+//   • the draft card (item kind `workflow_draft`): review -> save -> prove ->
+//     enable, every stage an explicit operator gesture, with the proof's
+//     per-step outcomes and freshness notes rendered where the proof put them;
+//   • the drift notice (item kind `workflow_drift`) — static, no controls and
+//     no authority (a fact about a past execution, never a decision) — and the
+//     heal proposal card (item kind `workflow_heal`), Allow/Deny bound to one
+//     proposal id with a bounded expiry.
+//
+// The visual language is the panel's existing one: `.card` plus the
+// `.permission-card-*` head/actions primitives and the shared `.btn` classes.
+// The drift notice deliberately shares NO class with a decision card (the rule
+// the threat warnings already follow), so "there is nothing to answer here" is
+// visible at a glance.
+const WORKFLOW_COPY = Object.freeze({
+  saveLabel: "Lưu thành workflow",
+  saveHint: "Lưu các bước của lượt này thành workflow để chạy lại — chỉ bật sau khi chạy thử đạt",
+  draftTitle: "Workflow nháp từ lượt này",
+  draftSavedTitle: "Workflow đã lưu (đang tắt)",
+  draftProvedTitle: "Workflow đã chạy thử",
+  draftEnabledTitle: "Workflow đã bật",
+  draftDetail: "Dựng lại từ dấu vết hành động của lượt này. Workflow được lưu ở trạng thái TẮT; chỉ bật sau khi chạy thử đạt trên trang đang mở.",
+  savedDetail: "Đã lưu và đang tắt. Chạy thử trên trang đang mở để kiểm chứng trước khi bật.",
+  provedDetail: "Đã chạy thử trên trang đang mở.",
+  enabledDetail: "Đã bật. Workflow sẽ được gợi ý khi bạn mở đúng trang.",
+  draftRestoredDetail: "Đã lưu ở phiên trước — danh sách bước không còn trong cửa sổ hội thoại này; chạy thử vẫn kiểm chứng được bản đã lưu.",
+  stepsHeading: "Các bước",
+  noSteps: "Không có danh sách bước trong hội thoại này.",
+  saveDraft: "Lưu bản nháp",
+  saving: "Đang lưu…",
+  prove: "Chạy thử",
+  proveAgain: "Chạy thử lại",
+  proving: "Đang chạy thử…",
+  enable: "Bật workflow",
+  cancel: "Hủy",
+  proofOk: "Chạy thử đạt",
+  proofFailed: "Chạy thử chưa đạt",
+  freshness: "Nguồn",
+  driftTitle: "Workflow bị lệch so với trang hiện tại",
+  driftHint: "Hãy nhờ trợ lý xem lại trang và đề xuất bản sửa cho workflow này.",
+  healTitle: "Đề xuất sửa workflow",
+  healDetail: "Trợ lý đề xuất một phiên bản mới cho workflow đã lệch. Chưa có gì được ghi cho tới khi bạn đồng ý.",
+  healAllow: "Lưu bản sửa",
+  healDeny: "Bỏ qua",
+  healDeciding: "Đang lưu…",
+  healSaved: "Đã lưu phiên bản mới",
+  healRejected: "Đã bỏ qua — không có gì được ghi",
+  healExpired: "Đã hết hạn",
+  healSuperseded: "Đã được thay thế bởi một đề xuất mới hơn",
+  healExpiresAt: "Đề xuất hết hạn lúc",
+  baseVersion: "Bản gốc",
+  hostUnavailable: "Mất kết nối với companion — chưa thực hiện được thao tác workflow.",
+  noTab: "Chưa gắn trang nào để chạy thử — hãy mở trang của workflow rồi thử lại.",
+  missingDraft: "Bản nháp này không còn đủ dữ liệu để lưu — hãy yêu cầu dựng lại từ lượt chạy.",
+  edit: "Sửa",
+  editSave: "Lưu phiên bản mới",
+  editSaving: "Đang lưu bản sửa…",
+  editCancel: "Huỷ sửa",
+  editLoading: "Đang tải các bước…",
+  editHint: "Sửa tham số hoặc xoá bước rồi lưu — bản lưu là một phiên bản mới, bản cũ vẫn giữ nguyên và bản mới cần chạy thử lại trước khi bật.",
+  editRemoveStep: "Xoá bước",
+  editInvalidArgs: "Tham số không phải JSON hợp lệ — sửa lại trước khi lưu.",
+  editNoSteps: "Không còn bước nào — cần ít nhất một bước để lưu."
+});
+
+// Why a derivation / proof / enable / heal answer was refused. The host names
+// the reason; this maps it to the operator's language rather than showing a
+// code — an unmapped code falls back to the generic sentence, never to a
+// fabricated explanation.
+const WORKFLOW_REFUSAL_REASON_VI = Object.freeze({
+  unknown_run: "không tìm thấy lượt chạy này",
+  run_not_completed: "lượt chạy chưa hoàn tất",
+  no_trail: "lượt chạy không có dấu vết hành động nào để dựng lại",
+  unknown_conversation: "cuộc trò chuyện không còn tồn tại",
+  unknown_workflow: "không tìm thấy workflow này (có thể đã bị xoá)",
+  busy: "trình duyệt đang được một lượt chạy khác sử dụng — hãy thử lại sau",
+  bridge_unavailable: "chưa kết nối được tới trình duyệt",
+  bridge_error: "cầu nối tới trình duyệt gặp lỗi",
+  extension_error: "tiện ích trình duyệt từ chối yêu cầu",
+  invalid_definition: "định nghĩa không hợp lệ",
+  stale_version: "phiên bản đã cũ so với bản đang lưu",
+  unknown_proposal: "đề xuất này không còn tồn tại",
+  expired: "đề xuất đã hết hạn",
+  superseded: "đề xuất đã được thay thế",
+  stale_base: "workflow đã thay đổi kể từ khi đề xuất được tạo",
+  invalid_candidate: "bản sửa không hợp lệ",
+  not_in_agent_group: "tab này không thuộc nhóm của trợ lý",
+  tab_gone: "tab đã đóng",
+  binding_mismatch: "trang hiện tại không còn khớp miền đã ghi trong workflow",
+  invalid_args: "yêu cầu không hợp lệ",
+  host_unavailable: "mất kết nối với companion"
+});
+
+const WORKFLOW_DRIFT_REASON_VI = Object.freeze({
+  target_no_longer_resolves: "phần tử mà bước này nhắm tới không còn tồn tại trên trang",
+  binding_mismatch: "trang hiện tại không còn khớp miền đã ghi trong workflow"
+});
+
+/** One operator-facing sentence for a refusal reason the host named. When the
+ * refusal carries the structured binding evidence (`expected`/`actualHost`),
+ * that is named too — the operator needs to see WHICH domain mismatched, not
+ * just that one did. */
+function workflowRefusalText(reason, detail) {
+  const known = reason && WORKFLOW_REFUSAL_REASON_VI[reason];
+  const base = known ? `Không thực hiện được: ${known}.` : "Không thực hiện được thao tác workflow này.";
+  const binding = detail && typeof detail === "object" ? detail : null;
+  if (binding && Array.isArray(binding.expected) && binding.expected.length) {
+    const expected = binding.expected.map((d) => String(d)).join(", ");
+    const actual = binding.actualHost ? String(binding.actualHost) : "không xác định";
+    return `${base} (miền đã ghi: ${expected}; trang hiện tại: ${actual})`;
+  }
+  return base;
+}
+
+/** The notice a refused derivation shows (never a card — the operator gets a
+ * sentence, not a review surface for a draft that does not exist). */
+function workflowDraftRefusalText(reply) {
+  if (reply && Array.isArray(reply.incomplete) && reply.incomplete.length) {
+    const reasons = reply.incomplete.map((r) => String(r)).filter(Boolean);
+    if (reasons.length) return `Chưa dựng được workflow từ lượt này: ${reasons.join("; ")}.`;
+  }
+  return workflowRefusalText(reply && reply.reason);
+}
+
+/** `HH:MM` for an ISO timestamp, or "" when it cannot be read. The same
+ * formatting the answer-source citation uses, so two freshness lines in one
+ * transcript never disagree. */
+function formatClockVi(iso) {
+  try {
+    return new Date(iso).toLocaleTimeString("vi-VN", { hour: "2-digit", minute: "2-digit" });
+  } catch {
+    return "";
+  }
+}
+
+/** `host · HH:MM` for a step outcome that read live content (the freshness
+ * evidence the spec requires on results). "" when the step carried none. */
+function workflowOutcomeSource(outcome) {
+  if (!outcome || typeof outcome.url !== "string" || !outcome.url) return "";
+  let host = outcome.url;
+  try {
+    host = new URL(outcome.url).hostname || outcome.url;
+  } catch {
+    host = outcome.url;
+  }
+  const time = outcome.fetchedAt ? formatClockVi(outcome.fetchedAt) : "";
+  return time ? `${host} · ${time}` : host;
+}
+
+/** Evidence from a drift event: the host's own text, or its JSON for the
+ * structured (binding-mismatch) case. Rendered escaped, always. */
+function workflowEvidenceText(evidence) {
+  if (evidence == null) return "";
+  if (typeof evidence === "string") return evidence;
+  try {
+    return JSON.stringify(evidence);
+  } catch {
+    return "";
+  }
+}
+
+const WORKFLOW_STEP_STATE_VI = Object.freeze({
+  ok: "đạt",
+  failed: "lỗi",
+  unexecutable: "không chạy được ở đây"
+});
+
+/** One step line: the step's own identity (kind + tool + args summary, through
+ * the SAME summarizer the action timeline uses) plus its proof outcome, if the
+ * proof reached it. `outcome` is absent for a draft that has not been proved. */
+function workflowStepLineHtml(step, index, outcome) {
+  const kind = step && typeof step.kind === "string" ? step.kind : "?";
+  const ref = step && typeof step.ref === "string" ? step.ref : "";
+  const display = ref ? toolRowDisplay({ toolName: ref, args: (step && step.args) || {}, status: "succeeded" }) : { label: kind, detail: "" };
+  const stateText = outcome ? WORKFLOW_STEP_STATE_VI[outcome.status] || outcome.status : "";
+  const reasonText = outcome && outcome.reason ? ` (${escapeHtml(String(outcome.reason))})` : "";
+  const source = outcome ? workflowOutcomeSource(outcome) : "";
+  return `<li class="workflow-step" data-step-index="${escapeHtml(String(index))}" data-step-status="${escapeHtml(String(outcome ? outcome.status : "pending"))}">
+      <span class="workflow-step-index">${escapeHtml(String(index + 1))}</span>
+      <span class="workflow-step-main">
+        <span class="workflow-step-label">${escapeHtml(display.label)}${ref && display.label !== ref ? ` <code>${escapeHtml(ref)}</code>` : ""}</span>
+        ${display.detail ? `<span class="workflow-step-detail">${escapeHtml(display.detail)}</span>` : ""}
+        ${source ? `<span class="workflow-step-source">${escapeHtml(source)}</span>` : ""}
+      </span>
+      ${stateText ? `<span class="workflow-step-state is-${escapeHtml(String(outcome.status))}">${escapeHtml(stateText)}${reasonText}</span>` : ""}
+    </li>`;
+}
+
+function workflowStepsHtml(steps, outcomes) {
+  const list = Array.isArray(steps) ? steps : [];
+  if (!list.length) return `<p class="workflow-card-note">${escapeHtml(WORKFLOW_COPY.noSteps)}</p>`;
+  const byIndex = new Map((Array.isArray(outcomes) ? outcomes : []).map((o) => [o && o.index, o]));
+  return `<p class="workflow-card-subhead">${escapeHtml(WORKFLOW_COPY.stepsHeading)}</p>
+    <ul class="workflow-steps">${list.map((step, i) => workflowStepLineHtml(step, i, byIndex.get(i))).join("")}</ul>`;
+}
+
+/** Parse one edit row's args text: empty (or whitespace) means "no args"; a
+ * non-object JSON value or unparseable text is a refusal — never a thrown
+ * error, and never a silently dropped step. */
+function parseWorkflowEditArgs(text) {
+  const raw = String(text == null ? "" : text).trim();
+  if (!raw) return { ok: true, args: undefined };
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { ok: false };
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return { ok: false };
+  return { ok: true, args: parsed };
+}
+
+/** Merge one row's live text back into its step; the identity fields (kind,
+ * ref) are the host's and stay untouched. */
+function applyWorkflowEditArgs(step, text) {
+  const parsed = parseWorkflowEditArgs(text);
+  if (!parsed.ok) return { ok: false };
+  const next = { ...(step || {}) };
+  if (parsed.args === undefined) delete next.args;
+  else next.args = parsed.args;
+  return { ok: true, step: next };
+}
+
+/** Rebuild the steps array from the working copy plus the row inputs, in
+ * order. All-or-nothing: one bad row refuses the whole save and names its
+ * index, so nothing half-edited is ever sent. */
+function buildWorkflowEditSteps(steps, texts) {
+  const list = Array.isArray(steps) ? steps : [];
+  const inputs = Array.isArray(texts) ? texts : [];
+  const out = [];
+  for (const [index, step] of list.entries()) {
+    const merged = applyWorkflowEditArgs(step, inputs[index]);
+    if (!merged.ok) return { ok: false, index };
+    out.push(merged.step);
+  }
+  return { ok: true, steps: out };
+}
+
+/** The edit view: one row per step — identity read-only, args as editable
+ * JSON, a remove control per row. Rows mirror the step list's markup so a
+ * proof outcome rendered under an edited step stays visually consistent. */
+function workflowEditHtml(item) {
+  const edit = item.edit;
+  if (!edit) return "";
+  if (edit.status === "loading") return `<p class="workflow-card-note">${escapeHtml(WORKFLOW_COPY.editLoading)}</p>`;
+  const steps = Array.isArray(edit.steps) ? edit.steps : [];
+  const disabled = edit.status === "saving" ? "disabled" : "";
+  const rows = steps
+    .map((step, i) => {
+      const ref = step && typeof step.ref === "string" ? step.ref : "";
+      const kind = step && typeof step.kind === "string" ? step.kind : "tool";
+      const argsText = step && step.args && typeof step.args === "object" ? JSON.stringify(step.args) : "";
+      return `<li class="workflow-step is-edit" data-step-index="${escapeHtml(String(i))}" data-step-status="pending">
+      <span class="workflow-step-index">${escapeHtml(String(i + 1))}</span>
+      <span class="workflow-step-main">
+        <span class="workflow-step-label"><code>${escapeHtml(ref || kind)}</code></span>
+        <input class="workflow-edit-args" data-step-args="${escapeHtml(String(i))}" type="text" spellcheck="false"
+          value="${escapeHtml(argsText)}" placeholder="{}" aria-label="${escapeHtml(`Tham số bước ${i + 1}`)}" ${disabled} />
+      </span>
+      <button class="btn btn-ghost btn-sm" type="button" data-workflow-action="remove-step"
+        data-workflow-id="${escapeHtml(String(item.workflowId ?? ""))}" data-step-index="${escapeHtml(String(i))}"
+        title="${escapeHtml(WORKFLOW_COPY.editRemoveStep)}" aria-label="${escapeHtml(`${WORKFLOW_COPY.editRemoveStep} ${i + 1}`)}" ${disabled}>✕</button>
+    </li>`;
+    })
+    .join("");
+  return `<p class="workflow-card-subhead">${escapeHtml(WORKFLOW_COPY.stepsHeading)}</p>
+    <ul class="workflow-steps is-editing">${rows || `<li class="workflow-step"><span class="workflow-step-main">${escapeHtml(WORKFLOW_COPY.editNoSteps)}</span></li>`}</ul>
+    <p class="workflow-card-note">${escapeHtml(WORKFLOW_COPY.editHint)}</p>`;
+}
+
+/** The edit view's problem line: a local refusal's own text, or the host's
+ * structured refusal (schema errors first, then a named reason and the
+ * current version when one was disclosed). */
+function workflowEditProblemHtml(item) {
+  const problem = item.edit && item.edit.problem;
+  if (!problem) return "";
+  const text = problem.text
+    ? problem.text
+    : Array.isArray(problem.errors) && problem.errors.length
+      ? problem.errors
+          .map((e) => (e && (e.message || e.code)) || String(e))
+          .filter(Boolean)
+          .join("; ")
+      : `${workflowRefusalText(problem.reason || "edit_refused")}${Number.isInteger(problem.latest) ? ` (bản mới nhất: v${problem.latest})` : ""}`;
+  return text ? `<p class="workflow-card-error" role="alert">${escapeHtml(text)}</p>` : "";
+}
+
+/** The card's identity/meta line: record id, version, step count, domain and
+ * document binding. Every field is shown only when the host actually reported
+ * it — nothing is inferred. */
+function workflowMetaHtml(item) {
+  const review = item.review && typeof item.review === "object" ? item.review : {};
+  const draft = item.draft && typeof item.draft === "object" ? item.draft : {};
+  // A domain constraint reaches this card either as the single bound `domain`
+  // or as the full recorded `domains` set (the host's draft reply carries the
+  // latter); both are shown, and nothing is inferred when neither is present.
+  const domainOf = (v) =>
+    typeof v === "string" && v.trim() ? v.trim() : Array.isArray(v) ? v.filter((d) => typeof d === "string" && d.trim()).join(", ") : "";
+  const parts = [];
+  if (item.workflowId) parts.push(`<code>${escapeHtml(String(item.workflowId))}</code>`);
+  if (item.version != null) parts.push(`phiên bản v${escapeHtml(String(item.version))}`);
+  const stepCount = Array.isArray(review.steps) ? review.steps.length : item.stepsCount;
+  if (Number.isInteger(stepCount)) parts.push(`${escapeHtml(String(stepCount))} bước`);
+  const domain = domainOf(review.domains) || domainOf(review.domain) || domainOf(draft.domains) || domainOf(draft.domain);
+  parts.push(domain ? `miền: ${escapeHtml(domain)}` : "miền: không giới hạn");
+  if (review.document) parts.push("có ràng buộc tài liệu đã gắn");
+  return parts.length ? `<p class="workflow-card-meta">${parts.join(" · ")}</p>` : "";
+}
+
+function workflowProofHtml(item) {
+  if (!item.proof) return "";
+  const ok = item.proof.ok === true;
+  // Verdict + the host's summary only: the per-step outcomes are rendered ON
+  // the step list itself (renderWorkflowDraftItemHtml passes item.proofOutcomes
+  // down), so a proof never shows a second, parallel copy of the same steps.
+  return `<div class="workflow-proof ${ok ? "is-ok" : "is-failed"}" role="status">
+      <p class="workflow-proof-verdict">${iconMarkup(ok ? "checkCircle" : "xCircle", { size: 14 })} ${escapeHtml(ok ? WORKFLOW_COPY.proofOk : WORKFLOW_COPY.proofFailed)}</p>
+      ${item.proof.summary ? `<p class="workflow-card-note">${escapeHtml(String(item.proof.summary))}</p>` : ""}
+    </div>`;
+}
+
+function workflowErrorHtml(item) {
+  const err = item.lastError;
+  if (!err) return "";
+  if (err.op === "save" && Array.isArray(err.errors) && err.errors.length) {
+    const lines = err.errors.map((e) => (e && (e.message || e.code)) || String(e)).filter(Boolean);
+    return `<p class="workflow-card-error" role="alert">${escapeHtml(WORKFLOW_COPY.saveDraft)}: ${escapeHtml(lines.join("; "))}</p>`;
+  }
+  return `<p class="workflow-card-error" role="alert">${escapeHtml(workflowRefusalText(err.reason))}</p>`;
+}
+
+function workflowDraftActionsHtml(item) {
+  const dismiss = `<button class="btn btn-ghost btn-sm" type="button" data-workflow-action="dismiss" data-workflow-run-id="${escapeHtml(String(item.runId ?? ""))}">${escapeHtml(WORKFLOW_COPY.cancel)}</button>`;
+  if (item.edit) {
+    const saving = item.edit.status === "saving";
+    const ready = item.edit.status === "editing";
+    return `<div class="workflow-card-actions">
+        <button class="btn btn-ghost btn-sm" type="button" data-workflow-action="edit-cancel" data-workflow-id="${escapeHtml(String(item.workflowId ?? ""))}" ${saving ? "disabled" : ""}>${escapeHtml(WORKFLOW_COPY.editCancel)}</button>
+        <button class="btn btn-primary btn-sm" type="button" data-workflow-action="edit-save" data-workflow-id="${escapeHtml(String(item.workflowId ?? ""))}" ${ready ? "" : "disabled"}>${escapeHtml(saving ? WORKFLOW_COPY.editSaving : WORKFLOW_COPY.editSave)}</button>
+      </div>`;
+  }
+  if (item.status === "review") {
+    const busy = item.busy === "saving";
+    return `<div class="workflow-card-actions">
+        ${dismiss}
+        <button class="btn btn-primary btn-sm" type="button" data-workflow-action="save" data-workflow-run-id="${escapeHtml(String(item.runId ?? ""))}" ${busy ? "disabled" : ""}>${escapeHtml(busy ? WORKFLOW_COPY.saving : WORKFLOW_COPY.saveDraft)}</button>
+      </div>`;
+  }
+  if (item.status === "saved" || item.status === "proved") {
+    const proving = item.busy === "proving";
+    const canEnable = item.status === "proved" && item.proof && item.proof.ok === true;
+    const proveLabel = item.status === "proved" ? WORKFLOW_COPY.proveAgain : WORKFLOW_COPY.prove;
+    return `<div class="workflow-card-actions">
+        ${dismiss}
+        <button class="btn ${canEnable ? "btn-secondary" : "btn-primary"} btn-sm" type="button" data-workflow-action="prove" data-workflow-id="${escapeHtml(String(item.workflowId ?? ""))}" ${proving ? "disabled" : ""}>${escapeHtml(proving ? WORKFLOW_COPY.proving : proveLabel)}</button>
+        ${
+          canEnable
+            ? `<button class="btn btn-primary btn-sm" type="button" data-workflow-action="enable" data-workflow-id="${escapeHtml(String(item.workflowId ?? ""))}">${escapeHtml(WORKFLOW_COPY.enable)}</button>`
+            : ""
+        }
+        <button class="btn btn-secondary btn-sm" type="button" data-workflow-action="edit" data-workflow-id="${escapeHtml(String(item.workflowId ?? ""))}">${escapeHtml(WORKFLOW_COPY.edit)}</button>
+      </div>`;
+  }
+  if (item.status === "enabled") {
+    return `<div class="workflow-card-actions">
+        ${dismiss}
+        <button class="btn btn-secondary btn-sm" type="button" data-workflow-action="edit" data-workflow-id="${escapeHtml(String(item.workflowId ?? ""))}">${escapeHtml(WORKFLOW_COPY.edit)}</button>
+      </div>`;
+  }
+  return ""; // dismissed
+}
+
+/** The draft card. States: review (derived, not stored) -> saving -> saved
+ * (disabled, awaiting proof) -> proving -> proved (proof.ok decides whether
+ * enablement is offered) -> enabled. A card restored purely from events has no
+ * step list (the definition lives host-side) and says so rather than showing
+ * an invented one. */
+function renderWorkflowDraftItemHtml(item) {
+  if (!item || item.dismissed) return "";
+  const title =
+    item.status === "enabled"
+      ? WORKFLOW_COPY.draftEnabledTitle
+      : item.status === "proved"
+        ? WORKFLOW_COPY.draftProvedTitle
+        : item.status === "saved"
+          ? WORKFLOW_COPY.draftSavedTitle
+          : WORKFLOW_COPY.draftTitle;
+  const detail =
+    item.status === "enabled"
+      ? WORKFLOW_COPY.enabledDetail
+      : item.status === "proved"
+        ? WORKFLOW_COPY.provedDetail
+        : item.status === "saved"
+          ? WORKFLOW_COPY.savedDetail
+          : WORKFLOW_COPY.draftDetail;
+  const steps = Array.isArray(item.review?.steps) ? item.review.steps : Array.isArray(item.draft?.steps) ? item.draft.steps : [];
+  const stepsHtml = item.edit
+    ? workflowEditHtml(item)
+    : steps.length
+      ? workflowStepsHtml(steps, Array.isArray(item.proofOutcomes) ? item.proofOutcomes : null)
+      : item.status === "review"
+        ? ""
+        : `<p class="workflow-card-note">${escapeHtml(WORKFLOW_COPY.draftRestoredDetail)}</p>`;
+  return `<div class="card workflow-card" data-workflow-kind="draft" data-workflow-status="${escapeHtml(String(item.status))}">
+      <div class="permission-card-head">
+        <span class="permission-card-icon">${iconMarkup("skills", { size: 18 })}</span>
+        <div>
+          <p class="permission-card-title">${escapeHtml(title)}</p>
+          <p class="permission-card-detail">${escapeHtml(detail)}</p>
+        </div>
+      </div>
+      ${workflowMetaHtml(item)}
+      ${stepsHtml}
+      ${workflowProofHtml(item)}
+      ${workflowEditProblemHtml(item)}
+      ${workflowErrorHtml(item)}
+      ${workflowDraftActionsHtml(item)}
+    </div>`;
+}
+
+/** The drift notice: a FACT about a past execution — no controls, no
+ * `role="alertdialog"`, nothing to answer (spec "Drift is a distinguishable
+ * execution outcome" / the change's "static, no authority" rule). */
+function renderWorkflowDriftItemHtml(item) {
+  if (!item) return "";
+  const stepLabel = item.step != null ? `bước ${item.step + 1}` : "một bước";
+  const reason = WORKFLOW_DRIFT_REASON_VI[item.reason] || "workflow không còn khớp với trang";
+  const evidence = workflowEvidenceText(item.evidence);
+  return `<div class="workflow-drift-note" role="status" data-workflow-kind="drift">
+      <span class="workflow-drift-icon">${iconMarkup("alertTriangle", { size: 14 })}</span>
+      <div class="workflow-drift-body">
+        <p class="workflow-drift-title">${escapeHtml(WORKFLOW_COPY.driftTitle)}: ${escapeHtml(String(item.workflowId || "(không rõ)"))}</p>
+        <p class="workflow-drift-line">${escapeHtml(`${stepLabel} — ${reason}`)}</p>
+        ${evidence ? `<div class="workflow-drift-evidence"><code>${escapeHtml(evidence)}</code></div>` : ""}
+        <p class="workflow-drift-hint">${escapeHtml(WORKFLOW_COPY.driftHint)}</p>
+      </div>
+    </div>`;
+}
+
+/** The heal proposal card: reason + evidence + base version, with Allow/Deny
+ * bound to THIS proposal id, and a bounded expiry that resolves to its own
+ * distinguishable state (never to "still pending"). */
+function renderWorkflowHealItemHtml(item, now = Date.now()) {
+  if (!item || item.dismissed) return "";
+  const expired = item.status === "pending" && typeof item.expiresAt === "number" && item.expiresAt <= now;
+  const status = expired ? "expired" : item.status;
+  const lines = [];
+  if (item.reason) lines.push(item.reason);
+  const evidence = workflowEvidenceText(item.evidence);
+  if (evidence) lines.push(evidence);
+  const statusHtml =
+    status === "saved"
+      ? `<p class="workflow-card-note is-ok">${escapeHtml(`${WORKFLOW_COPY.healSaved}${item.toVersion != null ? ` (v${item.toVersion})` : ""}`)}</p>`
+      : status === "rejected"
+        ? `<p class="workflow-card-note">${escapeHtml(WORKFLOW_COPY.healRejected)}</p>`
+        : status === "expired"
+          ? `<p class="workflow-card-note">${escapeHtml(WORKFLOW_COPY.healExpired)}</p>`
+          : status === "superseded"
+            ? `<p class="workflow-card-note">${escapeHtml(WORKFLOW_COPY.healSuperseded)}</p>`
+            : "";
+  const expiryHtml =
+    status === "pending" && typeof item.expiresAt === "number"
+      ? `<p class="workflow-card-note">${escapeHtml(`${WORKFLOW_COPY.healExpiresAt} ${formatClockVi(new Date(item.expiresAt).toISOString())}`)}</p>`
+      : "";
+  const busy = item.busy === "deciding";
+  const actionsHtml =
+    status === "pending"
+      ? `<div class="workflow-card-actions">
+          <button class="btn btn-ghost btn-sm" type="button" data-workflow-action="heal-deny" data-workflow-proposal-id="${escapeHtml(String(item.proposalId))}" ${busy ? "disabled" : ""}>${escapeHtml(WORKFLOW_COPY.healDeny)}</button>
+          <button class="btn btn-primary btn-sm" type="button" data-workflow-action="heal-allow" data-workflow-proposal-id="${escapeHtml(String(item.proposalId))}" ${busy ? "disabled" : ""}>${escapeHtml(busy ? WORKFLOW_COPY.healDeciding : WORKFLOW_COPY.healAllow)}</button>
+        </div>`
+      : "";
+  return `<div class="card workflow-card workflow-heal-card" data-workflow-kind="heal" data-workflow-status="${escapeHtml(String(status))}">
+      <div class="permission-card-head">
+        <span class="permission-card-icon">${iconMarkup("spark", { size: 18 })}</span>
+        <div>
+          <p class="permission-card-title">${escapeHtml(WORKFLOW_COPY.healTitle)}</p>
+          <p class="permission-card-detail">${escapeHtml(WORKFLOW_COPY.healDetail)}</p>
+        </div>
+      </div>
+      <p class="workflow-card-meta">${escapeHtml(`${WORKFLOW_COPY.baseVersion} v${item.baseVersion != null ? item.baseVersion : "?"}`)}${item.workflowId ? ` · <code>${escapeHtml(String(item.workflowId))}</code>` : ""}</p>
+      <ul class="workflow-heal-reasons">${lines.map((l) => `<li>${escapeHtml(String(l))}</li>`).join("")}</ul>
+      ${workflowErrorHtml(item)}
+      ${statusHtml}
+      ${expiryHtml}
+      ${actionsHtml}
+    </div>`;
+}
+
+// ---- the composer-level notice (never a card) -----------------------------
+// An incomplete derivation is a sentence about something that did NOT happen
+// (no draft exists to review), so it belongs in the same inline slot family
+// composer-scoped problems already use — not in a permission card, which would
+// imply a decision.
+function installWorkflowNotice() {
+  const notice = document.createElement("div");
+  notice.className = "workflow-notice";
+  notice.setAttribute("id", "workflow-notice");
+  notice.setAttribute("role", "alert");
+  notice.hidden = true;
+  el.composerWrap.insertBefore(notice, el.composerInput.parentNode);
+  return notice;
+}
+{
+  el.workflowNotice = installWorkflowNotice();
+}
+
+/** Show/replace the inline workflow notice. Never a card, never a decision. */
+function showWorkflowNotice(text) {
+  if (!el.workflowNotice) return;
+  el.workflowNotice.textContent = text || "";
+  el.workflowNotice.hidden = !text;
+}
+function clearWorkflowNotice() {
+  showWorkflowNotice("");
+}
+
+// ---- the turn footer's affordance -----------------------------------------
+// The run whose turn should offer "Lưu thành workflow", or null. Deliberately
+// narrow: the LATEST turn, only once it COMPLETED (a run still going has no
+// finished trail), never while a run is active or a derivation/enhancement is
+// in flight, and never twice for the same run — once a draft card exists for
+// it, the card is the affordance.
+// Takes one plain options object (NOT a destructured parameter) so
+// test/_extract.mjs's brace-matching — which lands on the first `{` after the
+// function name — finds this function's actual body rather than a
+// destructuring pattern in its own parameter list. The same constraint
+// background.js's createAgentSettingsRelay documents.
+function workflowAffordanceRunId(model, options) {
+  const opts = options && typeof options === "object" ? options : {};
+  if (!model || opts.draftPending === true || opts.enhancePending === true) return null;
+  if (typeof model.hasActiveRun === "function" && model.hasActiveRun()) return null;
+  let latest = null;
+  for (let i = model.items.length - 1; i >= 0; i--) {
+    if (model.items[i].kind === "assistant_turn") {
+      latest = model.items[i];
+      break;
+    }
+  }
+  if (!latest || latest.complete !== true || latest.runId == null) return null;
+  if (model.items.some((it) => it.kind === "workflow_draft" && String(it.runId) === String(latest.runId))) return null;
+  return latest.runId;
+}
+
+/** In-flight derivation state for the affordance (module-local: it exists only
+ * while a request the panel itself made is outstanding, and it dies with the
+ * document on purpose). */
+let workflowDraftPendingRunId = null;
+
+/** The tab a proof runs against: the page this panel document is bound to,
+ * read FRESH at click time. A cached tabId could prove a different page than
+ * the one on screen, which is exactly the freshness the proof exists to
+ * establish. */
+function currentWorkflowTabId() {
+  const snap = pageContext ? pageContext.snapshot() : null;
+  return snap && typeof snap.tabId === "number" ? snap.tabId : null;
+}
+
+/** The definition payload for `workflow_draft_save`: ONLY what the derivation
+ * produced. The host re-validates it with the registry's own schema and owns
+ * the owner/enabled policy, so this never fabricates an owner and never asks
+ * for enablement. */
+function buildWorkflowDefinitionFromDraft(draft) {
+  if (!draft || typeof draft !== "object") return null;
+  const id = typeof draft.workflowId === "string" ? draft.workflowId : typeof draft.id === "string" ? draft.id : null;
+  if (!id || !Array.isArray(draft.steps) || !draft.steps.length) return null;
+  const definition = {
+    id,
+    name: typeof draft.name === "string" && draft.name.trim() ? draft.name.trim() : id,
+    steps: draft.steps
+  };
+  if (typeof draft.domain === "string" && draft.domain.trim()) definition.domainConstraints = [draft.domain.trim()];
+  else if (Array.isArray(draft.domain) && draft.domain.length) definition.domainConstraints = draft.domain.filter((d) => typeof d === "string");
+  // The host's own draft reply may carry EVERY recorded host as `domains`
+  // (rather than the single bound `domain`): when it does, the constraint list
+  // is that set — the definition must not silently narrow to one host.
+  if (Array.isArray(draft.domains) && draft.domains.length) {
+    const domains = draft.domains.filter((d) => typeof d === "string" && d.trim());
+    if (domains.length) definition.domainConstraints = domains;
+  }
+  if (draft.document) definition.documentConstraints = { requireBoundDocument: true };
+  return definition;
+}
+
+async function requestWorkflowDraftForRun(runId) {
+  if (runId == null || workflowDraftPendingRunId != null) return;
+  workflowDraftPendingRunId = runId;
+  clearWorkflowNotice();
+  render(); // the affordance disappears while its own request is in flight
+  let reply = null;
+  try {
+    reply = await panel.requestWorkflowDraft(runId);
+  } finally {
+    workflowDraftPendingRunId = null;
+  }
+  if (!reply) showWorkflowNotice(WORKFLOW_COPY.hostUnavailable);
+  else if (reply.ok !== true) showWorkflowNotice(workflowDraftRefusalText(reply));
+  render();
+}
+
+async function saveWorkflowDraftItem(item) {
+  if (!item) return;
+  const definition = buildWorkflowDefinitionFromDraft(item.draft);
+  if (!definition) {
+    showWorkflowNotice(WORKFLOW_COPY.missingDraft);
+    render();
+    return;
+  }
+  const reply = await panel.saveWorkflowDraft(item.runId, definition);
+  if (!reply) showWorkflowNotice(WORKFLOW_COPY.hostUnavailable);
+  render();
+}
+
+async function proveWorkflowItem(item) {
+  if (!item || !item.workflowId) return;
+  const tabId = currentWorkflowTabId();
+  if (tabId == null) {
+    showWorkflowNotice(WORKFLOW_COPY.noTab);
+    render();
+    return;
+  }
+  const reply = await panel.proveWorkflow({ workflowId: item.workflowId, version: item.version, tabId });
+  if (!reply) showWorkflowNotice(WORKFLOW_COPY.hostUnavailable);
+  else if (reply.ok !== true) showWorkflowNotice(workflowRefusalText(reply.reason, reply.detail));
+  render();
+}
+
+async function enableWorkflowItem(item) {
+  if (!item || !item.workflowId) return;
+  const reply = await panel.enableWorkflow({ workflowId: item.workflowId, version: item.version });
+  if (!reply) showWorkflowNotice(WORKFLOW_COPY.hostUnavailable);
+  else if (reply.ok !== true) showWorkflowNotice(workflowRefusalText(reply.reason));
+  render();
+}
+
+/** The live args inputs of one edit card, in row order. */
+function workflowEditRowTexts(card) {
+  return Array.from(card.querySelectorAll("input.workflow-edit-args")).map((input) => input.value);
+}
+
+async function openWorkflowEditItem(item) {
+  if (!item || !item.workflowId) return;
+  await panel.requestWorkflowEdit({ workflowId: item.workflowId, version: item.version });
+  render();
+}
+
+async function saveWorkflowEditItem(item, btn, model) {
+  if (!item || !item.workflowId || !item.edit || !btn) return;
+  const card = btn.closest(".workflow-card");
+  const collected = card ? buildWorkflowEditSteps(item.edit.steps, workflowEditRowTexts(card)) : { ok: false };
+  if (!collected.ok) {
+    model.setWorkflowEditProblem(item.workflowId, WORKFLOW_COPY.editInvalidArgs);
+    render();
+    return;
+  }
+  const reply = await panel.saveWorkflowEdit({ workflowId: item.workflowId, version: item.edit.version ?? item.version, steps: collected.steps });
+  if (!reply) showWorkflowNotice(WORKFLOW_COPY.hostUnavailable);
+  render();
+}
+
+function removeWorkflowEditRow(item, btn, model) {
+  if (!item || !item.edit || !btn) return;
+  const card = btn.closest(".workflow-card");
+  const index = Number(btn.getAttribute("data-step-index"));
+  if (!card || !Number.isInteger(index)) return;
+  const collected = buildWorkflowEditSteps(item.edit.steps, workflowEditRowTexts(card));
+  if (!collected.ok) {
+    model.setWorkflowEditProblem(item.workflowId, WORKFLOW_COPY.editInvalidArgs);
+    render();
+    return;
+  }
+  model.replaceWorkflowEditSteps(item.workflowId, collected.steps.filter((_, i) => i !== index));
+  render();
+}
+
+async function decideWorkflowHealItem(item, decision) {
+  if (!item || !item.proposalId) return;
+  const reply = await panel.decideWorkflowHeal({ proposalId: item.proposalId, decision });
+  if (!reply) showWorkflowNotice(WORKFLOW_COPY.hostUnavailable);
+  // A refusal is rendered ON the card (settleWorkflowHealDecision stores the
+  // host's reason), so a late decision shows what the host actually said
+  // instead of a card that quietly resets to pending.
+  render();
+}
+
+/** The item a workflow card's control belongs to. Cards carry the identity
+ * their buttons act on (runId while unsaved, workflowId once saved, proposalId
+ * for a heal) because item ORDER is not identity: a re-render must never let a
+ * click land on a different card's record. */
+function workflowItemForControl(model, btn) {
+  if (!model || !btn) return null;
+  const proposalId = btn.getAttribute("data-workflow-proposal-id");
+  if (proposalId) return model.workflowHealItem(proposalId);
+  const workflowId = btn.getAttribute("data-workflow-id");
+  if (workflowId) return model.workflowDraftItem({ workflowId });
+  const runId = btn.getAttribute("data-workflow-run-id");
+  if (runId != null && runId !== "") return model.workflowDraftItem({ runId });
+  return null;
+}
+
+function wireWorkflowControls(model) {
+  for (const btn of el.transcript.querySelectorAll(".turn-workflow-btn")) {
+    btn.addEventListener("click", () => requestWorkflowDraftForRun(btn.getAttribute("data-run-id")));
+  }
+  for (const btn of el.transcript.querySelectorAll("[data-workflow-action]")) {
+    btn.addEventListener("click", () => {
+      const item = workflowItemForControl(model, btn);
+      if (!item) return;
+      const action = btn.getAttribute("data-workflow-action");
+      if (action === "save") return saveWorkflowDraftItem(item);
+      if (action === "prove") return proveWorkflowItem(item);
+      if (action === "enable") return enableWorkflowItem(item);
+      if (action === "edit") return openWorkflowEditItem(item);
+      if (action === "edit-save") return saveWorkflowEditItem(item, btn, model);
+      if (action === "edit-cancel") {
+        model.cancelWorkflowEdit(item.workflowId);
+        render();
+        return;
+      }
+      if (action === "remove-step") return removeWorkflowEditRow(item, btn, model);
+      if (action === "heal-allow") return decideWorkflowHealItem(item, "allow");
+      if (action === "heal-deny") return decideWorkflowHealItem(item, "deny");
+      if (action === "dismiss") {
+        // Local only, and deliberately so: the durable record (the saved
+        // version, the proposal's outcome) is the host's, while "stop showing
+        // me this card" is the operator's — a reload rebuilds the card from
+        // the host's events, which is the honest behaviour for a record that
+        // still exists.
+        item.dismissed = true;
+        render();
+      }
+    });
+  }
 }
 
 let wasNearBottom = true;
@@ -1453,7 +2355,13 @@ function transcriptStructureSignature(model, opts) {
   for (const item of model.items) {
     switch (item.kind) {
       case "user":
-        parts.push(`u:${item.runId ?? ""}:${item.isPlaceholder ? 1 : 0}:${(item.attachments || []).length}`);
+        // `queueState`/`interruptFellBack` are structural: a chip appearing,
+        // changing, or disappearing with a cancel control must go through the
+        // structural renderer, not the in-place streaming painter (which only
+        // ever touches the latest turn's answer text).
+        parts.push(
+          `u:${item.runId ?? ""}:${item.isPlaceholder ? 1 : 0}:${(item.attachments || []).length}:${item.queueState || ""}:${item.interruptFellBack ? 1 : 0}`
+        );
         break;
       case "recording":
         parts.push(`rec:${item.recordingId}:${item.transcriptStatus || ""}`);
@@ -1463,6 +2371,25 @@ function transcriptStructureSignature(model, opts) {
         break;
       case "download_decision":
         parts.push(`dd:${item.requestId}:${item.decision}`);
+        break;
+      // Rerunnable workflows + self-healing (this change): every visible state
+      // change of a card must go through the structural renderer — a card
+      // appearing, a stage advancing, a proof's verdict flipping, a heal
+      // proposal expiring or being answered. None of these are reachable by
+      // the in-place streaming painter (which only touches the latest turn's
+      // answer text).
+      case "workflow_draft":
+        parts.push(
+          `wd:${item.runId ?? ""}:${item.workflowId ?? ""}:${item.version ?? ""}:${item.status}:${item.busy || ""}:${item.proof ? (item.proof.ok ? "ok" : "fail") : ""}:${item.proofOutcomes ? item.proofOutcomes.length : ""}:${item.dismissed ? 1 : 0}:${item.lastError ? item.lastError.reason || item.lastError.op : ""}:${(item.review?.steps || item.draft?.steps || []).length}`
+        );
+        break;
+      case "workflow_drift":
+        parts.push(`wfdrift:${item.driftId}`);
+        break;
+      case "workflow_heal":
+        parts.push(
+          `wh:${item.proposalId}:${item.status}:${item.busy || ""}:${item.decision || ""}:${item.dismissed ? 1 : 0}:${item.lastError ? item.lastError.reason || item.lastError.op : ""}:${item.expiresAt ?? ""}`
+        );
         break;
       case "assistant_turn":
         parts.push([
@@ -1543,6 +2470,21 @@ function paintStreamingTail(nodes, turn) {
   return true;
 }
 
+/** Index of the LATEST assistant turn in `items`, or -1. The streaming path
+ * keys on this rather than on `items.length - 1`: a workflow card (a drift
+ * notice the companion records mid-run, a heal proposal the assistant raises)
+ * is appended as an item and legitimately sits BELOW a turn that is still
+ * streaming, and treating such a card as "the latest item" would demote the
+ * live turn to finished — no cursor, no in-place painting, a full rebuild per
+ * token batch. Pure so the rule is testable without a DOM. */
+function latestAssistantTurnIndex(items) {
+  const list = Array.isArray(items) ? items : [];
+  for (let i = list.length - 1; i >= 0; i--) {
+    if (list[i] && list[i].kind === "assistant_turn") return i;
+  }
+  return -1;
+}
+
 function renderTranscript({ force = false } = {}) {
   const model = panel.currentModel();
   el.emptyStateSlot.innerHTML = "";
@@ -1560,8 +2502,12 @@ function renderTranscript({ force = false } = {}) {
   const isBusy = !!model.isBusy?.() && model.isBusy();
   const elapsedVisible = isBusy && model.busyElapsedSeconds() >= 3;
   const signature = transcriptStructureSignature(model, { busy: isBusy });
-  const latest = model.items[model.items.length - 1];
-  if (!force && signature === lastStructureSignature && latest.kind === "assistant_turn") {
+  // The turn the streaming path paints into: the LATEST ASSISTANT TURN, which
+  // is NOT necessarily the last item — see latestAssistantTurnIndex() for why
+  // (workflow cards can sit below a turn that is still streaming).
+  const latestTurnIndex = latestAssistantTurnIndex(model.items);
+  const latest = latestTurnIndex >= 0 ? model.items[latestTurnIndex] : null;
+  if (!force && latest && signature === lastStructureSignature && latest.kind === "assistant_turn") {
     const nodes = streamingTailNodes();
     if (nodes && paintStreamingTail(nodes, latest)) {
       // Same as the structural path's near-bottom snap: a reader already at
@@ -1573,17 +2519,29 @@ function renderTranscript({ force = false } = {}) {
       return;
     }
   }
+  // Which turn (if any) offers "Lưu thành workflow" — computed ONCE per render,
+  // not per item (see workflowAffordanceRunId for the visibility rules).
+  const workflowRunId = workflowAffordanceRunId(model, {
+    draftPending: workflowDraftPendingRunId != null,
+    enhancePending: !!enhanceState
+  });
   const html = model.items
     .map((item, idx) => {
       if (item.kind === "user") return renderUserItemHtml(item);
       if (item.kind === "recording") return renderRecordingItemHtml(item);
       if (item.kind === "download_notice") return renderDownloadNoticeItemHtml(item);
       if (item.kind === "download_decision") return renderDownloadDecisionItemHtml(item);
-      const isLatest = idx === model.items.length - 1;
+      // Rerunnable workflows + self-healing (this change): three card kinds,
+      // rendered where the run they describe ended.
+      if (item.kind === "workflow_draft") return renderWorkflowDraftItemHtml(item);
+      if (item.kind === "workflow_drift") return renderWorkflowDriftItemHtml(item);
+      if (item.kind === "workflow_heal") return renderWorkflowHealItemHtml(item);
+      const isLatest = idx === latestTurnIndex;
       return renderTurnHtml(item, {
         isLatestStreaming: isLatest && (item.lifecycle === "running" || item.lifecycle === "created"),
         busy: isLatest && isBusy,
-        elapsedVisible: isLatest && elapsedVisible
+        elapsedVisible: isLatest && elapsedVisible,
+        workflowAffordance: workflowRunId != null && String(item.runId) === String(workflowRunId)
       });
     })
     .join("");
@@ -1593,12 +2551,30 @@ function renderTranscript({ force = false } = {}) {
   wireThumbButtons();
   wireDocumentCards();
   wireCopyButtons(model);
+  wireQueuedMessageControls();
+  wireWorkflowControls(model);
   el.transcript.querySelector("#btn-older-transcript")?.addEventListener("click", () => {
     loadOlderTranscript();
   });
   if (preserveScroll) el.panelScroll.scrollTop = el.panelScroll.scrollHeight;
   updateJumpLatest();
   lastStructureSignature = signature;
+}
+
+/** The per-message cancel control on a still-pending queued message. Its reply
+ * is what the panel follows — an accepted cancel arrives as the durable
+ * `message_cancelled` event (so a second panel sees it too), and a refusal
+ * discloses the state the message actually reached — so this handler only
+ * sends the request and leaves the visible state to the model. */
+function wireQueuedMessageControls() {
+  for (const btn of el.transcript.querySelectorAll("[data-cancel-message-id]")) {
+    btn.addEventListener("click", () => {
+      const raw = btn.getAttribute("data-cancel-message-id");
+      const messageId = Number(raw);
+      if (!Number.isFinite(messageId)) return;
+      panel.cancelQueuedMessage(messageId);
+    });
+  }
 }
 
 function wireToolRowIcons(model) {
@@ -1888,8 +2864,22 @@ function render() {
     lastAnnouncedPhase = phase;
   }
   announceBusyTransitions(phase);
-  updateSendStopButton(phase);
+  updateRunControls(phase);
+  renderQueuePausedBanner();
   syncBusyElapsedTimer();
+}
+
+// The paused-drain banner (tasks.md 6.2, panel spec "Resume control after
+// stop"). Driven purely by the model's `queuePaused`, which is the host's own
+// durable flag restored from the snapshot and updated by the
+// message_queue_paused/message_queue_resumed events — never by the panel's
+// optimism about a resume it has not seen confirmed.
+function renderQueuePausedBanner() {
+  if (!el.queuePausedBanner) return;
+  const model = panel.currentModel();
+  // `display`, not `hidden`: `.active-control-banner` sets its own display (see
+  // installQueueControls()).
+  el.queuePausedBanner.style.display = model && model.queuePaused === true ? "" : "none";
 }
 
 // ---- busy/working indicator: elapsed-time affordance (task 6.8) ----------
@@ -1938,17 +2928,22 @@ function stopBusyElapsedTimer() {
   }
 }
 
-function updateSendStopButton(phase) {
+// Per-phase presentation of the run's own controls (tasks.md 6.1/6.2).
+//
+// #btn-send is now ALWAYS Send: submitting while a run is active queues the
+// message behind it, so it must never double as Stop (that was the pre-change
+// behaviour this change removes). #btn-stop takes over the run's own control
+// and #btn-run-now is the interrupt choice; both exist only while a run is
+// active, where they mean something.
+function updateRunControls(phase) {
   const running = phase === RUN_PHASE.STREAMING || phase === RUN_PHASE.QUEUED || phase === RUN_PHASE.STOPPING || phase === RUN_PHASE.WAITING_FOR_PERMISSION;
-  if (running) {
-    el.btnSend.className = "btn-icon is-danger-solid";
-    el.btnSend.setAttribute("aria-label", "Dừng");
-    el.btnSend.innerHTML = iconMarkup("stop", { size: 16 });
-  } else {
-    el.btnSend.className = "btn-icon";
-    el.btnSend.setAttribute("aria-label", "Gửi");
-    el.btnSend.innerHTML = iconMarkup("send", { size: 18 });
-  }
+  el.btnSend.className = "btn-icon";
+  el.btnSend.setAttribute("aria-label", "Gửi");
+  el.btnSend.innerHTML = iconMarkup("send", { size: 18, title: "Gửi" });
+  // See installQueueControls(): `display` is toggled inline because the
+  // controls' own classes declare a display that would beat `[hidden]`.
+  if (el.btnStop) el.btnStop.style.display = running ? "" : "none";
+  if (el.btnRunNow) el.btnRunNow.style.display = running ? "" : "none";
 }
 
 // Composer prompt-enhancement in-flight state (design.md decision 6): null
@@ -1964,14 +2959,17 @@ function updateSendEnabled() {
   const phase = panel.currentPhase();
   const running = phase === RUN_PHASE.STREAMING || phase === RUN_PHASE.QUEUED || phase === RUN_PHASE.STOPPING || phase === RUN_PHASE.WAITING_FOR_PERMISSION;
   if (running) {
-    el.btnSend.disabled = false; // acts as Stop
-    el.composerInput.disabled = true;
-    // A run occupies the composer; enhancement never overlaps one (spec.md
-    // "Prompt enhancement availability": disabled "when a run is queued,
-    // streaming, stopping, or waiting for permission").
+    // The prompt-enhancement control keeps its own, unchanged availability
+    // rule (spec.md "Prompt enhancement availability": disabled "when a run is
+    // queued, streaming, stopping, or waiting for permission") -- only the SEND
+    // control's enablement changes in this change. The composer stays usable,
+    // so a submission is QUEUED behind the active run instead of the operator
+    // having to choose between waiting and stopping it (panel spec "Composer
+    // remains usable while a run is active").
     if (el.btnEnhance) el.btnEnhance.disabled = true;
-    return;
   }
+  // The composer itself is never disabled any more: typing a next message
+  // while the current turn streams is exactly what the queue exists for.
   el.composerInput.disabled = false;
   const trimmed = el.composerInput.value.trim();
   const hasText = trimmed.length > 0;
@@ -1982,17 +2980,20 @@ function updateSendEnabled() {
   // doSend() itself bails immediately (see its own comment) -- Send is
   // html-disabled here too so its visible state agrees with what a click or
   // Enter actually does, rather than looking clickable and silently no-op'ing.
+  // The same expression gates the run-now control: it submits the same draft,
+  // only with mode:"interrupt", so it must never look available on an empty one.
   el.btnSend.disabled = !hasText || !panel.currentConversationId || !!enhanceState;
-  if (el.btnEnhance) {
+  if (el.btnRunNow) el.btnRunNow.disabled = el.btnSend.disabled;
+  if (el.btnEnhance && !running) {
     if (enhanceState) {
       // In flight: the control now acts as Cancel (spec.md "Prompt
       // enhancement in-flight and cancellation") and must stay clickable for
-      // that, not html-disabled -- exactly the same "acts as Stop" pattern
-      // el.btnSend.disabled = false above already uses while a run is
-      // active. It cannot be reused to start a SECOND overlapping generate
-      // while in this state, but that is enforced by what a click on it does
-      // (doEnhance() below always cancels, never generates, while
-      // enhanceState is set), not by the disabled attribute.
+      // that, not html-disabled -- exactly the same "acts as" pattern
+      // el.btnStop relies on while a run is active. It cannot be reused to
+      // start a SECOND overlapping generate while in this state, but that is
+      // enforced by what a click on it does (doEnhance() below always
+      // cancels, never generates, while enhanceState is set), not by the
+      // disabled attribute.
       el.btnEnhance.disabled = false;
     } else {
       // A slash command's literal text is what the companion dispatches on
@@ -2665,6 +3666,16 @@ el.composerInput.addEventListener("keydown", (e) => {
     openAttachmentPicker();
     return;
   }
+  if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key === "Enter" && !el.slashPicker.isVisible()) {
+    // Run now (tasks.md 6.1's keyboard access to the interrupt choice): the
+    // same key that sends, with the modifier that asks for it immediately.
+    // Checked before the plain Enter branch below, and carrying the same
+    // slash-picker guard that branch has, so an open picker keeps owning
+    // Enter rather than dispatching half-typed slash text.
+    e.preventDefault();
+    doSendRunNow();
+    return;
+  }
   if (e.key === "Enter" && !e.shiftKey && !el.slashPicker.isVisible()) {
     e.preventDefault();
     doSend();
@@ -2736,21 +3747,45 @@ function wireDragDrop(root) {
 wireDragDrop(el.panelScroll);
 wireDragDrop(el.composerWrap || document.getElementById("composer-wrap"));
 
+// The mode the NEXT dispatch carries (host/agent/protocol.js's START_MODES).
+// The dispatch function's own signature is deliberately parameterless: the
+// shared extractor (test/_extract.mjs) brace-matches from the first `{` after
+// the declarator, so a destructuring parameter would truncate the extracted
+// body at its own parameter list — and an existing structural test pins the
+// parameterless form verbatim. The run-now entry points therefore set this
+// one-shot flag immediately before calling it, and the dispatch function
+// consumes the flag synchronously before its first await; "queue" is the
+// default every other path (Send, Enter) leaves in place.
+// NOTE: do not spell the declarator out in a comment above it — the extractor
+// finds it by the first textual match of its name and would match the comment.
+let pendingSendMode = "queue";
+
+/** Run now (tasks.md 6.1's explicit interrupt choice, shared by the run-now
+ * control and Ctrl+Enter): dispatch the current draft asking the host to stop
+ * the active turn and run this message immediately. With no run active the
+ * host treats it as an ordinary submission, so this is safe to use any time. */
+function doSendRunNow() {
+  pendingSendMode = "interrupt";
+  doSend();
+}
+
 async function doSend() {
+  // Consumed synchronously, before the first await, so a second activation can
+  // never inherit a stale interrupt intent.
+  const mode = pendingSendMode;
+  pendingSendMode = "queue";
   // The composer is `readOnly` (not `disabled`) while an enhancement request
   // is in flight (design.md decision 6), so it still keeps focus and still
   // dispatches keydown -- Enter would otherwise reach here and START a run
   // against the pre-enhancement text out from under the outstanding request.
   // spec.md's "composer SHALL be read-only" requirement means dispatch is
-  // blocked too, not just that typing is: bail here (covers both the Enter
-  // path and a click on #btn-send, since both funnel through doSend()).
+  // blocked too, not just that typing is: bail here (covers the Enter path, a
+  // click on #btn-send and a click on #btn-run-now, since all three funnel
+  // through doSend()).
   if (enhanceState) return;
-  const phase = panel.currentPhase();
-  if (phase === RUN_PHASE.STREAMING || phase === RUN_PHASE.QUEUED || phase === RUN_PHASE.STOPPING || phase === RUN_PHASE.WAITING_FOR_PERMISSION) {
-    panel.stop("user_stop");
-    render();
-    return;
-  }
+  // A run no longer takes Send: submitting while one is active queues the
+  // message behind it (or interrupts, for run-now) instead of stopping the
+  // run. Stop is its own control now (#btn-stop) -- see updateRunControls().
   const text = el.composerInput.value.trim();
   if (!text || !panel.currentConversationId) return;
 
@@ -2882,17 +3917,69 @@ async function doSend() {
   // above and is cleared along with every other attachment below.
   pickedElement = null;
   clearAttachments();
-  await panel.sendMessage(text, {
+  // The submission is not finished until the host has ANSWERED it: a refusal
+  // (`queue_full` etc.) must leave the operator with their text and an
+  // explanation, not a message that silently went nowhere (panel spec
+  // "Queue-full refusal preserves the draft"). Everything below the clear
+  // above is therefore only the OPTIMISTIC half of Send; the awaited outcome is
+  // what decides whether it stands.
+  const outcome = await panel.sendMessage(text, {
     tabScope,
     modelId: panel._selectedModelId,
     pageContext: context,
     attachments: attachmentRefs,
     elementRecord,
-    effort: selectedEffort
+    effort: selectedEffort,
+    mode
   });
+  if (outcome && outcome.accepted === false) restoreRefusedDraft(text, outcome);
   render();
 }
-el.btnSend.addEventListener("click", doSend);
+
+/**
+ * The host refused this submission, so it never entered the queue and never
+ * will run: the draft goes back into the composer (when the operator has not
+ * already started typing something else, which must never be clobbered), and
+ * the reason is shown where composer-scoped problems already appear — the same
+ * alert slot attachment failures use, because it is the same kind of message:
+ * this submission did not leave, and here is why. The line stays in the
+ * transcript as "Không chạy được" (see ConversationModel.markSendRefused),
+ * so nothing the operator typed disappears.
+ */
+function restoreRefusedDraft(text, outcome) {
+  if (el.composerInput.value.trim().length === 0) {
+    el.composerInput.value = text;
+    autoGrow();
+  }
+  clearAttachmentError();
+  showAttachmentError(sendRefusalNotice(outcome));
+  updateSendEnabled();
+}
+
+function sendRefusalNotice(outcome) {
+  if (outcome.reason === "queue_full") {
+    const limit = Number.isInteger(outcome.limit) ? outcome.limit : null;
+    return limit != null
+      ? `Hàng đợi tin nhắn đã đầy (tối đa ${limit} tin đang chờ). Tin nhắn chưa được gửi.`
+      : "Hàng đợi tin nhắn đã đầy. Tin nhắn chưa được gửi.";
+  }
+  if (outcome.reason === "malformed_mode") return "Yêu cầu gửi không hợp lệ. Tin nhắn chưa được gửi.";
+  if (outcome.reason === "host_unavailable") return "Mất kết nối với companion. Tin nhắn chưa được gửi — nội dung đã được giữ lại.";
+  return "Không gửi được tin nhắn. Nội dung đã được giữ lại.";
+}
+
+el.btnSend.addEventListener("click", () => doSend());
+// Run now (tasks.md 6.1): the explicit interrupt. Only reachable while a run is
+// active — that is the only state in which it means something different from an
+// ordinary Send — and disabled on an empty draft by updateSendEnabled().
+el.btnRunNow.addEventListener("click", doSendRunNow);
+el.btnStop.addEventListener("click", () => {
+  panel.stop("user_stop");
+  render();
+});
+el.btnResumeQueue.addEventListener("click", () => {
+  panel.resumeQueue();
+});
 
 // ---- composer prompt enhancement (openspec/changes/add-composer-enhance-prompt) ----
 //
@@ -2907,7 +3994,7 @@ function newEnhanceRequestId() {
 }
 
 /** Idle -> busy, or busy -> idle presentation for #btn-enhance. Mirrors
- * updateSendStopButton()'s icon/aria-label swap for Send/Stop above. */
+ * updateRunControls()'s icon/aria-label swap for the run's own controls. */
 function updateEnhanceButtonPresentation() {
   if (!el.btnEnhance) return;
   if (enhanceState) {

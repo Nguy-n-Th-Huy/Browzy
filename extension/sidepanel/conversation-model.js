@@ -163,6 +163,16 @@ export class ConversationModel {
     // dedup needed (design decision 3 above: the rebuild replaces rather
     // than merges).
     this.tabRisk = new Map();
+    // Queued-message drain state (openspec/changes/add-message-queue-and-
+    // steering, design.md decision 5): mirrors the host's durable
+    // `meta.queuePaused`. Stop with messages still pending pauses the drain,
+    // and the panel must not present those messages as about to run until the
+    // operator resumes (panel spec "Resume control after stop"). Per-message
+    // state lives on the user items themselves (`messageId`/`queueState`), so
+    // a chip renders with the message it describes. Restored from the host's
+    // authoritative meta (+ the queue events) on every applySnapshot and
+    // carried across a window rebuild — see _captureLiveState().
+    this.queuePaused = false;
     this._turnsByRunId = new Map(); // runId -> item (assistant_turn)
     this._pendingUserIndex = null; // index of a just-sent, not-yet-bound user item
     this._localPrompts = new Map(); // runId -> original prompt text (this session's own echo cache)
@@ -209,14 +219,31 @@ export class ConversationModel {
    * `opts.attachments` is the EXACT attachment snapshot captured at Send
    * time (references only: id/mimeType/fileName, never bytes — mirroring
    * the page-context exact-identity binding), so the transcript shows
-   * precisely which images were bound to this message. */
+   * precisely which images were bound to this message.
+   *
+   * openspec/changes/add-message-queue-and-steering (design.md decisions
+   * 1/2/11): when the host admits this send into the conversation's message
+   * QUEUE rather than starting a run, the same item carries the queue
+   * entry's own identity and lifecycle — `messageId` (the seq of the
+   * host's `message_queued` event) and `queueState` (see
+   * MESSAGE_QUEUE_LABEL_VI). The item fields exist from the start and stay
+   * null on the ordinary run path, so a chip is a property of the message
+   * rather than a second, parallel representation of it. `interruptFellBack`
+   * is the interrupt-honesty note (design.md decision 3): the operator asked
+   * to run this message now and the active run could not be stopped in time,
+   * so it runs as the next turn instead. */
   addLocalUserMessage(text, { attachments = [] } = {}) {
     this.items.push({
       kind: "user",
       text,
       attachments: attachments.length ? attachments.map((a) => ({ id: a.id, mimeType: a.mimeType, fileName: a.fileName })) : [],
       ts: Date.now(),
-      runId: null
+      runId: null,
+      messageId: null, // host queue entry identity (the message_queued event seq)
+      queueMode: null, // "queue" | "interrupt" — what the operator asked for
+      queueState: null, // null (not queued) | pending | dispatching | cancelled | failed
+      queueError: null, // host-reported reason behind a cancelled/failed state
+      interruptFellBack: false
     });
     this._pendingUserIndex = this.items.length - 1;
   }
@@ -225,10 +252,111 @@ export class ConversationModel {
     if (this._pendingUserIndex == null) return;
     const item = this.items[this._pendingUserIndex];
     if (item && item.kind === "user") {
-      item.runId = runId;
-      this._localPrompts.set(runId, item.text);
+      this._bindItemToRun(item, runId);
     }
     this._pendingUserIndex = null;
+  }
+
+  /** A message the host admitted into its queue (the START reply's queued ack,
+   * host/agent/protocol.js's `{conversationId, accepted:true, queued:true,
+   * entry:{messageId, mode, state, enqueuedAt}, idempotent?}`). Binds the
+   * just-sent local echo to the entry's `messageId` so the chip and the later
+   * claim have one identity to key on.
+   *
+   * `idempotent` (design.md decision 7): the host recognized this send as a
+   * retry of one it already accepted, so the entry — and the bubble already
+   * bound to it — exists. The echo this retry just pushed is a duplicate of
+   * that message and leaves again (panel spec: "no second copy"); the
+   * existing item keeps its state.
+   *
+   * A queued ack whose `messageId` matches nothing and with no pending echo
+   * to bind (a second panel, or a reply arriving after a rebuild) is a no-op
+   * here: the `message_queued` event itself carries the text and is what
+   * materializes the bubble. */
+  bindQueuedAck({ messageId, mode, state, idempotent }) {
+    if (messageId == null) return;
+    const existing = this._userItemForMessage(messageId);
+    const echo = this._pendingUser();
+    if (existing) {
+      if (idempotent === true && echo && echo !== existing) this._dropItem(echo);
+      existing.queueState = normalizedQueueState(state) || existing.queueState;
+      if (mode) existing.queueMode = mode;
+      return;
+    }
+    if (!echo) return;
+    echo.messageId = messageId;
+    echo.queueMode = mode || echo.queueMode;
+    echo.queueState = normalizedQueueState(state) || "pending";
+    echo.queueError = null;
+    this._pendingUserIndex = null;
+  }
+
+  /** The host REFUSED this submission (the change's `queue_full` refusal, or
+   * any other conversation-scoped ERROR answering a Send). The echo is not
+   * removed: it becomes the honest record that this message was never
+   * accepted — "Không chạy được" plus the host's reason — and the composer
+   * gets its draft back (panel spec "Queue-full refusal preserves the
+   * draft"). Nothing about it ever claims to be queued. */
+  markSendRefused(reason) {
+    const echo = this._pendingUser();
+    if (echo) {
+      echo.queueState = "failed";
+      echo.queueError = reason || "send_refused";
+      echo.queueMode = null;
+    }
+    this._pendingUserIndex = null;
+  }
+
+  /** Apply a queue state the HOST disclosed rather than one the panel derived
+   * from an event: a `cancel_message` reply of `{ok:true}` (the host confirmed
+   * the cancel, so nothing is claimed that the host did not do) or
+   * `{ok:false, reason:"already_claimed", state:"dispatching"}` — task 6.2's
+   * "the request is refused with the claimed state disclosed". Never invents a
+   * state the host did not name. */
+  discloseQueueState(messageId, state) {
+    const item = this._userItemForMessage(messageId);
+    if (!item || !DISCLOSED_QUEUE_STATES.has(state)) return;
+    item.queueState = state;
+    item.queueError = null;
+  }
+
+  _pendingUser() {
+    if (this._pendingUserIndex == null) return null;
+    const item = this.items[this._pendingUserIndex];
+    return item && item.kind === "user" ? item : null;
+  }
+
+  _userItemForMessage(messageId) {
+    if (messageId == null) return null;
+    for (const item of this.items) {
+      if (item.kind === "user" && item.messageId === messageId) return item;
+    }
+    return null;
+  }
+
+  /** Bind a user item to the run that will answer it, and remember the prompt
+   * text under that runId (the local echo cache every rebuild path reads —
+   * see `_ensureUserItemForRun()`/`seedLocalPrompts()`). Single place, because
+   * three paths need it now: the immediate START reply, `message_claimed`
+   * (a queued message the drain picked up), and `message_consumed`'s
+   * reconciliation branch. */
+  _bindItemToRun(item, runId) {
+    if (!item || runId == null) return;
+    item.runId = runId;
+    if (typeof item.text === "string") this._localPrompts.set(runId, item.text);
+    if (this._pendingUserIndex != null && this.items[this._pendingUserIndex] === item) this._pendingUserIndex = null;
+  }
+
+  /** Remove one item the model itself put there by mistake — today, exactly
+   * one case: the duplicate echo a retried (idempotent) queued send pushed
+   * (see bindQueuedAck). Keyed by identity, and it also repairs the pending
+   * index, so no later bind can resurrect it. */
+  _dropItem(item) {
+    const idx = this.items.indexOf(item);
+    if (idx === -1) return;
+    this.items.splice(idx, 1);
+    if (this._pendingUserIndex === idx) this._pendingUserIndex = null;
+    else if (this._pendingUserIndex != null && this._pendingUserIndex > idx) this._pendingUserIndex -= 1;
   }
 
   /** Full rebuild from a `snapshot` reply payload ({conversationId, meta,
@@ -246,6 +374,13 @@ export class ConversationModel {
     const events = snapshot.events || [];
     for (const event of events) this.applyEvent(event, { trim: false });
     this._maybeTrimWindow();
+    // The host's own `messageQueue`/`queuePaused` are the AUTHORITATIVE live
+    // queue state (tasks.md 5.3 / design.md decision 1); the replayed events
+    // above carry every state transition, including the terminal ones the
+    // meta deliberately does not keep. Reconciliation runs after both, so the
+    // visible state is the host's and never a guess (panel spec "Queue
+    // restore renders from authoritative state").
+    this._applyQueueMeta(snapshot.meta);
     // The host's own watermark can be ahead of the newest event in the page
     // (it is the log's true last sequence). Keeping it means a later live
     // event at that seq is not mistaken for new.
@@ -369,8 +504,14 @@ export class ConversationModel {
       pendingQuestion: this.pendingQuestion,
       pendingDownloadDecision: this.pendingDownloadDecision,
       connectionError: this.connectionError,
+      queuePaused: this.queuePaused,
       tabRisk: new Map(this.tabRisk),
       pendingUserText: pendingUser && pendingUser.kind === "user" ? pendingUser.text : null,
+      // Workflow cards (see the workflow section below): their unsaved/local
+      // half has no durable event to rebuild from, so a window rebuild carries
+      // the cards themselves — the same reasoning as pendingApproval above, a
+      // memory budget must not drop the card the operator is looking at.
+      workflowItems: this.items.filter((i) => WORKFLOW_ITEM_KINDS.has(i.kind)).map((i) => ({ ...i })),
       turns: new Map(
         [...this._turnsByRunId].map(([runId, turn]) => [
           runId,
@@ -394,6 +535,10 @@ export class ConversationModel {
     if (carry.pendingQuestion) this.pendingQuestion = carry.pendingQuestion;
     if (carry.pendingDownloadDecision) this.pendingDownloadDecision = carry.pendingDownloadDecision;
     if (carry.connectionError) this.connectionError = carry.connectionError;
+    // A window rebuild is about MEMORY, not about forgetting whether the drain
+    // is paused: a trim must never make the resume affordance disappear while
+    // the host's durable flag still says paused.
+    if (carry.queuePaused) this.queuePaused = true;
     for (const [tabId, entry] of carry.tabRisk) this.tabRisk.set(tabId, entry);
     if (carry.pendingUserText != null) {
       for (let i = this.items.length - 1; i >= 0; i--) {
@@ -402,6 +547,86 @@ export class ConversationModel {
           break;
         }
       }
+    }
+    // Workflow cards: the rebuild recreated whatever the retained events
+    // proved; anything the events could not prove (an unsaved review card, a
+    // proof's per-step detail, a locally-disclosed refusal) is restored here.
+    // The saved copy wins only for fields the rebuilt card does not have, so a
+    // replayed event can never be overwritten by a stale local snapshot.
+    if (Array.isArray(carry.workflowItems)) {
+      for (const saved of carry.workflowItems) this._restoreWorkflowItem(saved);
+    }
+  }
+
+  /** Re-attach one carried workflow card after a rebuild. Identity per kind:
+   * draft -> runId (workflowId once it has one), drift -> driftId, heal ->
+   * proposalId. A card the rebuild already rebuilt is MERGED, never
+   * duplicated. */
+  _restoreWorkflowItem(saved) {
+    let existing = null;
+    if (saved.kind === "workflow_draft") existing = this.workflowDraftItem({ runId: saved.runId ?? undefined, workflowId: saved.workflowId ?? undefined });
+    else if (saved.kind === "workflow_drift") existing = this.items.find((i) => i.kind === "workflow_drift" && i.driftId === saved.driftId) || null;
+    else if (saved.kind === "workflow_heal") existing = this.workflowHealItem(saved.proposalId);
+    if (!existing) {
+      this.items.push({ ...saved });
+      return;
+    }
+    // The event-derived card is the base; the carried copy only fills in the
+    // local half (and any identity field the replayed events could not
+    // carry), never blanks a field the rebuild proved.
+    for (const [key, value] of Object.entries(saved)) {
+      if (value == null) continue;
+      if (key === "draft" || key === "review" || key === "proof" || key === "proofOutcomes" || key === "lastError" || key === "busy" || key === "status") {
+        if (existing[key] == null || key === "status") existing[key] = value;
+        continue;
+      }
+      if (existing[key] == null) existing[key] = value;
+    }
+  }
+
+  /**
+   * Fold the host's authoritative live queue state (meta.messageQueue /
+   * meta.queuePaused, tasks.md 5.3) onto the items the replayed events just
+   * rebuilt.
+   *
+   * Why both sources: the events are the history of every transition
+   * (queued/claimed/consumed/cancelled/failed), while the meta holds only what
+   * is LIVE right now. Reconciliation therefore answers two questions the
+   * events alone cannot: which of the items that look pending still are, and
+   * whether the drain is paused.
+   *
+   * A live entry whose `message_queued` event is older than this bounded
+   * window is deliberately NOT materialized as an item: the panel spec's
+   * reload scenario requires that a pending message is "shown once ... no
+   * second copy or placeholder", and this model has no text for it — the
+   * placeholder would be a fabricated transcript line. The host's own
+   * `hasOlder`/older-page affordance is the honest way to reach that history;
+   * the entry itself is still tracked host-side and drains as normal.
+   */
+  _applyQueueMeta(meta) {
+    this.queuePaused = !!(meta && meta.queuePaused === true);
+    const live = new Map();
+    const entries = meta && Array.isArray(meta.messageQueue) ? meta.messageQueue : [];
+    for (const entry of entries) {
+      if (entry && entry.messageId != null) live.set(entry.messageId, entry);
+    }
+    for (const item of this.items) {
+      if (item.kind !== "user" || item.messageId == null) continue;
+      const entry = live.get(item.messageId);
+      if (!entry) {
+        // Not live any more. A terminal event above already said which way it
+        // ended (cancelled/failed/consumed); if none survived in this window,
+        // drop the chip rather than guess a state the host does not report
+        // (panel spec: no assumed progress).
+        if (item.queueState === "pending" || item.queueState === "dispatching") item.queueState = null;
+        continue;
+      }
+      item.queueState = normalizedQueueState(entry.state) || "pending";
+      item.queueError = null;
+      // `claimedByRunId` is the same binding message_claimed carries; applying
+      // it here keeps the item attached to its run even when that event fell
+      // outside the window, so the run's own turn never pushes a second copy.
+      if (entry.claimedByRunId != null && item.runId == null) this._bindItemToRun(item, entry.claimedByRunId);
     }
   }
 
@@ -437,6 +662,12 @@ export class ConversationModel {
    *      this connection never sent (e.g. a second attached panel) -> use
    *      the seeded local-prompt cache, or an honest placeholder if this
    *      profile never saw that prompt at all. Never fabricates text.
+   *
+   * Queued messages bind BEFORE any of this runs: the host appends
+   * `message_claimed {messageId, runId}` (which sets the item's runId) before
+   * it creates the run, so case 1 above is what a drained queued message hits
+   * — one bubble, bound to the run that finally answers it, never a second
+   * copy (panel spec "Reload with a pending message").
    */
   _ensureUserItemForRun(runId) {
     if (this.items.some((it) => it.kind === "user" && it.runId === runId)) return;
@@ -622,6 +853,136 @@ export class ConversationModel {
         }
         this._dropPartialBuffers(event.runId);
         this._invalidatePendingDownloadDecisionForRun(event.runId);
+        break;
+      }
+      // ---- Queued-message lifecycle (openspec/changes/add-message-queue-and-
+      // steering, design.md decisions 1/2/4/5/9/11) --------------------------
+      //
+      // The queue's nine events, hand-synced from the change's frozen wire
+      // contract (host/agent/protocol.js names the envelopes; the event family
+      // lives in the host's queue module). `messageId` is the seq of the
+      // message's own `message_queued` event and is the entry's identity for
+      // every one of them.
+      //
+      // One rule runs through all of these: an item is looked up by
+      // `messageId` and is NEVER duplicated. `message_claimed` is the event
+      // that binds a queued message to the run that will answer it, which is
+      // also what makes the run_created/run_started `_ensureUserItemForRun()`
+      // calls that follow no-ops instead of second bubbles.
+      //
+      // These arrive LIVE too (design decision 9: events, not polling) — the
+      // host forwards them even when no run is active, and they are durable,
+      // so a reload replays exactly the same transitions through
+      // applySnapshot().
+      case "message_queued": {
+        const messageId = queueMessageId(event, this._windowSeq(event));
+        if (messageId == null) break; // no identity: nothing could ever claim or cancel it
+        if (this._userItemForMessage(messageId)) break; // the START ack already bound this bubble
+        const submission = event.submission && typeof event.submission === "object" ? event.submission : {};
+        const echo = this._pendingUser();
+        if (echo) {
+          // Live path: the panel echoed this exact message at Send time and
+          // the entry's ack has not arrived yet (or this event raced ahead of
+          // it) — bind the echo rather than push a second bubble.
+          echo.messageId = messageId;
+          echo.queueMode = event.mode || echo.queueMode;
+          echo.queueState = "pending";
+          echo.queueError = null;
+          this._pendingUserIndex = null;
+          break;
+        }
+        // Rebuild/second-panel path: the event itself carries the text
+        // (design.md decision 9's "one text source"), so a reopened panel
+        // renders the queued message exactly once, with no placeholder and
+        // nothing re-resolved.
+        const text = typeof submission.text === "string" ? submission.text : null;
+        this.items.push({
+          kind: "user",
+          text: text != null ? text : "[Nội dung tin nhắn trước đó không có sẵn]",
+          isPlaceholder: text == null,
+          attachments: (Array.isArray(submission.attachmentRefs) ? submission.attachmentRefs : [])
+            .filter((a) => a && a.id)
+            .map((a) => ({ id: a.id, mimeType: a.mimeType, fileName: a.name })),
+          ts: typeof event.ts === "number" && event.ts > 0 ? event.ts : Date.now(),
+          runId: null,
+          messageId,
+          queueMode: event.mode || null,
+          queueState: "pending",
+          queueError: null,
+          interruptFellBack: false
+        });
+        break;
+      }
+      case "message_claimed": {
+        const item = this._userItemForMessage(event.messageId);
+        if (item) {
+          this._bindItemToRun(item, event.runId);
+          item.queueState = "dispatching";
+        } else if (event.runId != null) {
+          // The message's own event is outside this bounded window, but the
+          // run it was handed to is not: show it through the existing
+          // local-prompt/placeholder rule instead of dropping it silently.
+          this._ensureUserItemForRun(event.runId);
+        }
+        break;
+      }
+      case "message_consumed": {
+        const item = this._userItemForMessage(event.messageId);
+        if (item) {
+          if (event.runId != null) this._bindItemToRun(item, event.runId);
+          // The run now owns the message; its own lifecycle is what the header
+          // pill and the turn describe, so the chip goes away.
+          item.queueState = null;
+          item.queueError = null;
+        } else if (event.runId != null) {
+          this._ensureUserItemForRun(event.runId);
+        }
+        break;
+      }
+      case "message_cancelled": {
+        const item = this._userItemForMessage(event.messageId);
+        if (item) {
+          item.queueState = "cancelled";
+          item.queueError = event.reason || null;
+          item.interruptFellBack = false;
+        }
+        break;
+      }
+      case "message_failed": {
+        const item = this._userItemForMessage(event.messageId);
+        if (item) {
+          item.queueState = "failed";
+          item.queueError = event.reason || null;
+        }
+        break;
+      }
+      case "message_requeued": {
+        const item = this._userItemForMessage(event.messageId);
+        if (item) {
+          // Back to pending: the run this message was handed to never began
+          // (design.md decision 2's reconciliation branch — a stop landed
+          // while the run waited for the lease, or a restart happened before
+          // `run_started`). The claim's runId is dropped, so the NEXT claim
+          // binds this same bubble to the run that finally runs it, instead of
+          // leaving `_ensureUserItemForRun()` to push a second copy of the
+          // same message.
+          item.runId = null;
+          item.queueState = "pending";
+          item.queueError = event.reason || null;
+        }
+        break;
+      }
+      case "message_interrupt_fallback": {
+        const item = this._userItemForMessage(event.messageId);
+        if (item) item.interruptFellBack = true;
+        break;
+      }
+      case "message_queue_paused": {
+        this.queuePaused = true;
+        break;
+      }
+      case "message_queue_resumed": {
+        this.queuePaused = false;
         break;
       }
       case "tool_rejected": {
@@ -823,6 +1184,46 @@ export class ConversationModel {
       case "download_decision_recorded":
         this._pushDownloadDecisionItem(event);
         break;
+      // ---- Rerunnable workflows + self-healing (openspec/changes/
+      // add-workflow-materialization-and-heal) ----------------------------
+      //
+      // Nine events, hand-synced from the change's frozen wire contract. They
+      // are DURABLE (the host appends them to the conversation transcript), so
+      // a reload rebuilds every card from them; the panel's own local actions
+      // (a draft/prove/enable reply) set the SAME fields, which is why every
+      // case below is idempotent and merges rather than replaces. Identity per
+      // card: draft -> runId (then workflowId), drift -> driftId, heal ->
+      // proposalId.
+      case "workflow_draft_saved":
+        this._applyWorkflowDraftSaved(event);
+        break;
+      case "workflow_proof":
+        this._applyWorkflowProofEvent(event);
+        break;
+      case "workflow_drift":
+        this._applyWorkflowDriftEvent(event);
+        break;
+      case "workflow_heal_proposed":
+        this._applyWorkflowHealProposed(event);
+        break;
+      case "workflow_heal_saved":
+        this._applyWorkflowHealResolved(event.proposalId, { status: "saved", toVersion: event.toVersion, workflowId: event.workflowId, fromVersion: event.fromVersion });
+        break;
+      case "workflow_heal_rejected":
+        this._applyWorkflowHealResolved(event.proposalId, { status: "rejected" });
+        break;
+      case "workflow_heal_expired":
+        this._applyWorkflowHealResolved(event.proposalId, { status: "expired", workflowId: event.workflowId });
+        break;
+      case "workflow_heal_superseded":
+        this._applyWorkflowHealResolved(event.oldProposalId, { status: "superseded", supersededBy: event.newProposalId ?? null });
+        break;
+      case "workflow_enabled":
+        this._applyWorkflowEnabled(event);
+        break;
+      case "workflow_updated":
+        this._applyWorkflowUpdated(event);
+        break;
       default:
         // Unknown event types are ignored, not fatal — protocol.js's own
         // "unknown_message_type" convention for envelopes; a future event
@@ -912,6 +1313,475 @@ export class ConversationModel {
    * round trip. */
   recordDownloadDecision({ requestId, decision, category, filename, url }) {
     this._pushDownloadDecisionItem({ requestId, decision, category, filename, url, ts: Date.now() });
+  }
+
+  // ---- Rerunnable workflows + self-healing (openspec/changes/
+  // add-workflow-materialization-and-heal) --------------------------------
+  //
+  // Three card kinds live in `items` (they belong where the run they describe
+  // ended): `workflow_draft` (derived from one completed run's trail, then
+  // saved -> proved -> enabled), `workflow_drift` (a static notice naming the
+  // step and the evidence a rerun broke on), `workflow_heal` (one proposal,
+  // answered Allow/Deny). The durable half is the event cases in
+  // _applyEventToItems(); every method below is the LOCAL half (a request's
+  // reply, or the in-flight marker for one), and each sets the same fields the
+  // event sets, so the two orders converge on one state.
+  //
+  // KNOWN LIMIT, deliberate: the REVIEW state of a draft (before the operator
+  // saves it) exists only because the panel asked for it — the host appends no
+  // event for the derivation itself, so it does not survive a reload. That is
+  // acceptable because the run's recorded trail does: the footer affordance
+  // re-derives the draft in one click. Window rebuilds (a trim, an older-page
+  // load) DO carry the cards, for the same reason a pending approval is
+  // carried — a memory budget must not drop the card the operator is looking
+  // at.
+
+  /** The newest `workflow_draft` card, optionally for one run / one record.
+   * The run id is compared as a STRING because it reaches this model both from
+   * the host's events (as sent) and from rendered buttons' attributes (always
+   * text) — a card must never be missed because the two spellings differ. */
+  workflowDraftItem({ runId, workflowId } = {}) {
+    for (let i = this.items.length - 1; i >= 0; i--) {
+      const item = this.items[i];
+      if (!item || item.kind !== "workflow_draft") continue;
+      if (runId != null && String(item.runId ?? "") !== String(runId)) continue;
+      if (workflowId != null && item.workflowId !== workflowId) continue;
+      return item;
+    }
+    return null;
+  }
+
+  /** Whether this run already has a draft card — the turn footer's
+   * affordance hides once it does (the card is the affordance then). */
+  hasWorkflowDraftForRun(runId) {
+    return !!this.workflowDraftItem({ runId });
+  }
+
+  /** Show the draft the host derived from one run's recorded trail (the
+   * draft_request reply's `{draft, review}`). Asking again for the same run
+   * replaces the card's content in place — never a second card. */
+  presentWorkflowDraft(runId, { draft, review } = {}) {
+    let item = this.workflowDraftItem({ runId });
+    if (!item) {
+      item = {
+        kind: "workflow_draft",
+        runId: runId ?? null,
+        draft: null,
+        review: null,
+        workflowId: null,
+        version: null,
+        stepsCount: null,
+        status: "review",
+        busy: null,
+        proof: null,
+        proofOutcomes: null,
+        lastError: null,
+        edit: null,
+        ts: Date.now()
+      };
+      this.items.push(item);
+    }
+    item.draft = draft || null;
+    item.review = review || null;
+    item.workflowId = (draft && draft.workflowId) || item.workflowId;
+    item.status = item.status === "enabled" ? "enabled" : "review";
+    item.busy = null;
+    item.lastError = null;
+    return item;
+  }
+
+  /** The draft_save reply. A refusal keeps the card in review WITH the host's
+   * schema errors (a draft is never presented as saved on a refusal); the
+   * durable `workflow_draft_saved` event is what carries the saved state
+   * across a reload. */
+  settleWorkflowDraftSave({ runId, ok, workflowId = null, version = null, stepsCount = null, errors = null }) {
+    let item = this.workflowDraftItem({ runId });
+    if (!item && !ok) return null;
+    if (!item) item = this.presentWorkflowDraft(runId, {});
+    item.busy = null;
+    if (!ok) {
+      item.status = "review";
+      item.lastError = { op: "save", errors: Array.isArray(errors) ? errors : [], at: Date.now() };
+      return item;
+    }
+    item.workflowId = workflowId || item.workflowId;
+    item.version = version != null ? version : item.version;
+    if (Number.isInteger(stepsCount)) item.stepsCount = stepsCount;
+    item.status = "saved";
+    item.lastError = null;
+    return item;
+  }
+
+  /** Open the edit view for one saved card: the definition is fetched from
+   * the host (the record lives host-side), never taken from this model's
+   * possibly-stale copy — the card's own step list may be a derivation, not
+   * what is actually stored. */
+  beginWorkflowEditLoad(workflowId) {
+    const item = this.workflowDraftItem({ workflowId });
+    if (item) item.edit = { status: "loading", steps: null, version: null, problem: null };
+    return item;
+  }
+
+  /** The edit-fetch reply. Success puts the card into editing with the
+   * host's CURRENT steps; a refusal leaves the card as it was, with the
+   * reason named. */
+  settleWorkflowEditLoad({ workflowId, ok, version = null, steps = null, reason = null }) {
+    const item = this.workflowDraftItem({ workflowId });
+    if (!item) return null;
+    if (!ok || !Array.isArray(steps)) {
+      item.edit = null;
+      item.lastError = { op: "edit", reason: reason || "edit_refused", at: Date.now() };
+      return item;
+    }
+    item.edit = { status: "editing", steps, version: version != null ? version : item.version, problem: null };
+    item.lastError = null;
+    return item;
+  }
+
+  /** Replace the rows being edited (a removed step) without leaving edit
+   * mode — the operator's working copy lives on the card so a re-render
+   * never loses it. */
+  replaceWorkflowEditSteps(workflowId, steps) {
+    const item = this.workflowDraftItem({ workflowId });
+    if (!item || !item.edit) return null;
+    item.edit.steps = Array.isArray(steps) ? steps : [];
+    return item;
+  }
+
+  /** A local problem with the working copy (invalid args JSON, a host
+   * refusal): shown on the card, editing continues — nothing is silently
+   * dropped and nothing is saved. */
+  setWorkflowEditProblem(workflowId, problem) {
+    const item = this.workflowDraftItem({ workflowId });
+    if (!item || !item.edit) return null;
+    item.edit.problem = typeof problem === "string" ? { text: problem } : problem || null;
+    return item;
+  }
+
+  /** Leave edit mode: the working copy is discarded, nothing was written. */
+  cancelWorkflowEdit(workflowId) {
+    const item = this.workflowDraftItem({ workflowId });
+    if (item) item.edit = null;
+    return item;
+  }
+
+  /** The edit-save request left for the host. */
+  beginWorkflowEditSave(workflowId) {
+    const item = this.workflowDraftItem({ workflowId });
+    if (item && item.edit) {
+      item.edit.status = "saving";
+      item.edit.problem = null;
+    }
+    return item;
+  }
+
+  /** The edit-save reply. Success exits edit mode onto the new version —
+   * unproven by construction (the registry's own rule: a saved version is
+   * disabled until a proof passes) — so the card returns to "saved" and the
+   * proof has to be earned again. A refusal keeps the working copy with the
+   * host's own errors on it. */
+  settleWorkflowEditSave({ workflowId, ok, version = null, reason = null, errors = null, latest = null }) {
+    const item = this.workflowDraftItem({ workflowId });
+    if (!item) return null;
+    if (!ok) {
+      if (item.edit) {
+        item.edit.status = "editing";
+        item.edit.problem = {
+          reason: reason || "edit_refused",
+          errors: Array.isArray(errors) ? errors : null,
+          latest: Number.isInteger(latest) ? latest : null
+        };
+      }
+      return item;
+    }
+    item.edit = null;
+    item.version = version != null ? version : item.version;
+    item.status = "saved";
+    item.proof = null;
+    item.proofOutcomes = null;
+    item.busy = null;
+    item.lastError = null;
+    return item;
+  }
+
+  /** A version was written by an operator edit (this panel or another): the
+   * card moves onto it and the version is unproven by construction. */
+  _applyWorkflowUpdated(event) {
+    if (!event || !event.workflowId) return;
+    const item = this.workflowDraftItem({ workflowId: event.workflowId });
+    if (!item) return;
+    item.version = event.toVersion != null ? event.toVersion : item.version;
+    item.edit = null;
+    item.status = item.status === "enabled" ? "enabled" : "saved";
+    item.proof = null;
+    item.proofOutcomes = null;
+  }
+
+  /** Mark a proof in flight for one card (the operator pressed "Chạy thử"). */
+  beginWorkflowProof(workflowId) {
+    const item = this.workflowDraftItem({ workflowId });
+    if (item) item.busy = "proving";
+    return item;
+  }
+
+  /** The prove reply, or a local refusal (`reason`) — `ok` is the HOST's
+   * verdict on the execution, never re-derived from the panel's own step
+   * list, so an "unexecutable" step the extension could not validate can never
+   * read as a successful proof. */
+  settleWorkflowProof({ workflowId, ok, version = null, outcomes = null, summary = null, evidenceFile = null, reason = null }) {
+    const item = this.workflowDraftItem({ workflowId });
+    if (!item) return null;
+    item.busy = null;
+    item.version = version != null ? version : item.version;
+    if (reason) {
+      item.lastError = { op: "prove", reason, at: Date.now() };
+      return item;
+    }
+    item.lastError = null;
+    item.proof = {
+      ok: ok === true,
+      summary: typeof summary === "string" ? summary : null,
+      evidenceFile: typeof evidenceFile === "string" ? evidenceFile : null,
+      at: Date.now()
+    };
+    // Per-step detail is panel-local: the durable `workflow_proof` event
+    // carries only the verdict, so a reloaded card shows the verdict and the
+    // step list the event could not keep is gone (never fabricated back).
+    item.proofOutcomes = Array.isArray(outcomes) ? outcomes : null;
+    item.status = item.status === "enabled" ? "enabled" : "proved";
+    return item;
+  }
+
+  /** The enable reply. A stale/unknown refusal is disclosed, never applied. */
+  settleWorkflowEnable({ workflowId, ok, version = null, reason = null }) {
+    const item = this.workflowDraftItem({ workflowId });
+    if (!item) return null;
+    item.busy = null;
+    if (!ok) {
+      item.lastError = { op: "enable", reason: reason || "enable_refused", at: Date.now() };
+      return item;
+    }
+    item.version = version != null ? version : item.version;
+    item.status = "enabled";
+    item.lastError = null;
+    return item;
+  }
+
+  /** The heal_decide reply (the Allow/Deny click). `ok:false` renders the
+   * host's refusal — `unknown_proposal`/`expired`/`superseded`/`stale_base`/
+   * `invalid_candidate`, with `state` when the host disclosed one — and leaves
+   * the stored definition untouched. */
+  settleWorkflowHealDecision({ proposalId, ok, decision = null, workflowId = null, fromVersion = null, toVersion = null, reason = null, state = null, errors = null }) {
+    const item = this.workflowHealItem(proposalId);
+    if (!item) return null;
+    item.busy = null;
+    if (!ok) {
+      item.lastError = { op: "heal", reason: reason || "heal_refused", state: state ?? null, errors: Array.isArray(errors) ? errors : null, at: Date.now() };
+      // A refusal that names the proposal as expired/superseded is a TERMINAL
+      // state for the card (there is nothing left to answer); a refusal that
+      // leaves it answerable (a transient host error) keeps it pending.
+      if (reason === "expired") item.status = "expired";
+      else if (reason === "superseded") item.status = "superseded";
+      return item;
+    }
+    item.lastError = null;
+    item.decision = decision || item.decision;
+    if (decision === "deny") item.status = "rejected";
+    else {
+      item.status = "saved";
+      item.workflowId = workflowId || item.workflowId;
+      item.fromVersion = fromVersion != null ? fromVersion : item.fromVersion;
+      item.toVersion = toVersion != null ? toVersion : item.toVersion;
+    }
+    return item;
+  }
+
+  /** The newest heal-proposal card for one proposal id, or null. */
+  workflowHealItem(proposalId) {
+    if (proposalId == null) return null;
+    for (let i = this.items.length - 1; i >= 0; i--) {
+      const item = this.items[i];
+      if (item && item.kind === "workflow_heal" && item.proposalId === proposalId) return item;
+    }
+    return null;
+  }
+
+  /** Open heal proposals (a card the operator has not yet answered or that a
+   * later event has not closed), oldest first. */
+  openWorkflowHealItems(now = Date.now()) {
+    return this.items.filter(
+      (i) => i.kind === "workflow_heal" && i.status === "pending" && !(typeof i.expiresAt === "number" && i.expiresAt <= now)
+    );
+  }
+
+  _applyWorkflowDraftSaved(event) {
+    let item = event.workflowId != null ? this.workflowDraftItem({ workflowId: event.workflowId }) : null;
+    if (!item && event.runId != null) item = this.workflowDraftItem({ runId: event.runId });
+    if (!item) {
+      // The only draft still awaiting a save — the live path, where the reply
+      // reached the panel before this event did.
+      item = this.workflowDraftItem({});
+      if (item && item.workflowId != null) item = null;
+    }
+    if (!item) {
+      // Reload path: this save is the first durable fact this conversation
+      // has about the workflow. The definition's steps are NOT in the event
+      // (they live host-side), so the card names the record and offers the
+      // proof rather than inventing a step list.
+      item = {
+        kind: "workflow_draft",
+        runId: event.runId ?? null,
+        draft: null,
+        review: null,
+        workflowId: event.workflowId ?? null,
+        version: event.version ?? null,
+        stepsCount: Number.isInteger(event.stepsCount) ? event.stepsCount : null,
+        status: "saved",
+        busy: null,
+        proof: null,
+        proofOutcomes: null,
+        lastError: null,
+        ts: event.ts || Date.now()
+      };
+      this.items.push(item);
+      return;
+    }
+    item.workflowId = event.workflowId ?? item.workflowId;
+    item.version = event.version != null ? event.version : item.version;
+    if (Number.isInteger(event.stepsCount)) item.stepsCount = event.stepsCount;
+    item.status = item.status === "enabled" ? "enabled" : "saved";
+    item.busy = null;
+    item.lastError = null;
+  }
+
+  _applyWorkflowProofEvent(event) {
+    let item = event.workflowId != null ? this.workflowDraftItem({ workflowId: event.workflowId }) : null;
+    if (!item) {
+      item = {
+        kind: "workflow_draft",
+        runId: event.runId ?? null,
+        draft: null,
+        review: null,
+        workflowId: event.workflowId ?? null,
+        version: event.version ?? null,
+        stepsCount: null,
+        status: "saved",
+        busy: null,
+        proof: null,
+        proofOutcomes: null,
+        lastError: null,
+        ts: event.ts || Date.now()
+      };
+      this.items.push(item);
+    }
+    item.version = event.version != null ? event.version : item.version;
+    item.proof = {
+      ok: event.ok === true,
+      summary: typeof event.summary === "string" ? event.summary : null,
+      evidenceFile: null,
+      at: event.ts || Date.now()
+    };
+    item.status = item.status === "enabled" ? "enabled" : "proved";
+    item.busy = null;
+    item.lastError = null;
+  }
+
+  _applyWorkflowEnabled(event) {
+    let item = event.workflowId != null ? this.workflowDraftItem({ workflowId: event.workflowId }) : null;
+    if (!item) {
+      item = {
+        kind: "workflow_draft",
+        runId: event.runId ?? null,
+        draft: null,
+        review: null,
+        workflowId: event.workflowId ?? null,
+        version: event.version ?? null,
+        stepsCount: null,
+        status: "enabled",
+        busy: null,
+        proof: null,
+        proofOutcomes: null,
+        lastError: null,
+        ts: event.ts || Date.now()
+      };
+      this.items.push(item);
+      return;
+    }
+    item.version = event.version != null ? event.version : item.version;
+    item.status = "enabled";
+    item.busy = null;
+    item.lastError = null;
+  }
+
+  _applyWorkflowDriftEvent(event) {
+    // Deduped by a stable identity built from the event's own fields (the
+    // event carries no id of its own): the same recorded drift replayed —
+    // live once, then from a snapshot — must render once, while a genuinely
+    // NEW drift at the same step carries a new timestamp and does render.
+    const driftId = `${event.workflowId ?? "?"}#${event.step ?? "?"}#${event.ref ?? "?"}#${event.reason ?? "?"}#${event.ts ?? ""}`;
+    if (this.items.some((i) => i.kind === "workflow_drift" && i.driftId === driftId)) return;
+    this.items.push({
+      kind: "workflow_drift",
+      driftId,
+      workflowId: event.workflowId ?? null,
+      step: Number.isInteger(event.step) ? event.step : null,
+      ref: event.ref ?? null,
+      reason: event.reason ?? null,
+      evidence: event.evidence ?? null,
+      ts: event.ts || Date.now()
+    });
+  }
+
+  _applyWorkflowHealProposed(event) {
+    if (event.proposalId == null) return;
+    const existing = this.workflowHealItem(event.proposalId);
+    const card = existing || {
+      kind: "workflow_heal",
+      proposalId: event.proposalId,
+      workflowId: event.workflowId ?? null,
+      baseVersion: Number.isInteger(event.baseVersion) ? event.baseVersion : null,
+      reason: typeof event.reason === "string" ? event.reason : null,
+      evidence: event.evidence != null ? event.evidence : null,
+      steps: Array.isArray(event.steps) ? event.steps : null,
+      proposedAt: typeof event.proposedAt === "number" ? event.proposedAt : event.ts || Date.now(),
+      expiresAt: typeof event.expiresAt === "number" ? event.expiresAt : null,
+      status: "pending",
+      busy: null,
+      decision: null,
+      fromVersion: null,
+      toVersion: null,
+      supersededBy: null,
+      lastError: null,
+      ts: event.ts || Date.now()
+    };
+    card.workflowId = event.workflowId ?? card.workflowId;
+    card.baseVersion = Number.isInteger(event.baseVersion) ? event.baseVersion : card.baseVersion;
+    card.reason = typeof event.reason === "string" ? event.reason : card.reason;
+    card.evidence = event.evidence != null ? event.evidence : card.evidence;
+    card.steps = Array.isArray(event.steps) ? event.steps : card.steps;
+    if (typeof event.expiresAt === "number") card.expiresAt = event.expiresAt;
+    if (!existing) this.items.push(card);
+    // One live proposal per (owner, id) line is the host's rule; the explicit
+    // `workflow_heal_superseded` event is the authority for it, but closing
+    // any older pending card for the SAME workflow here removes the window in
+    // which two live cards for one line would both look answerable.
+    for (const other of this.items) {
+      if (other === card || other.kind !== "workflow_heal") continue;
+      if (other.status !== "pending" || other.workflowId !== card.workflowId) continue;
+      other.status = "superseded";
+      other.supersededBy = card.proposalId;
+    }
+  }
+
+  _applyWorkflowHealResolved(proposalId, patch) {
+    const item = this.workflowHealItem(proposalId);
+    if (!item) return;
+    item.status = patch.status;
+    if (patch.toVersion != null) item.toVersion = patch.toVersion;
+    if (patch.fromVersion != null) item.fromVersion = patch.fromVersion;
+    if (patch.workflowId != null) item.workflowId = patch.workflowId;
+    if (patch.supersededBy != null) item.supersededBy = patch.supersededBy;
+    item.busy = null;
   }
 
   /** Task 9.7: clears a resolved/expired question (after the user answered,
@@ -1291,6 +2161,33 @@ function findOldestUnresolved(toolRows, toolName) {
     if (row.status === "running" && (toolName == null || row.toolName === toolName)) return row;
   }
   return null;
+}
+
+// Queue entry states, as the panel models them (see
+// MESSAGE_QUEUE_LABEL_VI). The host's `messageQueue` entries use only the two
+// LIVE ones ("pending"/"dispatching") — anything else is refused rather than
+// rendered as something the host did not say. A state the host DISCLOSES in a
+// cancel reply may also be a terminal one it has just applied, so that path
+// accepts every state this model can render.
+function normalizedQueueState(state) {
+  return state === "pending" || state === "dispatching" ? state : null;
+}
+
+const DISCLOSED_QUEUE_STATES = new Set(["pending", "dispatching", "cancelled", "failed"]);
+
+/** The three transcript item kinds the workflow lifecycle adds (see the
+ * workflow section in ConversationModel). Listed once so the window-rebuild
+ * carry (_captureLiveState) cannot drift from the model's own kinds. */
+const WORKFLOW_ITEM_KINDS = new Set(["workflow_draft", "workflow_drift", "workflow_heal"]);
+
+/** The queue identity of a `message_queued` event: the event's own body field
+ * (it is the seq of the event itself, design.md decision 1), falling back to
+ * the stored `seq` for a record that predates the body field. Live events
+ * carry no `seq` — only replayed ones do — which is exactly why the body
+ * field exists. */
+function queueMessageId(event, storedSeq) {
+  if (event && event.messageId != null) return event.messageId;
+  return storedSeq > 0 ? storedSeq : null;
 }
 
 export function toolRowDisplay(row) {

@@ -174,7 +174,15 @@ await test("new -> start -> stop: full happy-path lifecycle with a fake SDK", as
   assert(snap.events.some((e) => e.type === "run_done"), "transcript should record run completion");
 });
 
-await test("a second start on the same conversation while one is active is rejected (one active run per conversation)", async () => {
+// openspec/changes/add-message-queue-and-steering replaced this test's old
+// expectation. It used to assert the second send was REJECTED with
+// `run_start_rejected`; the spec now requires it to be ACCEPTED into the
+// conversation's queue while the run is active ("Messages submitted during a
+// run are queued"), and the invariant this test exists to protect — one
+// ACTIVE run per conversation — is asserted directly instead of through a
+// refusal the change deliberately removed (see host/test/message-queue.test.mjs
+// for the queue's own lifecycle coverage).
+await test("a second start on the same conversation while one is active is queued, never a second concurrent run", async () => {
   const core = buildCore({
     sdk: {
       async *query() {
@@ -188,7 +196,18 @@ await test("a second start on the same conversation while one is active is rejec
   const first = await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.START, { conversationId, prompt: "a" }));
   assert(first.accepted, "first start should be accepted");
   const second = await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.START, { conversationId, prompt: "b" }));
-  assert(second.type === AGENT_MESSAGE_TYPES.ERROR && second.reason === "run_start_rejected", "a second concurrent start on the same conversation must be rejected");
+  assert(second.type === AGENT_MESSAGE_TYPES.START, "a second send while a run is active must be accepted");
+  assert(second.accepted === true && second.queued === true, "it is accepted as a queued message");
+  assert(second.runId === undefined, "a queued message has no run yet");
+  assert(second.entry && second.entry.state === "pending", "the ack carries the pending entry");
+  assert(
+    core.sessionManager.activeRun(conversationId).runId === first.runId,
+    "the active run is untouched by the queued send — there is still exactly one"
+  );
+  assert(
+    core.sessionManager.snapshotSince(conversationId, 0).events.filter((e) => e.type === "run_created").length === 1,
+    "no second run may be created while the first is active"
+  );
   await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.STOP, { conversationId }));
 });
 

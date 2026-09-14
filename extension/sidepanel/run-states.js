@@ -49,6 +49,36 @@ export const PHASE_LABEL_VI = Object.freeze({
 // claim a response is already flowing. "Đang xử lý…" = "working on it…".
 export const BUSY_LABEL_VI = "Đang xử lý…";
 
+// Message-queue vocabulary (openspec/changes/add-message-queue-and-steering,
+// design.md decision 11; panel spec "Truthful queue states with per-message
+// control"). These describe the MESSAGE, never the run: the header pill above
+// keeps describing the run exactly as before, and the two vocabularies are
+// deliberately kept in this ONE module so neither can drift into the other's
+// surface. `pending` reuses the already-reviewed phrase the run's own QUEUED
+// state uses — from the operator's point of view a message waiting for its
+// turn and a run waiting for the browser lease mean the same thing, and a
+// second wording for the same state would be a vocabulary split rather than
+// a distinction.
+export const MESSAGE_QUEUE_LABEL_VI = Object.freeze({
+  pending: "Đang chờ lượt",
+  dispatching: "Sắp chạy",
+  cancelled: "Đã hủy",
+  failed: "Không chạy được"
+});
+
+// The interrupt-honesty note (design.md decision 3's fallback disclosure rule,
+// panel spec "Run-now while the run streams"): the operator asked to run a
+// message now, the active run could not be stopped in time, and the message
+// therefore runs as the next turn. Said on the message itself, because that is
+// the only place the distinction is observable — the message still runs, just
+// not when it was asked to.
+export const QUEUE_FALLBACK_NOTE_VI = "Chưa dừng kịp — tin nhắn sẽ chạy sau lượt hiện tại";
+
+// Shown with the resume control while the drain is paused (design.md decision
+// 5): Stop with messages pending is an intervention, so nothing starts until
+// the operator says so.
+export const QUEUE_PAUSED_NOTE_VI = "Hàng đợi tin nhắn đang tạm dừng";
+
 // Maps a phase to the shared `.connection-state.is-*` modifier already
 // defined in extension/ui/components.css (is-ready/is-connecting/is-error
 // are the only three that exist there -- the panel never invents a second

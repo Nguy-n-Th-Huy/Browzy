@@ -270,6 +270,38 @@ export const AGENT_MESSAGE_TYPES = Object.freeze({
   // tasks.md 6.3/6.6), not claimed here.
   RECORDING_ATTACH: "recording_attach",
 
+  // Message-queue operator controls (openspec/changes/add-message-queue-and-
+  // steering, design.md decision 4/5 + the change's frozen wire contract).
+  // Both reuse the one-type request/reply convention
+  // AGENT_SETTINGS/UPDATE_CONVERSATION above already establish, are gated
+  // behind hello like every other conversation-scoped operation, and are
+  // additive with NO PROTOCOL_VERSION bump: an older companion answers
+  // unknown_message_type rather than hanging.
+  //
+  // CANCEL_MESSAGE is the per-message cancel affordance the panel offers
+  // while a message is still `pending`. The host answers from the entry's
+  // own durable state, never from optimism: a message the next turn has
+  // already claimed is refused with `already_claimed` (plus the claimed
+  // state disclosed) — once claimed, the run's own Stop is the only control
+  // left, exactly as the panel spec's "Cancel affordance follows the claim"
+  // scenario requires. Wire shape:
+  //   panel -> companion  {v, type:"cancel_message", conversationId,
+  //                         messageId, requestId}
+  //   companion -> panel  {v, type:"cancel_message", ok:true, messageId}
+  //   companion -> panel  {v, type:"cancel_message", ok:false, reason:
+  //                         "already_claimed"|"unknown_message"|
+  //                         "conversation_deleted", state?}
+  //
+  // RESUME_QUEUE is the operator's explicit "drain the queue now" action,
+  // offered when Stop paused the drain (design.md decision 5). It clears the
+  // durable `queuePaused` flag and drains in submission order.
+  //   panel -> companion  {v, type:"resume_queue", conversationId, requestId}
+  //   companion -> panel  {v, type:"resume_queue", ok:true}
+  //   companion -> panel  {v, type:"resume_queue", ok:false, reason:
+  //                         "unknown_conversation"|"conversation_deleted"}
+  CANCEL_MESSAGE: "cancel_message",
+  RESUME_QUEUE: "resume_queue",
+
   // Administrator-managed permission policy channel
   // (add-permission-modes-and-threat-signals, design.md decision 7 / task
   // 4.1). The host cannot read `chrome.storage.managed` itself — the
@@ -292,6 +324,60 @@ export const AGENT_MESSAGE_TYPES = Object.freeze({
   // validated host-side (permission-modes.js's `validateManagedPolicy`) and
   // handled the same way: ignored for decisions, reported as unreadable.
   MANAGED_POLICY_SNAPSHOT: "managed_policy_snapshot",
+
+  // Rerunnable workflows + self-healing
+  // (openspec/changes/add-workflow-materialization-and-heal, the change's
+  // frozen wire contract). Five additive request/reply pairs reusing one type
+  // name per operation — the convention CANCEL_MESSAGE/RESUME_QUEUE above
+  // establish — gated behind hello like every other conversation-scoped
+  // operation, and additive with NO PROTOCOL_VERSION bump: an older companion
+  // answers unknown_message_type rather than hanging (see companion.js's
+  // handleEnvelope() default branch), which the panel maps to an explicit
+  // "companion needs updating" state.
+  //
+  //   panel -> companion  {v, type:"workflow_draft_request", conversationId, runId, requestId}
+  //   companion -> panel  {v, type:"workflow_draft_request", conversationId, requestId,
+  //                        ok:true, draft:{workflowId, name, steps, domain, document, domains},
+  //                        review:{workflowId, name, steps, domain, document, domains}}
+  //   companion -> panel  {v, type:"workflow_draft_request", ..., ok:false, incomplete:[...]}
+  //   companion -> panel  {v, type:"workflow_draft_request", ..., ok:false,
+  //                        reason:"unknown_run"|"run_not_completed"|"no_trail"|"unknown_conversation"}
+  //
+  //   panel -> companion  {v, type:"workflow_draft_save", conversationId, runId, definition, requestId}
+  //   companion -> panel  {v, type:"workflow_draft_save", ..., ok:true, workflowId, version}
+  //   companion -> panel  {v, type:"workflow_draft_save", ..., ok:false,
+  //                        reason:"invalid_definition", errors:[{code, message}]}
+  //
+  //   panel -> companion  {v, type:"workflow_prove", conversationId, workflowId, version?, tabId, requestId}
+  //   companion -> panel  {v, type:"workflow_prove", ..., ok:true, outcomes:[...], evidenceFile}
+  //   companion -> panel  {v, type:"workflow_prove", ..., ok:false,
+  //                        reason:"unknown_workflow"|"unknown_conversation"|"busy"|"bridge_unavailable"|"bridge_error"|"extension_error",
+  //                        detail?}
+  //
+  //   panel -> companion  {v, type:"workflow_enable", conversationId, workflowId, version, requestId}
+  //   companion -> panel  {v, type:"workflow_enable", ..., ok:true, version}
+  //   companion -> panel  {v, type:"workflow_enable", ..., ok:false, reason:"unknown_workflow"|"stale_version", latest?}
+  //
+  //   panel -> companion  {v, type:"workflow_heal_decide", conversationId, proposalId,
+  //                        decision:"allow"|"deny", requestId}
+  //   companion -> panel  {v, type:"workflow_heal_decide", ..., ok:true, decision,
+  //                        workflowId?, fromVersion?, toVersion?}
+  //   companion -> panel  {v, type:"workflow_heal_decide", ..., ok:false,
+  //                        reason:"unknown_proposal"|"expired"|"superseded"|"stale_base"|"invalid_candidate",
+  //                        state?, errors?, latest?}
+  //
+  // The transcript event family these operations append (stream_event
+  // envelopes, panel-restorable): workflow_draft_saved, workflow_proof,
+  // workflow_drift, workflow_heal_proposed, workflow_heal_saved,
+  // workflow_heal_rejected, workflow_heal_expired, workflow_heal_superseded,
+  // workflow_enabled, workflow_updated.
+  WORKFLOW_DRAFT_REQUEST: "workflow_draft_request",
+  WORKFLOW_DRAFT_SAVE: "workflow_draft_save",
+  WORKFLOW_PROVE: "workflow_prove",
+  WORKFLOW_ENABLE: "workflow_enable",
+  WORKFLOW_HEAL_DECIDE: "workflow_heal_decide",
+  WORKFLOW_EDIT_REQUEST: "workflow_edit_request",
+  WORKFLOW_EDIT_SAVE: "workflow_edit_save",
 
   ERROR: "error"
 });
@@ -590,6 +676,60 @@ export function validateStartSessionChoice(value) {
   if (value === undefined || value === null) return { ok: true, newSdkSession: false };
   if (typeof value !== "boolean") return { ok: false, reason: "malformed_new_sdk_session" };
   return { ok: true, newSdkSession: value };
+}
+
+// --- START envelope's optional `mode` field --------------------------------
+//
+// openspec/changes/add-message-queue-and-steering, design.md decisions 3/7
+// and the change's frozen wire contract. A Send now says what should happen
+// when the conversation's run is already active:
+//
+//   "queue"     — the default, and the only behavior an older panel can
+//                 possibly mean: file this message behind the active run and
+//                 run it as the next turn, in submission order.
+//   "interrupt" — "run now": attempt to cancel the active run through the
+//                 EXISTING stop path (SessionManager.stopRun) so this message
+//                 runs immediately. Best-effort by construction; when the
+//                 stop path reports nothing to stop, the host discloses the
+//                 fallback instead of pretending an interrupt happened.
+//
+// Additive under PROTOCOL_VERSION 1, exactly like `effort`/`attachments`/
+// `elementRecord` above: an old peer never sends the field (→ "queue", which
+// is what admission already did), and a companion that has never heard of it
+// ignores it. A mode that is present but not one of these two literals is
+// rejected at the wire boundary (reason "malformed_mode", carried on the
+// ordinary ERROR envelope) rather than being silently coerced — a typo'd
+// "interupt" must never silently become a queued send when the operator
+// asked for run-now.
+//
+// The reply shapes this field decides between, so the whole queued-send
+// contract is auditable in one place (all on the START type, which stays a
+// request/reply-reuses-one-type like STOP/LIST_CONVERSATIONS):
+//   run started (existing shape, unchanged):
+//     {v, type:"start", conversationId, runId, accepted:true, queued:!wasFree}
+//   queued (no runId — no run exists yet):
+//     {v, type:"start", conversationId, accepted:true, queued:true,
+//      entry:{messageId, mode, state:"pending", enqueuedAt}}
+//   refused because the queue is full (nothing was appended):
+//     {v, type:"error", reason:"queue_full", limit, conversationId}
+// `idempotent:true` is added to a queued ack whose idempotencyKey already
+// produced it. The message's own text never appears in any of these: it is
+// durable in the `message_queued` transcript event (see
+// host/agent/session/manager.js's enqueueMessage), which is what a reopen
+// restores from.
+export const START_MODES = Object.freeze({
+  QUEUE: "queue",
+  INTERRUPT: "interrupt"
+});
+
+/**
+ * Validate START's optional `mode` field.
+ * @returns {{ok: true, mode: string} | {ok: false, reason: string}}
+ */
+export function validateStartMode(value) {
+  if (value === undefined || value === null) return { ok: true, mode: START_MODES.QUEUE };
+  if (value === START_MODES.QUEUE || value === START_MODES.INTERRUPT) return { ok: true, mode: value };
+  return { ok: false, reason: "malformed_mode" };
 }
 
 /**

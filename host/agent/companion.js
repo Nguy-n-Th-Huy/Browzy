@@ -40,6 +40,8 @@ import {
   ELEMENT_RECORD_MARKUP_MAX_CHARS,
   validateStartEffort,
   validateStartSessionChoice,
+  validateStartMode,
+  START_MODES,
   attachmentKind,
   makeEnvelope,
   validateHello,
@@ -129,6 +131,18 @@ import { CHATGPT_CAPABILITY_TEST_MARKER } from "./settings/profile-schema.js";
 // errors.js is dependency-free — nothing Node-specific or credential-bearing
 // rides into this module through it.
 import { ProviderError } from "./settings/errors.js";
+// Rerunnable workflows + self-healing
+// (openspec/changes/add-workflow-materialization-and-heal). The registry's
+// versioned CRUD, the run-trail derivation, the proof marker/evidence
+// helpers, and the heal proposal store — all pure host-side data work. The
+// prove op reaches the browser only through this.toolBridge, i.e. the SAME
+// tool_request path every browser tool uses (see _handleWorkflowProve()).
+import { createWorkflow, getWorkflow, setWorkflowEnabled, updateWorkflow } from "./skills/workflows-store.js";
+import { WorkflowValidationError } from "./skills/workflows-schema.js";
+import { deriveRunDraft, runTrailWindow } from "./skills/workflows-materialize.js";
+import { buildProveRequest, normalizeProveReply, writeProofEvidence, summarizeProofOutcomes } from "./skills/workflows-proof.js";
+import { HealProposalStore, buildHealProvenance, validateHealCandidate } from "./skills/workflows-heal.js";
+import { createProposeWorkflowHealTool, PROPOSE_WORKFLOW_HEAL_TOOL_NAME } from "./tools/propose-workflow-heal.js";
 
 // auth.js's `getSignInStatus`/`cancelSignIn` answer "no sign-in with this id"
 // (never started, or its terminal record already pruned after retention) with a
@@ -187,6 +201,28 @@ function extractSkillBody(raw) {
 // combined) are a panel-side concern (the composer UI refuses to send past
 // them), not re-checked here.
 export const MAX_USER_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+
+// --- Rerunnable workflows: host-side constants -----------------------------
+//
+// The registry owner every OPERATOR-initiated workflow save uses. One
+// documented constant, not a per-call invention: a draft derived from a run
+// and saved from the panel belongs to the person at this browser, and the
+// registry's owner field is what later scopes editing, enablement and heal
+// decisions (see workflows-store.js's ownership rules). A single-user
+// installation needs no identity resolution to write this down, and a
+// fabricated per-user value would be a lie about who owns the record.
+export const LOCAL_OPERATOR_OWNER = "local-operator";
+
+/** The extension's `workflow_prove` tool name on the shared bridge (the
+ *  request/response pair is documented in skills/workflows-proof.js). */
+const WORKFLOW_PROVE_TOOL = "workflow_prove";
+
+/** native-lease.js's busy refusal, matched by its own stable prefix. The
+ *  companion refuses a prove BEFORE dispatch whenever it can see a holder —
+ *  this catches the narrow race where a run takes the lease between that
+ *  check and the bridge's own arbitration. The optional `Error:` prefix is
+ *  tool-runtime.js's collapse of a transport error into result text. */
+const BRIDGE_BUSY_PATTERN = /^(?:Error:\s*)?Browser is busy\b/;
 
 // File extension per accepted MIME type for on-disk attachment bytes.
 const EXT_BY_MIME = Object.freeze({
@@ -322,7 +358,7 @@ export class CompanionCore {
    *   network call. Additive: omitted, the op resolves the real module
    *   lazily.
    */
-  constructor({ toolBridge, sessionManager, lease, coerceArgs, sdk, profileProvider, settingsProvider, chatgptAuthProvider, chatgptUsageReader, artifactStore, attachmentStore, askUserToolFactory, documentStore }) {
+  constructor({ toolBridge, sessionManager, lease, coerceArgs, sdk, profileProvider, settingsProvider, chatgptAuthProvider, chatgptUsageReader, artifactStore, attachmentStore, askUserToolFactory, documentStore, healProposals }) {
     this.toolBridge = toolBridge;
     this.sessionManager = sessionManager;
     this.lease = lease;
@@ -373,6 +409,27 @@ export class CompanionCore {
     // it hang indefinitely.
     this._pendingApprovals = new RequestIdTracker();
     this._pendingQuestions = new RequestIdTracker();
+
+    // Rerunnable workflows: the heal proposals this companion is holding for
+    // review. In-memory by design (see skills/workflows-heal.js's header) and
+    // shared across conversations of this bridge, because a proposal is
+    // addressed by its own proposalId — the panel that decides it carries the
+    // id, not a conversation-scoped lookup. The expiry callback is wired here
+    // so an unanswered proposal resolves to a durable, distinguishable
+    // `workflow_heal_expired` record in its own conversation's transcript
+    // even if the operator never touches the card again.
+    this.healProposals =
+      healProposals ||
+      new HealProposalStore({
+        onExpire: (proposal) => {
+          this._emitWorkflowEvent(proposal.conversationId, {
+            type: "workflow_heal_expired",
+            proposalId: proposal.proposalId,
+            workflowId: proposal.workflowId,
+            expiresAt: proposal.expiresAt
+          });
+        }
+      });
 
     // CRITICAL fix (add-permission-modes-and-threat-signals verification): a
     // TabRiskRegistry must outlive one Run — buildSdkTools() (adapter.js)
@@ -442,6 +499,28 @@ export class CompanionCore {
     // this one, where the wire-side cancel reaches in and aborts a call
     // that is already running its own for-await loop below.
     this._enhanceRequests = new Map();
+
+    // --- Queued messages (add-message-queue-and-steering) ------------------
+    //
+    // Success-only memo for START idempotency keys (R7). Same pattern and
+    // lifecycle as `_deleteReplies` below: a panel that retried a send after
+    // losing the reply gets the ORIGINAL acceptance back — the same entry, the
+    // same runId — instead of a second queue entry or a second run; failures
+    // are deliberately not memoized so a genuine retry can genuinely retry.
+    // In-memory, per process: the durable half of R7 is the entry's own
+    // `idempotencyKey` field in meta.json, which a restart or any later
+    // delivery still resolves against.
+    this._startReplies = new Map(); // idempotencyKey -> START reply envelope
+
+    // The queue's drain is host-managed but the turn itself is not: only this
+    // class knows how to resolve a profile/model, bind skills and reach the
+    // SDK. So SessionManager calls back into here after every run terminal,
+    // and this is the one place that knows how to turn a claimed message into
+    // a run. Assigned rather than injected because the manager is constructed
+    // before the core in both production wiring and every test harness; a
+    // manager with no core attached simply never drains (see
+    // SessionManager._maybeDrainQueue).
+    this.sessionManager.onQueueDrain = (conversationId) => this._drainConversationQueue(conversationId);
   }
 
   /** @returns {Promise<object>} the reply envelope, if any (some message types are fire-and-forget). */
@@ -462,6 +541,24 @@ export class CompanionCore {
         return this._handleStart(envelope);
       case AGENT_MESSAGE_TYPES.STOP:
         return this._handleStop(envelope);
+      case AGENT_MESSAGE_TYPES.CANCEL_MESSAGE:
+        return this._handleCancelMessage(envelope);
+      case AGENT_MESSAGE_TYPES.RESUME_QUEUE:
+        return this._handleResumeQueue(envelope);
+      case AGENT_MESSAGE_TYPES.WORKFLOW_DRAFT_REQUEST:
+        return this._handleWorkflowDraftRequest(envelope);
+      case AGENT_MESSAGE_TYPES.WORKFLOW_DRAFT_SAVE:
+        return this._handleWorkflowDraftSave(envelope);
+      case AGENT_MESSAGE_TYPES.WORKFLOW_PROVE:
+        return this._handleWorkflowProve(envelope);
+      case AGENT_MESSAGE_TYPES.WORKFLOW_ENABLE:
+        return this._handleWorkflowEnable(envelope);
+      case AGENT_MESSAGE_TYPES.WORKFLOW_EDIT_REQUEST:
+        return this._handleWorkflowEditRequest(envelope);
+      case AGENT_MESSAGE_TYPES.WORKFLOW_EDIT_SAVE:
+        return this._handleWorkflowEditSave(envelope);
+      case AGENT_MESSAGE_TYPES.WORKFLOW_HEAL_DECIDE:
+        return this._handleWorkflowHealDecide(envelope);
       case AGENT_MESSAGE_TYPES.APPROVAL_DECISION:
         return this._handleApprovalDecision(envelope);
       case AGENT_MESSAGE_TYPES.QUESTION_ANSWER:
@@ -565,11 +662,707 @@ export class CompanionCore {
     // approval or question for this run WITHOUT waiting for a late answer.
     // The next decision/answer that arrives for that requestId is rejected
     // (see _handleApprovalDecision's requestId check), not silently applied.
-    if (stopped) {
-      this._pendingApprovals.rejectAll({ reason: `cuộc trò chuyện đã dừng (${envelope.reason || "user_stop"})` });
-      this._pendingQuestions.rejectAll({ reason: `cuộc trò chuyện đã dừng (${envelope.reason || "user_stop"})` });
-    }
+    if (stopped) this._rejectPendingDecisions(envelope.reason || "user_stop");
     return makeEnvelope(AGENT_MESSAGE_TYPES.STOP, { conversationId: envelope.conversationId, stopped });
+  }
+
+  /**
+   * Deny every outstanding approval/question of the stopped run, with a
+   * distinguishable reason, so a decision that was already being awaited
+   * settles now instead of hanging until its caller gives up.
+   *
+   * Shared by the wire STOP and by interrupt (add-message-queue-and-steering,
+   * spec: "Interrupt while a decision is pending — THEN the pending decision
+   * is invalidated under the same rules as Stop"). Interrupt reuses the stop
+   * path for the run itself; this is the half of Stop's semantics that lives
+   * above the run, so it has to be applied explicitly there too.
+   */
+  _rejectPendingDecisions(reason) {
+    this._pendingApprovals.rejectAll({ reason: `cuộc trò chuyện đã dừng (${reason})` });
+    this._pendingQuestions.rejectAll({ reason: `cuộc trò chuyện đã dừng (${reason})` });
+  }
+
+  /**
+   * Per-message cancel (openspec/changes/add-message-queue-and-steering,
+   * tasks.md 3.4 / spec "Cancel a pending message" + "Cancel after claim").
+   *
+   * The decision is made entirely by the durable entry's own state: a
+   * `pending` message is cancelled and never runs; a `dispatching` one is
+   * refused with `already_claimed` and its state disclosed, because a turn has
+   * already taken ownership and the run's Stop is the control at that point.
+   * Nothing here touches an active run — a cancel that lands while a run
+   * streams must leave that run alone.
+   */
+  _handleCancelMessage(envelope) {
+    if (!this._requireHello()) return this._notHandshaked(envelope);
+    const { conversationId, messageId, requestId } = envelope;
+    if (!conversationId) {
+      return makeEnvelope(AGENT_MESSAGE_TYPES.ERROR, { reason: "missing_conversation_id", requestId });
+    }
+    if (!Number.isInteger(messageId)) {
+      return makeEnvelope(AGENT_MESSAGE_TYPES.ERROR, {
+        reason: "malformed_cancel_message",
+        detail: "messageId must be an integer",
+        conversationId,
+        requestId
+      });
+    }
+    const result = this.sessionManager.cancelQueuedMessage(conversationId, messageId);
+    if (!result.ok) {
+      return makeEnvelope(AGENT_MESSAGE_TYPES.CANCEL_MESSAGE, {
+        conversationId,
+        ok: false,
+        reason: result.reason,
+        ...(result.state ? { state: result.state } : {}),
+        ...(requestId !== undefined ? { requestId } : {})
+      });
+    }
+    return makeEnvelope(AGENT_MESSAGE_TYPES.CANCEL_MESSAGE, {
+      conversationId,
+      ok: true,
+      messageId,
+      ...(requestId !== undefined ? { requestId } : {})
+    });
+  }
+
+  /**
+   * Explicit resume of a paused drain (tasks.md 3.4, design.md decision 5):
+   * clears the durable pause and drains in submission order. This is also the
+   * operator's escape hatch if a drain trigger were ever missed — the drain's
+   * own preconditions make a resume with nothing to do harmless.
+   */
+  _handleResumeQueue(envelope) {
+    if (!this._requireHello()) return this._notHandshaked(envelope);
+    const { conversationId, requestId } = envelope;
+    if (!conversationId) {
+      return makeEnvelope(AGENT_MESSAGE_TYPES.ERROR, { reason: "missing_conversation_id", requestId });
+    }
+    const result = this.sessionManager.resumeQueue(conversationId);
+    if (!result.ok) {
+      return makeEnvelope(AGENT_MESSAGE_TYPES.RESUME_QUEUE, {
+        conversationId,
+        ok: false,
+        reason: result.reason,
+        ...(requestId !== undefined ? { requestId } : {})
+      });
+    }
+    return makeEnvelope(AGENT_MESSAGE_TYPES.RESUME_QUEUE, {
+      conversationId,
+      ok: true,
+      ...(requestId !== undefined ? { requestId } : {})
+    });
+  }
+
+  // --- Rerunnable workflows + self-healing --------------------------------
+  //
+  // Five operator-initiated operations (openspec/changes/add-workflow-
+  // materialization-and-heal, the change's frozen wire contract). All five
+  // are conversation-scoped and gated behind hello like the queue controls
+  // above; all five reply with their own type name and echo the requestId.
+  // Their decisions come from recorded state only — a run's stored trail, the
+  // registry's own records, a proposal the host itself minted — never from
+  // what a caller claims about them.
+
+  /**
+   * Append one workflow event to a conversation's transcript (durable) and
+   * push it live to any listening panel.
+   *
+   * SessionManager._emitConversationEvent() is the manager's conversation-
+   * level append+hook, and it is the right one here: these events belong to
+   * the conversation, not to a run (a draft save, a proof, a heal decision
+   * happen precisely when no run exists), so run.emit() would have nothing
+   * to attach them to. Event-sink failures are swallowed exactly like
+   * run.emit()'s own sink guard: a panel that could not be told something is
+   * recoverable (the event is on disk), a failed operation is not.
+   */
+  _emitWorkflowEvent(conversationId, event) {
+    if (!conversationId) return null;
+    try {
+      return this.sessionManager._emitConversationEvent(conversationId, event);
+    } catch {
+      return null;
+    }
+  }
+
+  /** One conversation's stored event log + recorded presentation metadata,
+   *  or null when the conversation does not exist (a deleted conversation is
+   *  answered by hasConversation()'s tombstone, never resurrected).
+   *
+   * The meta here is the RAW conversation record (store.loadMeta): its top
+   * level carries the recorded presentation metadata the workflow handlers
+   * need — `hostname` in particular, the domain fallback for a trail that
+   * names no URL. Deliberately NOT sessionManager.getConversationMetadata(),
+   * which returns the versioned `conversationMetadata` ENVELOPE
+   * (appProfile/sdkSessionRef/budgetPolicy/…) — an object that never carries
+   * `hostname`. Using the envelope made every metaHostname read undefined, so
+   * a run whose trail has no URL-bearing tool call (find/read/computer-only,
+   * the common case) could never derive a domain binding — found live on
+   * 2026-09-14: a real conversation whose meta.json DID record
+   * `hostname: "dauthau.asia"` still answered "names no page host". */
+  _workflowConversationContext(conversationId) {
+    if (!conversationId || !this.sessionManager.hasConversation(conversationId)) return null;
+    const meta = this.sessionManager.store.loadMeta(conversationId);
+    if (!meta) return null;
+    return { meta, events: this.sessionManager.store.allEvents(conversationId) };
+  }
+
+  /**
+   * Derive a workflow draft from a COMPLETED run's recorded trail
+   * (spec "Materialization from a completed run").
+   *
+   * The derivation reads the conversation's own stored stream_message events
+   * — the same bytes the panel replayed into the operator's transcript — and
+   * answers with either a draft, a list of specific incompleteness reasons,
+   * or the reason there is no trail to derive from. It never guesses a
+   * value, and it enables nothing.
+   */
+  _handleWorkflowDraftRequest(envelope) {
+    if (!this._requireHello()) return this._notHandshaked(envelope);
+    const { conversationId, runId, requestId } = envelope;
+    if (!conversationId) return makeEnvelope(AGENT_MESSAGE_TYPES.ERROR, { reason: "missing_conversation_id", requestId });
+    const reply = (payload) =>
+      makeEnvelope(AGENT_MESSAGE_TYPES.WORKFLOW_DRAFT_REQUEST, {
+        conversationId,
+        ...(requestId !== undefined ? { requestId } : {}),
+        ...payload
+      });
+    const context = this._workflowConversationContext(conversationId);
+    if (!context) return reply({ ok: false, reason: "unknown_conversation" });
+    const derived = deriveRunDraft({
+      conversationEvents: context.events,
+      runId,
+      metaHostname: context.meta && typeof context.meta.hostname === "string" ? context.meta.hostname : null,
+      // v1 carries a document binding only when one is recorded; a run that
+      // bound none derives a draft without one rather than a fabricated one.
+      document: null
+    });
+    if (!derived.ok) {
+      return reply(derived.reason ? { ok: false, reason: derived.reason } : { ok: false, incomplete: derived.incomplete });
+    }
+    return reply({ ok: true, draft: derived.draft, review: derived.review });
+  }
+
+  /**
+   * Save a reviewed draft as a NEW, DISABLED workflow version (spec: the
+   * derivation never enables; task 2.2: the enabling path stays the existing
+   * registry path, with no new flag or shortcut).
+   *
+   * The definition arrives from the panel (the operator may have edited it),
+   * so it is untrusted input: it is validated by the registry's own schema,
+   * re-homed under the local-operator identity, stored as a DISABLED version
+   * (version 1; the next version when the id is already stored — a save
+   * always stores what was reviewed), and its provenance is written by the
+   * HOST — a caller cannot claim where a definition came from.
+   */
+  _handleWorkflowDraftSave(envelope) {
+    if (!this._requireHello()) return this._notHandshaked(envelope);
+    const { conversationId, runId, definition, requestId } = envelope;
+    if (!conversationId) return makeEnvelope(AGENT_MESSAGE_TYPES.ERROR, { reason: "missing_conversation_id", requestId });
+    const reply = (payload) =>
+      makeEnvelope(AGENT_MESSAGE_TYPES.WORKFLOW_DRAFT_SAVE, {
+        conversationId,
+        ...(requestId !== undefined ? { requestId } : {}),
+        ...payload
+      });
+    const context = this._workflowConversationContext(conversationId);
+    if (!context) return reply({ ok: false, reason: "unknown_conversation" });
+    // A saved draft must still name a completed run: the provenance it
+    // records is only true while that run's trail is still derivable.
+    const window = runTrailWindow({ conversationEvents: context.events, runId });
+    if (!window.ok) return reply({ ok: false, reason: window.reason });
+    if (!definition || typeof definition !== "object" || Array.isArray(definition)) {
+      return reply({
+        ok: false,
+        reason: "invalid_definition",
+        errors: [{ code: "MISSING_FIELD", message: "a draft save requires the definition to be an object" }]
+      });
+    }
+    const now = new Date().toISOString();
+    let created;
+    try {
+      created = createWorkflow({
+        ...definition,
+        owner: LOCAL_OPERATOR_OWNER,
+        version: 1,
+        enabled: false,
+        provenance: { materializedFromRun: runId, conversationId, materializedAt: now },
+        createdAt: now,
+        updatedAt: now
+      });
+    } catch (err) {
+      if (err instanceof WorkflowValidationError && err.code === "DUPLICATE_IDENTITY") {
+        // A save ALWAYS stores what the operator reviewed (operator decision,
+        // 2026-09-15: "cứ có là tăng để lưu hết"). When this id@1 is already
+        // in the registry, the draft is the same workflow derived again —
+        // persist the NEXT version instead of refusing: earlier versions
+        // stay addressable, the new one is stored disabled exactly like a
+        // first save (a derived draft never enables itself), and its
+        // provenance names the version it replaced.
+        const stored = getWorkflow(definition.id, undefined, { owner: LOCAL_OPERATOR_OWNER });
+        if (!stored) {
+          return reply({ ok: false, reason: "invalid_definition", errors: [{ code: err.code, message: err.message }] });
+        }
+        const fields = { ...definition };
+        delete fields.id;
+        delete fields.version;
+        try {
+          created = updateWorkflow(
+            stored.id,
+            {
+              ...fields,
+              owner: LOCAL_OPERATOR_OWNER,
+              enabled: false,
+              provenance: {
+                materializedFromRun: runId,
+                conversationId,
+                materializedAt: now,
+                supersededVersion: stored.version
+              }
+            },
+            { owner: LOCAL_OPERATOR_OWNER }
+          );
+        } catch (bumpErr) {
+          if (bumpErr instanceof WorkflowValidationError) {
+            return reply({ ok: false, reason: "invalid_definition", errors: [{ code: bumpErr.code, message: bumpErr.message }] });
+          }
+          return reply({ ok: false, reason: "save_failed", detail: String((bumpErr && bumpErr.message) || bumpErr) });
+        }
+      } else if (err instanceof WorkflowValidationError) {
+        return reply({ ok: false, reason: "invalid_definition", errors: [{ code: err.code, message: err.message }] });
+      } else {
+        return reply({ ok: false, reason: "save_failed", detail: String((err && err.message) || err) });
+      }
+    }
+    this._emitWorkflowEvent(conversationId, {
+      type: "workflow_draft_saved",
+      workflowId: created.id,
+      version: created.version,
+      stepsCount: Array.isArray(created.steps) ? created.steps.length : 0
+    });
+    return reply({ ok: true, workflowId: created.id, version: created.version });
+  }
+
+  /**
+   * Hand the panel one stored definition for EDITING (operator decision,
+   * 2026-09-15: "kiểu gì cũng lỗi — cho phép sửa workflow"): a recording can
+   * always carry a wrong step, and re-recording the whole flow to fix one
+   * line is not a workflow feature. Read-only — resolves the exact requested
+   * version (the line's latest when the caller names none) and never writes.
+   */
+  _handleWorkflowEditRequest(envelope) {
+    if (!this._requireHello()) return this._notHandshaked(envelope);
+    const { conversationId, workflowId, version, requestId } = envelope;
+    if (!conversationId) return makeEnvelope(AGENT_MESSAGE_TYPES.ERROR, { reason: "missing_conversation_id", requestId });
+    const reply = (payload) =>
+      makeEnvelope(AGENT_MESSAGE_TYPES.WORKFLOW_EDIT_REQUEST, {
+        conversationId,
+        ...(requestId !== undefined ? { requestId } : {}),
+        ...payload
+      });
+    if (typeof workflowId !== "string" || !workflowId.trim()) return reply({ ok: false, reason: "unknown_workflow" });
+    if (!this.sessionManager.hasConversation(conversationId)) return reply({ ok: false, reason: "unknown_conversation" });
+    const workflow = this._resolveWorkflowForPanel(workflowId, version);
+    if (!workflow) return reply({ ok: false, reason: "unknown_workflow" });
+    return reply({
+      ok: true,
+      workflowId: workflow.id,
+      version: workflow.version,
+      name: workflow.name,
+      steps: Array.isArray(workflow.steps) ? workflow.steps : []
+    });
+  }
+
+  /**
+   * Save an operator-edited steps array as the NEXT version of the line.
+   *
+   * The edit arrives from the panel, so it is untrusted input. Only `steps`
+   * is accepted — the identity, domain binding and parameter schema of the
+   * stored record stay untouched — and the candidate is validated by the
+   * registry schema through the same door a heal candidate uses: unsafe
+   * kinds and malformed targets are refused with their codes, and an
+   * identical array is refused as NO_CHANGE rather than minting an empty
+   * version. The save goes through updateWorkflow (earlier versions stay
+   * addressable) and the new version carries the record's CURRENT enablement
+   * state, exactly the rule heal approval uses. A `version` that is no
+   * longer the line's latest is refused, never applied on top of a newer
+   * record.
+   */
+  _handleWorkflowEditSave(envelope) {
+    if (!this._requireHello()) return this._notHandshaked(envelope);
+    const { conversationId, workflowId, version, steps, requestId } = envelope;
+    if (!conversationId) return makeEnvelope(AGENT_MESSAGE_TYPES.ERROR, { reason: "missing_conversation_id", requestId });
+    const reply = (payload) =>
+      makeEnvelope(AGENT_MESSAGE_TYPES.WORKFLOW_EDIT_SAVE, {
+        conversationId,
+        ...(requestId !== undefined ? { requestId } : {}),
+        ...payload
+      });
+    if (typeof workflowId !== "string" || !workflowId.trim() || !Array.isArray(steps)) {
+      return makeEnvelope(AGENT_MESSAGE_TYPES.ERROR, {
+        reason: "malformed_workflow_edit",
+        detail: "workflow_edit_save requires a nonempty workflowId and a steps array",
+        conversationId,
+        ...(requestId !== undefined ? { requestId } : {})
+      });
+    }
+    if (!this.sessionManager.hasConversation(conversationId)) return reply({ ok: false, reason: "unknown_conversation" });
+    // The edit is applied to the LINE's latest version, never the version the
+    // caller names: a stale panel would otherwise write its old steps on top
+    // of a newer record.
+    const latest = this._resolveWorkflowForPanel(workflowId, undefined);
+    if (!latest) return reply({ ok: false, reason: "unknown_workflow" });
+    if (Number.isInteger(version) && version !== latest.version) {
+      return reply({ ok: false, reason: "stale_version", latest: latest.version });
+    }
+    const candidate = validateHealCandidate({ current: latest, steps });
+    if (!candidate.ok) return reply({ ok: false, reason: "invalid_candidate", errors: candidate.errors });
+    let next;
+    try {
+      next = updateWorkflow(
+        latest.id,
+        {
+          steps: candidate.steps,
+          provenance: { editedFrom: latest.version, editedAt: new Date().toISOString() },
+          // Same rule as heal approval: the operator's edit never changes the
+          // workflow's enablement state — it can neither silently enable a
+          // disabled workflow nor disable a running one.
+          enabled: latest.enabled !== false
+        },
+        { owner: latest.owner }
+      );
+    } catch (err) {
+      if (err instanceof WorkflowValidationError) {
+        return reply({ ok: false, reason: "invalid_candidate", errors: [{ code: err.code, message: err.message }] });
+      }
+      return reply({ ok: false, reason: "save_failed", detail: String((err && err.message) || err) });
+    }
+    this._emitWorkflowEvent(conversationId, {
+      type: "workflow_updated",
+      workflowId: next.id,
+      fromVersion: latest.version,
+      toVersion: next.version
+    });
+    return reply({ ok: true, workflowId: next.id, version: next.version });
+  }
+
+  /**
+   * Run a stored definition against the LIVE page and keep the evidence
+   * (side-panel-workflows: "Derived workflows prove themselves before they
+   * are offered as ready").
+   *
+   * Busy rule (frozen contract): a proof run must never race an active run
+   * or take the browser lease. It refuses with a distinguishable `busy`
+   * reason when this companion can see a holder, dispatches with NO
+   * lease-bearing meta (so the bridge never grants it one), and the bridge's
+   * own arbitration is the second line of defence for the race window.
+   * Nothing is waited for: a refusal is immediate, and the transport keeps
+   * its own bounded timeout.
+   */
+  async _handleWorkflowProve(envelope) {
+    if (!this._requireHello()) return this._notHandshaked(envelope);
+    const { conversationId, workflowId, version, tabId, requestId } = envelope;
+    if (!conversationId) return makeEnvelope(AGENT_MESSAGE_TYPES.ERROR, { reason: "missing_conversation_id", requestId });
+    const reply = (payload) =>
+      makeEnvelope(AGENT_MESSAGE_TYPES.WORKFLOW_PROVE, {
+        conversationId,
+        ...(requestId !== undefined ? { requestId } : {}),
+        ...payload
+      });
+    if (typeof workflowId !== "string" || !workflowId.trim() || !Number.isInteger(tabId)) {
+      return makeEnvelope(AGENT_MESSAGE_TYPES.ERROR, {
+        reason: "malformed_workflow_prove",
+        detail: "workflow_prove requires a nonempty workflowId and an integer tabId",
+        conversationId,
+        ...(requestId !== undefined ? { requestId } : {})
+      });
+    }
+    if (!this.sessionManager.hasConversation(conversationId)) return reply({ ok: false, reason: "unknown_conversation" });
+
+    const workflow = this._resolveWorkflowForPanel(workflowId, version);
+    if (!workflow) return reply({ ok: false, reason: "unknown_workflow" });
+
+    const busy = this._workflowBusyDetail();
+    if (busy) return reply({ ok: false, reason: "busy", detail: busy });
+
+    let call;
+    try {
+      // No meta: this request must not create, refresh, or steal the native
+      // browser lease (see the busy rule above).
+      call = await this.toolBridge.call(WORKFLOW_PROVE_TOOL, buildProveRequest({ workflow, tabId }));
+    } catch (err) {
+      return reply({ ok: false, reason: "bridge_error", detail: String((err && err.message) || err) });
+    }
+    const { result, resultUnknown } = call || {};
+    if (resultUnknown) {
+      return reply({
+        ok: false,
+        reason: "bridge_unavailable",
+        detail: "the browser connection dropped after the proof request was sent; its result is unknown"
+      });
+    }
+    const text = Array.isArray(result && result.content)
+      ? String((result.content.find((b) => b && b.type === "text") || {}).text || "")
+      : "";
+    if (BRIDGE_BUSY_PATTERN.test(text.trim())) {
+      // The bridge refused because a lease was taken between the check above
+      // and dispatch. Same distinguishable busy reason, no partial evidence.
+      return reply({ ok: false, reason: "busy", detail: text.trim().slice(0, 300) });
+    }
+    const parsed = normalizeProveReply(text);
+    if (!parsed.ok) {
+      return reply({
+        ok: false,
+        reason: parsed.reason === "unparseable" ? "extension_error" : parsed.reason,
+        ...(parsed.detail ? { detail: parsed.detail } : { detail: text.trim().slice(0, 300) })
+      });
+    }
+
+    const ranAt = new Date().toISOString();
+    let evidence;
+    try {
+      evidence = writeProofEvidence({
+        workflowId: workflow.id,
+        version: workflow.version,
+        tabId,
+        outcomes: parsed.outcomes,
+        source: parsed.finalUrl,
+        ranAt
+      });
+    } catch (err) {
+      return reply({ ok: false, reason: "evidence_write_failed", detail: String((err && err.message) || err) });
+    }
+    const allOk = parsed.outcomes.length > 0 && parsed.outcomes.every((outcome) => outcome.status === "ok");
+    this._emitWorkflowEvent(conversationId, {
+      type: "workflow_proof",
+      workflowId: workflow.id,
+      version: workflow.version,
+      ok: allOk,
+      summary: summarizeProofOutcomes(parsed.outcomes, parsed.finalUrl),
+      evidenceFile: evidence.logicalPath,
+      ranAt
+    });
+    return reply({
+      ok: true,
+      workflowId: workflow.id,
+      version: workflow.version,
+      outcomes: parsed.outcomes,
+      allOk,
+      finalUrl: parsed.finalUrl,
+      // Logical path only (under the agent root): a transcript event must not
+      // leak this machine's absolute layout.
+      evidenceFile: evidence.logicalPath
+    });
+  }
+
+  /**
+   * Enable a proven workflow. The OP itself is not proof-gated (frozen
+   * contract): the panel only offers it after a successful proof, and the
+   * host refuses the two things a stale panel could get wrong — an unknown
+   * workflow, and a version that is no longer the line's latest.
+   */
+  _handleWorkflowEnable(envelope) {
+    if (!this._requireHello()) return this._notHandshaked(envelope);
+    const { conversationId, workflowId, version, requestId } = envelope;
+    if (!conversationId) return makeEnvelope(AGENT_MESSAGE_TYPES.ERROR, { reason: "missing_conversation_id", requestId });
+    const reply = (payload) =>
+      makeEnvelope(AGENT_MESSAGE_TYPES.WORKFLOW_ENABLE, {
+        conversationId,
+        ...(requestId !== undefined ? { requestId } : {}),
+        ...payload
+      });
+    if (typeof workflowId !== "string" || !workflowId.trim()) {
+      return makeEnvelope(AGENT_MESSAGE_TYPES.ERROR, {
+        reason: "malformed_workflow_enable",
+        detail: "workflow_enable requires a nonempty workflowId",
+        conversationId,
+        ...(requestId !== undefined ? { requestId } : {})
+      });
+    }
+    // The decision is made against the LINE's latest version, never the
+    // version the caller named: enabling is a line-level act (the registry's
+    // setWorkflowEnabled persists the next version of the line), so a panel
+    // that proved version 1 while version 2 exists would otherwise enable a
+    // definition nobody proved.
+    const latest = this._resolveWorkflowForPanel(workflowId, undefined);
+    if (!latest) return reply({ ok: false, reason: "unknown_workflow" });
+    if (Number.isInteger(version) && version !== latest.version) {
+      return reply({ ok: false, reason: "stale_version", latest: latest.version });
+    }
+    const workflow = latest;
+    if (workflow.enabled !== false) {
+      // Already enabled: report the truth instead of minting an empty version
+      // bump (the registry's setWorkflowEnabled always persists a new one).
+      return reply({ ok: true, version: workflow.version, alreadyEnabled: true });
+    }
+    let next;
+    try {
+      next = setWorkflowEnabled(workflow.id, true, { owner: workflow.owner });
+    } catch (err) {
+      if (err instanceof WorkflowValidationError) {
+        return reply({ ok: false, reason: "invalid_workflow", errors: [{ code: err.code, message: err.message }] });
+      }
+      return reply({ ok: false, reason: "enable_failed", detail: String((err && err.message) || err) });
+    }
+    this._emitWorkflowEvent(conversationId, { type: "workflow_enabled", workflowId: next.id, version: next.version });
+    return reply({ ok: true, version: next.version });
+  }
+
+  /**
+   * Decide a heal proposal (spec "Healing proposes a new version and never
+   * rewrites silently").
+   *
+   * `allow` saves exactly one new version through the registry's own
+   * updateWorkflow mechanics — provenance naming the healed version and the
+   * drift evidence — and the previous version stays addressable. `deny` is a
+   * no-op with a distinguishable record. Unknown, superseded and expired
+   * proposals are refused with their state disclosed; a base version that
+   * moved under the proposal is refused rather than silently rebased.
+   */
+  _handleWorkflowHealDecide(envelope) {
+    if (!this._requireHello()) return this._notHandshaked(envelope);
+    const { conversationId, proposalId, decision, requestId } = envelope;
+    if (!conversationId) return makeEnvelope(AGENT_MESSAGE_TYPES.ERROR, { reason: "missing_conversation_id", requestId });
+    const reply = (payload) =>
+      makeEnvelope(AGENT_MESSAGE_TYPES.WORKFLOW_HEAL_DECIDE, {
+        conversationId,
+        ...(requestId !== undefined ? { requestId } : {}),
+        ...payload
+      });
+    if (typeof proposalId !== "string" || !proposalId || (decision !== "allow" && decision !== "deny")) {
+      return makeEnvelope(AGENT_MESSAGE_TYPES.ERROR, {
+        reason: "malformed_workflow_heal_decide",
+        detail: 'workflow_heal_decide requires a proposalId and decision "allow" | "deny"',
+        conversationId,
+        ...(requestId !== undefined ? { requestId } : {})
+      });
+    }
+    const held = this.healProposals.get(proposalId);
+    if (!held) return reply({ ok: false, reason: "unknown_proposal", state: { status: "unknown", proposalId } });
+
+    // Everything that can refuse the decision is checked BEFORE the proposal
+    // is settled, so a refusal leaves it decidable instead of burning it.
+    let current = this._resolveWorkflowForPanel(held.workflowId, undefined, held.owner);
+    if (decision === "allow") {
+      if (!current) return reply({ ok: false, reason: "unknown_workflow", workflowId: held.workflowId });
+      if (current.version !== held.baseVersion) {
+        return reply({
+          ok: false,
+          reason: "stale_base",
+          latest: current.version,
+          detail: "the workflow moved past the version this proposal heals; re-diagnose against the current version"
+        });
+      }
+      const candidate = validateHealCandidate({ current, steps: held.steps });
+      if (!candidate.ok) return reply({ ok: false, reason: "invalid_candidate", errors: candidate.errors });
+    }
+
+    const resolved = this.healProposals.resolve({ proposalId, decision });
+    if (!resolved.ok) {
+      if (resolved.expiredProposal) {
+        this._emitWorkflowEvent(resolved.expiredProposal.conversationId || conversationId, {
+          type: "workflow_heal_expired",
+          proposalId: resolved.expiredProposal.proposalId,
+          workflowId: resolved.expiredProposal.workflowId,
+          expiresAt: resolved.expiredProposal.expiresAt
+        });
+      }
+      return reply({ ok: false, reason: resolved.reason, state: resolved.state });
+    }
+    const proposal = resolved.proposal;
+
+    if (decision === "deny") {
+      this._emitWorkflowEvent(proposal.conversationId || conversationId, {
+        type: "workflow_heal_rejected",
+        proposalId: proposal.proposalId,
+        workflowId: proposal.workflowId
+      });
+      return reply({ ok: true, decision: "deny", workflowId: proposal.workflowId });
+    }
+
+    let next;
+    try {
+      next = updateWorkflow(
+        proposal.workflowId,
+        {
+          steps: held.steps,
+          provenance: buildHealProvenance({
+            current,
+            baseVersion: proposal.baseVersion,
+            reason: proposal.reason,
+            evidence: proposal.evidence,
+            proposedAt: proposal.proposedAt
+          }),
+          // "Enablement state is unchanged by the save" (design.md edge
+          // cases): the saved version carries the record's CURRENT enabled
+          // state, so approving a heal can never silently re-enable a
+          // workflow the operator disabled meanwhile — and never disables
+          // one that is running.
+          enabled: current.enabled !== false
+        },
+        { owner: current.owner }
+      );
+    } catch (err) {
+      // The decision was legitimate; the write was not. Reopen the proposal
+      // so the operator can retry it rather than losing the only decision
+      // surface they have, and report the failure honestly.
+      this.healProposals.reopen(proposalId);
+      if (err instanceof WorkflowValidationError) {
+        return reply({ ok: false, reason: "invalid_candidate", errors: [{ code: err.code, message: err.message }] });
+      }
+      return reply({ ok: false, reason: "save_failed", detail: String((err && err.message) || err) });
+    }
+    this._emitWorkflowEvent(proposal.conversationId || conversationId, {
+      type: "workflow_heal_saved",
+      workflowId: next.id,
+      fromVersion: proposal.baseVersion,
+      toVersion: next.version,
+      proposalId: proposal.proposalId
+    });
+    return reply({
+      ok: true,
+      decision: "allow",
+      workflowId: next.id,
+      fromVersion: proposal.baseVersion,
+      toVersion: next.version
+    });
+  }
+
+  /**
+   * Resolve a workflow for a panel operation. The panel's own saves are
+   * written under LOCAL_OPERATOR_OWNER, so that record wins; a definition
+   * the operator imported under another owner is still resolvable by id
+   * (single-user installations have exactly one owner in practice, and the
+   * registry permits several).
+   */
+  _resolveWorkflowForPanel(workflowId, version, owner = LOCAL_OPERATOR_OWNER) {
+    try {
+      return getWorkflow(workflowId, version, { owner }) || getWorkflow(workflowId, version);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * The busy rule's host-side half: is any conversation mid-run, or is the
+   * browser lease held right now? Returns the human-readable holder (or
+   * null). Cheap and synchronous — a proof run is an operator action, and a
+   * refusal is immediate rather than a wait.
+   */
+  _workflowBusyDetail() {
+    const holder = this.lease && typeof this.lease.currentHolder === "function" ? this.lease.currentHolder() : null;
+    if (holder) return `a run in conversation ${holder.conversationId || "unknown"} holds the browser lease`;
+    let conversations = [];
+    try {
+      conversations = this.sessionManager.listConversations();
+    } catch {
+      conversations = [];
+    }
+    for (const meta of conversations) {
+      if (meta && meta.conversationId && this.sessionManager.hasActiveRun(meta.conversationId)) {
+        return `conversation ${meta.conversationId} has an active run`;
+      }
+    }
+    return null;
   }
 
   _handleApprovalDecision(envelope) {
@@ -2137,7 +2930,20 @@ export class CompanionCore {
     // refs themselves carry no authority of any kind: tabScope, lease,
     // approval, and upload-allowlist decisions never consult them (design.md
     // Decision 5).
-    const { conversationId, profileId, modelId, tabScope, prompt, context, attachments, effort, newSdkSession, elementRecord } = envelope;
+    const {
+      conversationId,
+      profileId,
+      modelId,
+      tabScope,
+      prompt,
+      context,
+      attachments,
+      effort,
+      newSdkSession,
+      elementRecord,
+      mode,
+      idempotencyKey
+    } = envelope;
     if (!conversationId) return makeEnvelope(AGENT_MESSAGE_TYPES.ERROR, { reason: "missing_conversation_id" });
     // Rejected here, before any run exists, for the same reason a malformed
     // attachment is: a turn must never run at a different reasoning depth
@@ -2178,7 +2984,64 @@ export class CompanionCore {
         conversationId
       });
     }
+    // openspec/changes/add-message-queue-and-steering (tasks.md 1.3): what to
+    // do when this conversation's run is already active. Validated BEFORE any
+    // admission work, on the same footing as a malformed attachment — a
+    // typo'd mode must never be silently coerced into the default.
+    const modeResult = validateStartMode(mode);
+    if (!modeResult.ok) {
+      return makeEnvelope(AGENT_MESSAGE_TYPES.ERROR, { reason: modeResult.reason, conversationId });
+    }
+    // Reuses the existing idempotency-key validator (and its existing
+    // "malformed_idempotency_key" reason) — the same key shape the delete
+    // operations already take.
+    const keyResult = validateIdempotencyKey(idempotencyKey);
+    if (!keyResult.ok) {
+      return makeEnvelope(AGENT_MESSAGE_TYPES.ERROR, { reason: keyResult.reason, conversationId });
+    }
+    const idemKey = keyResult.key;
+    // R7: a retried delivery resolves to what the first one did — the same
+    // queued entry, or the same already-started run — instead of creating a
+    // second one. The memo covers "the entry already ran and left the queue";
+    // the durable entry check below covers "it is still waiting", including
+    // across a companion restart.
+    if (idemKey) {
+      const memoized = this._startReplyFor(idemKey);
+      if (memoized) return { ...memoized, idempotent: true };
+      const existingEntry = this.sessionManager.findQueuedByIdempotencyKey(conversationId, idemKey);
+      if (existingEntry) {
+        const replay = this._queuedStartReply(conversationId, existingEntry);
+        this._rememberStartReply(idemKey, replay);
+        return { ...replay, idempotent: true };
+      }
+    }
 
+    // R1's admission decision. An active run (queued behind the shared lease,
+    // running, or waiting for a decision — all three are the same RUN_STATES
+    // this class already answers hasActiveRun() for) means this message is
+    // filed behind it; so does a queue that still holds work, even if the
+    // conversation is idle right now (that message goes first: a new
+    // submission neither jumps the queue nor reorders it — design.md
+    // decision 7).
+    const submission = {
+      text: prompt,
+      context: context ?? null,
+      attachmentRefs: attachmentsResult.refs,
+      elementRecord: elementRecordResult.record,
+      effort: effortResult.effort,
+      profileId: profileId ?? null,
+      modelId: modelId ?? null,
+      newSdkSession: sessionChoiceResult.newSdkSession,
+      tabScope: tabScope || "any"
+    };
+    if (this.sessionManager.hasActiveRun(conversationId) || this.sessionManager.pendingQueueEntries(conversationId).length > 0) {
+      return this._admitQueuedStart(conversationId, { mode: modeResult.mode, idempotencyKey: idemKey, submission });
+    }
+
+    // Idle conversation, nothing queued: the pre-existing immediate-start path
+    // (R1's last branch). A new submission is also what re-arms a queue whose
+    // pause outlived the messages that caused it (design.md decision 5).
+    this.sessionManager.clearQueuePause(conversationId, "submission");
     let run;
     try {
       run = this.sessionManager.startRun(conversationId, { tabScope: tabScope || "any" });
@@ -2189,13 +3052,145 @@ export class CompanionCore {
         conversationId
       });
     }
-    // Tag the run with the profile it was started against so a later
-    // credential removal for this SAME profileId can find and cancel it —
-    // see SessionManager.activeRunsForProfile()/_cancelRunsForRevokedCredential()
-    // above. Set synchronously, before any await, so this holds even for a
-    // run that is still queued behind the shared browser lease.
-    run.profileId = profileId;
+    // Reply immediately with acceptance — including when this conversation's
+    // run must QUEUE behind another one holding the shared browser lease
+    // (spec: "Concurrent conversation" is queued, not rejected, and the UI
+    // must be able to show that state rather than the whole start/stop
+    // protocol call hanging until the lease frees up). Whether this run is
+    // already running or still queued is observable via run.state and the
+    // run_queued/run_started events already emitted by run.begin() below —
+    // both flow through the normal transcript/stream_event path.
+    const wasFree = !this.lease.isHeld();
+    const reply = makeEnvelope(AGENT_MESSAGE_TYPES.START, {
+      conversationId,
+      runId: run.runId,
+      accepted: true,
+      queued: !wasFree
+    });
+    if (idemKey) this._rememberStartReply(idemKey, reply);
+    this._launchRun(run, submission);
+    return reply;
+  }
 
+  /**
+   * R1/R2's queued-acceptance half, shared by both modes.
+   *
+   * Enqueue first, ALWAYS — before any interrupt attempt. That order is what
+   * makes the message impossible to lose when the stop path does preempt the
+   * run: the entry (and its durable `message_queued` event) already exists
+   * when the interrupted run emits its terminal, so the drain that follows
+   * has something to claim. A refusal (a full queue) returns here without
+   * having appended anything at all (tasks.md 2.2).
+   */
+  _admitQueuedStart(conversationId, { mode, idempotencyKey, submission }) {
+    const enqueued = this.sessionManager.enqueueMessage(conversationId, { mode, idempotencyKey, submission });
+    if (!enqueued.ok) {
+      if (enqueued.reason === "queue_full") {
+        // Distinguishable refusal that names the limit, so the panel can say
+        // why and keep the operator's draft (spec: "Queue full").
+        return makeEnvelope(AGENT_MESSAGE_TYPES.ERROR, {
+          reason: "queue_full",
+          limit: enqueued.limit,
+          conversationId
+        });
+      }
+      return makeEnvelope(AGENT_MESSAGE_TYPES.ERROR, { reason: enqueued.reason, conversationId });
+    }
+    // Built from the entry as it was accepted (`pending`), i.e. what the
+    // operator's send actually produced — never from its state a moment later,
+    // once an interrupt may already have claimed it.
+    const reply = this._queuedStartReply(conversationId, enqueued.entry);
+    if (idempotencyKey) this._rememberStartReply(idempotencyKey, reply);
+
+    if (mode === START_MODES.INTERRUPT) {
+      // R2: "run now" is the existing stop path plus a successor designation —
+      // never a second cancellation primitive. The stop path's fallback
+      // (blocking further browser dispatch, invalidating outstanding
+      // decisions) comes along with it by construction.
+      const outcome = this.sessionManager.interruptWithSuccessor(conversationId, enqueued.entry.messageId);
+      // The other half of Stop's semantics for a run that was waiting on a
+      // decision: deny the outstanding approval/question instead of leaving
+      // its resolver hanging (see _rejectPendingDecisions).
+      if (outcome === "interrupted") this._rejectPendingDecisions("user_interrupt");
+    }
+    // The queue's own drain trigger for this submission (R1's middle branch:
+    // "enqueue + clear paused + drain"; the pause was already cleared by
+    // enqueueMessage). Precondition-checked and idempotent, so this is a
+    // no-op when a run is still active or when the interrupt's stop already
+    // drained.
+    this.sessionManager.drainQueue(conversationId);
+    return reply;
+  }
+
+  /** The queued-send acceptance ack, carrying the entry's state — and no
+   * `runId`, because no run exists yet (the contract's queued shape). */
+  _queuedStartReply(conversationId, entry) {
+    return makeEnvelope(AGENT_MESSAGE_TYPES.START, {
+      conversationId,
+      accepted: true,
+      queued: true,
+      entry: {
+        messageId: entry.messageId,
+        mode: entry.mode,
+        state: entry.state,
+        enqueuedAt: entry.enqueuedAt
+      }
+    });
+  }
+
+  /** Bounded in-memory memo of START acceptances (see `_startReplies`). */
+  _rememberStartReply(key, reply) {
+    this._startReplies.set(key, reply);
+    if (this._startReplies.size > 256) {
+      const oldest = this._startReplies.keys().next().value;
+      this._startReplies.delete(oldest);
+    }
+  }
+
+  _startReplyFor(key) {
+    return this._startReplies.get(key) || null;
+  }
+
+  /**
+   * Turn ONE claimed queued message into a run (R3's launch half). Called by
+   * SessionManager through `onQueueDrain` after a run terminal, after an
+   * explicit resume, and after a submission that found queued work ahead of
+   * it. Synchronous by contract — it claims, launches, and returns, so the
+   * manager's in-flight guard is released before the launched turn's own
+   * terminal arrives.
+   *
+   * The submission is replayed from the message's own durable event, so the
+   * turn runs with exactly what was submitted — including the page context
+   * captured at submission time, never re-captured here (design.md
+   * decision 8).
+   */
+  _drainConversationQueue(conversationId) {
+    const claimed = this.sessionManager.claimNextQueuedMessage(conversationId);
+    if (!claimed) return;
+    this._launchRun(claimed.run, claimed.submission);
+  }
+
+  /**
+   * Common launch of one turn, shared by the immediate-start path and the
+   * drain. `submission` is always the STORED shape (`text`, `context`,
+   * `attachmentRefs`, `elementRecord`, `effort`, `profileId`, `modelId`,
+   * `newSdkSession`, `tabScope`) — the same object shape a `message_queued`
+   * event carries — so a queued turn and an immediate one are launched by
+   * exactly one code path with exactly one mapping (`text` → the turn's
+   * `prompt`).
+   *
+   * Tags the run with the profile it was started against, authorizes the page
+   * the operator bound at submission, arms the credential-revocation path, and
+   * hands off to `_runAfterLeaseGranted()` without awaiting it.
+   *
+   * The profile tag is set synchronously, before any await, so it holds even
+   * for a run still queued behind the shared browser lease — a later
+   * credential removal for this SAME profileId must find and cancel it
+   * (SessionManager.activeRunsForProfile()).
+   */
+  _launchRun(run, submission) {
+    const { context } = submission;
+    run.profileId = submission.profileId;
     // The page the operator had open when they sent this message IS the task's
     // working page, so it is authorized for this run — not merely readable.
     //
@@ -2211,6 +3206,12 @@ export class CompanionCore {
     // dispatch. Send/submit-class actions remain gated separately (design.md
     // decision 8) — this authorizes navigating and working the page, not
     // submitting on the operator's behalf.
+    //
+    // For a queued message `context` is the snapshot stored in its own
+    // `message_queued` event, i.e. the page as it was AT SUBMISSION — a tab
+    // switch between then and now deliberately changes nothing here
+    // (design.md decision 8 / panel spec "Context at submission, not at
+    // drain").
     if (context && typeof context.tabId === "number") {
       try {
         authorizeBorrowedTabMutation(run, context.tabId);
@@ -2223,36 +3224,21 @@ export class CompanionCore {
     // block starting the run — the settings surface may simply be
     // unavailable, which is not this run's problem).
     this._ensureCredentialRevocationWired().catch(() => {});
-
-    // Reply immediately with acceptance — including when this conversation's
-    // run must QUEUE behind another one holding the shared browser lease
-    // (spec: "Concurrent conversation" is queued, not rejected, and the UI
-    // must be able to show that state rather than the whole start/stop
-    // protocol call hanging until the lease frees up). Whether this run is
-    // already running or still queued is observable via run.state and the
-    // run_queued/run_started events already emitted by run.begin() below —
-    // both flow through the normal transcript/stream_event path.
-    const wasFree = !this.lease.isHeld();
     this._runAfterLeaseGranted(run, {
-      profileId,
-      modelId,
-      prompt,
-      context,
-      attachmentRefs: attachmentsResult.refs,
-      elementRecord: elementRecordResult.record,
-      effort: effortResult.effort,
-      newSdkSession: sessionChoiceResult.newSdkSession
+      profileId: submission.profileId ?? null,
+      modelId: submission.modelId ?? null,
+      prompt: submission.text,
+      context: submission.context ?? null,
+      attachmentRefs: submission.attachmentRefs || [],
+      elementRecord: submission.elementRecord ?? null,
+      effort: submission.effort ?? null,
+      newSdkSession: submission.newSdkSession === true
     }).catch((err) => {
       run.emit({ type: "run_error", error: String((err && err.message) || err) });
       this._releaseRunGatewayToken(run);
-      this.sessionManager.finishRun(conversationId);
-    });
-
-    return makeEnvelope(AGENT_MESSAGE_TYPES.START, {
-      conversationId,
-      runId: run.runId,
-      accepted: true,
-      queued: !wasFree
+      // The run identity travels with the call: an interrupted run's
+      // asynchronous unwind must never retire its successor's slot.
+      this.sessionManager.finishRun(run.conversationId, run);
     });
   }
 
@@ -2359,9 +3345,22 @@ export class CompanionCore {
       // Stopped while still queued — run.begin() already emitted
       // run_stopped and released the lease; nothing further to do, and
       // definitely no query() call for a run that never actually started.
-      this.sessionManager.finishRun(conversationId);
+      //
+      // If THIS run was claiming a queued message, the claim is rolled back
+      // first (R3): the message returns to `pending` with a
+      // `message_requeued` on it, so a stop during the lease wait costs the
+      // message nothing but time — it is never lost and never left
+      // `dispatching` with no run behind it. A no-op for an ordinary send.
+      this.sessionManager.requeueMessageForRun(conversationId, run.runId, "run_stopped_before_start");
+      this.sessionManager.finishRun(conversationId, run);
       return;
     }
+    // The lease is granted and the run is really executing: this is the
+    // single commit point at which a claimed queued message is consumed (R3 /
+    // design.md decision 2) — the message stops being "waiting" here, and
+    // nothing before this line may claim it ran. A no-op for an ordinary
+    // send that never claimed anything.
+    this.sessionManager.consumeMessageForRun(conversationId, run.runId);
 
     // Resolve every attachment reference to its stored bytes BEFORE any
     // other run work (tasks 4.2/4.4): a ref whose artifact is missing — or
@@ -2378,7 +3377,7 @@ export class CompanionCore {
     } catch (err) {
       run.emit({ type: "run_error", reason: "attachment_unavailable", detail: err.message });
       run.stop("attachment_unavailable");
-      this.sessionManager.finishRun(conversationId);
+      this.sessionManager.finishRun(conversationId, run);
       return;
     }
 
@@ -2389,7 +3388,7 @@ export class CompanionCore {
       const reason = err instanceof SkillSnapshotMismatchError ? "skills_snapshot_unavailable" : "skills_binding_failed";
       run.emit({ type: "run_error", reason, detail: err.message });
       run.stop(reason);
-      this.sessionManager.finishRun(conversationId);
+      this.sessionManager.finishRun(conversationId, run);
       return;
     }
 
@@ -2422,7 +3421,7 @@ export class CompanionCore {
         if (!(err instanceof SkillDispatchError)) throw err;
         run.emit({ type: "run_error", reason: "slash_dispatch_rejected", code: err.code, detail: err.message });
         run.stop("slash_dispatch_rejected");
-        this.sessionManager.finishRun(conversationId);
+        this.sessionManager.finishRun(conversationId, run);
         return;
       }
       // A built-in must reach the SDK exactly as typed (it is a real SDK
@@ -2444,7 +3443,7 @@ export class CompanionCore {
       const reason = err instanceof ProfileUnavailableError ? "profile_unavailable" : "profile_error";
       run.emit({ type: "run_error", reason, detail: err.message });
       run.stop("profile_unavailable");
-      this.sessionManager.finishRun(conversationId);
+      this.sessionManager.finishRun(conversationId, run);
       return;
     }
     // add-chatgpt-subscription-provider design.md decision 2: a `chatgpt`
@@ -2506,7 +3505,7 @@ export class CompanionCore {
       });
       run.stop("conversation_identity_incompatible");
       this._releaseRunGatewayToken(run);
-      this.sessionManager.finishRun(conversationId);
+      this.sessionManager.finishRun(conversationId, run);
       return;
     }
     // The session id THIS turn should ask the SDK to resume, or null to run
@@ -2535,11 +3534,24 @@ export class CompanionCore {
       conversationId,
       store: this.documentStore
     });
+    // Rerunnable workflows + self-healing: the heal proposal tool, bound to
+    // THIS conversation (never to a conversation id taken from tool args —
+    // a proposal is filed in the review surface the drift was seen in), and
+    // to the companion-wide proposal store the panel's decisions resolve
+    // against. Registered on the same server and named alongside the other
+    // two below; the three must move together or a tool is registered but
+    // invisible to the model.
+    const proposeHealTool = await createProposeWorkflowHealTool({
+      run,
+      proposals: this.healProposals,
+      conversationId,
+      owner: LOCAL_OPERATOR_OWNER
+    });
     const mcpServer = createBrowserMcpServer({
       toolBridge: this.toolBridge,
       coerceArgs: this.coerceArgs,
       run,
-      extraTools: [askUserTool, createDocumentTool],
+      extraTools: [askUserTool, createDocumentTool, proposeHealTool],
       // CRITICAL fix: this conversation's OWN TabRiskRegistry (see
       // _tabRiskRegistryFor()'s own comment), not the per-run default
       // buildSdkTools() would otherwise construct — this is what makes a
@@ -2664,7 +3676,7 @@ export class CompanionCore {
         // Registered on the same server just above as an extraTool; named here
         // so the model can actually see and call it. The two must move
         // together — see buildIsolatedOptions' note on extraToolNames.
-        extraToolNames: [ASK_USER_TOOL_NAME, CREATE_DOCUMENT_TOOL_NAME],
+        extraToolNames: [ASK_USER_TOOL_NAME, CREATE_DOCUMENT_TOOL_NAME, PROPOSE_WORKFLOW_HEAL_TOOL_NAME],
         effort,
         resume: resumeSessionId || undefined
       });
@@ -2672,7 +3684,7 @@ export class CompanionCore {
       run.emit({ type: "run_error", reason: "options_build_failed", detail: err.message });
       run.stop("options_build_failed");
       this._releaseRunGatewayToken(run);
-      this.sessionManager.finishRun(conversationId);
+      this.sessionManager.finishRun(conversationId, run);
       return;
     }
 
@@ -2867,7 +3879,10 @@ export class CompanionCore {
       }
     } finally {
       this._releaseRunGatewayToken(run);
-      this.sessionManager.finishRun(run.conversationId);
+      // `run` travels with the call: see finishRun()'s own comment — an
+      // interrupted run's unwind can land after a successor already owns this
+      // conversation's slot, and must not retire it.
+      this.sessionManager.finishRun(run.conversationId, run);
     }
   }
 }
@@ -3106,6 +4121,29 @@ async function runAsForkedChild() {
       }
     }
   });
+
+  // Queue transitions travel the same way, but they do NOT belong to a run:
+  // a message is queued, cancelled or paused precisely when no run exists to
+  // emit anything, so the run.emit wrapper below can never carry them. The
+  // manager's conversation-level hook (SessionManager._emitConversationEvent)
+  // fires for exactly these, with the stored event — so a panel sees the
+  // transition that produced the durable record, `seq` and all, instead of
+  // discovering it on its next snapshot. No batcher: these are lifecycle
+  // events, one per operator action, never a stream.
+  core.sessionManager.onConversationEvent = (conversationId, event) => {
+    if (!process.send) return;
+    process.send(
+      wrapAgentMessage(
+        makeEnvelope(AGENT_MESSAGE_TYPES.STREAM_EVENT, {
+          conversationId,
+          // Only a run-owned event names one (message_claimed/consumed carry
+          // their runId; message_queued/cancelled/paused do not).
+          ...(event.runId ? { runId: event.runId } : {}),
+          event
+        })
+      )
+    );
+  };
 
   // Also stream out-of-band run events (tool dispatch, tool_result_unknown,
   // stream messages, ...) as they are appended, per conversation, so the

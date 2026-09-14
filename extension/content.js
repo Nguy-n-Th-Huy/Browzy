@@ -1066,6 +1066,32 @@
     return { results, total };
   }
 
+  /** Resolve a STABLE target identity — `{role, name}`, the shape a workflow
+   *  step freezes at recording time — to the live element's coordinates.
+   *
+   *  A `ref_N` handle cannot survive the document that minted it (see
+   *  bumpDocumentEpoch); the identity recorded beside it can, so a replayed
+   *  step asks with the identity and gets a fresh ref plus a real point back.
+   *  Strict on purpose: the element's normalized name must EQUAL the
+   *  recorded one (role preferred, not required — pages do re-role controls),
+   *  and "no match" is a real answer the caller turns into drift, never a
+   *  guess at the nearest lookalike. */
+  function getTargetCoordinates(target, opts = {}) {
+    const name = target && typeof target.name === "string" ? target.name : "";
+    if (!name.trim()) return null;
+    const role = target && typeof target.role === "string" && target.role ? target.role : null;
+    const norm = (s) => String(s == null ? "" : s).replace(/\s+/g, " ").trim().toLowerCase();
+    const wanted = norm(name);
+    const { results } = findElements(name);
+    const hit =
+      results.find((r) => norm(r.name) === wanted && (!role || r.role === role)) ||
+      results.find((r) => norm(r.name) === wanted);
+    if (!hit) return null;
+    const coords = getRefCoordinates(hit.ref, { scrollIntoView: opts.scrollIntoView !== false });
+    if (!coords) return null;
+    return { ref: hit.ref, role: hit.role, name: hit.name, ...coords };
+  }
+
   // --- Form input ---
 
   // Find the actual input/textarea/select inside an element, traversing shadow DOM
@@ -1574,6 +1600,19 @@
 
     if (msg.type === "getRefCoordinates") {
       const result = getRefCoordinates(msg.ref, { scrollIntoView: msg.scrollIntoView });
+      sendResponse({ result });
+      return true;
+    }
+
+    // A replayed workflow step asks with the element's frozen identity, not
+    // a dead ref: resolve it against THIS document and hand back a fresh ref
+    // plus the point. getTargetCoordinates returns null on no match — the
+    // caller turns that into a drift, never a click at a guess.
+    if (msg.type === "getTargetCoordinates") {
+      const result = getTargetCoordinates(
+        { role: msg.role, name: msg.name },
+        { scrollIntoView: msg.scrollIntoView }
+      );
       sendResponse({ result });
       return true;
     }

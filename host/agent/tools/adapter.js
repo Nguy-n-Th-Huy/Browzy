@@ -36,6 +36,7 @@ import {
 } from "./mapping.js";
 import { TabRiskRegistry } from "../threat/tab-risk.js";
 import { observeToolResult } from "../threat/observe.js";
+import { readWorkflowDrift } from "../skills/workflows-proof.js";
 
 export const SDK_MCP_SERVER_NAME = "browzy-in-chrome-browser";
 
@@ -447,6 +448,38 @@ export function buildSdkTools({ toolBridge, coerceArgs, run, tabRiskRegistry }) 
           // Ordering matters: mark first, so the tab is never briefly
           // classified as borrowed while it is in scope.
           run.admitSessionOwnedTab?.(createdTabId);
+        }
+      }
+      // Rerunnable workflows + self-healing
+      // (add-workflow-materialization-and-heal task 3.2): a workflow whose
+      // live target no longer resolves must be recorded as DRIFT so the
+      // repair flow can cite the evidence later. This is the only place a
+      // `shortcuts_execute` result passes through host code together with the
+      // arguments that were actually dispatched — the workflow id is read
+      // from THOSE captured args, never from anything the result text claims.
+      // A transient failure carries no drift object in the executor's versioned
+      // marker (see skills/workflows-proof.js), so ordinary failures and the
+      // cancelled/stopped paths emit nothing here.
+      if (t.name === "shortcuts_execute" && !resultUnknown) {
+        try {
+          const drift = readWorkflowDrift({
+            toolName: t.name,
+            args: coerced,
+            resultText: firstTextOf(result)
+          });
+          if (drift) {
+            run.emit({
+              type: "workflow_drift",
+              workflowId: drift.workflowId,
+              step: drift.step,
+              ref: drift.ref,
+              reason: drift.reason,
+              evidence: drift.evidence
+            });
+          }
+        } catch {
+          // Observation only — a malformed marker must never be able to
+          // change the result the agent receives for its own call.
         }
       }
       return result;

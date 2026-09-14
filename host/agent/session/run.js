@@ -25,6 +25,8 @@ export class Run {
    * @param {import("../broker/browser-lease.js").BrowserLease} opts.lease
    * @param {import("../policy/approvals.js").ApprovalRegistry} opts.approvals
    * @param {Array<number>|'any'} [opts.tabScope]
+   * @param {string} [opts.runId] - a pre-generated id (see the constructor
+   *   body); omitted, the run mints its own.
    * @param {(event: object) => void} [opts.onEvent] - sink for transcript/event-log entries
    */
   /**
@@ -37,8 +39,16 @@ export class Run {
    * already finished — which is exactly what an operator hit in practice.
    * Injected rather than imported so a Run stays testable with no pipe.
    */
-  constructor({ conversationId, lease, approvals, tabScope = "any", onEvent, releaseNativeLease }) {
-    this.runId = newRunId();
+  constructor({ conversationId, lease, approvals, tabScope = "any", onEvent, releaseNativeLease, runId }) {
+    // A queued message's claim is a two-phase durable transition (design.md
+    // decision 2): the run id is generated and written to the entry's
+    // `claimedByRunId` BEFORE the run exists, so a crash between the two
+    // phases is decidable from durable records alone ("did a run with this id
+    // ever emit run_started?"). Accepting it here is what lets
+    // SessionManager.startRun() create the run with the id its claim already
+    // committed to; every other caller omits it and gets a fresh one, exactly
+    // as before.
+    this.runId = runId || newRunId();
     this.conversationId = conversationId;
     this.lease = lease;
     this.approvals = approvals;

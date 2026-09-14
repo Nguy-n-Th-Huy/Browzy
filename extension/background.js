@@ -2570,6 +2570,17 @@ function isTabInWireScope(tabScope, tabId) {
   return Array.isArray(tabScope) && tabScope.includes(tabId);
 }
 
+// The tab id of an in-flight workflow PROOF (see the workflow_prove handler
+// and runShortcutToolSteps): set only while a proof's steps run, restored by
+// its single exit funnel. isInGroup()'s proof-scoped branch consults it so
+// the proof's own steps can act on the tab the proof was admitted for — a
+// borrowed (adopted) tab the legacy gate refuses by design. Deliberately a
+// module-scope variable, not a parameter: the per-tool gate reads it from
+// inside toolHandlers. Scoped to one proof and one tab id at a time; a
+// concurrent SDK run never reaches that branch (its own check returns
+// first), so no run's wire scope is bypassed.
+let proveActiveTabId = null;
+
 async function isInGroup(tabId) {
   if (currentToolMeta && currentToolMeta.runId) {
     // SDK path: the run's own already-validated tab scope (see
@@ -2580,6 +2591,26 @@ async function isInGroup(tabId) {
     // added to the Chrome group, so the legacy check below would otherwise
     // incorrectly reject every read against it.
     return isTabInWireScope(currentToolMeta.tabScope, tabId);
+  }
+  // A running workflow PROOF whose admitted tab is THIS tab: the proof's
+  // steps must be able to act on it (see proveActiveTabId's declaration and
+  // the workflow_prove handler's reach check). Only the extension-owned-
+  // group half of that reach is re-evaluated here — deliberately the leaf
+  // helper, not isTabReachableForProve(), which calls back into this
+  // function and would recurse. Anything this does not accept falls through
+  // to the legacy checks below, byte-for-byte unchanged.
+  if (
+    typeof proveActiveTabId !== "undefined" &&
+    proveActiveTabId !== null &&
+    tabId === proveActiveTabId &&
+    typeof isTabInExtensionOwnedGroup === "function"
+  ) {
+    try {
+      const proofTab = await chrome.tabs.get(tabId);
+      if (await isTabInExtensionOwnedGroup(proofTab)) return true;
+    } catch {
+      // fall through: a vanished tab is refused by the legacy path below
+    }
   }
   // Legacy path — byte-for-byte unchanged.
   // Always check live state — in-memory tabGroupTabs can be stale after service worker restart
@@ -2637,6 +2668,77 @@ async function isInGroup(tabId) {
   } catch {
     return false;
   }
+}
+
+/**
+ * Reach check for the companion's `workflow_prove` request. Deliberately
+ * WIDER than isInGroup() above, for a reason that has nothing to do with
+ * widening anyone's authority:
+ *
+ *   • A proof is requested by the PANEL (the operator pressed "Chạy thử" in a
+ *     workflow card) and the companion sends it with NO run metadata — it must
+ *     not take the browser lease (the companion refuses while a run holds it).
+ *     Without run metadata, isInGroup()'s SDK branch is unavailable, so the
+ *     check falls to its LEGACY branch.
+ *   • That legacy branch refuses a BORROWED tab by design ("membership must
+ *     not become authority"), and the tab a panel is bound to IS borrowed:
+ *     an explicit toolbar-icon click adopts it into its own numbered solo
+ *     group (`adoptSoloAgentGroup`, which records it in adoptedBorrowedTabs).
+ *     The legacy rule exists so an external MCP client cannot reach the page
+ *     the operator happens to be reading; here, the operator is the one who
+ *     explicitly opened the assistant on that tab and explicitly asked for the
+ *     proof, so the intended target IS that tab.
+ *
+ * So: a tab is reachable for a proof when it carries a group linkage AND
+ * either isInGroup() accepts it (agent-created tabs, the shared group, or a
+ * run's own wire scope) or it sits in a group THIS EXTENSION owns — the shared
+ * group, a recorded solo group, or a live group carrying one of our family
+ * titles.
+ *
+ * Two refusals are absolute and are checked FIRST:
+ *   - a tab that cannot be read (closed);
+ *   - a tab in NO group at all (`groupId === -1`), even when isInGroup() would
+ *     accept it through its tracked-tab set — that set includes the transient
+ *     state before a grouping call completes, and a proof is a deliberate
+ *     operator action that must name a tab actually filed under our label.
+ * Nothing else: a tab in the operator's own group is still refused, exactly as
+ * for every other non-run-scoped reach check.
+ */
+async function isTabReachableForProve(tabId) {
+  let tab;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch {
+    return false;
+  }
+  if (!tab || typeof tab.groupId !== "number" || tab.groupId === -1) return false;
+  if (await isInGroup(tabId)) return true;
+  if (typeof isTabInExtensionOwnedGroup === "function") return await isTabInExtensionOwnedGroup(tab);
+  return false;
+}
+
+/**
+ * The extension-owned-group half of the proof reach check — the shared
+ * group, a recorded solo group, or a live group carrying one of our family
+ * titles. Shared by isTabReachableForProve() and isInGroup()'s proof-scoped
+ * branch: that branch cannot call isTabReachableForProve() itself (which
+ * calls back into isInGroup() — infinite recursion), so both use this leaf
+ * helper. Takes a tab object; never fetches one, never consults isInGroup.
+ */
+async function isTabInExtensionOwnedGroup(tab) {
+  if (!tab || typeof tab.groupId !== "number" || tab.groupId === -1) return false;
+  if (typeof isOwnAgentGroupId === "function" && isOwnAgentGroupId(tab.groupId)) return true;
+  if (chrome.tabGroups && typeof chrome.tabGroups.get === "function") {
+    try {
+      const liveGroup = await chrome.tabGroups.get(tab.groupId);
+      const liveTitle = liveGroup && liveGroup.title;
+      if (typeof isAgentFamilyTitle === "function" && isAgentFamilyTitle(liveTitle)) return true;
+      if (typeof LEGACY_TAB_GROUP_TITLES !== "undefined" && LEGACY_TAB_GROUP_TITLES.includes(liveTitle)) return true;
+    } catch {
+      // Unknown group: not ours.
+    }
+  }
+  return false;
 }
 
 /**
@@ -3243,6 +3345,29 @@ async function resolveRefToCoordinates(tabId, ref, opts = {}) {
     scrollIntoView: opts.scrollIntoView !== false
   });
   return resp?.result || null;
+}
+
+// Resolve a workflow step's STABLE target identity (`{role, name}` — what a
+// replayed step carries instead of its dead ref, see
+// host/agent/skills/workflows-materialize.js) to coordinates on the live
+// page. Returns null when nothing matches: an identity that no longer exists
+// is a real answer turned into a drift, never a nearest-lookalike guess.
+async function resolveTargetToCoordinates(tabId, target, opts = {}) {
+  const resp = await sendContentMessage(tabId, {
+    type: "getTargetCoordinates",
+    role: target && typeof target.role === "string" ? target.role : null,
+    name: target && typeof target.name === "string" ? target.name : "",
+    scrollIntoView: opts.scrollIntoView !== false
+  });
+  return resp?.result || null;
+}
+
+/** Human name for a step's recorded target identity, for failure texts and
+ *  hit notes: `link "Tìm kiếm"` (role omitted when none was recorded). */
+function describeTargetText(target) {
+  const role = target && typeof target.role === "string" && target.role ? `${target.role} ` : "";
+  const name = target && typeof target.name === "string" ? target.name : "";
+  return `${role}"${name}"`.trim();
 }
 
 // --- Screenshot helper ---
@@ -4799,6 +4924,39 @@ function validateShortcutsExecuteArgs(args) {
   };
 }
 
+// Argument validation for the companion's workflow_prove request
+// (openspec/changes/add-workflow-materialization-and-heal). The companion
+// resolved the stored record and hands over its definition, so this side
+// validates only what it needs to RUN it safely: a real tab, and a definition
+// shaped like one this executor accepts. Anything more would be this file
+// re-validating the host's registry schema, which it does not own. Pure:
+// exercised under plain Node (test/shortcut-prove-handler.test.mjs).
+function validateWorkflowProveArgs(args) {
+  if (!args || typeof args !== "object" || Array.isArray(args)) {
+    return { ok: false, message: "workflow_prove requires an arguments object with tabId and definition" };
+  }
+  const { tabId, workflowId, version, definition } = args;
+  if (typeof tabId !== "number" || !Number.isFinite(tabId)) {
+    return { ok: false, message: "workflow_prove requires a numeric tabId" };
+  }
+  if (!definition || typeof definition !== "object" || Array.isArray(definition)) {
+    return { ok: false, message: "workflow_prove requires the resolved workflow definition" };
+  }
+  if (!Array.isArray(definition.steps) || !definition.steps.length) {
+    return { ok: false, message: "workflow_prove requires a definition with at least one step" };
+  }
+  return {
+    ok: true,
+    tabId,
+    // Echoed back in the reply so the evidence file the companion writes names
+    // the exact record that was proved, even when the definition body is all
+    // it was given.
+    workflowId: typeof workflowId === "string" && workflowId ? workflowId : (typeof definition.id === "string" ? definition.id : null),
+    version: Number.isInteger(version) ? version : (Number.isInteger(definition.version) ? definition.version : null),
+    definition
+  };
+}
+
 // Registry tools whose args may carry the run's tab. A workflow step that
 // omits tabId inherits the tab the shortcut was addressed to; a step that
 // names one keeps it, and the callee's own scope check still applies. Mirrors
@@ -4824,6 +4982,159 @@ const SHORTCUT_TAB_SCOPED_TOOLS = new Set([
   "webmcp_call_tool"
 ]);
 
+// --- Workflow drift classification (openspec/changes/
+// add-workflow-materialization-and-heal) ------------------------------------
+//
+// A step's failure is classified AT THE BOUNDARY, because "the site changed
+// under a stored workflow" and "the network hiccuped" must never look alike
+// (spec "Drift is a distinguishable execution outcome"). Drift is reported
+// ONLY on evidence that the stored definition no longer fits the live page —
+// a ref/target that is gone, or a bound domain that no longer matches — while
+// every transport-class failure stays an ordinary failure (spec "A transient
+// failure is not drift"). The executor's result carries ONE stable
+// machine-readable marker line (OCIC_WORKFLOW_RESULT <json>) so the companion
+// records a drift outcome from a structured fact rather than from prose.
+
+/** `example.com` matches exactly `example.com`; `*.example.com` matches
+ * subdomains but never the bare domain and never a superstring host. Mirrors
+ * host/agent/skills/workflows-match.js's normalizeHost/domainMatches (that
+ * Node module cannot be imported here — see AGENT_PROTOCOL_VERSION's header —
+ * so the semantics are kept in sync by hand, the same way this file already
+ * mirrors host/agent/skills/workflows-mcp.js's validator). */
+function normalizeWorkflowHost(host) {
+  if (typeof host !== "string") return null;
+  let h = host.trim().toLowerCase();
+  if (h.endsWith(".")) h = h.slice(0, -1);
+  return h || null;
+}
+
+/** The normalized host of a URL string; null when unparseable. */
+function workflowHostOfUrl(url) {
+  try {
+    return normalizeWorkflowHost(new URL(url).hostname);
+  } catch {
+    return null;
+  }
+}
+
+/** One normalized host against one constraint pattern. */
+function workflowDomainMatches(host, pattern) {
+  const h = normalizeWorkflowHost(host);
+  if (!h || typeof pattern !== "string") return false;
+  const p = pattern.trim().toLowerCase();
+  if (p.startsWith("*.")) {
+    const base = p.slice(2);
+    return h !== base && h.endsWith(`.${base}`);
+  }
+  return h === p;
+}
+
+/** A definition's declared domain patterns (an array, or `{domains:[...]}`) —
+ * the same two shapes host/agent/skills/workflows-schema.js accepts. */
+function workflowDomainPatterns(definition) {
+  const dc = definition && definition.domainConstraints;
+  const list = Array.isArray(dc) ? dc : Array.isArray(dc && dc.domains) ? dc.domains : [];
+  return list.filter((p) => typeof p === "string" && p.trim());
+}
+
+/**
+ * The pre-flight binding check: does the definition's declared domain still
+ * cover the tab's live host? `applies` says whether the definition declares
+ * any constraint at all (a definition that declares none is never a binding
+ * mismatch — there is nothing to compare). A URL that cannot be read yields
+ * `applies: true, ok: false` ONLY when constraints were declared AND we could
+ * not establish a host — the caller decides whether that is a refusal; the
+ * check itself never invents a host.
+ *
+ * @returns {{applies: boolean, ok: boolean, expected: string[], actualHost: string|null, url: string|null, evidence: object|null}}
+ */
+function workflowBindingCheck(definition, url) {
+  const expected = workflowDomainPatterns(definition);
+  const actualHost = typeof url === "string" ? workflowHostOfUrl(url) : null;
+  const cleanUrl = typeof url === "string" ? url : null;
+  if (!expected.length) {
+    return { applies: false, ok: true, expected, actualHost, url: cleanUrl, evidence: null };
+  }
+  const ok = actualHost != null && expected.some((p) => workflowDomainMatches(actualHost, p));
+  return {
+    applies: true,
+    ok,
+    expected,
+    actualHost,
+    url: cleanUrl,
+    evidence: ok ? null : { expected, actualHost, url: cleanUrl }
+  };
+}
+
+/** The live URL of one tab, or null when it cannot be read (closed tab, a
+ * restricted page, or — under test/_extract.mjs — no `chrome` at all). Never
+ * throws: an unreadable URL only means the freshness note and the domain
+ * pre-flight have nothing to compare, never that a step failed. */
+async function shortcutStepTabUrl(tabId) {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    return tab && typeof tab.url === "string" ? tab.url : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Whether this step returns live page content — a read (`read_page`,
+ * `get_page_text`), a `find`, or a `computer` screenshot/zoom capture. Written
+ * as direct comparisons rather than a Set literal so the function stays
+ * SELF-CONTAINED: test/shortcut-prove-handler.test.mjs extracts it on its own,
+ * and it allocates nothing per call. */
+function shortcutStepProducesContent(ref, args) {
+  if (ref === "read_page" || ref === "get_page_text" || ref === "find") return true;
+  if (ref !== "computer") return false;
+  const action = args && typeof args.action === "string" ? args.action : "";
+  return action === "screenshot" || action === "zoom";
+}
+
+/** `"target_no_longer_resolves"` when a failure message names a ref/element
+ * that is gone, else null (an ordinary failure). The two patterns mirror
+ * batchItemResultFailed()'s shipped staleness rule above — the file's ONE
+ * existing definition of "this ref is gone" — so the batch executor and the
+ * workflow executor can never disagree about what a stale ref is. Anything
+ * else (transport, injection, a scope refusal) is deliberately NOT drift. */
+function shortcutDriftReason(text) {
+  const s = typeof text === "string" ? text : "";
+  if (!s) return null;
+  if (/^\s*could not (resolve|bring)\b/i.test(s)) return "target_no_longer_resolves";
+  if (/^\s*ref\s+".*"\s+no longer exists\b/i.test(s)) return "target_no_longer_resolves";
+  return null;
+}
+
+/** One-line JSON payload for the stable result marker. Strings are collapsed
+ * to single spaces so the marker is always exactly ONE line, whatever a
+ * handler's message contained. */
+function shortcutResultMarkerLine(outcomes, drift) {
+  const steps = Array.isArray(outcomes) ? outcomes : [];
+  const drifted = !!(drift && drift.reason);
+  const ok = steps.length > 0 && steps.every((s) => s && s.status === "ok");
+  const flat = (v) => String(v == null ? "" : v).replace(/\s+/g, " ").slice(0, 300);
+  const payload = {
+    outcome: drifted ? "drift" : ok ? "ok" : "failed",
+    steps: steps.map((s) => {
+      const out = { index: s.index, ref: s.ref, status: s.status };
+      if (s.reason) out.reason = flat(s.reason);
+      if (s.note) out.note = flat(s.note);
+      if (s.url) out.url = flat(s.url);
+      if (s.fetchedAt) out.fetchedAt = flat(s.fetchedAt);
+      return out;
+    })
+  };
+  if (drifted) {
+    payload.drift = {
+      step: Number.isInteger(drift.step) ? drift.step : null,
+      ref: drift.ref || null,
+      reason: flat(drift.reason),
+      evidence: drift.evidence && typeof drift.evidence === "object" ? drift.evidence : flat(drift.evidence)
+    };
+  }
+  return `OCIC_WORKFLOW_RESULT ${JSON.stringify(payload)}`;
+}
+
 // Run a resolved workflow's tool-kind steps in order through this
 // extension's own handlers, inside the calling run's tab scope (the dispatch
 // below happens synchronously within the shortcuts_execute call, so
@@ -4832,35 +5143,135 @@ const SHORTCUT_TAB_SCOPED_TOOLS = new Set([
 // companion's adapter and messages are prompts, neither is runnable here —
 // saying so beats pretending. Nested execution (a step naming
 // shortcuts_execute or browser_batch) is refused for the same reason.
-async function runShortcutToolSteps(definition, tabId) {
+//
+// `options.prove === true` is the PROOF-RUN mode (the companion's
+// workflow_prove request): a step this executor cannot run is then REPORTED as
+// `{status:"unexecutable"}` and the run continues, because a proof's whole job
+// is to say what could and could not be validated against the live page (spec
+// "An unvalidated draft stays a draft") — refusing the definition outright
+// would hide the rest of it. `options.tabUrl` lets a caller that already read
+// the tab's URL hand it over instead of paying another read.
+//
+// Returned: `{ok, lines, outcomes, drift, finalUrl, marker, error?}`.
+//   - `outcomes` is one entry per step actually attempted (plus unexecutable
+//     ones in a proof run): {index, ref, status, reason?, note?, url?, fetchedAt?}.
+//   - `drift` is non-null ONLY for the two evidence-backed reasons above.
+//   - `marker` is the single-line OCIC_WORKFLOW_RESULT payload (null when this
+//     helper set was not reachable — the extraction-sandbox case).
+async function runShortcutToolSteps(definition, tabId, options) {
+  const opts = options && typeof options === "object" ? options : {};
+  const proveRun = opts.prove === true;
+  // Every helper added after test/shortcut-handlers.test.mjs's fixed
+  // dependency list was written is reached through a `typeof` guard (this
+  // file's extraction convention — see tabs_create_mcp's comment): real in
+  // this module, a safe no-op in that sandbox, and injectable in the new
+  // classification tests (test/shortcut-prove-handler.test.mjs).
+  const checkBinding = typeof workflowBindingCheck === "function" ? workflowBindingCheck : null;
+  const readTabUrl = typeof shortcutStepTabUrl === "function" ? shortcutStepTabUrl : null;
+  const resultFailed = typeof batchItemResultFailed === "function" ? batchItemResultFailed : null;
+  const classifyDrift = typeof shortcutDriftReason === "function" ? shortcutDriftReason : null;
+  const contentStep = typeof shortcutStepProducesContent === "function" ? shortcutStepProducesContent : null;
+  const buildMarker = typeof shortcutResultMarkerLine === "function" ? shortcutResultMarkerLine : null;
+
   const lines = [];
+  const outcomes = [];
+  let drift = null;
+  let finalUrl = typeof opts.tabUrl === "string" ? opts.tabUrl : null;
+
+  // Proof scope (see proveActiveTabId's declaration and isInGroup()'s
+  // proof-scoped branch): while THIS proof's steps run, the per-tool group
+  // gate must accept the tab the proof was admitted for — the legacy gate
+  // refuses a borrowed tab by design (found live on 2026-09-14: the proof
+  // was admitted and then every step answered "not in the MCP group").
+  // finish() is this function's single exit funnel, so it restores the
+  // previous scope on every return path; save/restore (rather than
+  // set/clear) keeps a concurrent proof's own scope intact. typeof-guarded
+  // for the extraction sandboxes (same convention as the helpers above).
+  const hadProveScope = typeof proveActiveTabId !== "undefined";
+  const previousProveTab = hadProveScope ? proveActiveTabId : null;
+  if (proveRun && hadProveScope) proveActiveTabId = tabId;
+
+  const finish = (result) => {
+    if (hadProveScope) proveActiveTabId = previousProveTab;
+    const stepped = Array.isArray(result.outcomes) ? result.outcomes : outcomes;
+    const driftObj = result.drift !== undefined ? result.drift : drift;
+    // `ok` means "the run completed AND every step it reported actually
+    // succeeded" — the same verdict shortcutResultMarkerLine() derives for the
+    // marker, so the two can never disagree. A proof run whose definition has
+    // an `unexecutable` step is therefore NOT ok: that step was not validated
+    // (spec "An unvalidated draft stays a draft"), and a non-prove refusal
+    // (zero outcomes) is not ok either.
+    const ok = result.ok === true && stepped.length > 0 && stepped.every((s) => s && s.status === "ok");
+    const out = { ok, lines, outcomes: stepped, drift: driftObj || null, finalUrl, marker: null };
+    if (result.error) out.error = result.error;
+    if (buildMarker) out.marker = buildMarker(stepped, out.drift);
+    return out;
+  };
+
+  // Pre-flight: the definition's declared domain must still cover the tab's
+  // live host. Nothing runs when it does not — the whole definition was
+  // written for another site, and running its steps there is exactly the
+  // "acted on the wrong page" outcome this check exists to prevent.
+  if (checkBinding) {
+    const binding = checkBinding(definition, finalUrl);
+    if (binding.applies && !binding.ok) {
+      drift = { step: null, ref: null, reason: "binding_mismatch", evidence: binding.evidence };
+      return finish({
+        ok: false,
+        drift,
+        error: `Workflow "${definition.id}" is bound to ${binding.expected.join(", ")}; this tab is on ${binding.actualHost || "an unreadable URL"}. Nothing ran.`
+      });
+    }
+  }
+
   for (let k = 0; k < definition.steps.length; k++) {
     const step = definition.steps[k];
+    const stepRef = step && typeof step.ref === "string" ? step.ref : null;
+    // A step this executor cannot run at all. In a proof run it is REPORTED
+    // per step (unexecutable) and the run goes on; in an ordinary run the
+    // definition is refused before anything runs, exactly as before.
+    const unexecutable = (reason, label) => {
+      outcomes.push({ index: k, ref: stepRef, status: "unexecutable", reason });
+      lines.push(`step ${k + 1} (${label}): unexecutable — this executor runs tool steps only`);
+    };
     if (!step || step.kind !== "tool") {
       const kind = step && typeof step.kind === "string" ? step.kind : "malformed";
-      return {
+      if (proveRun) {
+        unexecutable(`${kind}_step`, kind);
+        continue;
+      }
+      return finish({
         ok: false,
-        lines,
         error: `Shortcut "${definition.id}" declares a ${kind} step (step ${k + 1}); this executor runs tool steps only. Nothing ran.`
-      };
+      });
     }
     if (step.ref === "shortcuts_execute" || step.ref === "browser_batch") {
-      return {
+      if (proveRun) {
+        unexecutable("nested_execution", step.ref);
+        continue;
+      }
+      return finish({
         ok: false,
-        lines,
         error: `Shortcut "${definition.id}" nests "${step.ref}" (step ${k + 1}); nested execution is refused. Nothing ran.`
-      };
+      });
     }
     const handler = toolHandlers[step.ref];
     if (typeof handler !== "function") {
-      return {
+      if (proveRun) {
+        unexecutable("unknown_tool", step.ref);
+        continue;
+      }
+      return finish({
         ok: false,
-        lines,
         error: `Shortcut "${definition.id}" names unknown tool "${step.ref}" (step ${k + 1}). Nothing ran.`
-      };
+      });
     }
     const stepArgs = { ...((step.args && typeof step.args === "object") ? step.args : {}) };
     if (SHORTCUT_TAB_SCOPED_TOOLS.has(step.ref) && stepArgs.tabId === undefined) stepArgs.tabId = tabId;
+    // Content the step returns is FRESH by construction: it is read from the
+    // live page during this run, and the outcome records where and when.
+    const isContentStep = contentStep ? contentStep(step.ref, stepArgs) : false;
+    const outcome = { index: k, ref: step.ref, status: "ok" };
     try {
       const res = await handler(stepArgs);
       const first = res && Array.isArray(res.content) ? res.content[0] : null;
@@ -4868,13 +5279,58 @@ async function runShortcutToolSteps(definition, tabId) {
         ? (typeof first.text === "string" && first.text ? first.text.split("\n")[0].slice(0, 160)
           : first.type === "image" ? "image returned" : "")
         : "";
+      // Handlers in this file signal failure three ways (a throw, an isError
+      // flag, an error-shaped text payload) — the SAME rule the batch
+      // executor already applies, reused rather than redefined, so a step
+      // that returned "Could not resolve ref ..." is a FAILED step here
+      // instead of a note attached to a success.
+      const failureText = res && Array.isArray(res.content)
+        ? res.content.filter((b) => b && b.type === "text").map((b) => String(b.text || "")).join("\n")
+        : "";
+      if (resultFailed && resultFailed(res)) {
+        const reason = (classifyDrift ? classifyDrift(failureText) : null) || "transient";
+        outcome.status = "failed";
+        outcome.reason = reason;
+        outcome.note = failureText.slice(0, 300) || note;
+        outcomes.push(outcome);
+        if (reason === "target_no_longer_resolves") {
+          drift = { step: k, ref: step.ref, reason, evidence: failureText.slice(0, 300) };
+        }
+        lines.push(`step ${k + 1} (${step.ref}): failed — ${failureText.split("\n")[0].slice(0, 160)}`);
+        return finish({ ok: false, drift, error: `Shortcut "${definition.id}" failed at step ${k + 1} (${step.ref}).` });
+      }
+      if (note) outcome.note = note;
+      if (isContentStep && readTabUrl) {
+        const url = await readTabUrl(tabId);
+        if (typeof url === "string" && url) {
+          finalUrl = url;
+          outcome.url = url;
+          outcome.fetchedAt = new Date().toISOString();
+        }
+      }
+      outcomes.push(outcome);
       lines.push(`step ${k + 1} (${step.ref}): ok${note ? ` — ${note}` : ""}`);
     } catch (e) {
-      lines.push(`step ${k + 1} (${step.ref}): failed — ${String((e && e.message) || e).slice(0, 300)}`);
-      return { ok: false, lines, error: `Shortcut "${definition.id}" failed at step ${k + 1} (${step.ref}).` };
+      const message = String((e && e.message) || e).slice(0, 300);
+      const reason = (classifyDrift ? classifyDrift(message) : null) || "transient";
+      outcome.status = "failed";
+      outcome.reason = reason;
+      outcome.note = message;
+      outcomes.push(outcome);
+      if (reason === "target_no_longer_resolves") {
+        drift = { step: k, ref: step.ref, reason, evidence: message };
+      }
+      lines.push(`step ${k + 1} (${step.ref}): failed — ${message}`);
+      return finish({ ok: false, drift, error: `Shortcut "${definition.id}" failed at step ${k + 1} (${step.ref}).` });
     }
   }
-  return { ok: true, lines };
+  // The URL the run ended on — the honest "where did this read happen"
+  // answer even when no content step ran (a navigation moved the page).
+  if (readTabUrl && !proveRun) {
+    const url = await readTabUrl(tabId);
+    if (typeof url === "string" && url) finalUrl = url;
+  }
+  return finish({ ok: true });
 }
 actionEvents.onActionEvent(collectGifCaptureInput);
 
@@ -5280,28 +5736,74 @@ const toolHandlers = {
     // from the inside, exactly like a click that worked.
     let refCovering = null;
     let refProxiedFrom = null;
-    if (args.ref) {
-      const res = await resolveRefToCoordinates(tabId, args.ref);
-      if (!res) return { content: [{ type: "text", text: `Could not resolve ref "${args.ref}" to coordinates. The page may have changed — re-run read_page or find for a fresh ref.` }] };
-      if (!res.reachable) {
-        // A ref that has gone stale and one that is merely out of reach are
-        // different problems with different fixes, and saying which is which
-        // saves the caller from retrying the wrong one.
-        return {
-          content: [
-            {
-              type: "text",
-              text: res.detached
-                ? `Ref "${args.ref}" no longer exists on the page — the element was removed since it was found. This happens to items inside a dropdown or popup once it closes: the list is rebuilt each time it opens. Re-open it if needed, run find again for a fresh ref, and click that.`
-                : `Could not bring ref "${args.ref}" into view — it is still outside the viewport after scrolling, so a click there would land on the page background rather than the element. It may be inside a container that needs scrolling separately, or hidden.`
-            }
-          ]
-        };
+    // The ref that actually resolved (LIVE), for the hit notes below. Set for
+    // both resolution sources: resolving a target mints a fresh live ref.
+    let aimRef = null;
+    if (args.ref || args.target) {
+      // Two ways to name the element a click aims at:
+      //   - `ref`: a HANDLE minted by find/read_page. It resolves only inside
+      //     the document that minted it (content.js's WeakRef map dies on
+      //     navigation, SPA route changes, tab close and browser restart) —
+      //     but within one document it is the most precise thing available,
+      //     so it is tried first whenever present.
+      //   - `target`: the element's stable IDENTITY (`{role, name}`, frozen
+      //     beside the original ref at materialization time). It survives
+      //     document death and is re-resolved against the live page HERE —
+      //     this is what makes a stored workflow step land at all; a
+      //     handle-only step is guaranteed to drift on a later run.
+      // Both failing is a real failure, and the caller-facing text says
+      // which element was aimed at either way.
+      let res = null;
+      let failure = null; // { kind: "unresolved"|"detached"|"unreachable" }
+      if (args.ref) {
+        const viaRef = await resolveRefToCoordinates(tabId, args.ref);
+        if (viaRef && viaRef.reachable) {
+          res = viaRef;
+          aimRef = args.ref;
+        } else {
+          failure = viaRef
+            ? { kind: viaRef.detached ? "detached" : "unreachable" }
+            : { kind: "unresolved" };
+        }
+      }
+      if (!res && args.target) {
+        const viaTarget = await resolveTargetToCoordinates(tabId, args.target);
+        if (viaTarget && viaTarget.reachable) {
+          res = viaTarget;
+          aimRef = viaTarget.ref || null;
+          failure = null;
+        } else {
+          // A target that resolves into an unreachable element is its own
+          // story; a target that does not match at all supersedes whatever
+          // the stale handle managed to say.
+          failure = viaTarget
+            ? { kind: viaTarget.detached ? "detached" : "unreachable" }
+            : { kind: "unresolved" };
+        }
+      }
+      if (!res) {
+        if (args.target) {
+          const aim = describeTargetText(args.target);
+          const text =
+            failure && failure.kind === "detached"
+              ? `Could not resolve the step target ${aim} — the element is gone from the page.`
+              : failure && failure.kind === "unreachable"
+                ? `Could not bring the step target ${aim} into view — it is still outside the viewport after scrolling, so a click there would land on the page background rather than the element.`
+                : `Could not resolve the step target ${aim} — no element matching that identity exists on the page. The site has changed since this step was recorded; the workflow needs healing.`;
+          return { content: [{ type: "text", text }] };
+        }
+        const text =
+          failure && failure.kind === "detached"
+            ? `Ref "${args.ref}" no longer exists on the page — the element was removed since it was found. This happens to items inside a dropdown or popup once it closes: the list is rebuilt each time it opens. Re-open it if needed, run find again for a fresh ref, and click that.`
+            : failure && failure.kind === "unreachable"
+              ? `Could not bring ref "${args.ref}" into view — it is still outside the viewport after scrolling, so a click there would land on the page background rather than the element. It may be inside a container that needs scrolling separately, or hidden.`
+              : `Could not resolve ref "${args.ref}" to coordinates. The page may have changed — re-run read_page or find for a fresh ref.`;
+        return { content: [{ type: "text", text }] };
       }
       if (coordinate && (coordinate[0] !== res.x || coordinate[1] !== res.y)) {
         dbg(
           "hit",
-          `${args.ref} resolved to (${res.x},${res.y}); the coordinate sent with it (${coordinate[0]},${coordinate[1]}) was not used`,
+          `${aimRef || describeTargetText(args.target)} resolved to (${res.x},${res.y}); the coordinate sent with it (${coordinate[0]},${coordinate[1]}) was not used`,
           { tab: tabId }
         );
       }
@@ -5313,7 +5815,7 @@ const toolHandlers = {
         // what stops a reader of the log concluding no scroll took place.
         dbg(
           "hit",
-          `${args.ref} scrolled into view: (${res.scrolledFrom[0]},${res.scrolledFrom[1]}) -> (${res.x},${res.y})`,
+          `${aimRef || describeTargetText(args.target)} scrolled into view: (${res.scrolledFrom[0]},${res.scrolledFrom[1]}) -> (${res.x},${res.y})`,
           { tab: tabId }
         );
       }
@@ -5331,21 +5833,22 @@ const toolHandlers = {
     // is derived from THIS, never from a note that merely says which element
     // received the click — see probeNotes_().
     let hitWarning = "";
-    if (args.ref && coordinate) {
-      // Resolving the ref already scrolled it into view and hit-tested the
-      // result, so there is nothing left to check — only interception is worth
-      // mentioning, and it is deliberately not auto-corrected: a person
-      // clicking there would hit the same thing.
+    if (aimRef && coordinate) {
+      // Resolving the aim (a ref, or a target resolved into a fresh ref)
+      // already scrolled it into view and hit-tested the result, so there is
+      // nothing left to check — only interception is worth mentioning, and it
+      // is deliberately not auto-corrected: a person clicking there would hit
+      // the same thing.
       if (refProxiedFrom) {
         // Not a warning: this is what a person's click does too. But the agent
         // named one element and another is being clicked, so it has to be told.
         hitNote = ` — NOTE: ${refProxiedFrom} sits outside the page (a visually hidden control), so this was aimed at the label that operates it, exactly as a click by hand would be.`;
         hitWarning = hitNote;
-        dbg("hit", `${args.ref} unreachable; clicked its label instead @(${coordinate[0]},${coordinate[1]})`, { tab: tabId });
+        dbg("hit", `${aimRef} unreachable; clicked its label instead @(${coordinate[0]},${coordinate[1]})`, { tab: tabId });
       } else if (refCovering) {
-        hitNote = ` — NOTE: <${args.ref}> is covered at that point by ${refCovering}, which received this instead.`;
+        hitNote = ` — NOTE: <${aimRef}> is covered at that point by ${refCovering}, which received this instead.`;
         hitWarning = hitNote;
-        dbg("hit", `${args.ref} @(${coordinate[0]},${coordinate[1]}) COVERED BY ${refCovering}`, { tab: tabId });
+        dbg("hit", `${aimRef} @(${coordinate[0]},${coordinate[1]}) COVERED BY ${refCovering}`, { tab: tabId });
       } else if (HIT_PROBED.includes(action)) {
         // Say WHICH element received it, exactly as the coordinate path does.
         //
@@ -5361,9 +5864,9 @@ const toolHandlers = {
         // discovering the same mistake costs at least one model round trip.
         const probe = await probeHit(tabId, coordinate[0], coordinate[1]);
         hitNote = hitLandedNote_(probe);
-        dbg("hit", `${args.ref} @(${coordinate[0]},${coordinate[1]}) ${formatHit(probe)}`, { tab: tabId });
+        dbg("hit", `${aimRef} @(${coordinate[0]},${coordinate[1]}) ${formatHit(probe)}`, { tab: tabId });
       } else {
-        dbg("hit", `${args.ref} @(${coordinate[0]},${coordinate[1]}) reachable`, { tab: tabId });
+        dbg("hit", `${aimRef} @(${coordinate[0]},${coordinate[1]}) reachable`, { tab: tabId });
       }
     } else if (HIT_PROBED.includes(action) && coordinate) {
       const probe = await probeHit(tabId, coordinate[0], coordinate[1]);
@@ -6002,14 +6505,44 @@ const toolHandlers = {
   },
 
   async form_input(args) {
-    const { ref, value, tabId } = args;
+    const { ref, value, tabId, target } = args;
     if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
 
-    const resp = await sendContentMessage(tabId, { type: "setFormValue", ref, value });
+    // A replayed step carries the element's stable identity; its recorded ref
+    // died with the document that minted it (see resolveTargetToCoordinates).
+    // Resolve the identity against the live page first — that is what makes a
+    // stored form step land — and fall back to a ref only when one is given
+    // and still resolves.
+    let liveRef = null;
+    if (target && typeof target === "object" && typeof target.name === "string" && target.name.trim()) {
+      const resolved = await resolveTargetToCoordinates(tabId, target);
+      if (resolved && resolved.reachable && resolved.ref) {
+        liveRef = resolved.ref;
+      } else if (ref) {
+        const fallback = await resolveRefToCoordinates(tabId, ref);
+        if (fallback && fallback.reachable) liveRef = ref;
+      }
+      if (!liveRef) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Could not resolve the step target ${describeTargetText(target)} — no element matching that identity exists on the page. The site has changed since this step was recorded; the workflow needs healing.`
+            }
+          ]
+        };
+      }
+    }
+    if (!liveRef && ref) liveRef = ref;
+    if (!liveRef) {
+      return { content: [{ type: "text", text: "Error: form_input requires a ref or a target" }] };
+    }
+
+    const resp = await sendContentMessage(tabId, { type: "setFormValue", ref: liveRef, value });
     const result = resp?.result;
 
     if (result?.error) return { content: [{ type: "text", text: `Error: ${result.error}` }] };
-    return { content: [{ type: "text", text: `Set ${ref} to "${value}". Result: ${JSON.stringify(result)}` }] };
+    return { content: [{ type: "text", text: `Set ${liveRef} to "${value}". Result: ${JSON.stringify(result)}` }] };
   },
 
   async javascript_tool(args) {
@@ -6715,11 +7248,99 @@ const toolHandlers = {
     if (!def || !Array.isArray(def.steps) || !def.steps.length) {
       return { content: [{ type: "text", text: `Shortcut "${v.target}" resolved to an empty definition. Nothing ran.` }] };
     }
-    const run = await runShortcutToolSteps(def, v.tabId);
+    const run = await runShortcutToolSteps(def, v.tabId, { tabUrl: url });
     const head = run.ok
       ? `Shortcut "${def.id}" finished: ${run.lines.length} step(s) ran.`
       : `${run.error} ${run.lines.length} step(s) completed before the failure.`;
-    return { content: [{ type: "text", text: `${head}\n${run.lines.join("\n")}` }] };
+    // The executor's structured result rides the result text as ONE stable
+    // final line (openspec/changes/add-workflow-materialization-and-heal):
+    // the companion records a drift outcome from that fact rather than from
+    // the prose above, and an ordinary success carries `outcome:"ok"` the same
+    // way. Exactly once, always last.
+    const body = `${head}\n${run.lines.join("\n")}`;
+    return { content: [{ type: "text", text: run.marker ? `${body}\n${run.marker}` : body }] };
+  },
+
+  // Extension half of the companion's workflow_prove request (openspec/
+  // changes/add-workflow-materialization-and-heal). The companion holds the
+  // record and the lease; this side runs ONE live proof of the definition's
+  // tool steps in the addressed tab and reports per-step outcomes — it enables
+  // nothing, stores nothing, and never touches the registry. The reply is a
+  // single JSON text block (the ordinary tool_response shape) so the companion
+  // can parse it without a second protocol:
+  //   {ok:true, workflowId, version, outcomes, finalUrl}
+  //   {ok:false, reason:"invalid_args"|"not_in_agent_group"|"tab_gone"|"binding_mismatch", detail?, finalUrl?}
+  // `ok` is true only when EVERY reported step ran and succeeded: an
+  // `unexecutable` step (a skill/message step, an unknown tool, a nested
+  // step this executor refuses) means the draft was NOT fully validated, and
+  // an unvalidated draft stays a draft (spec "An unvalidated draft stays a
+  // draft"). Busy/lease arbitration is the companion's side; this handler only
+  // refuses what it can see for itself — a tab outside the agent group, or one
+  // that is gone.
+  async workflow_prove(args) {
+    const v = validateWorkflowProveArgs(args);
+    if (!v.ok) {
+      return { content: [{ type: "text", text: JSON.stringify({ ok: false, reason: "invalid_args", detail: v.message }) }] };
+    }
+    // Reach rule: the panel's own bound tab (solo group, borrowed) or a tab in
+    // any group this extension owns — see isTabReachableForProve(), which
+    // explains why a proof needs exactly this and nothing more.
+    if (!(await isTabReachableForProve(v.tabId))) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ ok: false, reason: "not_in_agent_group", detail: `Tab ${v.tabId} is not in the MCP group.` })
+          }
+        ]
+      };
+    }
+    let tab = null;
+    try {
+      tab = await chrome.tabs.get(v.tabId);
+    } catch {
+      tab = null;
+    }
+    if (!tab) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ ok: false, reason: "tab_gone", detail: `Tab ${v.tabId} is not open.` })
+          }
+        ]
+      };
+    }
+    const tabUrl = typeof tab.url === "string" ? tab.url : null;
+    const run = await runShortcutToolSteps(v.definition, v.tabId, { prove: true, tabUrl });
+    // The domain pre-flight refused before any step ran: report that as
+    // itself (distinguishable from a step failure) rather than as an empty
+    // successful proof.
+    if (run.drift && run.drift.reason === "binding_mismatch" && !run.outcomes.length) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ ok: false, reason: "binding_mismatch", detail: run.drift.evidence, finalUrl: run.finalUrl })
+          }
+        ]
+      };
+    }
+    const ok = run.outcomes.length > 0 && run.outcomes.every((o) => o && o.status === "ok");
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            ok,
+            workflowId: v.workflowId,
+            version: v.version,
+            outcomes: run.outcomes,
+            finalUrl: run.finalUrl
+          })
+        }
+      ]
+    };
   },
 
   async list_connected_browsers(args) {

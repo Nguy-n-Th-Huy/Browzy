@@ -311,7 +311,15 @@
         </div>
 
         <div id="chatgpt-session-expired-actions" hidden>
-          <button class="btn btn-primary btn-sm" type="button" id="btn-chatgpt-signin-again">Đăng nhập lại</button>
+          <div class="field-row-actions">
+            <button class="btn btn-primary btn-sm" type="button" id="btn-chatgpt-signin-again">Đăng nhập lại</button>
+            <!-- An explicit sign-out stays reachable from an expired session
+                 too (agent-settings spec: the ChatGPT settings surface
+                 contains "A 'Sign out' action") — an expired profile still
+                 has a bound account the operator may want to disown or
+                 replace before signing in again. -->
+            <button class="btn btn-ghost btn-sm" type="button" id="btn-chatgpt-signout-expired">Đăng xuất</button>
+          </div>
         </div>
       </div>
 

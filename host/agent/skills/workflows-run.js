@@ -192,15 +192,23 @@ export function buildRunInvocation({ executionId, plan, profileSnapshot, skillSn
  * concrete value, the domain and document bindings are exact. Otherwise a
  * specific incomplete-evidence reason per gap — never a partial draft.
  *
- * @param {{ events: Array<{ kind, ref?, params? }>, domain, document, workflow }} args
+ * `requireDocument` (add-workflow-materialization-and-heal): a RECORDING must
+ * establish a document binding to be replayed, so the recording path keeps
+ * requiring one. A completed RUN's trail legitimately may not have one — the
+ * run bound no document — and the derived draft says so (`document: null`)
+ * instead of being withheld, so that path passes `false`. The rest of the
+ * contract (every step, parameter, and domain resolved or a specific reason)
+ * is shared verbatim: there is exactly one definition of "reviewable draft".
+ *
+ * @param {{ events: Array<{ kind, ref?, params? }>, domain, document, workflow, requireDocument? }} args
  */
-export function buildRecordingDraft({ events, domain, document, workflow }) {
+export function buildRecordingDraft({ events, domain, document, workflow, requireDocument = true }) {
   const incomplete = [];
   if (!Array.isArray(events) || !events.length) {
     return { ok: false, incomplete: ["no recording events to derive a draft from"] };
   }
   if (!domain) incomplete.push("recording does not establish an exact domain binding");
-  if (!document) incomplete.push("recording does not establish an exact document binding");
+  if (requireDocument && !document) incomplete.push("recording does not establish an exact document binding");
   const steps = [];
   for (const [index, event] of events.entries()) {
     if (!event || (event.kind !== "skill" && event.kind !== "tool" && event.kind !== "message")) {

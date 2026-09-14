@@ -303,6 +303,22 @@ body {
   gap: var(--space-1);
 }
 
+/* While a run is active its controls (Stop, "Chạy ngay") join this row; at
+   the panel's narrowest supported widths the row can outgrow its width and
+   flex-shrink used to crush the trailing icon controls (Stop, Send) to zero
+   width — invisible exactly when Stop matters most, and below the minimum
+   pointer target. Let the row wrap onto a second line while those controls
+   are displayed (they are toggled through an inline display style), so every
+   control keeps its size and stays reachable. Above this width, and in the
+   idle state, the existing single-line behaviour is unchanged. Found by the
+   live-panel 320px run-state check on 2026-09-14. */
+@media (max-width: 430px) {
+  .composer-actions:has(#btn-stop:not([style*="display: none"])) {
+    flex-wrap: wrap;
+    row-gap: var(--space-1);
+  }
+}
+
 .model-select-trigger {
   display: inline-flex;
   align-items: center;
@@ -442,6 +458,25 @@ body {
 .msg-user-bubble.is-placeholder {
   font-style: italic;
   color: var(--color-text-secondary);
+}
+/* Message-queue state row on a user item (openspec/changes/add-message-queue-
+   and-steering, panel spec "Truthful queue states with per-message control"):
+   the chip (+ per-message cancel / interrupt-fallback note) describes the
+   message and sits right-aligned with the bubble it belongs to. The shared
+   .chip/.btn primitives carry their own treatment; this owns layout only. */
+.msg-user-queue {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  margin-top: var(--space-1);
+  max-width: 88%;
+}
+.msg-user-queue-note {
+  font-size: var(--font-size-small);
+  color: var(--color-text-secondary);
+  text-align: right;
 }
 .msg-assistant-body {
   width: 100%;
@@ -938,6 +973,220 @@ body {
 }
 .turn-duration {
   color: var(--color-text-secondary);
+}
+
+/* ============ Rerunnable workflows + self-healing (this change) ============ *
+ * Three surfaces, all inside the existing visual language: the turn footer's
+ * quiet affordance, the draft/heal cards (`.card` + the `.permission-card-*`
+ * head/actions primitives), and the drift notice — which deliberately shares
+ * NO class with a decision card, so "there is nothing to answer here" reads at
+ * a glance (the same rule the threat warnings follow). Everything here is
+ * layout only; every color/spacing value comes from the shared tokens.
+ */
+.turn-workflow-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  color: var(--color-text-secondary);
+}
+.turn-workflow-btn:hover,
+.turn-workflow-btn:focus-visible {
+  color: var(--color-text);
+}
+.workflow-notice {
+  font-size: var(--font-size-small);
+  color: var(--color-status-warning);
+  padding: var(--space-1) var(--space-2);
+  margin-bottom: var(--space-2);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-status-warning);
+  background: color-mix(in srgb, var(--color-status-warning) 8%, var(--color-surface));
+}
+.workflow-notice[hidden] {
+  display: none;
+}
+.workflow-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: var(--space-3) 0;
+}
+.workflow-card-subhead {
+  margin: 0;
+  font-size: var(--font-size-small);
+  font-weight: 600;
+  color: var(--color-text-secondary);
+}
+.workflow-card-meta {
+  margin: 0;
+  font-size: var(--font-size-small);
+  color: var(--color-text-secondary);
+  overflow-wrap: anywhere;
+}
+.workflow-card-note {
+  margin: 0;
+  font-size: var(--font-size-small);
+  color: var(--color-text-secondary);
+}
+.workflow-card-note.is-ok {
+  color: var(--color-status-success);
+}
+.workflow-card-error {
+  margin: 0;
+  font-size: var(--font-size-small);
+  color: var(--color-status-danger);
+}
+.workflow-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  justify-content: flex-end;
+}
+.workflow-steps {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.workflow-step {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-sunken);
+  font-size: var(--font-size-small);
+}
+.workflow-step-index {
+  flex: none;
+  min-width: 1.5em;
+  color: var(--color-text-secondary);
+  font-family: var(--font-mono);
+}
+.workflow-step-main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1;
+}
+.workflow-step-label {
+  overflow-wrap: anywhere;
+}
+.workflow-step-detail {
+  color: var(--color-text-secondary);
+  overflow-wrap: anywhere;
+}
+.workflow-step-source {
+  color: var(--color-text-secondary);
+}
+.workflow-step-state {
+  flex: none;
+  color: var(--color-text-secondary);
+}
+/* Edit rows (the card's "Sửa" view): identity stays a line, the args input
+ * takes the row's remaining width, and the remove control sits at the end. */
+.workflow-steps.is-editing .workflow-step {
+  align-items: center;
+}
+.workflow-edit-args {
+  width: 100%;
+  margin-top: 2px;
+  padding: 2px var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-small);
+  color: var(--color-text);
+  background: var(--color-canvas);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+}
+.workflow-edit-args:focus {
+  outline: none;
+  border-color: var(--color-accent-text);
+}
+.workflow-step-state.is-ok {
+  color: var(--color-status-success);
+}
+.workflow-step-state.is-failed {
+  color: var(--color-status-danger);
+}
+.workflow-step-state.is-unexecutable {
+  color: var(--color-status-warning);
+}
+.workflow-proof {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-2);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-border-subtle);
+}
+.workflow-proof.is-ok {
+  border-color: var(--color-status-success);
+}
+.workflow-proof.is-failed {
+  border-color: var(--color-status-danger);
+}
+.workflow-proof-verdict {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  margin: 0;
+  font-size: var(--font-size-small);
+  font-weight: 600;
+}
+.workflow-proof.is-ok .workflow-proof-verdict {
+  color: var(--color-status-success);
+}
+.workflow-proof.is-failed .workflow-proof-verdict {
+  color: var(--color-status-danger);
+}
+/* The drift notice: no buttons, no dialog role, nothing to answer. */
+.workflow-drift-note {
+  display: flex;
+  gap: var(--space-2);
+  align-items: flex-start;
+  margin: var(--space-3) 0;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--color-status-warning);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--color-status-warning) 8%, var(--color-surface));
+  font-size: var(--font-size-small);
+}
+.workflow-drift-icon {
+  flex: none;
+  display: flex;
+  color: var(--color-status-warning);
+}
+.workflow-drift-body {
+  min-width: 0;
+}
+.workflow-drift-title {
+  margin: 0;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.workflow-drift-line,
+.workflow-drift-hint {
+  margin: var(--space-1) 0 0;
+  color: var(--color-text-secondary);
+  overflow-wrap: anywhere;
+}
+.workflow-drift-evidence code {
+  display: block;
+  margin-top: var(--space-1);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: var(--font-mono);
+  color: var(--color-text-secondary);
+}
+.workflow-heal-reasons {
+  margin: 0;
+  padding-left: var(--space-4);
+  font-size: var(--font-size-small);
+  color: var(--color-text-secondary);
+  overflow-wrap: anywhere;
 }
 
 /* ========================= Image attachment composer UI ===================== */

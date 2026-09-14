@@ -114,8 +114,15 @@ function renderChatgptFields(state) {
   $("btn-chatgpt-signin-browser").textContent = phase === "starting_browser" ? "Đang mở…" : "Đăng nhập với ChatGPT";
   $("btn-chatgpt-use-code").textContent = phase === "starting_device" ? "Đang lấy mã…" : "Dùng mã thay thế";
   $("btn-chatgpt-cancel-signin").disabled = phase === "cancelling";
-  $("btn-chatgpt-signout").disabled = state.signingOut;
-  $("btn-chatgpt-signout").textContent = state.signingOut ? "Đang đăng xuất…" : "Đăng xuất";
+  // Both explicit sign-out controls — the signed-in surface's and the
+  // session-expired surface's — share this one update, so neither state can
+  // drift from the other (a profile whose session expired still has a bound
+  // account the operator may want to disown; see settings.html's note).
+  for (const id of ["btn-chatgpt-signout", "btn-chatgpt-signout-expired"]) {
+    const btn = $(id);
+    btn.disabled = state.signingOut;
+    btn.textContent = state.signingOut ? "Đang đăng xuất…" : "Đăng xuất";
+  }
 
   const deviceCodeBox = $("chatgpt-device-code-box");
   const showDeviceCode = phase === "pending_device" && Boolean(signIn.userCode);
@@ -738,10 +745,14 @@ function wireEvents() {
   });
   $("btn-chatgpt-use-code").addEventListener("click", () => controller.startDeviceSignIn());
   $("btn-chatgpt-cancel-signin").addEventListener("click", () => controller.cancelSignIn());
-  $("btn-chatgpt-signout").addEventListener("click", async () => {
+  // One handler for both sign-out controls (signed-in and session-expired):
+  // the same confirmation, the same host call — never two divergent paths.
+  const confirmThenSignOut = async () => {
     if (!confirm("Đăng xuất khỏi ChatGPT? Các phiên đang chạy dùng tài khoản này sẽ bị hủy.")) return;
     await controller.signOut();
-  });
+  };
+  $("btn-chatgpt-signout").addEventListener("click", confirmThenSignOut);
+  $("btn-chatgpt-signout-expired").addEventListener("click", confirmThenSignOut);
   $("btn-chatgpt-copy-code").addEventListener("click", async () => {
     const code = $("chatgpt-device-code").value;
     if (!code) return;

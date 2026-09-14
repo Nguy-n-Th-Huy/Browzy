@@ -84,6 +84,42 @@ function readJsonSafe(file, fallback) {
   }
 }
 
+// --- Queued-message state (openspec/changes/add-message-queue-and-steering)
+//
+// The message queue is host-owned state that lives in this same meta.json,
+// not in a second file (design.md decision 1): it is bounded, small, and
+// rewritten as a whole, which is exactly the shape meta.json already has —
+// a separate `queue.json` would buy a second atomic-write path without
+// buying anything this one does not already give. Only LIVE entries
+// (pending/dispatching) live here; a consumed/cancelled entry leaves the
+// array and survives as an event in the append-only log. The message TEXT
+// never lives here — it stays in its own `message_queued` event, so no
+// restore path can render it twice and the meta document cannot grow with
+// operator prose (design.md decisions 1/9).
+//
+// The bound counts `pending` entries only and is checked BEFORE anything is
+// appended (design.md decision 6), so a refusal leaves no trace: no entry,
+// no message event, and the operator's draft is still theirs to edit. One
+// constant in one place; raising it later is not a contract change.
+export const QUEUE_LIMIT = 20;
+
+/** The two live queue-entry states. `pending` → `dispatching` is the claim
+ * boundary (design.md decision 2); terminal outcomes (consumed/cancelled/
+ * failed) exist only as events, never as entries in this list. */
+export const QUEUE_ENTRY_STATES = Object.freeze({
+  PENDING: "pending",
+  DISPATCHING: "dispatching"
+});
+
+/** Default fields every conversation record carries so a reader never has to
+ * distinguish "no queue yet" from "empty queue" — the migration story for an
+ * already-on-disk conversation is exactly this: absent means empty/unpaused
+ * (design.md "Migration Plan"). A function, not a frozen literal, so two
+ * records never share one array instance. */
+function queueMetaDefaults() {
+  return { messageQueue: [], queuePaused: false, successorMessageId: null };
+}
+
 // Presentation-metadata bounds (openspec/changes/optimize-chat-history task
 // 1.1). These are enforced a second time at the wire boundary
 // (host/agent/protocol.js's validateConversationUpdate) — the store clamps
@@ -156,6 +192,10 @@ export class TranscriptStore {
       // explicit `meta.conversationMetadata` (uncommon) still wins via the
       // spread below, same as every other default field here.
       conversationMetadata: initConversationMetadataEnvelope(),
+      // Additive queue fields (see QUEUE_META_DEFAULTS above): absent from an
+      // already-persisted conversation means empty/unpaused, and every
+      // conversation created from here on carries them explicitly.
+      ...queueMetaDefaults(),
       ...meta
     };
     atomicWriteJson(conversationMetaFile(conversationId), record);
@@ -409,6 +449,39 @@ export class TranscriptStore {
         }
       })
       .filter(Boolean);
+  }
+
+  /**
+   * The sequence number the NEXT appendEvent() for this conversation will
+   * assign. Public because a queued message's durable id IS that number: the
+   * `message_queued` event carries it as `messageId`, and every later
+   * transition (claimed/consumed/cancelled) names the message by it. Callers
+   * MUST append immediately and without an intervening await — the value is a
+   * read of the allocator, not a reservation. Safe after a crash for the same
+   * reason allocation itself is: `_lastSeqOf()` seeds from the log, so this
+   * can never hand back a seq the log already holds.
+   */
+  nextSeq(conversationId) {
+    assertSafeId(conversationId, "conversationId");
+    return this._lastSeqOf(conversationId) + 1;
+  }
+
+  /**
+   * Read + parse this conversation's whole log (ascending seq).
+   *
+   * Unlike eventsAfter(id, 0) — which bounds itself to maxSnapshotEvents so a
+   * cold reconnect can never pull an unbounded history into one wire payload
+   * — this is never window-truncated. The queue paths need the COMPLETE log:
+   * "did this claimed run ever emit run_started?" (design.md decision 2's
+   * recovery reconciliation) and "what did this queued message's own
+   * message_queued event carry?" are questions whose answers must not depend
+   * on how many events happened since, so a long-running turn that pushed the
+   * queued message's event out of the newest-window slice would otherwise
+   * turn a recoverable entry into a wrong answer.
+   */
+  allEvents(conversationId) {
+    assertSafeId(conversationId, "conversationId");
+    return this._readEvents(conversationId);
   }
 
   /**

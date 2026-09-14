@@ -188,6 +188,25 @@ function validateSteps(steps, parameterSchema) {
       fail("UNSUPPORTED_STEP", `${kind} step at index ${index} args must be a plain object`);
     }
     const cleanArgs = args ? { ...args } : {};
+    // A stable replay target (see workflows-materialize.js): the element
+    // identity a step aims at, frozen so a later replay re-resolves it live
+    // instead of relying on a ref handle that dies with its document.
+    // Shape-checked here so a malformed target is a validation error, never
+    // a runtime surprise.
+    if (cleanArgs.target !== undefined) {
+      const t = cleanArgs.target;
+      if (!isPlainObject(t) || typeof t.name !== "string" || !t.name.trim() || t.name.length > 200) {
+        fail("UNSUPPORTED_STEP", `${kind} step at index ${index} target must be an object with a nonempty name of at most 200 characters`);
+      }
+      if (t.role !== undefined && (typeof t.role !== "string" || !t.role.trim() || t.role.length > 40)) {
+        fail("UNSUPPORTED_STEP", `${kind} step at index ${index} target.role must be a nonempty string of at most 40 characters`);
+      }
+      for (const key of Object.keys(t)) {
+        if (key !== "role" && key !== "name") {
+          fail("UNSUPPORTED_STEP", `${kind} step at index ${index} target carries unsupported field "${key}"`);
+        }
+      }
+    }
     // Every `{{param}}` template referenced by args must be declared.
     const templateRefs = new Set();
     const scan = (node) => {

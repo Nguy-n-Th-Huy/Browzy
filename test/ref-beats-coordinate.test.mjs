@@ -49,8 +49,11 @@ ok(
   "ref resolution is not gated on the coordinate being absent — that gate is what let a guessed pixel win"
 );
 
-const guard = body.indexOf("if (args.ref) {");
-ok(guard !== -1, "the resolution branch is entered whenever a ref is supplied");
+const guard = body.indexOf("if (args.ref || args.target) {");
+ok(
+  guard !== -1,
+  "the resolution branch is entered whenever a ref (or a frozen replay target) is supplied"
+);
 
 const branchEnd = endOfBlock(body, guard);
 const resolve = body.indexOf("resolveRefToCoordinates(tabId, args.ref)");
@@ -59,11 +62,11 @@ const assign = body.indexOf("coordinate = [res.x, res.y];");
 ok(guard < resolve && resolve < branchEnd, "the ref is resolved inside that branch");
 ok(
   guard < assign && assign < branchEnd,
-  "and the resolved position overwrites whatever coordinate came in with it"
+  "and the resolved position overwrites whatever coordinate came in with it, before any probe or dispatch (the probe phase starts only after the branch)"
 );
 
-const hitBranch = body.indexOf("if (args.ref && coordinate) {");
-ok(hitBranch !== -1, "the hit-note branch for a ref click is still present");
+const hitBranch = body.indexOf("if (aimRef && coordinate) {");
+ok(hitBranch !== -1, "the hit-note branch for an aimed click is still present (it keys off the ref that actually resolved)");
 ok(
   hitBranch > branchEnd,
   "it runs after the resolution branch, so its assumption that the ref was already resolved and hit-tested holds"

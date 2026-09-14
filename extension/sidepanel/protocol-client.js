@@ -83,6 +83,42 @@ export const MSG = Object.freeze({
   // transcript to replay.
   DOCUMENT_REQUEST: "document_request",
   DOCUMENT: "document",
+  // Message-queue operator controls (openspec/changes/add-message-queue-and-
+  // steering, design.md decisions 4/5). Mirrors host/agent/protocol.js's own
+  // CANCEL_MESSAGE / RESUME_QUEUE, which document the wire shapes in full;
+  // both are request/reply pairs correlated by `requestId`, and both are
+  // additive under PROTOCOL_VERSION 1 — an older companion answers
+  // unknown_message_type through the existing ERROR path above.
+  CANCEL_MESSAGE: "cancel_message",
+  RESUME_QUEUE: "resume_queue",
+  // Rerunnable workflows + self-healing (openspec/changes/
+  // add-workflow-materialization-and-heal). Five request/reply pairs, all
+  // additive under PROTOCOL_VERSION 1 — an older companion answers each of
+  // them with the existing `unknown_message_type` ERROR path above, which the
+  // panel already maps to a "companion needs updating" state rather than
+  // hanging:
+  //   workflow_draft_request — derive a draft from one completed run's trail
+  //   workflow_draft_save    — validate + store it disabled (never enabled by
+  //                            the derivation itself)
+  //   workflow_prove         — run the stored definition live ONCE for
+  //                            evidence, before it may be enabled
+  //   workflow_enable        — the operator's explicit enable, after a proof
+  //   workflow_heal_decide   — Allow/Deny for one heal proposal
+  //   workflow_edit_request  — fetch one stored definition's editable steps
+  //   workflow_edit_save     — store an operator-edited steps array as the
+  //                            next version of the line
+  // The events these operations append (`workflow_draft_saved`,
+  // `workflow_proof`, `workflow_drift`, `workflow_heal_*`, `workflow_enabled`,
+  // `workflow_updated`) are NOT envelope types: they ride the existing
+  // stream_event/token_batch envelopes into conversation-model.js like every
+  // other transcript event.
+  WORKFLOW_DRAFT_REQUEST: "workflow_draft_request",
+  WORKFLOW_DRAFT_SAVE: "workflow_draft_save",
+  WORKFLOW_PROVE: "workflow_prove",
+  WORKFLOW_ENABLE: "workflow_enable",
+  WORKFLOW_HEAL_DECIDE: "workflow_heal_decide",
+  WORKFLOW_EDIT_REQUEST: "workflow_edit_request",
+  WORKFLOW_EDIT_SAVE: "workflow_edit_save",
   ERROR: "error"
 });
 
@@ -267,7 +303,7 @@ export class ProtocolClient {
    * `attachments`, when present, is an additive optional field of artifact
    * references (never raw bytes) — ignored by older companions.
    */
-  start({ conversationId, profileId, modelId, tabScope, prompt, context, attachments, effort, elementRecord }) {
+  start({ conversationId, profileId, modelId, tabScope, prompt, context, attachments, effort, elementRecord, mode, idempotencyKey }) {
     const payload = { conversationId, profileId, modelId, tabScope, prompt, context };
     if (attachments && attachments.length) payload.attachments = attachments;
     // Absent, not null: the companion reads an absent field as "send no effort
@@ -278,7 +314,103 @@ export class ProtocolClient {
     // design-mode picked element's own field, beside `attachments` — never
     // spliced into `prompt`. Additive optional: an old companion ignores it.
     if (elementRecord) payload.elementRecord = elementRecord;
+    // Message-queue send mode (host/agent/protocol.js's START_MODES,
+    // openspec/changes/add-message-queue-and-steering design.md decisions
+    // 3/7): "queue" files the message behind the conversation's active run,
+    // "interrupt" is the panel's explicit run-now choice. Sent explicitly by
+    // the panel's own Send (see panel-controller.js sendMessage()) so the
+    // envelope states which of the two this submission is, rather than
+    // relying on the host's default for it.
+    if (mode) payload.mode = mode;
+    // Retry identity for a queued send (design.md decision 7 / task 1.4): a
+    // duplicate delivery of the SAME send resolves to the entry it already
+    // created instead of queueing the message twice.
+    if (idempotencyKey) payload.idempotencyKey = idempotencyKey;
     this._send(envelope(MSG.START, payload));
+  }
+
+  /**
+   * Cancel one still-`pending` queued message (task 6.2's per-message cancel
+   * affordance). The reply reuses this type name and is correlated by
+   * `requestId` like every other request/reply pair here; a message the next
+   * turn has already claimed is refused host-side with the claimed state
+   * disclosed, never applied optimistically.
+   */
+  cancelMessage({ conversationId, messageId, requestId }) {
+    this._send(envelope(MSG.CANCEL_MESSAGE, { conversationId, messageId, requestId }));
+  }
+
+  /** Resume a drain Stop paused (task 6.2's resume control); correlated by
+   * `requestId` like cancelMessage above. */
+  resumeQueue({ conversationId, requestId }) {
+    this._send(envelope(MSG.RESUME_QUEUE, { conversationId, requestId }));
+  }
+
+  /**
+   * Ask the host to derive a workflow draft from ONE completed run's recorded
+   * action trail and bound context (openspec/changes/
+   * add-workflow-materialization-and-heal). Derived from the transcript, never
+   * from model memory; the host answers `{ok:true, draft, review}` for a fully
+   * resolved derivation, `{ok:false, incomplete:[reasons]}` for a trail with
+   * gaps it refuses to guess around, or `{ok:false, reason}` (`unknown_run`,
+   * `run_not_completed`, `no_trail`, `unknown_conversation`). Nothing is stored
+   * or enabled by this call.
+   */
+  workflowDraftRequest({ conversationId, runId, requestId }) {
+    this._send(envelope(MSG.WORKFLOW_DRAFT_REQUEST, { conversationId, runId, requestId }));
+  }
+
+  /**
+   * Save a reviewed draft as a DISABLED workflow — the derivation and this
+   * save both never enable it; enabling is the separate, post-proof step below.
+   * The host re-validates the definition with the registry's own schema and
+   * answers `{ok:true, workflowId, version}` or
+   * `{ok:false, reason:"invalid_definition", errors:[...]}`.
+   */
+  workflowDraftSave({ conversationId, runId, definition, requestId }) {
+    this._send(envelope(MSG.WORKFLOW_DRAFT_SAVE, { conversationId, runId, definition, requestId }));
+  }
+
+  /**
+   * Run one stored workflow against the live page, for evidence, before it may
+   * be enabled. The reply is `{ok:true, outcomes, evidenceFile}` when the proof
+   * executed — `ok` is the host's verdict on the execution, `outcomes` the
+   * per-step detail — or `{ok:false, reason}` where reason names why no proof
+   * happened at all (`unknown_workflow`, `busy`, `bridge_unavailable`,
+   * `bridge_error`, `extension_error`). `version` pins the exact record being
+   * proved; `tabId` is the page the proof runs against.
+   */
+  workflowProve({ conversationId, workflowId, version, tabId, requestId }) {
+    this._send(envelope(MSG.WORKFLOW_PROVE, { conversationId, workflowId, version, tabId, requestId }));
+  }
+
+  /** Enable a proven workflow (`{ok:true, version}`). The host owns the
+   * version check — a stale version comes back as
+   * `{ok:false, reason:"stale_version", latest}` rather than overwriting a
+   * newer record. */
+  workflowEnable({ conversationId, workflowId, version, requestId }) {
+    this._send(envelope(MSG.WORKFLOW_ENABLE, { conversationId, workflowId, version, requestId }));
+  }
+
+  /** Allow or deny one heal proposal. `decision:"allow"` saves a new version
+   * through the registry's existing version bump; `"deny"` is a recorded
+   * no-op. Refusals disclose state: `unknown_proposal`, `expired`,
+   * `superseded`, `stale_base`, `invalid_candidate`. */
+  workflowHealDecide({ conversationId, proposalId, decision, requestId }) {
+    this._send(envelope(MSG.WORKFLOW_HEAL_DECIDE, { conversationId, proposalId, decision, requestId }));
+  }
+
+  /** Fetch one stored definition's editable steps: reply `{ok:true,
+   * workflowId, version, name, steps}` or `{ok:false, reason}`. */
+  workflowEditRequest({ conversationId, workflowId, version, requestId }) {
+    this._send(envelope(MSG.WORKFLOW_EDIT_REQUEST, { conversationId, workflowId, version, requestId }));
+  }
+
+  /** Save an operator-edited steps array as the next version (`{ok:true,
+   * version}`), or a refusal naming why — `stale_version` (with `latest`),
+   * `invalid_candidate` (with the registry's `errors`), `unknown_workflow`. */
+  workflowEditSave({ conversationId, workflowId, version, steps, requestId }) {
+    this._send(envelope(MSG.WORKFLOW_EDIT_SAVE, { conversationId, workflowId, version, steps, requestId }));
   }
 
   stop({ conversationId, reason = "user_stop" }) {

@@ -19,7 +19,23 @@
 //                          batch containing only transient fragments is
 //                          display-only traffic and writes no history.
 //   START (reply)        -> binds the just-sent local user message to its
-//                          real runId and persists it to HistoryStore
+//                          real runId and persists it to HistoryStore; when
+//                          the host admitted the message into the
+//                          conversation's message QUEUE instead (no run yet),
+//                          the same reply carries `entry` and the message is
+//                          bound to that queue entry's own messageId
+//                          (openspec/changes/add-message-queue-and-steering,
+//                          design.md decisions 1/2). Either shape settles the
+//                          Send's own deferred (see _settlePendingSend())
+//   ERROR (conversation-scoped) answering an outstanding Send
+//                        -> that Send's REFUSAL (`queue_full`, `malformed_mode`,
+//                          the pre-existing malformed_* / run_start_rejected):
+//                          the message is marked as never accepted and the
+//                          composer gets its draft back
+//   CANCEL_MESSAGE (reply) / RESUME_QUEUE (reply)
+//                        -> settle the matching requestId; the durable
+//                          message_cancelled / message_queue_resumed events
+//                          are what the transcript and the resume banner follow
 //   STOP (reply)         -> no-op beyond logging; run_stopped (a
 //                          STREAM_EVENT) is what actually updates state
 //   ERROR (conversation-scoped, i.e. carries conversationId)
@@ -157,6 +173,13 @@ export class PanelController {
     // without the panel having to re-resolve a page it no longer displays.
     this._pageHostnameByConversation = new Map();
     this._idempotencySeq = 0;
+    // The one Send this panel is currently awaiting an answer for — `{text,
+    // mode, idempotencyKey, conversationId, resolve}`. Sends are serialized by
+    // the composer (clear-then-await), so one slot is the honest model of it,
+    // exactly like `enhanceState` is for prompt enhancement. Settled by
+    // `_settlePendingSend()` on the first of: the START reply's two shapes, a
+    // conversation-scoped ERROR, or a dropped connection.
+    this._pendingSend = null;
     // Set while a NEW request is outstanding, so the snapshot that answers it
     // is adopted as the active conversation even though one is already open.
     // The wire envelope carries no request id (see protocol-client.js's
@@ -248,7 +271,19 @@ export class PanelController {
 
     this.protocol.onEnvelope((env) => this._onEnvelope(env));
     this.protocol.onHandshakeChange(() => this._notify());
-    this.protocol.onDisconnect(() => this._notify());
+    this.protocol.onDisconnect(() => {
+      // A Send still awaiting its answer whose connection just died was never
+      // accepted — no ack can arrive any more. Settle it now so the caller
+      // restores the draft and the message is marked as not sent, rather than
+      // leaving a bubble that claims a queue entry the host never created.
+      const pending = this._pendingSend;
+      if (pending) {
+        const model = this.models.get(pending.conversationId);
+        if (model) model.markSendRefused("host_unavailable");
+        this._settlePendingSend({ accepted: false, reason: "host_unavailable" });
+      }
+      this._notify();
+    });
   }
 
   onUpdate(fn) {
@@ -1073,38 +1108,132 @@ export class PanelController {
    *   re-validated its recorded page identity against this exact send via
    *   page-context.js's sameIdentity() (design.md D8) before calling this.
    */
-  async sendMessage(text, { tabScope = "any", profileId, modelId, pageContext = null, attachments = null, effort = null, elementRecord = null } = {}) {
+  async sendMessage(
+    text,
+    { tabScope = "any", profileId, modelId, pageContext = null, attachments = null, effort = null, elementRecord = null, mode = "queue" } = {}
+  ) {
     const model = this.currentModel();
     if (!model) throw new Error("PanelController.sendMessage: no active conversation");
+    const conversationId = this.currentConversationId;
     model.addLocalUserMessage(text, { attachments: attachments || [] });
     // Remember which page this conversation is bound to, so the host summary
     // can carry a hostname even after the operator navigates away (task 1.1).
     if (pageContext && pageContext.hostname) {
-      this._pageHostnameByConversation.set(this.currentConversationId, pageContext.hostname);
+      this._pageHostnameByConversation.set(conversationId, pageContext.hostname);
     }
     this._notify();
-    this._pendingSend = { conversationId: this.currentConversationId, text };
-    // `prompt` is the user's own literal text, UNCHANGED (design.md section
-    // 5: "User messages and page/tool content remain distinctly typed").
-    // The bound page context, when present, travels as a SEPARATE `context`
-    // field — structured trusted metadata, never merged into the user's
-    // turn — which host/agent/companion.js forwards into
-    // host/agent/tools/query-options.js's constructed `query()` options as
-    // the SDK's own `systemPrompt` (see that file for the sdk.d.ts citation).
-    this.protocol.start({
-      conversationId: this.currentConversationId,
-      profileId: profileId ?? (this.profile && this.profile.profileId),
-      modelId: modelId ?? (this.profile && this.profile.defaultModelId),
-      tabScope,
-      prompt: text,
-      context: buildContextMetadata({ text, context: pageContext }),
-      ...(attachments && attachments.length ? { attachments } : {}),
-      ...(elementRecord ? { elementRecord } : {}),
-      // Only sent when the composer actually chose a level. Omitted means the
-      // run sends no effort parameter and the model's own default applies —
-      // deliberately not the same as pinning it to today's default.
-      ...(effort ? { effort } : {})
+    // The pending send is a DEFERRED, not just a text cache: the panel must
+    // know whether the host accepted this submission, because a refusal
+    // (`queue_full`, or any other conversation-scoped ERROR answering a Send)
+    // means the composer has to get its draft back and the transcript must not
+    // leave an unmarked bubble behind (panel spec "Queue-full refusal
+    // preserves the draft"). It is settled by the FIRST of: the START reply
+    // (run started or queued ack), a refusal, or the port going away — see
+    // `_settlePendingSend()`.
+    const idempotencyKey = this._newIdempotencyKey("send", conversationId);
+    return new Promise((resolve) => {
+      this._pendingSend = { conversationId, text, mode, idempotencyKey, resolve };
+      // `prompt` is the user's own literal text, UNCHANGED (design.md section
+      // 5: "User messages and page/tool content remain distinctly typed").
+      // The bound page context, when present, travels as a SEPARATE `context`
+      // field — structured trusted metadata, never merged into the user's
+      // turn — which host/agent/companion.js forwards into
+      // host/agent/tools/query-options.js's constructed `query()` options as
+      // the SDK's own `systemPrompt` (see that file for the sdk.d.ts citation).
+      try {
+        this.protocol.start({
+          conversationId,
+          profileId: profileId ?? (this.profile && this.profile.profileId),
+          modelId: modelId ?? (this.profile && this.profile.defaultModelId),
+          tabScope,
+          prompt: text,
+          context: buildContextMetadata({ text, context: pageContext }),
+          ...(attachments && attachments.length ? { attachments } : {}),
+          ...(elementRecord ? { elementRecord } : {}),
+          // Only sent when the composer actually chose a level. Omitted means the
+          // run sends no effort parameter and the model's own default applies —
+          // deliberately not the same as pinning it to today's default.
+          ...(effort ? { effort } : {}),
+          // Message-queue steering (design.md decisions 3/7): "queue" is the
+          // ordinary Send — the host starts a run when the conversation is
+          // free and files the message behind the active one when it is not
+          // (admission rule R1) — while "interrupt" is the explicit run-now
+          // choice. The key makes a duplicate delivery of THIS send resolve to
+          // the entry it already created (design.md decision 7).
+          mode,
+          idempotencyKey
+        });
+      } catch {
+        // The send never left (ProtocolClient throws when its port is gone).
+        // Settle it as refused instead of leaving the caller's await hanging:
+        // the message was not accepted, and the panel says so.
+        model.markSendRefused("host_unavailable");
+        this._settlePendingSend({ accepted: false, reason: "host_unavailable" });
+        this._notify();
+      }
     });
+  }
+
+  /**
+   * Settle the send awaiting its reply, exactly once. Every path that can
+   * answer a Send funnels through here (the START reply's two shapes, a
+   * conversation-scoped ERROR, a dead port) so no submission can be left
+   * unresolved and no second answer can resolve it twice.
+   */
+  _settlePendingSend(outcome) {
+    const pending = this._pendingSend;
+    this._pendingSend = null;
+    if (!pending) return;
+    if (typeof pending.resolve === "function") pending.resolve(outcome);
+  }
+
+  /**
+   * Cancel one still-pending queued message (task 6.2's per-message control,
+   * panel spec "Cancel affordance follows the claim"). The host answers from
+   * the entry's durable state: `ok:true`, or a refusal naming why — and when
+   * the next turn has already claimed the message, the claimed state comes
+   * back with it and is applied to the item rather than the panel pretending
+   * the cancel worked.
+   *
+   * @returns {Promise<{ok: true, messageId} | {ok: false, reason: string, state?: string} | null>}
+   *   `null` when the host did not answer at all (no claim is made either way).
+   */
+  async cancelQueuedMessage(messageId, conversationId = this.currentConversationId) {
+    const model = conversationId ? this.models.get(conversationId) : null;
+    if (!model || messageId == null) return null;
+    const reply = await this._sendRequest("cancelMessage", { conversationId, messageId });
+    if (!reply) return null;
+    if (reply.ok === true) {
+      // The authoritative transition is the `message_cancelled` event the host
+      // appends for it; this only removes the item from the panel's own view
+      // when the event has not arrived (or is not coming — a second panel's
+      // cancel, or a reply replayed from a different connection).
+      model.discloseQueueState(messageId, "cancelled");
+    } else {
+      model.discloseQueueState(messageId, reply.state);
+    }
+    this._notify();
+    return reply;
+  }
+
+  /**
+   * Resume a drain Stop paused (task 6.2's resume control, design.md decision
+   * 5). Clearing the host's durable flag also makes it drain FIFO in
+   * submission order; the panel clears its own banner only on a confirmed
+   * `ok:true` — an unanswered request must not claim the queue resumed, and
+   * the live `message_queue_resumed` event is what clears it in the ordinary
+   * case anyway.
+   *
+   * @returns {Promise<{ok: true} | {ok: false, reason: string} | null>}
+   */
+  async resumeQueue(conversationId = this.currentConversationId) {
+    const model = conversationId ? this.models.get(conversationId) : null;
+    if (!model) return null;
+    const reply = await this._sendRequest("resumeQueue", { conversationId });
+    if (!reply) return null;
+    if (reply.ok === true) model.queuePaused = false;
+    this._notify();
+    return reply;
   }
 
   stop(reason = "user_stop") {
@@ -1113,6 +1242,226 @@ export class PanelController {
     model.markStopRequested();
     this._notify();
     this.protocol.stop({ conversationId: this.currentConversationId, reason });
+  }
+
+  // ---- Rerunnable workflows + self-healing (openspec/changes/
+  // add-workflow-materialization-and-heal) --------------------------------
+  //
+  // Five request/reply operations behind the panel's workflow surfaces. Each
+  // always resolves — never rejects — with the host's reply envelope or `null`
+  // when the host did not answer at all (`_sendRequest`'s contract), so a
+  // caller can never mistake "no answer" for consent: every state change is
+  // applied ONLY from a reply that actually arrived, and the durable events
+  // the host appends for the same operation are what survive a reload.
+
+  /**
+   * Derive a workflow draft from one COMPLETED run's recorded trail.
+   *
+   * @returns {Promise<{ok: true, draft, review} | {ok: false, incomplete?: string[], reason?: string} | null>}
+   *   A refusal is an answer: `incomplete` names the specific gaps the
+   *   derivation refused to guess around (rendered as a quiet notice, never a
+   *   card), and `reason` names the coarser refusals (`unknown_run`,
+   *   `run_not_completed`, `no_trail`). `null` = the host did not answer.
+   */
+  async requestWorkflowDraft(runId, conversationId = this.currentConversationId) {
+    const model = conversationId ? this.models.get(conversationId) : null;
+    if (!model || runId == null) return null;
+    const reply = await this._sendRequest("workflowDraftRequest", { conversationId, runId });
+    if (!reply) return null;
+    if (reply.ok === true && reply.draft) model.presentWorkflowDraft(runId, { draft: reply.draft, review: reply.review });
+    this._notify();
+    return reply;
+  }
+
+  /**
+   * Save a reviewed draft as a DISABLED workflow (the derivation never
+   * enables; enabling is a separate, post-proof step).
+   *
+   * @returns {Promise<{ok: true, workflowId, version} | {ok: false, reason: string, errors?: object[]} | null>}
+   */
+  async saveWorkflowDraft(runId, definition, conversationId = this.currentConversationId) {
+    const model = conversationId ? this.models.get(conversationId) : null;
+    if (!model || runId == null || !definition) return null;
+    const item = model.workflowDraftItem({ runId });
+    if (item) item.busy = "saving";
+    this._notify();
+    const reply = await this._sendRequest("workflowDraftSave", { conversationId, runId, definition });
+    if (!reply) {
+      if (item) item.busy = null;
+      this._notify();
+      return null;
+    }
+    model.settleWorkflowDraftSave({
+      runId,
+      ok: reply.ok === true,
+      workflowId: reply.workflowId ?? null,
+      version: reply.version ?? null,
+      stepsCount: Number.isInteger(reply.stepsCount) ? reply.stepsCount : null,
+      errors: reply.errors ?? null
+    });
+    this._notify();
+    return reply;
+  }
+
+  /**
+   * Run one stored workflow against the live page for evidence, before it may
+   * be enabled. The proof itself is host-orchestrated (the host reads the
+   * record, takes the browser bridge and writes the evidence file); this only
+   * carries the tab the operator is on.
+   *
+   * @returns {Promise<{ok: true, outcomes: object[], evidenceFile: string} | {ok: false, reason: string} | null>}
+   */
+  async proveWorkflow({ workflowId, version = null, tabId } = {}, conversationId = this.currentConversationId) {
+    const model = conversationId ? this.models.get(conversationId) : null;
+    if (!model || !workflowId || typeof tabId !== "number") return null;
+    model.beginWorkflowProof(workflowId);
+    this._notify();
+    const reply = await this._sendRequest("workflowProve", { conversationId, workflowId, version, tabId });
+    if (!reply) {
+      model.settleWorkflowProof({ workflowId, ok: false, reason: "host_unavailable" });
+      this._notify();
+      return null;
+    }
+    // Two different questions, and the host answers both: did a proof RUN
+    // (a non-empty `outcomes`, or `ok:true`), and was it SUCCESSFUL (`allOk`
+    // when the host reports it — a proof can run and still not validate every
+    // step — otherwise `ok` itself). Conflating them would let a partially
+    // unvalidated run read as "Chạy thử đạt" and offer enablement on a draft
+    // the spec says must stay a draft.
+    const outcomes = Array.isArray(reply.outcomes) ? reply.outcomes : null;
+    const ran = reply.ok === true || (outcomes !== null && outcomes.length > 0);
+    if (!ran) {
+      model.settleWorkflowProof({ workflowId, ok: false, reason: reply.reason || "prove_refused" });
+      this._notify();
+      return reply;
+    }
+    model.settleWorkflowProof({
+      workflowId,
+      ok: typeof reply.allOk === "boolean" ? reply.allOk : reply.ok === true,
+      version: reply.version ?? version,
+      outcomes,
+      summary: reply.summary ?? null,
+      evidenceFile: reply.evidenceFile ?? null
+    });
+    this._notify();
+    return reply;
+  }
+
+  /**
+   * Enable a workflow whose proof succeeded. The host owns the version check:
+   * a stale `version` is refused with the current one disclosed, never
+   * silently applied.
+   *
+   * @returns {Promise<{ok: true, version} | {ok: false, reason: string, latest?: number} | null>}
+   */
+  async enableWorkflow({ workflowId, version = null } = {}, conversationId = this.currentConversationId) {
+    const model = conversationId ? this.models.get(conversationId) : null;
+    if (!model || !workflowId) return null;
+    const reply = await this._sendRequest("workflowEnable", { conversationId, workflowId, version });
+    if (!reply) return null;
+    model.settleWorkflowEnable({
+      workflowId,
+      ok: reply.ok === true,
+      version: reply.version ?? version,
+      reason: reply.ok === true ? null : reply.reason || "enable_refused"
+    });
+    this._notify();
+    return reply;
+  }
+
+  /**
+   * Fetch one stored definition's editable steps for the card's edit view.
+   * Read-only: a refusal (`unknown_workflow`, `host_unavailable`) leaves the
+   * card as it was.
+   *
+   * @returns {Promise<{ok: true, steps: object[]} | {ok: false, reason: string} | null>}
+   */
+  async requestWorkflowEdit({ workflowId, version = null } = {}, conversationId = this.currentConversationId) {
+    const model = conversationId ? this.models.get(conversationId) : null;
+    if (!model || !workflowId) return null;
+    model.beginWorkflowEditLoad(workflowId);
+    this._notify();
+    const reply = await this._sendRequest("workflowEditRequest", { conversationId, workflowId, version });
+    if (!reply) {
+      model.settleWorkflowEditLoad({ workflowId, ok: false, reason: "host_unavailable" });
+      this._notify();
+      return null;
+    }
+    model.settleWorkflowEditLoad({
+      workflowId,
+      ok: reply.ok === true && Array.isArray(reply.steps),
+      version: reply.version ?? version,
+      steps: Array.isArray(reply.steps) ? reply.steps : null,
+      reason: reply.ok === true ? null : reply.reason || "edit_refused"
+    });
+    this._notify();
+    return reply;
+  }
+
+  /**
+   * Save the operator-edited steps as the next version of the line. The host
+   * owns validation and the version check: a stale `version` is refused with
+   * the current one disclosed, schema failures come back as `errors`, and
+   * nothing is applied on a refusal.
+   *
+   * @returns {Promise<{ok: true, version: number} | {ok: false, reason: string, latest?: number, errors?: object[]} | null>}
+   */
+  async saveWorkflowEdit({ workflowId, version = null, steps } = {}, conversationId = this.currentConversationId) {
+    const model = conversationId ? this.models.get(conversationId) : null;
+    if (!model || !workflowId || !Array.isArray(steps)) return null;
+    model.beginWorkflowEditSave(workflowId);
+    this._notify();
+    const reply = await this._sendRequest("workflowEditSave", { conversationId, workflowId, version, steps });
+    if (!reply) {
+      model.settleWorkflowEditSave({ workflowId, ok: false, reason: "host_unavailable" });
+      this._notify();
+      return null;
+    }
+    model.settleWorkflowEditSave({
+      workflowId,
+      ok: reply.ok === true,
+      version: reply.version ?? null,
+      reason: reply.ok === true ? null : reply.reason || "edit_refused",
+      errors: Array.isArray(reply.errors) ? reply.errors : null,
+      latest: Number.isInteger(reply.latest) ? reply.latest : null
+    });
+    this._notify();
+    return reply;
+  }
+
+  /**
+   * Answer one heal proposal (Allow saves a new version through the registry's
+   * existing bump; Deny is a recorded no-op). A refusal discloses the state
+   * (`unknown_proposal`/`expired`/`superseded`/`stale_base`/`invalid_candidate`)
+   * and never applies anything.
+   *
+   * @returns {Promise<{ok: true, decision: string} | {ok: false, reason: string} | null>}
+   */
+  async decideWorkflowHeal({ proposalId, decision } = {}, conversationId = this.currentConversationId) {
+    const model = conversationId ? this.models.get(conversationId) : null;
+    if (!model || !proposalId || (decision !== "allow" && decision !== "deny")) return null;
+    const item = model.workflowHealItem(proposalId);
+    if (item) item.busy = "deciding";
+    this._notify();
+    const reply = await this._sendRequest("workflowHealDecide", { conversationId, proposalId, decision });
+    if (!reply) {
+      if (item) item.busy = null;
+      this._notify();
+      return null;
+    }
+    model.settleWorkflowHealDecision({
+      proposalId,
+      ok: reply.ok === true,
+      decision: reply.decision || decision,
+      workflowId: reply.workflowId ?? null,
+      fromVersion: reply.fromVersion ?? null,
+      toVersion: reply.toVersion ?? null,
+      reason: reply.ok === true ? null : reply.reason || "heal_refused",
+      state: reply.state ?? null,
+      errors: reply.errors ?? null
+    });
+    this._notify();
+    return reply;
   }
 
   /**
@@ -1341,6 +1690,27 @@ export class PanelController {
       case "delete_all_conversations":
       case "transcript_window":
       case "update_conversation":
+      // Message-queue operator controls (this change): both replies reuse the
+      // request's own type and are correlated by `requestId`, exactly like the
+      // history family above. Nothing here mutates a model directly — the
+      // durable `message_cancelled`/`message_queue_resumed` events are what the
+      // transcript and the resume banner follow; these settle the awaiting
+      // caller (see cancelQueuedMessage()/resumeQueue()).
+      case "cancel_message":
+      case "resume_queue":
+      // Rerunnable workflows + self-healing (this change): all five are
+      // request/reply pairs correlated by `requestId`, exactly like the two
+      // above. Nothing here mutates a model directly — the durable
+      // `workflow_*` events are the transcript's source, and the awaiting
+      // caller (see requestWorkflowDraft() and friends) applies what the reply
+      // itself settles.
+      case "workflow_draft_request":
+      case "workflow_draft_save":
+      case "workflow_prove":
+      case "workflow_enable":
+      case "workflow_heal_decide":
+      case "workflow_edit_request":
+      case "workflow_edit_save":
         this._resolveRequest(env);
         return;
       case "snapshot": {
@@ -1376,14 +1746,17 @@ export class PanelController {
         break;
       }
       case "start": {
+        const model = this.models.get(env.conversationId);
+        const pending = this._pendingSend && this._pendingSend.conversationId === env.conversationId ? this._pendingSend : null;
         if (env.runId) {
-          const model = this.models.get(env.conversationId);
+          // Shape 1 — a run was created for this send (whether it starts now
+          // or queues behind the shared browser lease; `env.queued` only says
+          // which). Unchanged from before this change.
           if (model) {
             model.bindRunToLastUserMessage(env.runId);
-            if (this._pendingSend) {
-              const promptText = this._pendingSend.text;
+            if (pending) {
+              const promptText = pending.text;
               this.historyStore.recordPrompt(env.conversationId, env.runId, promptText).catch(() => {});
-              this._pendingSend = null;
               // Mirror the store's own first-write-wins order: this send is
               // the conversation's first question only while its user item is
               // the leading one. In a resumed conversation whose earlier
@@ -1392,6 +1765,32 @@ export class PanelController {
               if (model.items.find((i) => i.kind === "user")?.runId === env.runId) this._rememberFirstPrompt(env.conversationId, promptText);
             }
           }
+          this._settlePendingSend({ accepted: true, runId: env.runId, queued: env.queued === true });
+        } else if (env.queued === true && env.entry) {
+          // Shape 2 — the message was admitted into the conversation's queue
+          // (design.md decision 1/2: no run exists yet, so there is no runId
+          // to bind). The bubble is bound to the entry's own `messageId`
+          // instead, and only the message_claimed event will attach it to the
+          // run that eventually answers it.
+          if (model) {
+            model.bindQueuedAck({
+              messageId: env.entry.messageId,
+              mode: env.entry.mode,
+              state: env.entry.state,
+              idempotent: env.idempotent === true
+            });
+            // No runId to key a local prompt echo to yet — the message's text
+            // is durable host-side in its own message_queued event — but the
+            // first-question record is still this text, exactly as it would be
+            // for an immediate run.
+            if (pending) this._rememberFirstPrompt(env.conversationId, pending.text);
+          }
+          this._settlePendingSend({
+            accepted: true,
+            queued: true,
+            messageId: env.entry.messageId,
+            idempotent: env.idempotent === true
+          });
         }
         this._notify();
         break;
@@ -1432,7 +1831,21 @@ export class PanelController {
       case "error": {
         if (env.conversationId) {
           const model = this.models.get(env.conversationId);
-          if (model) model.connectionError = { reason: env.reason, detail: env.detail };
+          // A conversation-scoped ERROR arriving while THIS conversation has a
+          // Send outstanding is that send's refusal: the companion's START
+          // validation failures (`malformed_mode` added by this change, plus
+          // the pre-existing malformed_* ones and `run_start_rejected`) and the
+          // queue's `queue_full` all answer a submission rather than reporting
+          // a broken connection. They settle the send so the composer gets its
+          // draft back and the message is marked as never accepted, instead of
+          // being presented as an ordinary connection error banner.
+          const pending = this._pendingSend && this._pendingSend.conversationId === env.conversationId ? this._pendingSend : null;
+          if (pending || env.reason === "queue_full" || env.reason === "malformed_mode") {
+            if (model) model.markSendRefused(env.reason || "error");
+            this._settlePendingSend({ accepted: false, reason: env.reason || "error", limit: env.limit });
+          } else if (model) {
+            model.connectionError = { reason: env.reason, detail: env.detail };
+          }
         } else if (env.reason === "unknown_conversation") {
           this._handleUnknownConversationError(env);
         }

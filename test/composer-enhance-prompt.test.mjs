@@ -53,7 +53,10 @@ console.log("\n== availability gating lives inside updateSendEnabled(), not a pa
   ok(Boolean(block), "updateSendEnabled() is found");
   const body = block[1];
   ok(/if \(el\.btnEnhance\) el\.btnEnhance\.disabled = true;/.test(body), "disabled outright while a run is queued/streaming/stopping/waiting-for-permission");
-  ok(/el\.btnSend\.disabled = false; \/\/ acts as Stop/.test(body), "Send's own running-state behaviour is unchanged");
+  ok(
+    !/acts as Stop/.test(body) && /el\.btnSend\.disabled = !hasText \|\| !panel\.currentConversationId \|\| !!enhanceState;/.test(body),
+    "Send no longer acts as Stop while a run is active -- submitting queues behind it instead (add-message-queue-and-steering); the run's Stop is its own control (#btn-stop)"
+  );
   ok(/if \(enhanceState\)/.test(body) && /el\.btnEnhance\.disabled = false;/.test(body), "while its own request is in flight, the control stays enabled (acts as Cancel) rather than being disabled");
   ok(/isSlashCommand/.test(body) && /trimmed\.startsWith\("\/"\)/.test(body), "a leading '/' disables it (the dispatched slash command's literal text must never be rewritten)");
   ok(
@@ -100,8 +103,12 @@ console.log("\n== doSend() refuses to dispatch while an enhancement is in flight
 {
   const block = panelJs.match(/async function doSend\(\)\s*\{([\s\S]*?)\n\}/)[1];
   const guardAt = block.indexOf("if (enhanceState) return;");
-  const phaseCheckAt = block.indexOf("const phase = panel.currentPhase();");
-  ok(guardAt >= 0 && phaseCheckAt >= 0 && guardAt < phaseCheckAt, "the enhanceState guard runs before anything else in doSend() -- readOnly does not stop keydown, so Enter must be refused before dispatch/stop logic runs");
+  const captureAt = block.indexOf("await pageContext.captureForSend(");
+  const dispatchAt = block.indexOf("await panel.sendMessage(");
+  ok(
+    guardAt >= 0 && captureAt >= 0 && dispatchAt >= 0 && guardAt < captureAt && guardAt < dispatchAt,
+    "the enhanceState guard runs before any dispatch work in doSend() -- readOnly does not stop keydown, so Enter must be refused before the send is dispatched"
+  );
 }
 
 console.log("\n== the success path commits through the browser's native undo path ==");

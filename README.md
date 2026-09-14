@@ -457,7 +457,12 @@ screenshot-verified at 320/400/480px in light and dark
 search/filter/export/privacy surface added later by
 `openspec/changes/optimize-chat-history` is covered by that change's
 `reports/implementation-evidence.md` rather than by new screenshots — plus
-composer prompt enhancement (the "Cải thiện prompt" control next to Send).
+composer prompt enhancement (the "Cải thiện prompt" control next to Send), and
+message queueing with run-now, per-message cancel, and a paused-drain resume
+control (`openspec/changes/add-message-queue-and-steering`; see below), and
+rerunnable workflows with self-healing — save a completed run as a workflow,
+prove it live, and repair it when the page drifts
+(`openspec/changes/add-workflow-materialization-and-heal`; see below).
 
 **Live answer and thinking.** While a run is in flight the panel shows the
 assistant's answer text as it is produced into the same response being
@@ -466,6 +471,37 @@ that turn — not only once the message completes. Both are display-only: what
 streams is never written to the conversation's stored history, and the
 completed message is reconciled with what was already shown so no text appears
 twice.
+
+**Message queueing and run controls.** While a run is active the composer
+stays usable: submitting files the message behind the run (`Đang chờ lượt`) and
+it runs as the next turn, in submission order — up to 20 pending messages per
+conversation, with an explicit refusal that keeps the draft when the bound is
+reached. **Chạy ngay** (or Ctrl/Cmd+Enter) is the explicit run-now choice: it
+stops the current turn through the same path Stop uses and runs the message
+immediately, falling back transparently — with the fallback disclosed on the
+message — when the run cannot be stopped in time. A pending message can be
+cancelled until the next turn claims it; once claimed, the run's Stop is the
+control. Stop is its own control next to Send and also pauses the drain:
+pending messages stay pending until the operator resumes (`Tiếp tục`) or sends
+a new message. Queue state is durable — it survives a panel reload and a
+companion restart — and a message that was never claimed returns to pending
+rather than being replayed. The prompt-enhancement control's availability is
+unchanged.
+
+**Rerunnable workflows and self-healing.** A completed run can be saved as a
+workflow without hand-authoring: the turn footer offers **Lưu thành workflow**,
+which derives a draft from the run's own recorded actions (tool steps, with
+every value that cannot be resolved confidently — secrets, high-entropy
+strings, anything unreadable from the record — halted and named instead of
+guessed). The draft is reviewed as a card (steps, domain binding), saved as a
+disabled workflow, **proved** by a live run against the page — per-step
+outcomes and freshness notes are shown — and only then enabled. When a stored
+workflow's target page drifts, the execution ends in a drift outcome (a
+missing target or a binding mismatch, never a transient network error), the
+panel shows a drift notice, and the assistant can propose a repaired
+definition: saving it requires the operator's explicit approval and lands as a
+new version, with the previous version left intact. Workflow definitions never
+carry run outputs or secrets.
 
 **Documents the agent creates.** When a run produces something that is a
 document in its own right — a report, an audit, a data table, a set of slides —

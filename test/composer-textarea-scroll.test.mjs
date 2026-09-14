@@ -78,6 +78,24 @@ console.log("\n== .composer-actions: left/right split ==");
   );
 }
 
+console.log("\n== .composer-actions: run controls stay reachable at narrow widths ==");
+{
+  // Found by the live-panel UI pass on 2026-09-14 (the queue change's stop/
+  // run-now controls join this row): at the panel's narrowest supported
+  // widths the row could outgrow itself and flex-shrink crushed the trailing
+  // icon controls below usable sizes — below the minimum pointer target,
+  // exactly when Stop matters most. While the run controls are displayed the
+  // row must wrap instead.
+  const wrap = panelCss.match(
+    /@media \(max-width: 430px\) \{\s*\.composer-actions:has\(#btn-stop:not\(\[style\*="display: none"\]\)\) \{([\s\S]*?)\}/
+  );
+  ok(Boolean(wrap), "sidepanel.css scopes a narrow-width rule to the run-controls-visible state");
+  ok(
+    Boolean(wrap) && /flex-wrap:\s*wrap/.test(wrap[1]),
+    "which enables flex-wrap, so Stop/Send keep their size instead of being crushed"
+  );
+}
+
 console.log("\n== autoGrow(): one source of truth for the cap ==");
 {
   const block = panelJs.match(/function autoGrow\(\) \{([\s\S]*?)\n\}/);
