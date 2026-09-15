@@ -253,6 +253,32 @@ export const AGENT_MESSAGE_TYPES = Object.freeze({
   // rather than hanging or failing silently.
   ENHANCE_PROMPT: "enhance_prompt",
 
+  // User-mediated upload grants (the side panel's native file picker → the
+  // conversation's upload allowlist). One additive request/reply pair reusing
+  // a single type name, the same convention ENHANCE_PROMPT/AGENT_SETTINGS
+  // above follow. Wire shape:
+  //   panel -> companion  {v, type:"upload_grant", requestId, conversationId,
+  //                         op:"grant"|"revoke", paths:[absolute,...], ts}
+  //   companion -> panel  {v, type:"upload_grant", requestId, conversationId,
+  //                         ok:true, result:{granted:[...],
+  //                         skipped:[{path, reason}], revoked:[...]}, ts}
+  //   companion -> panel  {v, type:"upload_grant", requestId, ok:false,
+  //                         error:{code, message}, ts}
+  // The paths are ABSOLUTE filesystem paths the OPERATOR selected in a native
+  // file dialog (host/pick-files.js) — never anything the model wrote. This
+  // is the only thing that ever populates a run's RunUploadAllowlist
+  // (host/agent/policy/authorization.js), and it confers exactly one
+  // capability: attaching those files to a page's file input via
+  // file_upload. Grants are conversation-scoped and applied to every run of
+  // that conversation until revoked, the conversation is deleted, or the
+  // companion restarts (in-memory only, honestly: nothing here is persisted).
+  // Deliberately additive with NO PROTOCOL_VERSION bump: an older companion
+  // answers through handleEnvelope()'s default branch with
+  // {type:"error", reason:"unknown_message_type", inReplyTo:"upload_grant"},
+  // which the panel surfaces as "companion needs updating" rather than
+  // hanging.
+  UPLOAD_GRANT: "upload_grant",
+
   // Recording attachment claim (upgrade-agent-reliability-and-workflows
   // tasks.md 6.1/6.3): the panel selects one IDLE conversation for one
   // finished recording and sends an idempotency key. Same additive,
@@ -568,6 +594,38 @@ export const ATTACHMENT_NAME_MAX_LENGTH = 255;
 /** Which content block a given accepted MIME type becomes. */
 export function attachmentKind(mimeType) {
   return ATTACHMENT_MIME_KINDS[mimeType] || null;
+}
+
+// --- upload_grant payload validation (UPLOAD_GRANT above) ------------------
+//
+// Bounded three ways — array, count, per-path length — so a malformed or
+// hostile caller cannot turn one envelope into unbounded filesystem work;
+// the companion separately checks every accepted path against the real
+// filesystem (exists, is a regular file) before granting anything.
+export const UPLOAD_GRANT_MAX_PATHS = 32;
+export const UPLOAD_GRANT_MAX_PATH_LENGTH = 4096;
+
+/** POSIX "/...", a Windows drive form ("C:\..." / "C:/..."), or a UNC path.
+ *  Deliberately shape-only: whether the path exists is the filesystem's
+ *  answer, asked separately. */
+function isAbsoluteUploadPath(p) {
+  return p.startsWith("/") || /^[A-Za-z]:[\\/]/.test(p) || p.startsWith("\\\\");
+}
+
+/**
+ * @param {unknown} paths - the envelope's `paths` field.
+ * @returns {{ok: true, paths: string[]} | {ok: false, reason: string}}
+ */
+export function validateUploadGrantPaths(paths) {
+  if (!Array.isArray(paths) || paths.length === 0) return { ok: false, reason: "malformed_paths" };
+  if (paths.length > UPLOAD_GRANT_MAX_PATHS) return { ok: false, reason: "too_many_paths" };
+  const out = [];
+  for (const p of paths) {
+    if (typeof p !== "string" || !p || p.length > UPLOAD_GRANT_MAX_PATH_LENGTH) return { ok: false, reason: "malformed_path" };
+    if (!isAbsoluteUploadPath(p)) return { ok: false, reason: "not_absolute" };
+    out.push(p);
+  }
+  return { ok: true, paths: out };
 }
 
 // START's optional `effort` field: how much reasoning the model applies to

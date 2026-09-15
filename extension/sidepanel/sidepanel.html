@@ -56,6 +56,8 @@
       <div id="question-slot"></div>
       <div class="context-chip-row" id="context-chip-row"></div>
       <div id="attachment-strip" class="attachment-strip" hidden aria-label="Tệp đính kèm"></div>
+      <div id="upload-grant-strip" class="upload-grant-strip" hidden aria-label="Tệp đã chia sẻ cho agent upload"></div>
+      <div id="upload-grant-error" class="attachment-error" role="alert" hidden></div>
       <div id="attachment-error" class="attachment-error" role="alert" hidden></div>
       <input id="attachment-file-input" type="file" accept=".png,.jpg,.jpeg,.webp,.gif,.pdf,.txt,.md,.markdown,.csv,.json" multiple hidden />
       <div class="composer" id="composer">
@@ -68,6 +70,10 @@
                 <span id="icon-add-files"></span>
                 <span>Thêm tệp hoặc ảnh</span>
                 <kbd class="menu-item-kbd">Ctrl U</kbd>
+              </button>
+              <button type="button" class="menu-item" role="menuitem" id="add-menu-upload-grant">
+                <span id="icon-add-upload-grant"></span>
+                <span>Chọn tệp cho agent upload</span>
               </button>
             </div>
           </ui-menu>

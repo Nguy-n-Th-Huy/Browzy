@@ -1521,7 +1521,7 @@ function sendError(id, error) {
 const pendingNative = new Map(); // request id -> { resolve, reject }
 let nativeReqSeq = 0;
 
-function nativeRequest(msg) {
+function nativeRequest(msg, { timeoutMs = CDP_TIMEOUT_MS } = {}) {
   return new Promise((resolve, reject) => {
     if (!nativePort) { reject(new Error("Native host not connected")); return; }
     const id = `nr_${Date.now()}_${nativeReqSeq++}`;
@@ -1530,8 +1530,85 @@ function nativeRequest(msg) {
     setTimeout(() => {
       const p = pendingNative.get(id);
       if (p) { pendingNative.delete(id); p.reject(new Error("Native request timed out")); }
-    }, CDP_TIMEOUT_MS);
+    }, timeoutMs);
   });
+}
+
+// --- Upload restrictions, enforced before anything reaches CDP -------------
+//
+// The upload tool's description states three rules, and they are enforced
+// here rather than merely requested: the paths must be real files that exist
+// on this machine, no file may carry more than one hard link, and the
+// combined size stays under the same ceiling the description names. The
+// hard-link rule is not cosmetic — package-manager stores (pnpm's, for one)
+// are built out of hard links, so "one file" there can mean an entire
+// dependency tree reachable through the same inode.
+//
+// This runs on BOTH client paths (a side panel run and an external MCP
+// client), because it lives in the tool's only executor: the restriction is a
+// property of the tool, not of one caller. The extension has no filesystem
+// access of its own, so the facts come from the native host's `inspect_files`
+// op — and a host that cannot answer fails CLOSED (nothing is uploaded).
+const UPLOAD_MAX_TOTAL_BYTES = 10 * 1024 * 1024;
+
+/**
+ * @param {string[]} paths - absolute paths exactly as the caller supplied them.
+ * @returns {Promise<{text: string}|null>} a refusal sentence, or null when the
+ *   paths pass every rule.
+ */
+async function evaluateUploadPaths(paths) {
+  const one = paths.length === 1;
+  let inspected;
+  try {
+    inspected = await nativeRequest({ type: "inspect_files", paths });
+  } catch (e) {
+    return { text: `Could not check the file${one ? "" : "s"} before uploading (${String((e && e.message) || e)}). Nothing was uploaded.` };
+  }
+  const files = inspected && Array.isArray(inspected.files) ? inspected.files : null;
+  if (!files || files.length !== paths.length) {
+    return { text: "Could not check the files before uploading: the native host returned no usable file information. Nothing was uploaded." };
+  }
+  const missing = files.filter((f) => !f.exists).map((f) => f.path);
+  if (missing.length) {
+    return { text: `No such file${missing.length === 1 ? "" : "s"}: ${missing.join(", ")}. file_upload needs absolute paths that already exist on this machine.` };
+  }
+  const notFiles = files.filter((f) => f.kind !== "file");
+  if (notFiles.length) {
+    return { text: `Only regular files can be attached to a page — this is ${notFiles.map((f) => `${f.path} (${f.kind})`).join(", ")}.` };
+  }
+  const hardLinked = files.filter((f) => Number(f.nlink) > 1);
+  if (hardLinked.length) {
+    return {
+      text:
+        `Refusing to upload ${hardLinked.map((f) => f.path).join(", ")}: ` +
+        `${hardLinked.length === 1 ? "this file carries" : "these files carry"} more than one hard link, which usually means a package-manager store — ` +
+        "copy the file somewhere else first if you really mean to upload it."
+    };
+  }
+  const total = files.reduce((sum, f) => sum + (Number(f.size) || 0), 0);
+  if (total > UPLOAD_MAX_TOTAL_BYTES) {
+    const mb = (n) => Math.round((n / (1024 * 1024)) * 10) / 10;
+    return { text: `Refusing to upload ${mb(total)} MB in one call — the ceiling is ${mb(UPLOAD_MAX_TOTAL_BYTES)} MB of files per upload.` };
+  }
+  return null;
+}
+
+// The panel's own file picker for upload grants: the operator picks files in
+// a native dialog (the browser cannot hand a page a filesystem path — see
+// host/pick-files.js), and the paths go back to the panel, which sends them
+// to the companion as this conversation's upload_grant. Named rather than
+// inline in the listener so tests can drive it directly.
+//
+// The dialog stays open as long as the operator needs it, so this request
+// gets its own, much longer deadline than an ordinary native round trip —
+// while still being bounded (a closed panel must not leave a promise pending
+// until the process ends).
+const UPLOAD_PICK_TIMEOUT_MS = 10 * 60 * 1000;
+
+async function pickUploadFilesForPanel() {
+  const result = await nativeRequest({ type: "pick_files" }, { timeoutMs: UPLOAD_PICK_TIMEOUT_MS });
+  const paths = result && Array.isArray(result.paths) ? result.paths.filter((p) => typeof p === "string" && p) : [];
+  return { ok: true, paths, cancelled: !!(result && result.cancelled) };
 }
 
 // --- Tab group management ---
@@ -6059,12 +6136,12 @@ const toolHandlers = {
       // no browser API that reads the live cursor: `cursorByTab` is updated by
       // every pointer dispatch this extension makes (mouseClick, hover,
       // mouse_move, humanized plans...), so it is the one honest answer
-      // available â€” and it is exactly the value the caller itself moved.
+      // available — and it is exactly the value the caller itself moved.
       // Unknown is reported as unknown rather than guessed at (0, 0).
       case "cursor_position": {
         const at = cursorByTab.get(tabId);
         if (!at) {
-          return { content: [{ type: "text", text: "Cursor position on this tab is not known yet â€” no pointer action has been dispatched here, so there is no position to report." }] };
+          return { content: [{ type: "text", text: "Cursor position on this tab is not known yet — no pointer action has been dispatched here, so there is no position to report." }] };
         }
         return { content: [{ type: "text", text: `Cursor is at (${at.x}, ${at.y})` }] };
       }
@@ -7016,6 +7093,11 @@ const toolHandlers = {
     if (!ref || typeof ref !== "string") {
       return { content: [{ type: "text", text: "file_upload requires 'ref' — the element reference of an <input type=file> from read_page or find." }] };
     }
+
+    // Check the paths BEFORE anything is attached to anything: a refused
+    // upload must leave the page untouched (see evaluateUploadPaths).
+    const refusal = await evaluateUploadPaths(paths);
+    if (refusal) return { content: [{ type: "text", text: refusal.text }] };
 
     await ensureAttached(tabId);
     await ensureDomain(tabId, "DOM");
@@ -8926,6 +9008,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 // interferes with it and vice-versa). Uses panelIdOf(sender) for scoping.
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || typeof msg.type !== "string") return;
+  if (msg.type === "panelPickUploadFiles") {
+    pickUploadFilesForPanel()
+      .then((res) => sendResponse(res))
+      .catch((e) => sendResponse({ ok: false, error: String((e && e.message) || e) }));
+    return true; // async response
+  }
   if (msg.type === "panelAttachmentAdd") {
     const panelId = panelIdOf(sender);
     const mimeType = String(msg.mimeType || "");

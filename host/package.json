@@ -16,6 +16,7 @@
     "endpoint.js",
     "mcp-server.js",
     "native-host.js",
+    "pick-files.js",
     "parent-watch.js",
     "tool-definitions.js",
     "tool-runtime.js",

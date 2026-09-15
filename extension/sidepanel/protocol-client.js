@@ -68,6 +68,11 @@ export const MSG = Object.freeze({
   // ERROR path above, which sidepanel.js maps to a "companion needs
   // updating" state.
   ENHANCE_PROMPT: "enhance_prompt",
+  // User-mediated upload grants (host/agent/protocol.js's UPLOAD_GRANT): the
+  // operator's own native-dialog file selection, sent per conversation. The
+  // reply (same type, correlated by requestId) reports, per path, what the
+  // companion actually granted — the panel renders only that.
+  UPLOAD_GRANT: "upload_grant",
   // Agent-created documents (host/agent/protocol.js's DOCUMENT_REQUEST /
   // DOCUMENT). Additive under the same PROTOCOL_VERSION: an older companion
   // answers an unknown type through the existing ERROR path, which the panel
@@ -496,6 +501,17 @@ export class ProtocolClient {
   enhancePrompt({ requestId, op, prompt, profileId, modelId }) {
     const payload = op === "cancel" ? { requestId, op } : { requestId, op, prompt, profileId, modelId };
     this._send(envelope(MSG.ENHANCE_PROMPT, payload));
+  }
+
+  /**
+   * Send the operator's own file selection as this conversation's upload
+   * grants. `paths` are absolute paths picked in the native file dialog
+   * (never anything the model wrote); `op` is "grant" or "revoke". The reply
+   * (also type upload_grant, correlated by requestId) surfaces through
+   * onEnvelope() like every other request/reply pair here.
+   */
+  uploadGrant({ requestId, conversationId, op, paths }) {
+    this._send(envelope(MSG.UPLOAD_GRANT, { requestId, conversationId, op, paths }));
   }
 }
 

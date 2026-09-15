@@ -58,7 +58,8 @@ const TAB_ARG_KEYS = {
  * contract (existing tool schema), so this is the only thing standing between
  * "browse the user's whole filesystem" and "attach the file the user picked".
  * Nothing populates this except an explicit user selection surfaced by the
- * (future) panel UI; a model asking for a path never adds it.
+ * panel UI (protocol.js's upload_grant: the operator's own native-dialog file
+ * picker); a model asking for a path never adds it.
  */
 export class RunUploadAllowlist {
   constructor() {
@@ -66,6 +67,10 @@ export class RunUploadAllowlist {
   }
   allow(absolutePath) {
     this._paths.add(normalizePath(absolutePath));
+  }
+  /** Drop one grant (the operator revoked it in the panel). Idempotent. */
+  revoke(absolutePath) {
+    this._paths.delete(normalizePath(absolutePath));
   }
   isAllowed(absolutePath) {
     return this._paths.has(normalizePath(absolutePath));

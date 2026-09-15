@@ -467,6 +467,28 @@ export function renderPageContextSystemPrompt(pageContext) {
 }
 
 /**
+ * Render the OPERATOR's own upload grants (protocol.js's upload_grant) as a
+ * system-prompt section, so the model knows which local files this
+ * conversation may attach to a page, and by which exact path.
+ *
+ * This text is DATA, never authorization: it grants nothing that the run's
+ * own RunUploadAllowlist does not already hold, and that allowlist is
+ * consulted again on every file_upload call (host/agent/policy/
+ * authorization.js). An empty list renders nothing at all — a run with no
+ * grants gets no section, never an empty one implying a capability exists.
+ */
+export function renderUploadGrantsSystemPrompt(uploadGrants) {
+  const paths = Array.isArray(uploadGrants) ? uploadGrants.filter((p) => typeof p === "string" && p) : [];
+  if (paths.length === 0) return null;
+  return [
+    "## Files the user shared for upload",
+    "The user picked these files on this machine and allowed them to be attached to pages (the path is the exact one to pass to file_upload; the file input's ref comes from read_page/find):",
+    ...paths.map((p) => `- ${p}`),
+    "Any other local path is refused before dispatch — do not guess at one."
+  ].join("\n");
+}
+
+/**
  * Typed error thrown when no credential is available for a run — mirrors the
  * contract's "throws a typed error if no credential is available" for
  * snapshotForRun, surfaced uniformly whether the real module or a test
@@ -615,6 +637,11 @@ export function buildIsolatedOptions({
   extraEnv = {},
   skills,
   pageContext = null,
+  // User-mediated upload grants (protocol.js's upload_grant): absolute paths
+  // the OPERATOR shared with this conversation. Rendered into the system
+  // prompt only — the run's own uploadAllowlist is the authorization, and it
+  // is applied by the caller (companion.js's _runAfterLeaseGranted).
+  uploadGrants = null,
   canUseTool,
   browserToolNames,
   extraToolNames = [],
@@ -712,7 +739,8 @@ export function buildIsolatedOptions({
   // the text are always the ones registered a few lines below.
   const systemPromptText = [
     renderBrowserAutomationSystemPrompt(serverName),
-    renderPageContextSystemPrompt(pageContext)
+    renderPageContextSystemPrompt(pageContext),
+    renderUploadGrantsSystemPrompt(uploadGrants)
   ]
     .filter(Boolean)
     .join("\n\n");

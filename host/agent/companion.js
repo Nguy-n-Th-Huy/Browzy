@@ -47,6 +47,7 @@ import {
   validateHello,
   validateConversationUpdate,
   validateIdempotencyKey,
+  validateUploadGrantPaths,
   isSupportedVersion,
   versionMismatchEnvelope,
   helloAckEnvelope,
@@ -399,6 +400,14 @@ export class CompanionCore {
     // be mid-flight concurrently, each with its own chunkId.
     this._chunkReassemblers = new Map();
 
+    // User-mediated upload grants (protocol.js's upload_grant), keyed by
+    // conversationId -> Map<absolutePath, {grantedAt}>. In-memory only, and
+    // honestly so: a companion restart forgets every grant, which is the
+    // right default for a capability the operator hands over for a session.
+    // The panel clears its own chips when the connection drops for the same
+    // reason — it may only ever state what the companion confirmed.
+    this._uploadGrantsByConversation = new Map();
+
     // Task 9.2/9.5: pending approval decisions and question answers, keyed
     // by requestId so the panel's reply matches the companion's request
     // exactly. The createCanUseTool callback and the ask-the-user tool handler
@@ -581,6 +590,8 @@ export class CompanionCore {
         return this._handleManagedPolicySnapshot(envelope);
       case AGENT_MESSAGE_TYPES.ENHANCE_PROMPT:
         return this._handleEnhancePrompt(envelope);
+      case AGENT_MESSAGE_TYPES.UPLOAD_GRANT:
+        return this._handleUploadGrant(envelope);
       case AGENT_MESSAGE_TYPES.ACTION_EVENT:
         return this._handleActionEvent(envelope);
       case AGENT_MESSAGE_TYPES.ACTION_ARTIFACT_REQUEST:
@@ -1365,6 +1376,86 @@ export class CompanionCore {
     return null;
   }
 
+  /**
+   * protocol.js's upload_grant: the operator's own file picker handing this
+   * conversation a set of absolute paths it may attach to pages. The ONLY
+   * writer of this capability — a model asking for a path (or naming one in
+   * a file_upload call) never adds it.
+   *
+   * Granting is synchronous with the reply: the panel's chips only ever state
+   * what this method confirmed (granted/skipped comes back per path), so the
+   * UI cannot claim a file was shared that the companion never accepted.
+   */
+  _handleUploadGrant(envelope) {
+    const requestId = envelope.requestId ?? null;
+    const { conversationId } = envelope;
+    const reply = (payload) => makeEnvelope(AGENT_MESSAGE_TYPES.UPLOAD_GRANT, { conversationId, requestId, ...payload });
+    if (!this._requireHello()) return this._notHandshaked(envelope);
+    if (!conversationId) {
+      return reply({ ok: false, error: { code: "PROTOCOL_ERROR", message: "missing conversationId" } });
+    }
+    if (!this.sessionManager.hasConversation(conversationId)) {
+      return reply({ ok: false, error: { code: "NOT_FOUND", message: "unknown conversation" } });
+    }
+    const op = envelope.op === "revoke" ? "revoke" : envelope.op === "grant" ? "grant" : null;
+    if (!op) return reply({ ok: false, error: { code: "PROTOCOL_ERROR", message: "unknown op" } });
+    const validated = validateUploadGrantPaths(envelope.paths);
+    if (!validated.ok) return reply({ ok: false, error: { code: "PROTOCOL_ERROR", message: validated.reason } });
+
+    let store = this._uploadGrantsByConversation.get(conversationId);
+    if (!store) {
+      store = new Map();
+      this._uploadGrantsByConversation.set(conversationId, store);
+    }
+    // A grant or revoke that lands while a run is already active applies to
+    // that run's allowlist immediately (the allowlist is read at call time).
+    // The model cannot SEE a new path until its next turn — the system prompt
+    // for a turn in flight has already been sent — which is why the panel
+    // picks files before the message that needs them.
+    const run = this.sessionManager.activeRun(conversationId);
+    if (op === "revoke") {
+      const revoked = [];
+      for (const p of validated.paths) {
+        if (store.delete(p)) revoked.push(p);
+        if (run && run.uploadAllowlist) run.uploadAllowlist.revoke(p);
+      }
+      return reply({ ok: true, result: { granted: [], skipped: [], revoked } });
+    }
+    const granted = [];
+    const skipped = [];
+    for (const p of validated.paths) {
+      const verdict = this._inspectUploadGrantPath(p);
+      if (!verdict.ok) {
+        skipped.push({ path: p, reason: verdict.reason });
+        continue;
+      }
+      store.set(p, { grantedAt: Date.now() });
+      granted.push(p);
+      if (run && run.uploadAllowlist) run.uploadAllowlist.allow(p);
+    }
+    return reply({ ok: true, result: { granted, skipped, revoked: [] } });
+  }
+
+  /** Exists-and-is-a-regular-file, checked against the real filesystem before
+   *  a path is ever granted (the wire validates shape only). */
+  _inspectUploadGrantPath(p) {
+    try {
+      const st = fs.statSync(p);
+      if (!st.isFile()) return { ok: false, reason: "not_a_file" };
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, reason: e && e.code === "ENOENT" ? "not_found" : "unreadable" };
+    }
+  }
+
+  /** Every path this conversation currently holds a grant for — applied to a
+   *  new run's allowlist and rendered into its system prompt (see
+   *  tools/query-options.js's renderUploadGrantsSystemPrompt). */
+  _uploadGrantsFor(conversationId) {
+    const store = this._uploadGrantsByConversation.get(conversationId);
+    return store ? [...store.keys()] : [];
+  }
+
   _handleApprovalDecision(envelope) {
     if (!this._requireHello()) return this._notHandshaked(envelope);
     const run = this.sessionManager.activeRun(envelope.conversationId);
@@ -1767,6 +1858,8 @@ export class CompanionCore {
     // _tabRiskRegistryFor()) would otherwise linger in memory forever in a
     // long-lived companion process.
     this._tabRiskByConversation.delete(conversationId);
+    // The conversation is gone: its upload grants grant nothing any more.
+    this._uploadGrantsByConversation.delete(conversationId);
     const reply = makeEnvelope(AGENT_MESSAGE_TYPES.DELETE_CONVERSATION, {
       conversationId,
       idempotencyKey: key.key,
@@ -1794,6 +1887,7 @@ export class CompanionCore {
     if (replay) return { ...replay, requestId };
     const { removed, failed, hadActiveRuns } = this.sessionManager.deleteAllConversations();
     for (const conversationId of removed) this._tabRiskByConversation.delete(conversationId);
+    for (const conversationId of removed) this._uploadGrantsByConversation.delete(conversationId);
     const reply = makeEnvelope(AGENT_MESSAGE_TYPES.DELETE_ALL_CONVERSATIONS, {
       idempotencyKey: key.key,
       deleted: failed.length === 0,
@@ -3362,6 +3456,15 @@ export class CompanionCore {
     // send that never claimed anything.
     this.sessionManager.consumeMessageForRun(conversationId, run.runId);
 
+    // User-mediated upload grants (protocol.js's upload_grant): every path the
+    // operator has explicitly shared with THIS conversation is re-applied to
+    // this run's allowlist, and reaches the model through the run's system
+    // prompt (query-options.js's renderUploadGrantsSystemPrompt). Applied
+    // here rather than at startRun() so a run drained from the queue receives
+    // exactly the grants that exist when it actually starts.
+    const uploadGrants = this._uploadGrantsFor(conversationId);
+    for (const p of uploadGrants) run.uploadAllowlist.allow(p);
+
     // Resolve every attachment reference to its stored bytes BEFORE any
     // other run work (tasks 4.2/4.4): a ref whose artifact is missing — or
     // whose stored mimeType/byteLength disagrees with what START announced —
@@ -3658,6 +3761,7 @@ export class CompanionCore {
         abortController: run.abortController,
         skills,
         pageContext: context ?? null,
+        uploadGrants,
         canUseTool,
         // add-permission-modes-and-threat-signals: the SAME resolver AND the
         // SAME live `policySnapshot` getter just built above for

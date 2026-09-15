@@ -25,6 +25,7 @@ import { createPermissionsClient, PermissionsErrorLike } from "./permissions-cli
 import { PERMISSION_MODES, modeLabel, modeDescription, protectedCategoryLabel } from "../ui/permission-labels.js";
 import { viewWarning, viewRiskContext } from "../ui/threat-labels.js";
 import { FORMAT_LABELS as DOCUMENT_FORMAT_LABELS, EXTRACTED_PREVIEW_FORMATS, buildPreview, buildMarkdown } from "./document-viewer.js";
+import { createUploadGrantState } from "./upload-grants.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -53,6 +54,8 @@ const el = {
   addMenuWrap: $("add-menu-wrap"),
   addMenuFiles: $("add-menu-files"),
   iconAddFiles: $("icon-add-files"),
+  addMenuUploadGrant: $("add-menu-upload-grant"),
+  iconAddUploadGrant: $("icon-add-upload-grant"),
   btnDesignMode: $("btn-design-mode"),
   effortTrigger: $("effort-trigger"),
   effortTriggerLabel: $("effort-trigger-label"),
@@ -98,6 +101,7 @@ el.btnHistoryBack.style.transform = "scaleX(-1)";
 el.iconNewPlus.innerHTML = iconMarkup("plus", { size: 15 });
 el.btnAdd.innerHTML = iconMarkup("plus", { size: 18, title: "Thêm tệp hoặc ảnh" });
 el.iconAddFiles.innerHTML = iconMarkup("attach", { size: 15 });
+if (el.iconAddUploadGrant) el.iconAddUploadGrant.innerHTML = iconMarkup("folder", { size: 15 });
 // "click" (not a new icon — extension/ui/** is shared and not edited by this
 // change) is the closest existing glyph to "pick an element by clicking it".
 if (el.btnDesignMode) el.btnDesignMode.innerHTML = iconMarkup("click", { size: 18, title: "Chọn phần tử trên trang" });
@@ -2866,6 +2870,7 @@ function render() {
   announceBusyTransitions(phase);
   updateRunControls(phase);
   renderQueuePausedBanner();
+  renderUploadGrantStrip();
   syncBusyElapsedTimer();
 }
 
@@ -4133,6 +4138,146 @@ el.addMenuFiles.addEventListener("click", () => {
   if (!canAcceptAttachments()) return; // gated exactly as Send and Ctrl+U are
   openAttachmentPicker();
 });
+
+// ---- Upload grants (host/agent/protocol.js's upload_grant) ----------------
+//
+// The operator's own native-dialog file picker, handed to the companion as
+// this conversation's upload allowlist for file_upload. Deliberately NOT
+// optimistic: a chip appears only once the COMPANION confirms the path, so
+// the strip can never claim a file was shared that the run will then refuse.
+// State is per conversation and in-memory on both ends — a dropped connection
+// clears it here too, because a restarted companion no longer holds those
+// grants (see companion.js's _uploadGrantsByConversation). The state machine
+// itself lives in ./upload-grants.js (DOM-free, unit-tested on its own).
+const uploadGrantState = createUploadGrantState();
+
+function newUploadGrantRequestId() {
+  return typeof crypto !== "undefined" && crypto.randomUUID
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function uploadGrantPathsFor(conversationId) {
+  return uploadGrantState.pathsFor(conversationId);
+}
+
+function setUploadGrantError(message) {
+  const box = document.getElementById("upload-grant-error");
+  if (!box) return;
+  if (!message) {
+    box.hidden = true;
+    box.textContent = "";
+    return;
+  }
+  box.hidden = false;
+  box.textContent = message;
+}
+
+function renderUploadGrantStrip() {
+  const strip = document.getElementById("upload-grant-strip");
+  if (!strip) return;
+  const paths = uploadGrantPathsFor(panel.currentConversationId);
+  strip.innerHTML = "";
+  if (uploadGrantState.isPickPending()) {
+    const pending = document.createElement("span");
+    pending.className = "upload-grant-pending";
+    pending.textContent = "Đang chờ chọn tệp…";
+    strip.appendChild(pending);
+  }
+  for (const p of paths) {
+    const chip = document.createElement("span");
+    chip.className = "upload-grant-chip";
+    chip.title = p;
+    const name = document.createElement("span");
+    name.className = "upload-grant-name";
+    // Basename only on the chip; the full path is the tooltip, and it is the
+    // path the model receives in its own prompt section.
+    name.textContent = p.split(/[\\/]/).pop() || p;
+    chip.appendChild(name);
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "upload-grant-x";
+    remove.setAttribute("aria-label", `Thu hồi quyền upload cho ${p}`);
+    remove.innerHTML = iconMarkup("close", { size: 12 });
+    remove.addEventListener("click", () => revokeUploadGrant(p));
+    chip.appendChild(remove);
+    strip.appendChild(chip);
+  }
+  strip.hidden = paths.length === 0 && !uploadGrantState.isPickPending();
+}
+
+function sendUploadGrant({ op, paths }) {
+  const conversationId = panel.currentConversationId;
+  if (!conversationId || !paths.length) return;
+  const requestId = newUploadGrantRequestId();
+  uploadGrantState.noteRequest(requestId, { conversationId, op });
+  try {
+    protocolClient.uploadGrant({ requestId, conversationId, op, paths });
+  } catch {
+    uploadGrantState.forgetRequest(requestId);
+    setUploadGrantError("Chưa kết nối được companion để chia sẻ tệp.");
+  }
+}
+
+function revokeUploadGrant(path) {
+  sendUploadGrant({ op: "revoke", paths: [path] });
+}
+
+async function pickUploadFiles() {
+  el.addMenuWrap.close?.();
+  if (uploadGrantState.isPickPending()) return;
+  if (!panel.currentConversationId) {
+    setUploadGrantError("Chưa có hội thoại — hãy gửi một tin nhắn trước.");
+    return;
+  }
+  setUploadGrantError("");
+  uploadGrantState.beginPick();
+  renderUploadGrantStrip();
+  let res = null;
+  try {
+    res = await chrome.runtime.sendMessage({ type: "panelPickUploadFiles" });
+  } catch {
+    res = null;
+  }
+  uploadGrantState.endPick();
+  if (!res || res.ok !== true) {
+    setUploadGrantError(res && res.error ? `Không mở được hộp chọn tệp: ${res.error}` : "Không mở được hộp chọn tệp.");
+    renderUploadGrantStrip();
+    return;
+  }
+  const paths = Array.isArray(res.paths) ? res.paths : [];
+  renderUploadGrantStrip();
+  if (!paths.length) {
+    // Cancelling the dialog (or closing it with no selection) is a normal
+    // outcome, not an error: the strip simply stays as it was.
+    return;
+  }
+  sendUploadGrant({ op: "grant", paths });
+}
+
+function handleUploadGrantEnvelope(env) {
+  const outcome = uploadGrantState.applyReply(env);
+  if (!outcome) return; // not ours, or already answered
+  if (outcome.error) {
+    setUploadGrantError(`Không chia sẻ được tệp: ${outcome.error}`);
+  } else if (outcome.skipped.length) {
+    setUploadGrantError(`Không chia sẻ được: ${outcome.skipped.map((s) => `${s.path} (${s.reason})`).join(", ")}`);
+  } else {
+    setUploadGrantError("");
+  }
+  renderUploadGrantStrip();
+}
+
+if (el.addMenuUploadGrant) el.addMenuUploadGrant.addEventListener("click", pickUploadFiles);
+protocolClient.onEnvelope(handleUploadGrantEnvelope);
+protocolClient.onDisconnect(() => {
+  // A dropped connection means the companion may have restarted, and its
+  // grants are in-memory — the chips must stop claiming them.
+  if (!uploadGrantState.hasAny()) return;
+  uploadGrantState.clearAll();
+  renderUploadGrantStrip();
+});
+
 restoreEffort();
 // ---- history / recordings view ------------------------------------------
 

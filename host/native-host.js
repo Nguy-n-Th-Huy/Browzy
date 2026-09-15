@@ -29,6 +29,7 @@ import {
   AGENT_MESSAGE_TYPES
 } from "./agent/protocol.js";
 import { listWorkflows, getWorkflow } from "./agent/skills/workflows-store.js";
+import { runPickFiles } from "./pick-files.js";
 import { matchWorkflowToContext, hostOfUrl } from "./agent/skills/workflows-match.js";
 import { validateShortcutsExecuteCompat } from "./agent/skills/workflows-mcp.js";
 import {
@@ -613,6 +614,61 @@ function handleWriteTempFile(msg) {
     reply({ ok: false, error: String(e && e.message) });
   }
 }
+// Report what the extension needs to know about candidate upload files
+// BEFORE it hands their paths to the browser: existence, kind, size and hard
+// link count. The extension has no filesystem access of its own, and these
+// are exactly the restrictions the upload tool documents (the path must be a
+// real file, no multiple hard links, bounded combined size), so they are
+// checked at the one process that can see the disk. Reply is keyed by msg.id
+// for nativeRequest().
+function handleInspectFiles(msg) {
+  const reply = (payload) => writeNativeMessage({ id: msg.id, type: "files_inspected", ...payload });
+  try {
+    const paths = Array.isArray(msg.paths)
+      ? msg.paths.filter((p) => typeof p === "string" && p).slice(0, 32)
+      : [];
+    if (paths.length === 0) return reply({ ok: false, error: "no paths" });
+    const files = paths.map((p) => {
+      const entry = { path: p };
+      let st;
+      try {
+        st = fs.statSync(p);
+      } catch (e) {
+        entry.exists = false;
+        entry.error = String((e && e.code) || (e && e.message) || e);
+        return entry;
+      }
+      entry.exists = true;
+      entry.kind = st.isFile() ? "file" : st.isDirectory() ? "directory" : "other";
+      entry.size = st.size;
+      entry.nlink = st.nlink;
+      return entry;
+    });
+    reply({ ok: true, result: { files } });
+  } catch (e) {
+    reply({ ok: false, error: String(e && e.message) });
+  }
+}
+
+// Open the operator's own file dialog for upload grants and report the
+// absolute paths they picked. `cancelled` is a normal outcome, not an error
+// (see host/pick-files.js). One dialog at a time: a second request while one
+// is open is refused rather than stacking windows.
+let pickFilesInFlight = false;
+async function handlePickFiles(msg) {
+  const reply = (payload) => writeNativeMessage({ id: msg.id, type: "files_picked", ...payload });
+  if (pickFilesInFlight) return reply({ ok: false, error: "a file picker is already open" });
+  pickFilesInFlight = true;
+  try {
+    const result = await runPickFiles({});
+    reply({ ok: true, result });
+  } catch (e) {
+    reply({ ok: false, error: String((e && e.message) || e) });
+  } finally {
+    pickFilesInFlight = false;
+  }
+}
+
 // --- Shortcuts (extension-side handlers' companion contract) ---
 // The registry's shortcuts_list/shortcuts_execute operations run their
 // handlers in the extension, but the shortcut inventory lives here, beside
@@ -994,6 +1050,14 @@ process.stdin.on("data", (chunk) => {
     }
     if (msg && msg.type === "write_temp_file") {
       handleWriteTempFile(msg);
+      continue;
+    }
+    if (msg && msg.type === "inspect_files") {
+      handleInspectFiles(msg);
+      continue;
+    }
+    if (msg && msg.type === "pick_files") {
+      handlePickFiles(msg);
       continue;
     }
     if (msg && msg.type === "shortcuts_list") {
