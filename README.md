@@ -62,6 +62,17 @@ here. In particular:
   on-page cursor/action timeline, built-in slash commands in the picker) are
   listed as such in [Side panel status](#side-panel-status), not described as
   shipped.
+- **The side panel has no shell and no direct filesystem tools, by design.**
+  `Bash`, `Write`, `Edit` and `NotebookEdit` are disabled
+  (`HIGH_RISK_BUILTINS` in `host/agent/tools/query-options.js`), and
+  `Read`/`Glob`/`Grep` are not enabled either — the model cannot run
+  commands, edit files, or browse the filesystem on its own. Everything
+  file-shaped is *user-mediated*: composer attachments to bring a file in,
+  the upload picker (below) plus `file_upload` to attach one of those files
+  to a page, `create_document`/`screenshot save_to_disk` to get a file out.
+  Driving the browser from a Claude Code session (the external-MCP path) is
+  where a full local toolset legitimately lives: those are Claude Code's own
+  tools, running in your session, not this extension's.
 
 ### Blocked Domains in the Official Extension
 
@@ -996,7 +1007,23 @@ not](#what-this-is-not)):
 
 Notes on the divergences (✗):
 
-- `file_upload` matches Claude in Chrome's interface (`paths`, `ref`, `tabId`) but does **not** restrict sources to session-shared paths — any absolute path on this machine is accepted.
+- `file_upload` matches Claude in Chrome's interface (`paths`, `ref`, `tabId`)
+  and now carries the same three restrictions the official extension
+  documents — every path must be a real file that exists, no file may have
+  more than one hard link (package-manager stores are built from them), and
+  the combined size stays under 10 MB — enforced in the tool's only executor
+  (`extension/background.js`) so they hold on both paths. Where the two
+  paths differ is *which* paths may be named at all. In the **side panel**,
+  only files the operator picked for this conversation are accepted: the
+  composer's **+ → "Chọn tệp cho agent upload"** opens a native file dialog
+  (the browser cannot hand a page a filesystem path), the picked absolute
+  paths become that conversation's upload grants, and the run refuses every
+  other path before dispatch (`path_not_allowlisted`). Grants are per
+  conversation, revocable from their chips, and in-memory on both ends — a
+  companion restart forgets them. In the **external-MCP path** the deciding
+  gate is the Claude Code session's own read permissions, as in the official
+  integration; the extension receives whatever paths that session names and
+  applies the three restrictions above to them.
 - `select_browser` transfers automation through a directed, confirmed handoff between attached browsers rather than any timed release window.
 
 ### WebMCP page tools (experimental)
