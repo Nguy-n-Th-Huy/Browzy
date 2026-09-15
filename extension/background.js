@@ -6034,6 +6034,41 @@ const toolHandlers = {
         return { content: [{ type: "text", text: `Hovered at (${coordinate[0]}, ${coordinate[1]})${hitNote}` }] };
       }
 
+      // Move the pointer WITHOUT the hover semantics of the case above: no
+      // settle wait, no expectation that a tooltip is being revealed. The
+      // dispatch is the same single `mouseMoved`; only the intent differs, and
+      // it exists so a model can reposition before a drag or a click sequence
+      // without paying a hover's settle window or implying one.
+      case "mouse_move": {
+        if (!coordinate) return { content: [{ type: "text", text: "coordinate is required for mouse_move" }] };
+        if (await humanizeOn(tabId)) {
+          const s = human(effectiveConfig(tabId).humanize_speed, effectiveConfig(tabId).humanize_seed);
+          const from = cursorByTab.get(tabId) || { x: Math.max(0, coordinate[0] - 200), y: Math.max(0, coordinate[1] - 150) };
+          await dispatchPlan(tabId, humanize.planHover(s, from, { x: coordinate[0], y: coordinate[1] }), modifiers, onPointerStep);
+          if (onPointerStep) onPointerStep.flush();
+          return { content: [{ type: "text", text: `Moved the cursor to (${coordinate[0]}, ${coordinate[1]})` }] };
+        }
+        await dispatchMouse(tabId, "mouseMoved", coordinate[0], coordinate[1], { modifiers });
+        cursorByTab.set(tabId, { x: coordinate[0], y: coordinate[1] });
+        if (onPointerStep) onPointerStep({ k: "move", x: coordinate[0], y: coordinate[1] });
+        if (onPointerStep) onPointerStep.flush();
+        return { content: [{ type: "text", text: `Moved the cursor to (${coordinate[0]}, ${coordinate[1]})` }] };
+      }
+
+      // Report where this extension last left the pointer on this tab. There is
+      // no browser API that reads the live cursor: `cursorByTab` is updated by
+      // every pointer dispatch this extension makes (mouseClick, hover,
+      // mouse_move, humanized plans...), so it is the one honest answer
+      // available â€” and it is exactly the value the caller itself moved.
+      // Unknown is reported as unknown rather than guessed at (0, 0).
+      case "cursor_position": {
+        const at = cursorByTab.get(tabId);
+        if (!at) {
+          return { content: [{ type: "text", text: "Cursor position on this tab is not known yet â€” no pointer action has been dispatched here, so there is no position to report." }] };
+        }
+        return { content: [{ type: "text", text: `Cursor is at (${at.x}, ${at.y})` }] };
+      }
+
       case "type": {
         if (!args.text) return { content: [{ type: "text", text: "text is required for type action" }] };
         await ensureAttached(tabId);

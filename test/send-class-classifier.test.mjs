@@ -83,7 +83,7 @@ await test("only computer and javascript_tool can return true from isSendClassCa
 });
 
 await test("a non-click non-key computer action is not send-class — typing fill, scrolling, hovering, screenshot stay automatic", async () => {
-  for (const action of ["screenshot", "zoom", "scroll", "scroll_to", "wait", "type", "drag", "hover"]) {
+  for (const action of ["screenshot", "zoom", "scroll", "scroll_to", "wait", "type", "drag", "hover", "mouse_move", "cursor_position"]) {
     assert(isSendClassCall("computer", { action }) === false, `computer ${action} must not be send-class`);
   }
 });

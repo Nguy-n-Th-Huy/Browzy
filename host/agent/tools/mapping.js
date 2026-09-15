@@ -964,7 +964,12 @@ const MUTATING_LEGACY_TOOLS = new Set([
 // viewport" reading use case and do not mutate page state. Every other
 // `computer` action (click/type/key/drag/hover) is a real interaction with
 // the page and is conservatively treated as mutating.
-const COMPUTER_READ_ONLY_ACTIONS = new Set(["screenshot", "zoom", "scroll", "scroll_to", "wait"]);
+// `cursor_position` reports state this extension already tracked and
+// dispatches nothing to the page, so it joins the read-only set.
+// `mouse_move` deliberately does NOT: it sends a real `mouseMoved` to the
+// page (exactly like `hover` above), which can change hover state, so it is
+// conservatively treated as an interaction.
+const COMPUTER_READ_ONLY_ACTIONS = new Set(["screenshot", "zoom", "scroll", "scroll_to", "wait", "cursor_position"]);
 
 /**
  * @param {string} legacyToolName

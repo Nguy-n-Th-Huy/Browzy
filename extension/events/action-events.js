@@ -100,12 +100,20 @@ const COMPUTER_OP_TYPE = Object.freeze({
   double_click: ACTION_TYPES.CLICK,
   triple_click: ACTION_TYPES.CLICK,
   hover: ACTION_TYPES.HOVER,
+  // mouse_move is the same real dispatched pointer movement hover is (and so
+  // carries a pointer payload for the overlay cursor) — only its intent
+  // differs, and the action-event schema records what was dispatched, not why.
+  mouse_move: ACTION_TYPES.HOVER,
   type: ACTION_TYPES.TYPE,
   key: ACTION_TYPES.TYPE,
   scroll: ACTION_TYPES.SCROLL,
   scroll_to: ACTION_TYPES.SCROLL,
   wait: ACTION_TYPES.WAIT,
-  left_click_drag: ACTION_TYPES.DRAG
+  left_click_drag: ACTION_TYPES.DRAG,
+  // cursor_position dispatches nothing to the page — it only reads state this
+  // extension already tracked. Explicit here (rather than falling through)
+  // so the classification is a recorded decision, not an omission.
+  cursor_position: ACTION_TYPES.OTHER
   // diag_input (hidden diagnostic, not in the tool schema) intentionally
   // falls through to OTHER below.
 });

@@ -21,6 +21,8 @@ ok(ae.classifyAction("computer", { action: "right_click" }).type === ae.ACTION_T
 ok(ae.classifyAction("computer", { action: "double_click" }).type === ae.ACTION_TYPES.CLICK, "computer double_click -> click");
 ok(ae.classifyAction("computer", { action: "triple_click" }).type === ae.ACTION_TYPES.CLICK, "computer triple_click -> click");
 ok(ae.classifyAction("computer", { action: "hover" }).type === ae.ACTION_TYPES.HOVER, "computer hover -> hover");
+ok(ae.classifyAction("computer", { action: "mouse_move" }).type === ae.ACTION_TYPES.HOVER, "computer mouse_move -> hover (a dispatched pointer movement)");
+ok(ae.classifyAction("computer", { action: "cursor_position" }).type === ae.ACTION_TYPES.OTHER, "computer cursor_position -> other (dispatches nothing)");
 ok(ae.classifyAction("computer", { action: "scroll" }).type === ae.ACTION_TYPES.SCROLL, "computer scroll -> scroll");
 ok(ae.classifyAction("computer", { action: "scroll_to" }).type === ae.ACTION_TYPES.SCROLL, "computer scroll_to -> scroll");
 ok(ae.classifyAction("computer", { action: "type" }).type === ae.ACTION_TYPES.TYPE, "computer type -> type");
@@ -43,13 +45,14 @@ for (const [tool, args] of [
   ["computer", { action: "type", text: "hi" }],
   ["computer", { action: "key", text: "Enter" }],
   ["computer", { action: "screenshot" }],
-  ["computer", { action: "zoom" }]
+  ["computer", { action: "zoom" }],
+  ["computer", { action: "cursor_position" }]
 ]) {
   const { type } = ae.classifyAction(tool, args);
   ok(!ae.isPointerCapable(type), `${tool}/${args.action || ""} is not pointer-capable (type=${type})`);
 }
 console.log("\n== pointer-capable actions ==");
-for (const op of ["left_click", "right_click", "double_click", "triple_click", "hover", "scroll", "left_click_drag"]) {
+for (const op of ["left_click", "right_click", "double_click", "triple_click", "hover", "mouse_move", "scroll", "left_click_drag"]) {
   const { type } = ae.classifyAction("computer", { action: op });
   ok(ae.isPointerCapable(type), `computer ${op} IS pointer-capable`);
 }
