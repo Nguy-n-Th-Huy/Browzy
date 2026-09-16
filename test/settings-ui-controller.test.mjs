@@ -7,6 +7,7 @@
 //
 // Run: node test/settings-ui-controller.test.mjs
 import { SettingsController } from "../extension/settings/settings-controller.js";
+import { connectionGate } from "../extension/settings/connection-gate.js";
 import { createScriptedCompanion } from "./settings-ui-scripted-companion.mjs";
 
 let fail = 0;
@@ -70,6 +71,74 @@ console.log("== model catalog: add/edit/remove/reorder/default ==");
   ok(c.removeModel(1).ok, "remove the (renamed) default model");
   ok(c.getState().defaultModelId === "claude-opus-5", "removing the default reassigns to a remaining model rather than leaving it dangling");
   ok(c.removeModel(0).ok && c.getState().defaultModelId === null && c.getState().models.length === 0, "removing the last model clears the default to null, not a stale id");
+}
+
+console.log("== profile load: a nonempty model list with no default is repaired on arrival, never left as a dead test button ==");
+{
+  // The host forbids this state — host/agent/settings/models.js's
+  // validateModels(): "a default model is required when the model list is
+  // nonempty" — but a profile on disk written before that rule (or edited by
+  // hand) can still carry it. Every way of editing the list on this page
+  // already picks a default (addModel auto-selects the first, setDefaultModel,
+  // and removeModel() promotes the first remaining model); an already-loaded
+  // list had no such path, so the page rendered "Kiểm tra kết nối" disabled
+  // forever with nothing the user could click to fix it.
+  const companion = createScriptedCompanion({
+    profileId: "default", baseUrl: "https://api.anthropic.com",
+    models: [{ id: "m1", label: "M1" }, { id: "m2", label: "M2" }],
+    defaultModelId: null, hasCredential: true, memoryOnlyCredential: false, secretBackend: "windows-credential-manager", revision: 4
+  });
+  const c = new SettingsController(companion.client);
+  await c.init();
+  const s = c.getState();
+  ok(s.models.length === 2, "both models in the profile survive the load");
+  ok(s.defaultModelId === "m1", "the first model is adopted as the default — the same promotion removeModel() performs when the default is removed");
+  ok(connectionGate(s).canTest === true, "the repaired state is one the page's own gate lets test (it would otherwise report no_default_model)");
+  ok(connectionGate(s).hint === null, "and with nothing left to explain: no hint, no jump link");
+  ok(companion.calls.filter((x) => x.op === "save_profile").length === 0, "the repair is local state only — loading a profile never writes to the host");
+  const testResult = await c.testConnection();
+  const testCall = companion.calls.find((x) => x.op === "test_capability");
+  ok(testResult.ok === true && testCall.modelId === "m1", "the connection test now actually runs, against the adopted model");
+  const saveResult = await c.save();
+  ok(saveResult.ok && companion.getInternalProfile().defaultModelId === "m1", "and the adopted default persists on the next Save, like any other model-list edit made here");
+}
+{
+  const { client } = createScriptedCompanion({
+    profileId: "default", baseUrl: "https://api.anthropic.com",
+    models: [{ id: "m1", label: "M1" }, { id: "m2", label: "M2" }],
+    defaultModelId: "m2", hasCredential: true, memoryOnlyCredential: false, secretBackend: "windows-credential-manager", revision: 5
+  });
+  const c = new SettingsController(client);
+  await c.init();
+  ok(c.getState().defaultModelId === "m2", "a host-reported default is loaded verbatim, even when it is not the first model in the list");
+}
+{
+  const { client } = createScriptedCompanion({
+    profileId: "default", baseUrl: "https://api.anthropic.com", models: [],
+    defaultModelId: null, hasCredential: true, memoryOnlyCredential: false, secretBackend: null, revision: 6
+  });
+  const c = new SettingsController(client);
+  await c.init();
+  const s = c.getState();
+  ok(s.defaultModelId === null, "an empty list still has no default — there is nothing to promote");
+  ok(connectionGate(s).reason === "no_models", "and the gate asks for a model rather than pretending one exists");
+}
+{
+  // The ChatGPT half: signed in, no API key by design, same repair — the
+  // gateway binds this same default model.
+  const companion = createScriptedCompanion({
+    profileId: "default", baseUrl: "https://api.anthropic.com",
+    models: [{ id: "gpt-5.5", label: "gpt-5.5" }], defaultModelId: null,
+    hasCredential: false, memoryOnlyCredential: false, secretBackend: null, revision: 7,
+    credentialRevision: 0, providerType: "chatgpt",
+    chatgptAccount: { email: "user@example.com", planType: "plus" },
+    chatgptSessionState: "signed_in"
+  });
+  const c = new SettingsController(companion.client);
+  await c.init();
+  const s = c.getState();
+  ok(s.defaultModelId === "gpt-5.5", "a signed-in ChatGPT profile with no default gets one on load too");
+  ok(connectionGate(s).canTest === true, "so its test control is live: the credential check does not apply to this provider");
 }
 
 console.log("== save(): invalid URL blocks save and leaves nothing persisted ==");

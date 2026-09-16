@@ -177,7 +177,17 @@ export class SettingsController {
     s.baseUrl = profile.baseUrl;
     s.baseUrlDraft = profile.baseUrl;
     s.models = profile.models.map((m) => ({ ...m }));
-    s.defaultModelId = profile.defaultModelId;
+    // A nonempty model list with no default is a state the HOST forbids:
+    // host/agent/settings/models.js's validateModels() requires "a default
+    // model is required when the model list is nonempty". A profile that
+    // nevertheless arrives that way (written before that rule, or hand-edited
+    // on disk) used to render as a permanently dead "Kiểm tra kết nối" —
+    // nothing on this page could choose a default for an already-loaded list.
+    // Adopt the first model, exactly the promotion removeModel() already
+    // performs locally when the current default is removed; local state only
+    // (no host write), so it persists on the next Save like every other
+    // model-list edit made here.
+    s.defaultModelId = profile.defaultModelId || (s.models.length ? s.models[0].id : null);
     s.hasCredential = Boolean(profile.hasCredential);
     s.memoryOnlyCredential = Boolean(profile.memoryOnlyCredential);
     s.secretBackend = profile.secretBackend || null;

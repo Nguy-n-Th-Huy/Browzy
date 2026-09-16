@@ -54,6 +54,10 @@
   }
   #capability-detail { display: flex; flex-wrap: wrap; gap: var(--space-1); margin-top: var(--space-1); }
   .test-disclosure { margin: 0; }
+  /* The gate hint's jump link (settings-app.js renderTestGateFeedback) keeps
+     the navbar chips' look, minus that row's fixed height, so it can sit on a
+     hint line instead of forcing a second one. */
+  #test-gate-hint .settings-chip { height: auto; padding: 0 var(--space-2); }
 
   /* Provider type switch (add-chatgpt-subscription-provider) */
   .provider-type-row { flex-wrap: wrap; gap: var(--space-3); }
@@ -335,6 +339,14 @@
         <p class="field-hint test-disclosure" id="test-disclosure-anthropic">Kiểm tra kết nối gửi một yêu cầu nhỏ tới nhà cung cấp và có thể phát sinh chi phí API.</p>
         <p class="field-hint test-disclosure" id="test-disclosure-chatgpt" hidden>Kiểm tra kết nối sẽ tính vào giới hạn sử dụng của tài khoản ChatGPT.</p>
         <p class="field-hint" id="key-status-text">Chưa lưu API key</p>
+        <!-- Why the two test controls ("Kiểm tra lại" above, "Kiểm tra kết
+             nối" here) are disabled, when the reason is one this page can
+             point at: an empty model list, or a list with no default chosen —
+             both fixed in the "Mô hình" section below. Filled by
+             settings-app.js from connection-gate.js's hint, with a jump link
+             to that section; both controls carry
+             aria-describedby="test-gate-hint" while it is showing. -->
+        <p class="field-hint" id="test-gate-hint" hidden></p>
         <div id="capability-detail"></div>
       </div>
     </div>

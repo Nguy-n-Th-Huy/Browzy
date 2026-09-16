@@ -11,6 +11,7 @@ import { setThemeOverride } from "../ui/theme.js";
 import { createSettingsClient } from "./settings-client.js";
 import { SettingsController } from "./settings-controller.js";
 import { describeErrorCode } from "./errors-ui.js";
+import { connectionGate, connectionBlockedTitle } from "./connection-gate.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -421,11 +422,49 @@ function renderBanner(state) {
   area.appendChild(box);
 }
 
+/** Paints the reason a blocked test control is blocked, on both test
+ * controls at once (connection-gate.js owns the reasoning; this only applies
+ * it). Called from renderProvider — the later of the two renderers that own a
+ * test button — so one gate value drives both controls' explanation and the
+ * two can never describe the page differently.
+ *
+ * A disabled control must never be silent: the short reason travels on the
+ * control itself (`title`), and when the gate carries a hint — the two
+ * reasons whose fix is in the "Mô hình" section — the full line with its jump
+ * link is shown under the connection row and both controls describe
+ * themselves by it (`aria-describedby`). The hint is emptied, not merely
+ * hidden, so a stale explanation can never be announced by a screen reader
+ * while the control is enabled. */
+function renderTestGateFeedback(gate) {
+  const hintEl = $("test-gate-hint");
+  hintEl.innerHTML = "";
+  hintEl.hidden = !gate.hint;
+  if (gate.hint) {
+    hintEl.appendChild(document.createTextNode(`${gate.hint} `));
+    if (gate.jumpToModels) {
+      const jump = document.createElement("a");
+      jump.className = "settings-chip";
+      jump.href = "#section-models";
+      jump.textContent = "Tới mục “Mô hình”";
+      hintEl.appendChild(jump);
+    }
+  }
+
+  const title = gate.canTest ? null : connectionBlockedTitle(gate.reason);
+  for (const id of ["btn-status-retest", "btn-test-connection"]) {
+    const btn = $(id);
+    if (title) btn.title = title;
+    else btn.removeAttribute("title");
+    if (gate.hint) btn.setAttribute("aria-describedby", "test-gate-hint");
+    else btn.removeAttribute("aria-describedby");
+  }
+}
+
 // design.md decision D8: reads only existing controller state
 // (connectionStatus/hasCredential/defaultModelId) and never initiates a
 // connection test on load — testing costs API usage and stays an explicit
 // user action.
-function renderStatusCard(state) {
+function renderStatusCard(state, gate) {
   const icon = $("status-card-icon");
   const title = $("status-card-title");
   const sub = $("status-card-sub");
@@ -464,7 +503,7 @@ function renderStatusCard(state) {
   sub.textContent = subText;
 
   const retestBtn = $("btn-status-retest");
-  retestBtn.disabled = state.testing || !state.hasCredential || !state.defaultModelId;
+  retestBtn.disabled = !gate.canTest;
   retestBtn.textContent = state.testing ? "Đang kiểm tra…" : "Kiểm tra lại";
 }
 
@@ -533,7 +572,7 @@ function wireChipNav() {
   setCurrent(sections[0].id);
 }
 
-function renderProvider(state) {
+function renderProvider(state, gate) {
   $("provider-type-anthropic").checked = state.providerType === "anthropic";
   $("provider-type-chatgpt").checked = state.providerType === "chatgpt";
   $("provider-type-anthropic").disabled = state.switchingProviderType;
@@ -614,8 +653,12 @@ function renderProvider(state) {
 
   $("btn-save").disabled = state.saving;
   $("btn-save").textContent = state.saving ? "Đang lưu…" : "Lưu";
-  $("btn-test-connection").disabled = state.testing || !state.hasCredential || !state.defaultModelId;
+  // Both test controls read the one gate (never a second copy of the
+  // predicate — see connection-gate.js), and the last renderer paints its
+  // explanation once, after both buttons exist.
+  $("btn-test-connection").disabled = !gate.canTest;
   $("btn-test-connection").textContent = state.testing ? "Đang kiểm tra…" : "Kiểm tra kết nối";
+  renderTestGateFeedback(gate);
 }
 
 function renderModels(state) {
@@ -709,9 +752,12 @@ function renderModels(state) {
 }
 
 function render(state) {
+  // One gate per render pass, shared by both renderers that own a test
+  // control — the page has exactly one answer to "can a test run right now".
+  const gate = connectionGate(state);
   renderBanner(state);
-  renderStatusCard(state);
-  renderProvider(state);
+  renderStatusCard(state, gate);
+  renderProvider(state, gate);
   renderModels(state);
 }
 
