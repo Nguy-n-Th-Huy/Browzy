@@ -57,9 +57,12 @@ const BASELINE = JSON.parse(fs.readFileSync(SNAPSHOT_PATH, "utf8"));
 // openspec/changes/consume-webmcp-page-tools appended 2 post-baseline
 // entries (webmcp_list_tools, webmcp_call_tool),
 // openspec/changes/add-browser-batch-tool appended 1 more (browser_batch),
-// and openspec/changes/implement-stubbed-browser-tools appended 2 more
+// openspec/changes/implement-stubbed-browser-tools appended 2 more
 // (list_connected_browsers, select_browser) while removing switch_browser
-// (recorded in the baseline's removals set) — see
+// (recorded in the baseline's removals set),
+// openspec/changes/add-sensitive-info-masking appended 1 more
+// (mask_sensitive_info), and openspec/changes/add-typesafe-jev-provider
+// appended 1 more (page_snapshot) — see
 // test/registry-baseline.test.mjs's DESIGN_DOC_TOOL_LIST/
 // POST_BASELINE_ADDITIONS / REMOVED_BASELINE_OPERATIONS split, which is this
 // repo's canonical source for the three counts. This file cannot import those
@@ -68,7 +71,7 @@ const BASELINE = JSON.parse(fs.readFileSync(SNAPSHOT_PATH, "utf8"));
 // counts are mirrored here instead — every bare "26" this suite asserted
 // before those changes is replaced with the arithmetic below.
 const LEGACY_BASELINE_COUNT = 26;
-const POST_BASELINE_ADDITIONS_COUNT = 5;
+const POST_BASELINE_ADDITIONS_COUNT = 7;
 const REMOVED_BASELINE_COUNT = 1;
 const TOTAL_REGISTRY_COUNT = LEGACY_BASELINE_COUNT + POST_BASELINE_ADDITIONS_COUNT - REMOVED_BASELINE_COUNT;
 
@@ -287,6 +290,11 @@ await test(`isMutatingCall(): computer is classified per-action; every other one
   // effects, classified the same conservative way as javascript_tool.
   assert(isMutatingCall("webmcp_list_tools") === false, "webmcp_list_tools (reads a passive table) must be read-only");
   assert(isMutatingCall("webmcp_call_tool") === true, "webmcp_call_tool (arbitrary page-defined effects) must always be treated as mutating");
+  // openspec/changes/add-sensitive-info-masking's addition: a presentational,
+  // reversible protective transform — read-only by design (that change's
+  // design.md D4), so it stays usable on the borrowed tab, which is where
+  // credentials are most likely on screen.
+  assert(isMutatingCall("mask_sensitive_info") === false, "mask_sensitive_info (presentational + reversible, writes no values) must be read-only");
 
   const { readOnly, mutating } = _mutationClassificationCoverage();
   const covered = new Set([...readOnly, ...mutating, "computer"]);

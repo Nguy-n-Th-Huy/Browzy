@@ -596,12 +596,66 @@ await test("a start reply that DID carry a token field fails closed (secret-free
   assert(JSON.stringify(reply).indexOf("SECRET-REF-XYZ") === -1, "a refreshToken must never appear in the reply");
 });
 
+await test("set_typesafe_config persists the screenshot toggle and get_profile exposes it (default enabled)", async () => {
+  const core = buildRealSettingsCore();
+  const profileId = `${PROFILE_ID}-toggle`;
+  const saved = await core.handleEnvelope(
+    agentSettingsEnvelope("save_profile", { profileId, baseUrl: "https://api.anthropic.com", models: [], defaultModelId: null })
+  );
+  assert(saved.ok === true, `setup save_profile failed: ${JSON.stringify(saved.error)}`);
+  const typed = await core.handleEnvelope(agentSettingsEnvelope("set_provider_type", { profileId, providerType: "typesafe" }));
+  assert(typed.ok === true && typed.result.providerType === "typesafe", `setup set_provider_type failed: ${JSON.stringify(typed)}`);
+
+  // A profile this version just created carries the enabled default.
+  const initial = await core.handleEnvelope(agentSettingsEnvelope("get_profile", { profileId }));
+  assert(initial.ok === true && initial.result.sendScreenshots === true, `get_profile must expose the toggle: ${JSON.stringify(initial)}`);
+
+  // A profile STORED before the toggle existed (the field absent from disk)
+  // reads back as ENABLED — the documented default.
+  const profileFile = path.join(scratchConfigDir, "agent-profile.json");
+  const legacy = JSON.parse(fs.readFileSync(profileFile, "utf-8"));
+  delete legacy.sendScreenshots;
+  fs.writeFileSync(profileFile, JSON.stringify(legacy));
+  const legacyReply = await core.handleEnvelope(agentSettingsEnvelope("get_profile", { profileId }));
+  assert(legacyReply.ok === true && legacyReply.result.sendScreenshots === true, `an absent toggle must load enabled: ${JSON.stringify(legacyReply)}`);
+
+  // Off persists through the op, and the reply carries the stored value.
+  const off = await core.handleEnvelope(
+    agentSettingsEnvelope("set_typesafe_config", {
+      profileId,
+      textModelBaseUrl: "https://text.example.invalid/v1",
+      textModelId: "text-model",
+      sendScreenshots: false
+    })
+  );
+  assert(off.ok === true && off.result.sendScreenshots === false, `set_typesafe_config must persist the toggle: ${JSON.stringify(off)}`);
+  const reread = await core.handleEnvelope(agentSettingsEnvelope("get_profile", { profileId }));
+  assert(reread.ok === true && reread.result.sendScreenshots === false, `the toggle must survive the round trip: ${JSON.stringify(reread)}`);
+
+  // An omitted field keeps the stored value; a non-boolean is refused before
+  // anything is written.
+  const omitted = await core.handleEnvelope(
+    agentSettingsEnvelope("set_typesafe_config", { profileId, textModelBaseUrl: "https://text.example.invalid/v1", textModelId: "text-model" })
+  );
+  assert(omitted.ok === true && omitted.result.sendScreenshots === false, `an omitted toggle keeps the stored value: ${JSON.stringify(omitted)}`);
+  const bad = await core.handleEnvelope(
+    agentSettingsEnvelope("set_typesafe_config", {
+      profileId,
+      textModelBaseUrl: "https://text.example.invalid/v1",
+      textModelId: "text-model",
+      sendScreenshots: "off"
+    })
+  );
+  assert(bad.ok === false && bad.error.code === "PROTOCOL_ERROR", `a non-boolean toggle must be refused: ${JSON.stringify(bad)}`);
+  const afterBad = await core.handleEnvelope(agentSettingsEnvelope("get_profile", { profileId }));
+  assert(afterBad.result.sendScreenshots === false, "a refused call must leave the stored toggle untouched");
+});
+
 // --- test helpers ----------------------------------------------------------
 
 function crypto_randomHex() {
   return Math.random().toString(16).slice(2) + Date.now().toString(16);
 }
-
 async function core_save_and_credential(profileId, baseUrl, models, defaultModelId) {
   const core = buildRealSettingsCore();
   const saveReply = await core.handleEnvelope(agentSettingsEnvelope("save_profile", { profileId, baseUrl, models, defaultModelId }));

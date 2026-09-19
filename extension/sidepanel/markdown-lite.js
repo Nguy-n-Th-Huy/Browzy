@@ -64,11 +64,28 @@ function renderInline(escapedText) {
 
   let out = escapedText;
   out = out.replace(/`([^`]+)`/g, (_m, code) => hold(`<code>${code}</code>`));
-  out = out.replace(/\[([^\]\n]*)\]\(([^()\s]+)\)/g, (whole, label, url) =>
+  out = out.replace(/\[([^\]\n]*)\]\(((?:[^()\s]|\([^()\s]*\))+)\)/g, (whole, label, url) =>
     SAFE_LINK_SCHEME.test(url)
       ? hold(`<a href="${url}" target="_blank" rel="noopener noreferrer">${label || url}</a>`)
       : whole
   );
+  // Work on escaped text, preserving &amp; inside query strings. Quotes and
+  // angle brackets terminate links even though escaping expanded them.
+  out = out.replace(/(^|[\s([>]|&(?:lt|quot|#39);)(https?:\/\/(?:(?!&(?:lt|gt|quot|#39);)[^\s\u0000<>])+)/gi, (_whole, prefix, candidate) => {
+    let url = candidate;
+    for (;;) {
+      const previous = url;
+      url = url.replace(/[.,!?:]+$/, "");
+      if (url.endsWith(";") && !url.endsWith("&amp;")) url = url.slice(0, -1);
+      for (const [left, right] of [["(", ")"], ["[", "]"], ["{", "}"]]) {
+        while (url.endsWith(right) && url.split(right).length > url.split(left).length) url = url.slice(0, -1);
+      }
+      if (url === previous) break;
+    }
+    try { if (!new URL(url.replace(/&amp;/g, "&")).hostname) return prefix + candidate; }
+    catch { return prefix + candidate; }
+    return prefix + hold(`<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>`) + candidate.slice(url.length);
+  });
   out = out.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
   out = out.replace(/(^|[^*])\*([^*]+)\*(?!\*)/g, "$1<em>$2</em>");
   return out.replace(HOLD_PATTERN, (_m, i) => held[Number(i)]);
@@ -98,7 +115,7 @@ function splitRow(text) {
 function matchListItem(text) {
   const m = text.match(/^(\s*)([-*+]|\d{1,9}[.)])\s+(.*)$/);
   if (!m) return null;
-  return { indent: m[1].replace(/\t/g, "    ").length, ordered: /\d/.test(m[2]), content: m[3] };
+  return { indent: m[1].replace(/\t/g, "    ").length, ordered: /\d/.test(m[2]), ordinal: parseInt(m[2], 10), content: m[3] };
 }
 
 /**
@@ -113,6 +130,7 @@ function renderList(lines) {
   let html = "";
   const open = []; // stack of { indent, tag }
   for (const raw of lines) {
+    if (!raw.trim()) continue;
     const item = matchListItem(raw);
     if (!item) {
       // A wrapped continuation line of the item above.
@@ -127,15 +145,17 @@ function renderList(lines) {
       // Nest the new list INSIDE the item above it, so the sub-list belongs
       // to its parent rather than sitting as a sibling of the whole list.
       if (open.length) html = html.replace(/<\/li>$/, "");
-      open.push({ indent: item.indent, tag });
-      html += `<${tag}>`;
+      open.push({ indent: item.indent, tag, next: item.ordinal });
+      html += `<${tag}${item.ordered && item.ordinal !== 1 ? ` start="${item.ordinal}"` : ""}>`;
     } else if (open[open.length - 1].tag !== tag) {
       // The marker changed at this depth: close this list and open the other
       // kind rather than putting an <li> in the wrong container.
-      html += `</${open.pop().tag}><${tag}>`;
-      open.push({ indent: item.indent, tag });
+      html += `</${open.pop().tag}><${tag}${item.ordered && item.ordinal !== 1 ? ` start="${item.ordinal}"` : ""}>`;
+      open.push({ indent: item.indent, tag, next: item.ordinal });
     }
-    html += `<li>${line(item.content)}</li>`;
+    const level = open[open.length - 1];
+    html += `<li${item.ordered && item.ordinal !== level.next ? ` value="${item.ordinal}"` : ""}>${line(item.content)}</li>`;
+    level.next = item.ordinal + 1;
   }
   while (open.length) {
     html += `</${open.pop().tag}>`;
@@ -224,7 +244,18 @@ function renderBlocks(lines) {
     if (matchListItem(raw)) {
       flushParagraph();
       const items = [];
-      while (i < lines.length && lines[i].trim() && (matchListItem(lines[i]) || items.length)) {
+      const first = matchListItem(raw);
+      while (i < lines.length) {
+        if (!lines[i].trim()) {
+          let next = i + 1;
+          while (next < lines.length && !lines[next].trim()) next++;
+          const item = matchListItem(lines[next] ?? "");
+          const indent = (lines[next]?.match(/^\s*/)?.[0] ?? "").replace(/\t/g, "    ").length;
+          if (!(item && item.indent >= first.indent && item.ordered === first.ordered) && indent <= first.indent) break;
+          i = next;
+          continue;
+        }
+        if (/^#{1,6}\s|^\s*>|^\s*([-*_])(\s*\1){2,}\s*$/.test(lines[i])) break;
         items.push(lines[i]);
         i++;
       }
@@ -247,7 +278,7 @@ function renderBlocks(lines) {
  * @returns {string} safe HTML fragment.
  */
 export function renderMarkdownLite(text) {
-  const src = String(text ?? "");
+  const src = String(text ?? "").replace(/\u0000/g, "\ufffd");
   if (!src) return "";
 
   const lines = src.split("\n");

@@ -35,6 +35,12 @@ const TAB_ARG_KEYS = {
   form_input: ["tabId"],
   get_page_text: ["tabId"],
   javascript_tool: ["tabId"],
+  mask_sensitive_info: ["tabId"],
+  // One bounded, structured read of the current page state
+  // (openspec/changes/add-typesafe-jev-provider design.md decision 2). It is
+  // scope-checked exactly like the other reads, including on a borrowed tab —
+  // the observation the Jev runtime takes before every decision.
+  page_snapshot: ["tabId"],
   read_console_messages: ["tabId"],
   read_network_requests: ["tabId"],
   read_page: ["tabId"],

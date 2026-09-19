@@ -1,0 +1,50 @@
+import assert from "node:assert/strict";
+import { ProtocolClient } from "../extension/sidepanel/protocol-client.js";
+import { PanelController } from "../extension/sidepanel/panel-controller.js";
+import { chunkBuffer, flattenChunkedMessage } from "../host/agent/broker/chunked-transport.js";
+import { extractFunction, compile } from "./_extract.mjs";
+
+let receive, request;
+const protocol = new ProtocolClient({ createTransport: () => ({ postMessage: msg => { request = msg.envelope; }, onMessage: { addListener: fn => { receive = fn; } }, onDisconnect: { addListener() {} } }) });
+const panel = new PanelController({ protocolClient: protocol, historyStore: {}, profileCache: {} });
+protocol.connect();
+panel.currentModel = () => ({ conversationId: "c" });
+let rerenders = 0;
+panel.onUpdate(() => { rerenders++; button.isConnected = false; });
+let click;
+const slot = { textContent: "", image: null, querySelector() { return this.image; }, replaceChildren(img) { this.image = img; } };
+const button = { isConnected: true, dataset: { artifactId: "a" }, textContent: "Xem ảnh đã ghi", nextElementSibling: slot, addEventListener(type, fn) { if(type === "click") click = fn; } };
+const urls = new Set();
+const wire = compile(extractFunction("wireThumbButtons", "extension/sidepanel/sidepanel.js"), { el: { transcript: { querySelectorAll: () => [button] } }, panel, evidenceObjectUrls: urls, URL: { createObjectURL: () => "blob:historic", revokeObjectURL() {} }, Blob, document: { createElement: () => ({ addEventListener() {} }) } }, "wireThumbButtons");
+wire();
+const opening = click();
+assert.equal(request.type, "action_artifact_request");
+assert.equal(slot.textContent, "Đang tải ảnh đã ghi…");
+for (const env of flattenChunkedMessage(chunkBuffer(new Uint8Array([1,2,3]), { meta: { requestId: request.requestId, conversationId: "c", artifactId: "a", kind: "action_artifact_reply", mimeType: "image/jpeg" } }))) receive({ type: "agent_msg", envelope: env });
+await opening;
+assert.equal(rerenders, 0, "artifact transport must not rebuild transcript or collapse expanded row");
+assert.equal(slot.image.src, "blob:historic", "actual button path installs historical image after full wire transfer");
+assert.equal(button.disabled, false);
+assert.equal(urls.size, 1);
+const missing = click();
+receive({ type: "agent_msg", envelope: { type: "action_artifact", requestId: request.requestId, conversationId: "c", artifactId: "a", found: false, reason: "expired" } });
+await missing;
+assert.equal(rerenders, 0);
+assert.ok(slot.textContent.includes("không khả dụng"));
+// A timeout/disconnect drops correlation, not the distinction between byte
+// transport and transcript events. Trailing bytes never rebuild the view.
+const late = panel.artifacts.fetch({ conversationId: "c", artifactId: "late" });
+const lateSequence = flattenChunkedMessage(chunkBuffer(new Uint8Array([4,5,6]), { meta: { requestId: request.requestId, conversationId: "c", artifactId: "late", kind: "action_artifact_reply", mimeType: "image/jpeg" } }));
+receive({ type: "agent_msg", envelope: lateSequence[0] });
+panel.artifacts.disconnect();
+assert.equal((await late).reason, "disconnected");
+for (const envelope of [...lateSequence.slice(1), lateSequence[0], { type: "action_artifact", requestId: request.requestId, conversationId: "c", artifactId: "late", found: false }]) receive({ type: "agent_msg", envelope });
+assert.equal(rerenders, 0, "orphan/late retrieval envelopes are not model updates");
+// Document retrieval still reaches its own consumer before orphan filtering.
+const document = panel.documents.fetch({ conversationId: "c", documentId: "d" });
+for (const envelope of flattenChunkedMessage(chunkBuffer(new Uint8Array([7,8]), { meta: { requestId: request.requestId, conversationId: "c", documentId: "d", kind: "document_bytes", mimeType: "text/plain" } }))) receive({ type: "agent_msg", envelope });
+assert.deepEqual((await document).bytes, new Uint8Array([7,8]));
+assert.equal(rerenders, 0);
+receive({ type: "agent_msg", envelope: { type: "recording_complete" } });
+assert.equal(rerenders, 1, "genuine panel updates are not suppressed");
+console.log("PASS protocol/controller/thumbnail integration: chunks preserve DOM and render historical image; missing artifact remains visible");

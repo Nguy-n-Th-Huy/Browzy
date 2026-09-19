@@ -916,6 +916,13 @@ Parameters:
 - text (required): The JavaScript code to execute. The code will be evaluated in the page context. The result of the last expression will be returned automatically. Do NOT use 'return' statements — just write the expression you want to evaluate (e.g., 'window.myData.value' not 'return window.myData.value'). You can access and modify the DOM, call page functions, and interact with page variables. The result of the last expression will be returned automatically.
 - tabId (required): Tab ID to execute the code in. Must be a tab in the current group.
 
+MASK_SENSITIVE_INFO TOOL
+Mask sensitive information on the current page so it stays out of screenshots and page reads (read_page, get_page_text). Use it before capturing or reading a page that displays credentials, payment details (card number, CVC, expiry), account or routing numbers, one-time codes, or other personal identifiers — especially when the user asks you to be careful with them. Built-in detection covers password fields, payment inputs (autocomplete cc-*), one-time-code fields, and fields named or labelled for secrets (api keys, tokens, CSRF, SSN, IBAN, ...); for anything it misses, pass CSS selectors. Masking is presentational and text-level only: layout is preserved, no input value is changed, nothing is submitted, and action 'unmask' restores the page. It applies to the current document only — re-apply after navigation.
+Parameters:
+- action (required): 'mask' to mask sensitive elements on the page, 'unmask' to restore what this tool masked.
+- tabId (required): Tab ID to operate on. Must be a tab in the current group.
+- selectors (optional): Extra CSS selectors to mask beyond the built-in heuristics (e.g. '#iban', '.account-number'). Elements matching any selector are masked, along with their descendant form controls.
+
 \`</available_tools>\`
 
 \`<platform_specific>\`

@@ -1,0 +1,8 @@
+# Tasks: the agent's own hover survives the input shield
+
+- [x] 1 `extension/overlay/pointer-overlay.js`: carry a `hoverHeld` field on the overlay state — set when a hover settles (`complete`/`error`), cleared at the `start` of the next action that can move the pointer, carried untouched by everything else.
+- [x] 2 `shouldBlockInput()` returns false while the hold is in force, beside the in-flight and scroll-tail rules it already has.
+- [x] 3 Reuse the existing `POINTER_ACTION_TYPES` set as the "did this action move the pointer?" test — no second copy of that taxonomy in the file.
+- [x] 4 `test/overlay-pointer.test.mjs`: reducer cases (a started hover holds nothing; a settled hover holds; an observation and a capture never end a hold; the next pointer-moving action does) and a live wiring case (hover settles → the shield stays off; observation → still off; click settles → shielded again). The pointer-action set is injected into the compiled reducer FROM the shipped source, so changing that set cannot slip past the test.
+- [ ] 5 (OPEN — needs the operator) Re-run the task that exposed this against a hover-only menu and confirm the submenu stays open across the observation, the click lands, and the URL changes. Record the step rows in the change's reports.
+- [ ] 6 (OPEN — depends on 5) If the run still loops, the second defect found in the same transcript is next: `pageChanged` is true on every hover (opening a menu changes the element table), so the no-progress guard never counts to three and a hover/click ping-pong runs to the step budget. That is a separate change; the evidence is in `conv_d3bb74afe4104b5ae9`.

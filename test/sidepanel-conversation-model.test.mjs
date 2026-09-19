@@ -8,7 +8,8 @@
 
 import { ConversationModel, toolRowDisplay } from "../extension/sidepanel/conversation-model.js";
 import { RUN_PHASE, ALL_RUN_PHASES } from "../extension/sidepanel/run-states.js";
-import { redactArgsForDisplay, humanToolLabel, summarizeArgsForDetail } from "../extension/sidepanel/tool-labels.js";
+import { redactArgsForDisplay, humanToolLabel, summarizeArgsForDetail, JEV_REASON_LABELS_VI, jevOutcomeLineVi } from "../extension/sidepanel/tool-labels.js";
+import { JEV_REASON_VOCABULARY } from "../host/agent/jev/runtime.js";
 
 let fail = 0;
 function ok(cond, msg) {
@@ -891,6 +892,722 @@ console.log("== reconnect replay overlap: a snapshot page plus replayed live eve
   ok(turn.text === "phần một phần hai", "an overlapping live event at seq <= the watermark is dropped");
   m.applyEvent({ seq: 6, type: "stream_message", runId: "rr", message: { type: "assistant", message: { content: [{ type: "text", text: " ba" }] } } });
   ok(turn.text === "phần một phần hai ba" && m.highestSeq() === 6, "a newer event is applied exactly once");
+}
+
+console.log("== a Jev run records its decision steps and outcome, identically live and rebuilt ==");
+{
+  // The durable events a TypeSafe (Jev) run produces, in the pinned shape of
+  // design.md §7 as reworked by §10: the operation and its intent are the
+  // configured model's step decision, the target and its probability are the
+  // TypeSafe endpoint's element selection, and there is no
+  // `operationProbability` anywhere. No `seq` (only replayed events carry
+  // one), and no assistant text anywhere in the family.
+  const liveEvents = [
+    { type: "run_created", runId: "rj" },
+    { type: "run_started", runId: "rj" },
+    {
+      type: "jev_step",
+      runId: "rj",
+      step: 1,
+      operation: "CLICK",
+      intent: "nút Đăng nhập",
+      target: { index: 3, label: "Nút Đăng nhập" },
+      targetProbability: 0.91,
+      confidence: 0.88,
+      tool: "computer",
+      argsSummary: "action: left_click · ref: ref_3",
+      latencies: { decisionMs: 412, selectionMs: 260, dispatchMs: 88 },
+      pageChanged: true
+    },
+    {
+      type: "jev_step",
+      runId: "rj",
+      step: 2,
+      operation: "TYPE_TEXT",
+      intent: "ô nhập email",
+      target: { index: 4, label: "Email" },
+      targetProbability: 0.75,
+      confidence: 0.7,
+      tool: "form_input",
+      argsSummary: "ref: ref_4",
+      textField: "Email",
+      latencies: { decisionMs: 380, selectionMs: 300, dispatchMs: 95 },
+      pageChanged: false
+    },
+    {
+      // A decision that dispatched nothing: the runtime's own reason, and no
+      // tool at all.
+      type: "jev_step",
+      runId: "rj",
+      step: 3,
+      operation: "CLICK",
+      intent: "nút Gửi",
+      target: { index: 9, label: "Gửi" },
+      targetProbability: 0.66,
+      confidence: 0.6,
+      tool: null,
+      argsSummary: null,
+      skippedReason: "action_denied",
+      latencies: { decisionMs: 401, selectionMs: 240, dispatchMs: 0 },
+      pageChanged: false
+    },
+    { type: "jev_end", runId: "rj", outcome: "blocked", reason: "action_denied", steps: 3, doneIsDecided: false },
+    { type: "run_done", runId: "rj" }
+  ];
+  const m = new ConversationModel("j1");
+  m.addLocalUserMessage("đăng nhập giúp tôi");
+  m.bindRunToLastUserMessage("rj");
+  for (const event of liveEvents) m.applyEvent(event);
+  const turn = m.items.find((it) => it.kind === "assistant_turn");
+  ok(turn.toolRows.length === 3, `one activity row per recorded step (got ${turn.toolRows.length})`);
+  ok(turn.toolRows.map((r) => r.toolName).join(",") === "jev_click,jev_type_text,jev_click", "each row is named jev_<operation>");
+  ok(turn.text === "" && turn.lastContentKind === null, "no assistant text is ever fabricated for a Jev run");
+  ok(turn.lifecycle === "done" && turn.complete === true, "the run's own lifecycle still ends through run_done");
+
+  const first = toolRowDisplay(turn.toolRows[0]);
+  ok(
+    first.label === "Đã click (mô hình quyết định) — Jev chọn: Nút Đăng nhập",
+    `the row label names the model's operation and the element Jev selected (got "${first.label}")`
+  );
+  ok(/mô hình quyết định: CLICK/.test(first.detail), "the detail names what the configured model decided");
+  ok(/ý định: nút Đăng nhập/.test(first.detail), "…and the intent it decided it for");
+  ok(/Jev chọn · #3 · nhãn: Nút Đăng nhập/.test(first.detail), "…and the element Jev selected, with its offered index and label");
+  ok(/xác suất mục tiêu: 0.91/.test(first.detail) && /độ tin cậy: 0.88/.test(first.detail), "…with Jev's target probability and the recorded confidence");
+  ok(!/xác suất thao tác/.test(first.detail), "no operation probability is rendered — the operation is not a TypeSafe answer");
+  ok(/công cụ: computer/.test(first.detail) && /ref: ref_3/.test(first.detail), "…and the executed tool with its args summary");
+  ok(/trang đã thay đổi sau thao tác/.test(first.detail), "…and that the page changed");
+  ok(
+    /quyết định 412ms/.test(first.detail) && /chọn phần tử 260ms/.test(first.detail) && /thực thi 88ms/.test(first.detail),
+    "…and the per-stage latencies (decision, element selection, dispatch)"
+  );
+
+  const second = toolRowDisplay(turn.toolRows[1]);
+  ok(/trường văn bản: Email/.test(second.detail) && /chọn phần tử 300ms/.test(second.detail), "a TYPE_TEXT step names the field a value was written to and Jev's selection latency");
+  ok(/trang không thay đổi sau thao tác/.test(second.detail), "an unchanged page is stated when the runtime recorded it");
+
+  const third = toolRowDisplay(turn.toolRows[2]);
+  ok(turn.toolRows[2].status === "skipped", "a step that dispatched nothing is marked skipped, never succeeded");
+  ok(third.label.startsWith("Chưa gửi thao tác nào"), `a skipped step says nothing was sent (got "${third.label}")`);
+  ok(third.label.includes("người dùng đã từ chối thao tác"), "…naming the runtime's own reason");
+  ok(!/^Đã click/.test(third.label), "…and never borrows the phrasing of an action that ran");
+  ok(third.detail.includes("không gửi thao tác"), "the detail repeats the skip reason instead of a tool call");
+  ok(!/công cụ: /.test(third.detail), "a skipped step shows no executed tool it never ran");
+  ok(
+    !("operationProbability" in turn.toolRows[0].jev) && !("operationProbability" in third.jev),
+    "the copied step record carries no operationProbability at all (Jev is not asked about operations)"
+  );
+
+  // A record from a host that still carried `operationProbability` renders
+  // without it: the panel must never present an operation probability the
+  // reworked runtime cannot produce.
+  const legacy = new ConversationModel("c-jev-legacy");
+  legacy.applyEvent({ type: "run_started", runId: "rl" });
+  legacy.applyEvent({
+    type: "jev_step",
+    runId: "rl",
+    step: 1,
+    operation: "CLICK",
+    operationProbability: 0.82,
+    target: { index: 2, label: "Tiếp" },
+    targetProbability: 0.9,
+    confidence: 0.8,
+    latencies: { decisionMs: 300, textMs: 500, dispatchMs: 40 },
+    pageChanged: true
+  });
+  const legacyRow = toolRowDisplay(legacy.items.find((it) => it.kind === "assistant_turn").toolRows[0]);
+  ok(!/xác suất thao tác/.test(legacyRow.detail), `a legacy operationProbability is never rendered (got "${legacyRow.detail}")`);
+  ok(!/văn bản 500ms/.test(legacyRow.detail), "…and neither is the removed text-value stage latency");
+  ok(/xác suất mục tiêu: 0.9/.test(legacyRow.detail) && /quyết định 300ms/.test(legacyRow.detail), "…while the fields that still exist render unchanged");
+
+  // The DONE row reads as the outcome it is (never a truncated "nothing
+  // sent"), and the recorded observation — what the model actually saw, its
+  // size, what the bound cut, and a sample of the offered names — renders in
+  // the detail for every step that carries it.
+  const mDone = new ConversationModel("c-jev-done");
+  mDone.applyEvent({ type: "run_started", runId: "rd" });
+  mDone.applyEvent({
+    type: "jev_step",
+    runId: "rd",
+    step: 1,
+    operation: "DONE",
+    tool: null,
+    target: null,
+    latencies: { decisionMs: 250 },
+    pageChanged: false,
+    skippedReason: "done",
+    observed: { url: "https://example.com/list", elements: 250, omitted: { elements: 198, selectOptions: 0 }, sample: ["Nơi thực hiện", "Tìm kiếm"] }
+  });
+  const doneTurn = mDone.items.find((it) => it.kind === "assistant_turn");
+  const doneRow = toolRowDisplay(doneTurn.toolRows[0]);
+  ok(doneRow.label === "Quyết định DONE — mô hình báo xong", `a DONE step names the decision (got "${doneRow.label}")`);
+  ok(/quan sát: 250 phần tử, bị cắt 198/.test(doneRow.detail), `the detail lists what the model saw and what was cut (got "${doneRow.detail}")`);
+  ok(/mẫu: Nơi thực hiện · Tìm kiếm/.test(doneRow.detail), "…including a sample of the offered names");
+
+  // The run's own report becomes the turn's answer text — the deliverable a
+  // finished run owes the operator — and a rebuild replays it identically.
+  mDone.applyEvent({ type: "jev_result", runId: "rd", text: "Đã lọc được 10 TBMT tại Hải Phòng." });
+  ok(doneTurn.text === "Đã lọc được 10 TBMT tại Hải Phòng.", `the run's report becomes the turn's answer text (got "${doneTurn.text}")`);
+  ok(doneTurn.lastContentKind === "text", "…and counts as answer text for the busy indicator");
+  const rebuiltDone = new ConversationModel("c-jev-done-2");
+  rebuiltDone.applySnapshot({
+    conversationId: "c-jev-done-2",
+    meta: {},
+    lastSeq: 2,
+    firstSeq: 1,
+    hasOlder: false,
+    events: [
+      { seq: 1, type: "run_started", runId: "rd" },
+      { seq: 2, type: "jev_result", runId: "rd", text: "Đã lọc được 10 TBMT tại Hải Phòng." }
+    ]
+  });
+  const rebuiltTurn = rebuiltDone.items.find((it) => it.kind === "assistant_turn");
+  ok(rebuiltTurn && rebuiltTurn.text === "Đã lọc được 10 TBMT tại Hải Phòng.", "…and a rebuild restores it identically");
+
+  ok(
+    turn.jevOutcome && turn.jevOutcome.outcome === "blocked" && turn.jevOutcome.reason === "action_denied" && turn.jevOutcome.steps === 3,
+    "the terminal outcome is recorded exactly as the runtime reported it"
+  );
+
+  // Reconnect: the SAME facts, now durably seq-stamped, through a snapshot.
+  const snapshot = liveEvents.map((event, index) => ({ ...event, seq: index + 1 }));
+  const liveRows = JSON.stringify(turn.toolRows);
+  m.applySnapshot({ conversationId: "j1", meta: {}, lastSeq: snapshot.length, firstSeq: 1, hasOlder: false, events: snapshot });
+  m.applySnapshot({ conversationId: "j1", meta: {}, lastSeq: snapshot.length, firstSeq: 1, hasOlder: false, events: snapshot });
+  const rebuilt = m.items.find((it) => it.kind === "assistant_turn");
+  ok(m.items.filter((it) => it.kind === "assistant_turn").length === 1, "a reconnect never creates a second turn for the Jev run");
+  ok(rebuilt.toolRows.length === 3, "no duplicate step rows after a reconnect");
+  ok(JSON.stringify(rebuilt.toolRows) === liveRows, "the rebuilt step rows are byte-identical to the live ones");
+  ok(
+    rebuilt.jevOutcome && rebuilt.jevOutcome.outcome === "blocked" && rebuilt.jevOutcome.reason === "action_denied" && rebuilt.jevOutcome.steps === 3,
+    "the outcome is restored from the transcript, not lost"
+  );
+  ok(rebuilt.text === "", "the rebuilt turn still contains no fabricated assistant text");
+}
+
+console.log("== evaluation and an abstained selection carry onto the step row, live and restored ==");
+{
+  // add-jev-run-context extended (improve-jev-step-reasoning): the decision's
+  // own `evaluation` of the step before it, and the `targetAbstained`/
+  // `runnerUpProbability` pair a `target_unresolved` skip carries when the
+  // selection WAS received and validated but named no clear winner. Both
+  // must survive a reconnect rebuild exactly like every other step field.
+  const liveEvents = [
+    { type: "run_created", runId: "rev" },
+    { type: "run_started", runId: "rev" },
+    {
+      type: "jev_step",
+      runId: "rev",
+      step: 1,
+      operation: "CLICK",
+      intent: "nút Đăng nhập",
+      evaluation: "Bước trước nhằm mở trang đăng nhập; trang hiện đã hiển thị biểu mẫu đăng nhập.",
+      target: { index: 2, label: "Nút Đăng nhập" },
+      targetProbability: 0.88,
+      confidence: 0.8,
+      tool: "computer",
+      argsSummary: "action: left_click",
+      latencies: { decisionMs: 300, selectionMs: 200, dispatchMs: 60 },
+      pageChanged: true
+    },
+    {
+      // A validated selection that named no clear winner: an abstained skip,
+      // never a failure, and distinguishable from a step with no compatible
+      // candidate at all.
+      type: "jev_step",
+      runId: "rev",
+      step: 2,
+      operation: "CLICK",
+      intent: "nút Xác nhận",
+      evaluation: "Bước trước nhằm điền biểu mẫu; trang chưa cho thấy đã lưu.",
+      target: null,
+      targetProbability: 0.42,
+      confidence: 0.3,
+      runnerUpProbability: 0.39,
+      tool: null,
+      argsSummary: null,
+      skippedReason: "target_unresolved",
+      targetAbstained: true,
+      latencies: { decisionMs: 280, selectionMs: 190 },
+      pageChanged: false
+    },
+    { type: "jev_end", runId: "rev", outcome: "blocked", reason: "no_progress", steps: 2, doneIsDecided: false },
+    { type: "run_done", runId: "rev" }
+  ];
+  const m = new ConversationModel("j-eval");
+  m.addLocalUserMessage("đăng nhập giúp tôi");
+  m.bindRunToLastUserMessage("rev");
+  for (const event of liveEvents) m.applyEvent(event);
+  const turn = m.items.find((it) => it.kind === "assistant_turn");
+
+  ok(turn.toolRows[0].jev.evaluation === liveEvents[2].evaluation, "the evaluation is carried onto the step row verbatim");
+  ok(turn.toolRows[1].jev.targetAbstained === true, "the abstain flag is carried onto the step row");
+  ok(turn.toolRows[1].jev.runnerUpProbability === 0.39, "…with the runner-up probability that caused it");
+
+  const executed = toolRowDisplay(turn.toolRows[0]);
+  ok(/đánh giá bước trước: Bước trước nhằm mở trang đăng nhập/.test(executed.detail), "the evaluation renders as a human-readable line on the row, like intent and target");
+
+  const abstained = toolRowDisplay(turn.toolRows[1]);
+  ok(
+    abstained.label.startsWith("Bỏ qua bước") && /độ tin cậy.*thấp/.test(abstained.label),
+    `an abstained selection reads as a skip naming low selection confidence (got "${abstained.label}")`
+  );
+  ok(!/thất bại|lỗi/i.test(abstained.label), "…never worded as a failure");
+  ok(/xác suất á quân: 0.39/.test(abstained.detail), "…with the runner-up probability that caused it shown in the detail");
+
+  // The plain "no compatible candidate" case shares the same runtime reason
+  // but carries no `targetAbstained` flag — its label and detail must stay
+  // visibly distinct from the abstained wording above.
+  const noCandidate = toolRowDisplay({
+    jev: {
+      step: 3,
+      operation: "CLICK",
+      intent: "nút Xác nhận",
+      target: null,
+      targetProbability: null,
+      confidence: null,
+      skippedReason: "target_unresolved",
+      latencies: { decisionMs: 300 }
+    }
+  });
+  ok(noCandidate.label !== abstained.label, "a no-compatible-candidate skip is visibly distinct from an abstained one");
+  ok(!noCandidate.label.startsWith("Bỏ qua bước"), "…and keeps the existing 'nothing sent' wording rather than the abstain wording");
+  ok(noCandidate.label.includes("mục tiêu đã chọn không còn trong không gian thao tác"), "…naming the runtime's own no-candidate reason");
+  ok(!/xác suất á quân/.test(noCandidate.detail), "…and shows no runner-up probability, since none was ever selected");
+
+  // Reconnect: the same facts, now durably seq-stamped through a snapshot.
+  const snapshot = liveEvents.map((event, index) => ({ ...event, seq: index + 1 }));
+  const liveRows = JSON.stringify(turn.toolRows);
+  m.applySnapshot({ conversationId: "j-eval", meta: {}, lastSeq: snapshot.length, firstSeq: 1, hasOlder: false, events: snapshot });
+  m.applySnapshot({ conversationId: "j-eval", meta: {}, lastSeq: snapshot.length, firstSeq: 1, hasOlder: false, events: snapshot });
+  const rebuilt = m.items.find((it) => it.kind === "assistant_turn");
+  ok(m.items.filter((it) => it.kind === "assistant_turn").length === 1, "a reconnect never creates a second turn for this run");
+  ok(rebuilt.toolRows.length === 2, "no duplicate step rows after a reconnect");
+  ok(JSON.stringify(rebuilt.toolRows) === liveRows, "the rebuilt step rows — evaluation and the abstain fields included — are byte-identical to the live ones");
+  const rebuiltAbstained = toolRowDisplay(rebuilt.toolRows[1]);
+  ok(rebuiltAbstained.label === abstained.label, "…and render the same abstained-skip label after the rebuild");
+}
+
+console.log("== a Jev run's memory rows appear live and rebuild identically ==");
+{
+  // The durable `jev_memory` family (add-jev-run-context design.md §7): the
+  // run's plan, each context revision, and each stall recovery — the model's
+  // own words, carried verbatim, one row each, in the event's own 1-based
+  // order, with the event's own index as the row key.
+  const plan = { plan: "Mở trang tra cứu, lọc theo tỉnh Hải Phòng, đọc kết quả", doneWhen: "Danh sách kết quả hiển thị đúng bộ lọc Hải Phòng", notes: "Chưa mở bộ lọc" };
+  const revised = { plan: "Mở trang tra cứu, lọc theo tỉnh Hải Phòng, đọc kết quả", doneWhen: "Danh sách kết quả hiển thị đúng bộ lọc Hải Phòng", notes: "Đã mở bộ lọc, còn chọn tỉnh" };
+  const recovered = { plan: "Chuyển sang dùng ô tìm kiếm thay vì bộ lọc", doneWhen: "Kết quả tìm kiếm hiển thị danh sách cần đọc", notes: "Bộ lọc không phản hồi; thử ô tìm kiếm" };
+  const liveEvents = [
+    { type: "run_created", runId: "rm" },
+    { type: "run_started", runId: "rm" },
+    { type: "jev_memory", runId: "rm", index: 1, kind: "plan", trigger: "start", memory: plan, latencyMs: 900 },
+    { type: "jev_step", runId: "rm", step: 1, operation: "CLICK", intent: "nút mở bộ lọc", target: { index: 3, label: "Bộ lọc" }, targetProbability: 0.9, confidence: 0.8, tool: "computer", argsSummary: "action: left_click", latencies: { decisionMs: 400, selectionMs: 250, dispatchMs: 80 }, pageChanged: true },
+    { type: "jev_memory", runId: "rm", index: 2, kind: "update", trigger: "navigated", memory: revised, latencyMs: 1100 },
+    { type: "jev_memory", runId: "rm", index: 3, kind: "recovery", trigger: "stall", memory: recovered, latencyMs: 1250 },
+    { type: "jev_step", runId: "rm", step: 2, operation: "DONE", tool: null, target: null, latencies: { decisionMs: 300 }, pageChanged: false, skippedReason: "done", verification: { achieved: true } },
+    { type: "jev_end", runId: "rm", outcome: "done", reason: null, steps: 2, doneIsDecided: true, doneVerified: true },
+    { type: "run_done", runId: "rm" }
+  ];
+  const m = new ConversationModel("jm");
+  m.addLocalUserMessage("lọc theo Hải Phòng giúp tôi");
+  m.bindRunToLastUserMessage("rm");
+  for (const event of liveEvents) m.applyEvent(event);
+  const turn = m.items.find((it) => it.kind === "assistant_turn");
+  ok(
+    turn.toolRows.map((r) => r.key).join(",") === "jev_memory_1,jev_1,jev_memory_2,jev_memory_3,jev_2",
+    `each memory row keeps the event's own 1-based index as its key, in recorded order (got ${turn.toolRows.map((r) => r.key).join(",")})`
+  );
+  ok(turn.toolRows.filter((r) => r.jevMemory).length === 3, "every jev_memory event became exactly one row");
+  const memoryRow = turn.toolRows[0];
+  ok(memoryRow.toolName === "jev_memory" && memoryRow.status === "succeeded", "a memory row is a succeeded record, never a skipped action or a running one");
+  ok(
+    JSON.stringify(memoryRow.jevMemory) === JSON.stringify({ index: 1, kind: "plan", trigger: "start", memory: plan, latencyMs: 900 }),
+    "the row carries the event's fields verbatim"
+  );
+  const planDisplay = toolRowDisplay(memoryRow);
+  ok(planDisplay.label === "Kế hoạch lượt chạy — khi bắt đầu", `the plan row is labelled by kind and trigger (got "${planDisplay.label}")`);
+  ok(
+    planDisplay.detail.includes(`kế hoạch: ${plan.plan}`) &&
+      planDisplay.detail.includes(`điều kiện hoàn thành: ${plan.doneWhen}`) &&
+      planDisplay.detail.includes(`ghi chú: ${plan.notes}`),
+    "…and its detail shows the model's plan, completion condition, and notes verbatim"
+  );
+  ok(planDisplay.detail.includes("bản ghi 1") && planDisplay.detail.includes("thời gian: 900ms"), "…with the record's own index and the call's latency");
+  const updateDisplay = toolRowDisplay(turn.toolRows[2]);
+  ok(updateDisplay.label === "Cập nhật ngữ cảnh — trang đã chuyển", `a revision row names what triggered it (got "${updateDisplay.label}")`);
+  ok(updateDisplay.detail.includes(revised.notes), "…and carries the revised context");
+  const recoveryDisplay = toolRowDisplay(turn.toolRows[3]);
+  ok(recoveryDisplay.label === "Gỡ bế tắc — khi bế tắc", `a stall recovery reads as the recovery it is (got "${recoveryDisplay.label}")`);
+  ok(recoveryDisplay.detail.includes(recovered.plan), "…with the recovery guidance as the new plan");
+  ok(turn.jevOutcome && turn.jevOutcome.doneVerified === true, "the terminal record's verified completion is carried onto the turn");
+  ok(turn.text === "", "memory rows fabricate no assistant text either");
+
+  // Reconnect: the same facts, now durably seq-stamped — the memory rows must
+  // reproduce exactly, keys included, with no second copy.
+  const snapshot = liveEvents.map((event, index) => ({ ...event, seq: index + 1 }));
+  const liveRows = JSON.stringify(turn.toolRows);
+  m.applySnapshot({ conversationId: "jm", meta: {}, lastSeq: snapshot.length, firstSeq: 1, hasOlder: false, events: snapshot });
+  m.applySnapshot({ conversationId: "jm", meta: {}, lastSeq: snapshot.length, firstSeq: 1, hasOlder: false, events: snapshot });
+  const rebuilt = m.items.find((it) => it.kind === "assistant_turn");
+  ok(m.items.filter((it) => it.kind === "assistant_turn").length === 1, "a reconnect never creates a second turn for the memory rows");
+  ok(rebuilt.toolRows.length === 5, `no duplicated memory rows after a reconnect (got ${rebuilt.toolRows.length})`);
+  ok(JSON.stringify(rebuilt.toolRows) === liveRows, "the rebuilt memory rows are byte-identical to the live ones, keys included");
+  ok(rebuilt.jevOutcome.doneVerified === true, "the verified completion survives the rebuild");
+}
+
+console.log("== the completion check's verdict is rendered on the DONE step and in the outcome ==");
+{
+  const model = new ConversationModel("submission-check");
+  const events = [{ type: "run_started", runId: "submission-check-run" }, {
+    type: "jev_step", runId: "submission-check-run", step: 2, operation: "CLICK", decisionSource: "jev",
+    target: { label: "Search" }, tool: null, skippedReason: "done", verificationTrigger: "repeated_submission", verification: { achieved: true }
+  }];
+  events.forEach((event) => model.applyEvent(event));
+  const live = model.items.find((item) => item.kind === "assistant_turn").toolRows[0];
+  const display = toolRowDisplay(live);
+  ok(display.label === "Kiểm tra trước khi gửi lại — hoàn thành đã được xác nhận", "host submission checkpoint is labeled as independent verification");
+  ok(!display.label.includes("DONE"), "host verification never claims Jev selected DONE");
+  model.applySnapshot({ conversationId: "submission-check", meta: {}, lastSeq: events.length, firstSeq: 1, hasOlder: false,
+    events: events.map((event, index) => ({ ...event, seq: index + 1 })) });
+  const replayed = model.items.find((item) => item.kind === "assistant_turn").toolRows[0];
+  ok(JSON.stringify(replayed) === JSON.stringify(live), "submission verification attribution survives durable replay");
+}
+{
+  // Confirmed: the DONE step records the check's verdict and the run ends
+  // verified — the line must not also carry the judgment-alone disclosure.
+  const confirmed = new ConversationModel("jc");
+  confirmed.applyEvent({ type: "run_started", runId: "rc" });
+  confirmed.applyEvent({
+    type: "jev_step",
+    runId: "rc",
+    step: 1,
+    operation: "DONE",
+    tool: null,
+    target: null,
+    latencies: { decisionMs: 250 },
+    pageChanged: false,
+    skippedReason: "done",
+    verification: { achieved: true }
+  });
+  confirmed.applyEvent({ type: "jev_end", runId: "rc", outcome: "done", reason: null, steps: 1, doneIsDecided: true, doneVerified: true });
+  const confirmedTurn = confirmed.items.find((it) => it.kind === "assistant_turn");
+  const confirmedRow = toolRowDisplay(confirmedTurn.toolRows[0]);
+  ok(confirmedRow.label === "Quyết định DONE — hoàn thành đã được kiểm chứng", `a confirmed DONE says the check confirmed it (got "${confirmedRow.label}")`);
+  ok(confirmedRow.detail.includes("kiểm tra hoàn thành: đã xác nhận"), "…and its detail carries the verdict");
+  const verifiedLine = jevOutcomeLineVi(confirmedTurn.jevOutcome);
+  ok(verifiedLine.includes("Đã xong") && verifiedLine.includes("kiểm tra hoàn thành đã xác nhận"), `a verified completion says so: ${verifiedLine}`);
+  ok(!verifiedLine.includes("chưa được kiểm chứng"), "…and never also claims the decision model's judgment alone");
+
+  // Confirmed but with no usable report: the check's own failure rides on the
+  // record (`summaryError`) and the line names it — distinguishable from the
+  // plain confirmation above, and without the raw error text.
+  const noReport = new ConversationModel("jcn");
+  noReport.applyEvent({ type: "run_started", runId: "rn" });
+  noReport.applyEvent({
+    type: "jev_step",
+    runId: "rn",
+    step: 1,
+    operation: "DONE",
+    tool: null,
+    target: null,
+    latencies: { decisionMs: 250 },
+    pageChanged: false,
+    skippedReason: "done",
+    verification: { achieved: true }
+  });
+  noReport.applyEvent({
+    type: "jev_end",
+    runId: "rn",
+    outcome: "done",
+    reason: null,
+    steps: 1,
+    doneIsDecided: true,
+    doneVerified: true,
+    summaryError: "the completion check confirmed the goal but produced no report"
+  });
+  const noReportTurn = noReport.items.find((it) => it.kind === "assistant_turn");
+  ok(noReportTurn.jevOutcome.summaryError === "the completion check confirmed the goal but produced no report", "the check's recorded failure is carried onto the turn");
+  const noReportLine = jevOutcomeLineVi(noReportTurn.jevOutcome);
+  ok(
+    noReportLine.includes("kiểm tra hoàn thành đã xác nhận") && noReportLine.includes("không tạo được báo cáo"),
+    `a confirmation without a usable report says so: ${noReportLine}`
+  );
+  ok(!noReportLine.includes("completion check") && !noReportLine.includes("produced no report"), "…without printing the raw error text");
+
+  // Rejected: the step is recorded as skipped with the check's verdict — never
+  // as a completion — and the loop continues (no terminal done exists here).
+  const rejected = new ConversationModel("jr");
+  rejected.applyEvent({ type: "run_started", runId: "rr" });
+  rejected.applyEvent({
+    type: "jev_step",
+    runId: "rr",
+    step: 1,
+    operation: "DONE",
+    tool: null,
+    target: null,
+    latencies: { decisionMs: 250 },
+    pageChanged: false,
+    skippedReason: "completion_rejected",
+    verification: { achieved: false }
+  });
+  const rejectedTurn = rejected.items.find((it) => it.kind === "assistant_turn");
+  const rejectedRow = toolRowDisplay(rejectedTurn.toolRows[0]);
+  ok(rejectedTurn.toolRows[0].status === "skipped", "a rejected completion claim is a skipped step, never a completion");
+  ok(
+    !/Đã xong/.test(rejectedRow.label) && rejectedRow.label.includes("kiểm tra hoàn thành chưa xác nhận"),
+    `…labelled with the check's rejection (got "${rejectedRow.label}")`
+  );
+  ok(!rejectedRow.label.includes("completion_rejected"), "no raw reason token survives the label table");
+  ok(rejectedRow.detail.includes("kiểm tra hoàn thành: chưa xác nhận — chưa tính là hoàn thành"), "…and the verdict is repeated in the detail");
+
+  // Unavailable: the check could not be made, so the run still ends done — as
+  // the decision model's judgment — and the step records no verdict, with the
+  // check's own error named.
+  const unavailable = new ConversationModel("ju");
+  unavailable.applyEvent({ type: "run_started", runId: "ru" });
+  unavailable.applyEvent({
+    type: "jev_step",
+    runId: "ru",
+    step: 1,
+    operation: "DONE",
+    tool: null,
+    target: null,
+    latencies: { decisionMs: 250 },
+    pageChanged: false,
+    skippedReason: "done",
+    verification: { achieved: null, error: "HTTP 503" }
+  });
+  unavailable.applyEvent({ type: "jev_end", runId: "ru", outcome: "done", reason: null, steps: 1, doneIsDecided: true, doneVerified: false });
+  const unavailableTurn = unavailable.items.find((it) => it.kind === "assistant_turn");
+  const unavailableRow = toolRowDisplay(unavailableTurn.toolRows[0]);
+  ok(unavailableRow.detail.includes("kiểm tra hoàn thành: không thực hiện được (HTTP 503)"), `an unavailable check says why (got "${unavailableRow.detail}")`);
+  ok(unavailableTurn.jevOutcome.doneVerified === false, "…and the turn records that no verification happened");
+  const judgmentLine = jevOutcomeLineVi(unavailableTurn.jevOutcome);
+  ok(
+    judgmentLine.includes("theo quyết định của mô hình, chưa được kiểm chứng độc lập"),
+    `an unverified completion discloses the decision model's judgment alone: ${judgmentLine}`
+  );
+
+  // The check itself could not be made and that failure is on the record: the
+  // line says which of the two disclosed failures this is — still the
+  // judgment-alone disclosure, still no raw error text.
+  const checkFailed = new ConversationModel("jcf");
+  checkFailed.applyEvent({ type: "run_started", runId: "rf" });
+  checkFailed.applyEvent({ type: "jev_end", runId: "rf", outcome: "done", reason: null, steps: 1, doneIsDecided: true, doneVerified: false, summaryError: "HTTP 503" });
+  const checkFailedTurn = checkFailed.items.find((it) => it.kind === "assistant_turn");
+  ok(checkFailedTurn.jevOutcome.summaryError === "HTTP 503", "the check's failure is carried onto the turn");
+  const checkFailedLine = jevOutcomeLineVi(checkFailedTurn.jevOutcome);
+  ok(
+    checkFailedLine.includes("theo quyết định của mô hình, chưa được kiểm chứng độc lập") && checkFailedLine.includes("không thực hiện được kiểm tra hoàn thành"),
+    `a check that could not be made names that: ${checkFailedLine}`
+  );
+  ok(!checkFailedLine.includes("HTTP 503"), "…without printing the raw error text");
+
+  // Legacy/exactness: a record with no summaryError renders exactly the line
+  // it rendered before the field existed (doneVerified true, false, and
+  // absent alike).
+  ok(
+    jevOutcomeLineVi({ outcome: "done", reason: null, steps: 2, doneIsDecided: true, doneVerified: true }) === "Đã xong · kiểm tra hoàn thành đã xác nhận · 2 bước",
+    "a confirmed record without summaryError renders exactly as before"
+  );
+  ok(
+    jevOutcomeLineVi({ outcome: "done", reason: null, steps: 2, doneIsDecided: true, doneVerified: false }) ===
+      "Đã xong · theo quyết định của mô hình, chưa được kiểm chứng độc lập · 2 bước",
+    "an unverified record without summaryError renders exactly as before"
+  );
+  ok(
+    jevOutcomeLineVi({ outcome: "done", reason: null, steps: 2, doneIsDecided: true }) === "Đã xong · theo quyết định của mô hình, chưa được kiểm chứng độc lập · 2 bước",
+    "a legacy record with no doneVerified renders exactly as before"
+  );
+
+  // Blocked with completion_unverified: the done claims were disputed to the
+  // bound — it must never read as a completion.
+  const blockedLine = jevOutcomeLineVi({ outcome: "blocked", reason: "completion_unverified", steps: 4, doneIsDecided: false });
+  ok(!blockedLine.includes("Đã xong"), `an unverified completion is never presented as done: ${blockedLine}`);
+  ok(blockedLine.includes("kiểm tra hoàn thành chưa xác nhận hoặc không thực hiện được"), `…and names the reason in Vietnamese: ${blockedLine}`);
+  ok(!blockedLine.includes("completion_unverified"), "…with no raw reason token left in the line");
+}
+
+console.log("== an interrupted Jev run keeps its executed steps and is labelled distinctly ==");
+{
+  // Stopped after two executed steps: both stay visible, the terminal state is
+  // "stopped" (not a completion), and the generic stopped note still applies.
+  const stopped = new ConversationModel("j2");
+  stopped.addLocalUserMessage("đặt vé");
+  stopped.bindRunToLastUserMessage("js");
+  stopped.applyEvent({ type: "run_created", runId: "js" });
+  stopped.applyEvent({ type: "run_started", runId: "js" });
+  stopped.applyEvent({ type: "jev_step", runId: "js", step: 1, operation: "CLICK", tool: "computer", argsSummary: "action: left_click", target: { index: 1, label: "Tìm chuyến" }, latencies: { decisionMs: 300, dispatchMs: 70 }, pageChanged: true });
+  stopped.applyEvent({ type: "jev_step", runId: "js", step: 2, operation: "CLICK", tool: "computer", argsSummary: "action: left_click", target: { index: 2, label: "Chọn chuyến 8h" }, latencies: { decisionMs: 310, dispatchMs: 65 }, pageChanged: true });
+  stopped.markStopRequested();
+  stopped.applyEvent({ type: "run_stopped", runId: "js", reason: "user_stop" });
+  stopped.applyEvent({ type: "jev_end", runId: "js", outcome: "stopped", reason: "stopped", steps: 2, doneIsDecided: false });
+  const stoppedTurn = stopped.items.find((it) => it.kind === "assistant_turn");
+  ok(stoppedTurn.lifecycle === "stopped" && stoppedTurn.complete === false, "a stopped Jev run is stopped and not complete");
+  ok(stoppedTurn.toolRows.length === 2 && stoppedTurn.toolRows.every((r) => r.status === "succeeded"), "only the steps that actually ran are shown, none left as running");
+  ok(stoppedTurn.jevOutcome.outcome === "stopped", "the outcome says stopped, distinct from a completion");
+  ok(
+    jevOutcomeLineVi(stoppedTurn.jevOutcome).includes("lượt chạy đã bị dừng"),
+    `the runtime's own stop reason is shown translated, never as the raw token: ${jevOutcomeLineVi(stoppedTurn.jevOutcome)}`
+  );
+  ok(stoppedTurn.text === "", "a stopped Jev run still shows no invented answer text");
+
+  // Failed: a hard runtime failure (here an invalid decision) ends the run with
+  // run_error, and its own outcome line says failed.
+  const failed = new ConversationModel("j3");
+  failed.addLocalUserMessage("mua hàng");
+  failed.bindRunToLastUserMessage("jf");
+  failed.applyEvent({ type: "run_created", runId: "jf" });
+  failed.applyEvent({ type: "run_started", runId: "jf" });
+  failed.applyEvent({ type: "jev_step", runId: "jf", step: 1, operation: "SCROLL_DOWN", tool: "computer", argsSummary: "action: scroll", latencies: { decisionMs: 355, dispatchMs: 120 }, pageChanged: true });
+  failed.applyEvent({ type: "run_error", runId: "jf", reason: "invalid_decision", detail: "probabilities do not sum to 1" });
+  failed.applyEvent({ type: "jev_end", runId: "jf", outcome: "error", reason: "invalid_decision", steps: 1, doneIsDecided: false });
+  const failedTurn = failed.items.find((it) => it.kind === "assistant_turn");
+  ok(failedTurn.lifecycle === "error" && failedTurn.complete === false, "a failed Jev run is an error, never a completion");
+  ok(failedTurn.toolRows.length === 1 && failedTurn.toolRows[0].status === "succeeded", "the step that did run stays visible under the failure");
+  ok(failedTurn.jevOutcome.outcome === "error" && failedTurn.jevOutcome.reason === "invalid_decision", "the failure is named by its own recorded reason");
+  const failedLine = jevOutcomeLineVi(failedTurn.jevOutcome);
+  ok(failedLine.includes("câu trả lời của TypeSafe không hợp lệ"), `the invalid decision is shown in Vietnamese: ${failedLine}`);
+  ok(!failedLine.includes("invalid_decision"), "no raw reason token survives the label table");
+}
+
+console.log("== a Jev step only claims what the runtime recorded ==");
+{
+  // An operation this panel has no label for still gets an honest label; an
+  // omitted `pageChanged` is never rendered as "the page did not change".
+  const m = new ConversationModel("j4");
+  m.applyEvent({ type: "run_created", runId: "ju" });
+  m.applyEvent({ type: "jev_step", runId: "ju", step: 1, operation: "FLY", tool: "computer", argsSummary: "action: fly", latencies: { decisionMs: 200, dispatchMs: 40 } });
+  const row = m.items.find((it) => it.kind === "assistant_turn").toolRows[0];
+  const display = toolRowDisplay(row);
+  ok(
+    display.label === "Đã thực hiện thao tác FLY (mô hình quyết định)",
+    `an unmapped operation gets an honest label naming what was decided (got "${display.label}")`
+  );
+  ok(!/trang (đã|không) thay đổi/.test(display.detail), "an omitted pageChanged is not presented as an observation");
+  ok(
+    display.detail.includes("bước 1") && display.detail.includes("mô hình quyết định: FLY") && display.detail.includes("quyết định 200ms"),
+    "the step number, the decided operation and the latencies that WERE recorded are still shown"
+  );
+
+  // A target-bearing step whose intent is all the model got out (no element
+  // was ever selected) names the wanted element by that intent instead of
+  // inventing a target — and a step with no intent at all renders without the
+  // line rather than as an empty claim.
+  const unresolved = toolRowDisplay({
+    jev: { step: 2, operation: "CLICK", intent: "nút Gửi", target: null, targetProbability: null, confidence: null, skippedReason: "target_unresolved", latencies: { decisionMs: 350 } }
+  });
+  ok(
+    unresolved.label.includes("mô hình quyết định CLICK") && unresolved.label.includes("ý định: nút Gửi"),
+    `an unresolved target names what the model was after (got "${unresolved.label}")`
+  );
+  ok(unresolved.label.includes("mục tiêu đã chọn không còn trong không gian thao tác"), "…with the runtime's own reason");
+  const intentless = toolRowDisplay({ jev: { step: 3, operation: "SCROLL_DOWN", latencies: { decisionMs: 180 } } });
+  ok(!/ý định:/.test(intentless.detail), "a step with no recorded intent renders no intent line at all");
+
+  // Totality (the contract tool-labels.js states for its whole step section):
+  // an empty or malformed record — one from an older host, or a partially
+  // written event — renders an honest generic line instead of throwing.
+  const empty = toolRowDisplay({ jev: {} });
+  ok(empty.label === "Đã thực hiện một thao tác (mô hình quyết định)", `an empty record still renders a label (got "${empty.label}")`);
+  ok(empty.detail === "mô hình quyết định: (không rõ)", `…and a detail naming nothing it was not told (got "${empty.detail}")`);
+  const noSelection = toolRowDisplay({ jev: { operation: "CLICK", target: {}, targetProbability: null, confidence: null } });
+  ok(!/Jev chọn/.test(noSelection.detail), "a target object with no index or label makes no selection claim");
+  ok(toolRowDisplay({}).detail === "", "a row with no Jev record at all is untouched by the Jev copy");
+
+  // A `jev_end` arriving after the run's own terminal event still lands on the
+  // turn (this is why sidepanel.js's structure signature includes it).
+  const late = new ConversationModel("j5");
+  late.applyEvent({ type: "run_created", runId: "jl" });
+  late.applyEvent({ type: "run_started", runId: "jl" });
+  late.applyEvent({ type: "run_done", runId: "jl" });
+  late.applyEvent({ type: "jev_end", runId: "jl", outcome: "done", reason: null, steps: 0, doneIsDecided: true });
+  const lateTurn = late.items.find((it) => it.kind === "assistant_turn");
+  ok(
+    lateTurn.jevOutcome && lateTurn.jevOutcome.outcome === "done" && lateTurn.jevOutcome.doneIsDecided === true,
+    "a jev_end that follows run_done is still recorded on the same turn"
+  );
+}
+
+console.log("== the Jev reason table and the runtime's vocabulary cannot drift apart ==");
+{
+  // The panel translates exactly what the runtime can record: every reason in
+  // host/agent/jev/runtime.js's exported vocabulary has Vietnamese copy here,
+  // and no label is left behind for a reason nothing can produce (the dead
+  // `jev_invalid_response` key this table replaced rendered nothing at all
+  // while real invalid-decision failures showed the raw English token).
+  const vocabulary = new Set(Object.values(JEV_REASON_VOCABULARY).flat());
+  const labelled = new Set(Object.keys(JEV_REASON_LABELS_VI));
+  const missing = [...vocabulary].filter((reason) => !labelled.has(reason));
+  const dead = [...labelled].filter((reason) => !vocabulary.has(reason));
+  ok(missing.length === 0, `every reason the runtime records has Vietnamese copy (missing: ${missing.join(", ") || "none"})`);
+  ok(dead.length === 0, `no label names a reason the runtime cannot record (dead: ${dead.join(", ") || "none"})`);
+}
+
+// --- every finished run answers, and an absence is disclosed ---------------
+{
+  // A blocked run now carries its answer text like any other turn, and the
+  // terminal line says nothing special about it.
+  const m = new ConversationModel("j-answer");
+  m.addLocalUserMessage("tìm giúp tôi chuyến bay");
+  m.bindRunToLastUserMessage("ra");
+  for (const event of [
+    { type: "jev_result", runId: "ra", text: "Đã mở trang tìm kiếm nhưng kết quả nằm sau đăng nhập.", latencyMs: 900 },
+    { type: "jev_end", runId: "ra", outcome: "blocked", reason: "needs_operator", steps: 2, doneIsDecided: false, hasResult: true },
+    { type: "run_done", runId: "ra" }
+  ]) {
+    m.applyEvent(event);
+  }
+  const turn = m.items.find((it) => it.kind === "assistant_turn");
+  ok(/kết quả nằm sau đăng nhập/.test(turn.text), "a blocked run's answer becomes the turn's text");
+  const line = jevOutcomeLineVi(turn.jevOutcome);
+  ok(/cần bạn quyết định/.test(line), `a run blocked on the operator reads as a question (got "${line}")`);
+  ok(!/không tạo được câu trả lời/.test(line), "…and does not claim a missing answer when one exists");
+
+  // A run that produced no answer discloses that instead of looking blank.
+  const silent = new ConversationModel("j-silent");
+  silent.addLocalUserMessage("tìm giúp tôi chuyến bay");
+  silent.bindRunToLastUserMessage("rb");
+  for (const event of [
+    { type: "jev_end", runId: "rb", outcome: "blocked", reason: "no_progress", steps: 1, doneIsDecided: false, hasResult: false, summaryError: "the report call failed" },
+    { type: "run_done", runId: "rb" }
+  ]) {
+    silent.applyEvent(event);
+  }
+  const silentTurn = silent.items.find((it) => it.kind === "assistant_turn");
+  const silentLine = jevOutcomeLineVi(silentTurn.jevOutcome);
+  ok(/không tạo được câu trả lời/.test(silentLine), `a missing answer is disclosed (got "${silentLine}")`);
+
+  // Restored from the durable transcript, both read identically.
+  const rebuilt = new ConversationModel("j-answer");
+  rebuilt.applySnapshot({
+    events: [
+      { seq: 1, type: "message_submitted", runId: "ra", submission: { text: "tìm giúp tôi chuyến bay", attachments: [] } },
+      { seq: 2, type: "jev_result", runId: "ra", text: "Đã mở trang tìm kiếm nhưng kết quả nằm sau đăng nhập.", latencyMs: 900 },
+      { seq: 3, type: "jev_end", runId: "ra", outcome: "blocked", reason: "needs_operator", steps: 2, doneIsDecided: false, hasResult: true },
+      { seq: 4, type: "run_done", runId: "ra" }
+    ]
+  });
+  const rebuiltTurn = rebuilt.items.find((it) => it.kind === "assistant_turn");
+  ok(rebuiltTurn.text === turn.text, "the answer survives a rebuild from the transcript, exactly once");
+  ok(jevOutcomeLineVi(rebuiltTurn.jevOutcome) === line, "…and so does its terminal line");
+}
+
+{
+  const model = new ConversationModel("decision-layer");
+  model.applyEvent({ type: "run_created", runId: "jd" });
+  model.applyEvent({ type: "jev_step", runId: "jd", step: 1, operation: "CLICK",
+    decisionSource: "jev", actionKey: "a1", actionProbability: 0.9, actionConfidence: 0.8,
+    target: { index: "ref_1", label: "Continue" },
+    monitors: { goalDone: { choice: "no", probability: 0.9, confidence: 0.8 }, stuck: { choice: "yes", probability: 0.7, confidence: 0.6 } } });
+  const row = model.items.find((item) => item.kind === "assistant_turn").toolRows[0];
+  const display = toolRowDisplay(row);
+  ok(display.label.includes("Jev quyết định"), "new action row attributes the decision to Jev");
+  ok(display.detail.includes("xác suất hành động: 0.9") && display.detail.includes("độ tin cậy hành động: 0.8"), "action probabilities are not labelled target confidence");
+  ok(display.detail.includes("tín hiệu tham khảo") && !display.detail.includes("hoàn thành đã được kiểm chứng"), "independent monitors remain advisory");
+  ok(row.jev.monitors.stuck.choice === "yes", "decision monitor metadata survives transcript projection");
+  model.applyEvent({ type: "jev_end", runId: "jd", outcome: "blocked", reason: "needs_operator", needsOperator: true, steps: 1 });
+  const outcome = model.items.find((item) => item.kind === "assistant_turn").jevOutcome;
+  ok(outcome.needsOperator === true && jevOutcomeLineVi(outcome).includes("cần bạn quyết định"), "ASK preserves needsOperator while rendering the existing blocked question label");
 }
 
 console.log(fail === 0 ? "\nALL SIDEPANEL CONVERSATION-MODEL TESTS PASSED" : `\n${fail} FAILED`);

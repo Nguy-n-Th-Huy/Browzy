@@ -6,7 +6,9 @@
 
 .prose {
   color: var(--color-text);
-  font-family: 'JetBrains Mono', monospace;
+  font-family: var(--font-sans);
+  min-width: 0;
+  overflow-wrap: anywhere;
   font-size: var(--font-size-body);
   line-height: var(--line-height-body);
 }
@@ -93,6 +95,7 @@
 /* Tables scroll inside their own container; the page/panel itself never
    gains horizontal scroll from a wide table. */
 .prose .table-wrap {
+  max-width: 100%;
   overflow-x: auto;
   border: 1px solid var(--color-border-subtle);
   border-radius: var(--radius-sm);
@@ -108,7 +111,9 @@
   padding: var(--space-2) var(--space-3);
   text-align: left;
   border-bottom: 1px solid var(--color-border-subtle);
-  white-space: nowrap;
+  white-space: normal;
+  min-width: 6rem;
+  overflow-wrap: anywhere;
 }
 .prose thead th {
   color: var(--color-text-secondary);
@@ -160,3 +165,14 @@
   border-top: 1px solid var(--color-border-subtle);
   margin: var(--space-4) 0;
 }
+
+.report-details { border-top: 1px solid var(--color-border-subtle); padding-top: var(--space-3); }
+.report-details summary { cursor: pointer; color: var(--color-text-secondary); }
+.report-details summary:focus-visible, .evidence-image-button:focus-visible { outline: 2px solid var(--color-focus-ring); outline-offset: 2px; }
+.step-evidence { white-space: normal; overflow-wrap: anywhere; }
+.step-evidence section { border-top: 1px solid var(--color-border-subtle); padding: var(--space-2) 0; }
+.step-evidence time { display: block; color: var(--color-text-secondary); }
+.step-evidence p { margin: var(--space-1) 0; }
+.evidence-image-button { cursor: pointer; color: var(--color-accent-text); background: var(--color-surface); border: 1px solid var(--color-border-subtle); border-radius: var(--radius-sm); padding: var(--space-2); }
+.evidence-image-slot img { display: block; max-width: 100%; max-height: 320px; object-fit: contain; margin-top: var(--space-2); }
+.evidence-unavailable { color: var(--color-text-secondary); }

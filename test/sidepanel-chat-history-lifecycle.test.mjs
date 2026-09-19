@@ -616,6 +616,75 @@ async function main() {
     ok((await historyStore.get(conversationId)).title == null, "…and nothing is invented locally either");
   }
 
+  console.log("== reopening an OLD conversation shows what was asked, not a placeholder ==");
+  {
+    // The reported symptom, end to end: a conversation whose question this
+    // panel document never sent — the shape a browser restart, a fresh panel
+    // or a cleared local cache produces. The transcript is the ONLY source of
+    // the question (nothing is seeded into the local prompt cache here on
+    // purpose: that cache is bounded, local and provably empty for most real
+    // profiles).
+    const core = buildCore();
+    const first = buildPanel(core, { storage: memStorage(), scope: "tab-reopen-original" });
+    await first.panel.init();
+    await waitUntil(() => first.panel.protocol.handshakeState() === "ok");
+    await first.panel.startNewConversation();
+    await waitUntil(() => first.panel.currentConversationId != null);
+    const conversationId = first.panel.currentConversationId;
+    const prompt = "vì sao mở lại hội thoại cũ thì không thấy câu hỏi?";
+    await first.panel.sendMessage(prompt, { pageContext: { hostname: "vinades.org", url: "https://vinades.org/x", title: "X", tabId: 42 } });
+    await waitUntil(() => first.panel.currentPhase() === RUN_PHASE.COMPLETED);
+    ok(
+      core.sessionManager.store.allEvents(conversationId).some((e) => e.type === "message_submitted"),
+      "the host recorded the operator's message durably (not only in this panel's local cache)"
+    );
+
+    // A DIFFERENT panel document with an EMPTY local cache — no prompt echo,
+    // no reconciling list, nothing but the host.
+    const second = buildPanel(core, { storage: memStorage(), scope: "tab-reopen-fresh" });
+    await second.panel.init();
+    await waitUntil(() => second.panel.protocol.handshakeState() === "ok");
+    await second.panel.reopenConversation(conversationId);
+    await waitUntil(() => second.panel._pendingResumes.length === 0);
+
+    const rebuilt = second.panel.models.get(conversationId);
+    const firstUser = rebuilt.items.find((i) => i.kind === "user");
+    ok(!!firstUser, "the reopened conversation renders the operator's message");
+    ok(firstUser && firstUser.text === prompt, `...with the exact text that was sent ("${firstUser && firstUser.text}")`);
+    ok(firstUser && firstUser.isPlaceholder !== true, "...as a real bubble, never the \"[Nội dung tin nhắn trước đó không có sẵn]\" placeholder");
+    ok(rebuilt.items.filter((i) => i.kind === "user").length === 1, "...exactly once — the replay never doubles the bubble");
+
+    // The local prompt cache and the derived title are fed from that same
+    // durable record, so the row is titled from the question instead of
+    // staying the generic fallback.
+    ok(
+      (await second.historyStore.promptsFor(conversationId)).size === 1,
+      "the local prompt cache is seeded from the durable transcript"
+    );
+    const titled = await waitUntil(() => {
+      const summary = core.sessionManager.conversationSummaries().conversations.find((s) => s.conversationId === conversationId);
+      return !!summary && summary.title === prompt.slice(0, 60);
+    });
+    ok(titled, "and the conversation is titled from its first question");
+  }
+  {
+    // A conversation recorded BEFORE this change has no durable user message
+    // at all: the placeholder is then the honest answer, and it must still be
+    // exactly what renders (the fix must not invent text on its behalf).
+    const core = buildCore();
+    const { panel } = buildPanel(core, { storage: memStorage(), scope: "tab-reopen-legacy" });
+    await panel.init();
+    await waitUntil(() => panel.protocol.handshakeState() === "ok");
+    const conversationId = core.sessionManager.newConversation();
+    core.sessionManager.store.appendEvent(conversationId, { type: "run_created", runId: "run_legacy" });
+    core.sessionManager.store.appendEvent(conversationId, { type: "run_done", runId: "run_legacy" });
+
+    await panel.reopenConversation(conversationId);
+    await waitUntil(() => panel._pendingResumes.length === 0);
+    const firstUser = panel.models.get(conversationId).items.find((i) => i.kind === "user");
+    ok(firstUser && firstUser.isPlaceholder === true, "a legacy run with no recorded message still says so honestly");
+  }
+
   console.log("== migration-plan gate: an OLDER companion that refuses the history protocol gets the pre-change behaviour ==");
   {
     // Exactly the shape an older companion answers an unknown message type

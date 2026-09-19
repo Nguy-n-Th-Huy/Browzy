@@ -216,7 +216,15 @@ console.log("\n== teardownOverlayForRun / teardownAllOverlays ==");
   const stopped = [];
   const teardownOverlayForRun = compile(
     extractFunction("teardownOverlayForRun"),
-    { overlayRunTabs, sendOverlayMessage, stopOverlayKeepalive: (runId) => stopped.push(runId) },
+    {
+      overlayRunTabs,
+      sendOverlayMessage,
+      stopOverlayKeepalive: (runId) => stopped.push(runId),
+      // The teardown also clears the page's annotations. It is a separate
+      // concern with its own coverage, and its absence here made the whole
+      // block throw before a single assertion ran.
+      requestAnnotationClear: async () => {}
+    },
     "teardownOverlayForRun"
   );
   teardownOverlayForRun("run_a", "run_stopped");
@@ -313,6 +321,14 @@ console.log("\n== requestOverlayShow: ordered behind its own hide, never racing 
     return msg.phase === "hide" ? new Promise((r) => { releaseHide = r; }) : Promise.resolve();
   };
   const deps = {
+    // Per-run state and policy the handler touches on terminal events; each
+    // has its own coverage elsewhere, and here they only have to exist.
+    activeAgentRuns: new Map(),
+    requestAnnotationClear: async () => {},
+    invalidateDownloadDecisionsForRun: async () => {},
+    clearUploadGrantsForRun: async () => {},
+    releaseRunLocks: async () => {},
+    pushManagedPolicySnapshot: async () => {},
     sendOverlayMessage, OVERLAY_HIDE_WAIT_MS: 20, overlayHideInFlight,
     overlayCaptureIdCounter: 0, overlayHideCaptureId, OVERLAY_CAPTURE_LEASE_MS: 4000
   };
@@ -375,6 +391,14 @@ console.log("\n== handleAgentMessage: overlay teardown hook, relay untouched =="
   agentPorts.add({ postMessage: (m) => relayed.push(m) });
   const agentSettingsRelay = { handleReply: () => false };
   const deps = {
+    // Per-run state and policy the handler touches on terminal events; each
+    // has its own coverage elsewhere, and here they only have to exist.
+    activeAgentRuns: new Map(),
+    requestAnnotationClear: async () => {},
+    invalidateDownloadDecisionsForRun: async () => {},
+    clearUploadGrantsForRun: async () => {},
+    releaseRunLocks: async () => {},
+    pushManagedPolicySnapshot: async () => {},
     agentSettingsRelay,
     agentPorts,
     dbg: () => {},
@@ -384,7 +408,10 @@ console.log("\n== handleAgentMessage: overlay teardown hook, relay untouched =="
       return Promise.resolve();
     },
     forwardApprovalToOverlay: (runId, message) => approvalCalls.push({ runId, message }),
-    OVERLAY_TEARDOWN_RUN_EVENTS: new Set(["run_stopped", "run_error", "run_interrupted_by_restart"])
+    OVERLAY_TEARDOWN_RUN_EVENTS: new Set(["run_stopped", "run_error", "run_interrupted_by_restart"]),
+    // The run registry the handler maintains alongside the teardown this
+    // block is about: a real Map, so its deletes behave as they do in the
+    // shipped file.
   };
   // agentHandshakeState/agentHandshakeDetail are module-level `let`s
   // handleAgentMessage assigns — provide real mutable bindings via `let` in
@@ -430,6 +457,14 @@ console.log("\n== handleAgentMessage: approval bridge observer, relay untouched 
   agentPorts.add({ postMessage: (m) => relayed.push(m) });
   const agentSettingsRelay = { handleReply: () => false };
   const deps = {
+    // Per-run state and policy the handler touches on terminal events; each
+    // has its own coverage elsewhere, and here they only have to exist.
+    activeAgentRuns: new Map(),
+    requestAnnotationClear: async () => {},
+    invalidateDownloadDecisionsForRun: async () => {},
+    clearUploadGrantsForRun: async () => {},
+    releaseRunLocks: async () => {},
+    pushManagedPolicySnapshot: async () => {},
     agentSettingsRelay,
     agentPorts,
     dbg: () => {},
@@ -487,6 +522,14 @@ console.log("\n== approval bridge: no grant/deny control anywhere in what backgr
   const agentPorts = new Set();
   const agentSettingsRelay = { handleReply: () => false };
   const deps = {
+    // Per-run state and policy the handler touches on terminal events; each
+    // has its own coverage elsewhere, and here they only have to exist.
+    activeAgentRuns: new Map(),
+    requestAnnotationClear: async () => {},
+    invalidateDownloadDecisionsForRun: async () => {},
+    clearUploadGrantsForRun: async () => {},
+    releaseRunLocks: async () => {},
+    pushManagedPolicySnapshot: async () => {},
     agentSettingsRelay,
     agentPorts,
     dbg: () => {},
@@ -626,6 +669,14 @@ console.log("\n== startOverlayForRun: unscoped run raises through the tab group 
     const fakeClearInterval = () => {};
     const chrome = { tabs: { query: async () => groupTabs } };
     const deps = {
+    // Per-run state and policy the handler touches on terminal events; each
+    // has its own coverage elsewhere, and here they only have to exist.
+    activeAgentRuns: new Map(),
+    requestAnnotationClear: async () => {},
+    invalidateDownloadDecisionsForRun: async () => {},
+    clearUploadGrantsForRun: async () => {},
+    releaseRunLocks: async () => {},
+    pushManagedPolicySnapshot: async () => {},
       sendOverlayMessage, overlayRunTabs, overlayKeepaliveTimers,
       OVERLAY_KEEPALIVE_INTERVAL_MS: 1000,
       tabGroupId: tabGroupIdValue,
@@ -745,24 +796,23 @@ console.log("\n== structural: attachSuppressionWarning reads the SAME slot handl
 
 // =============================================================================
 // 12. Structural: extension/content.js excludes the overlay's own host from
-//     extraction (design.md D4 / task 4.1-4.2, 11.14). Implemented INLINE
-//     at the two real extraction sites, not as a new helper — getPageText()
-//     is compiled in test/registry-borrowed-tab-live-extraction.test.mjs
-//     with only elementMap/history/location/window/document in scope, so a
-//     new helper referenced from there would be a ReferenceError.
+//     extraction (design.md D4 / task 4.1-4.2, 11.14). The check lives INSIDE
+//     getPageText()'s walk, not as a module-level helper: getPageText() is
+//     compiled in test/registry-borrowed-tab-live-extraction.test.mjs with
+//     only elementMap/history/location/window/document in scope, so a helper
+//     outside it would be a ReferenceError there.
 // =============================================================================
 console.log("\n== structural: content.js excludes [data-browzy-overlay] from extraction (design.md D4) ==");
 {
   const contentSrc = fs.readFileSync(CONTENT, "utf8");
-  ok(/querySelectorAll\("script, style, noscript, template, svg, \[data-browzy-overlay\]"\)/.test(contentSrc),
-     "getPageText()'s cleanText() removal list includes [data-browzy-overlay] — the overlay's own subtree is stripped from any extracted text, by attribute rather than tag/id/class (task 4.2)");
+  ok(/el\.hasAttribute\("data-browzy-overlay"\) \|\| el\.hasAttribute\("data-browzy-annotation"\)/.test(contentSrc),
+     "getPageText()'s rendered-text walk skips [data-browzy-overlay] (and annotation labels) by attribute, so the overlay's own subtree is stripped from any extracted text (task 4.2)");
   ok(/el\.closest\("\[data-browzy-overlay\]"\)\) continue;/.test(contentSrc),
      "findElements() skips any node inside [data-browzy-overlay] — the overlay host itself IS reachable by collectAll(document)'s own querySelectorAll(\"*\"), unlike getPageText()'s document.body-rooted walk");
-  // Task 11.14's own ReferenceError concern: no new top-level helper
-  // function was introduced for this — both exclusions are inline at their
-  // real call sites.
+  // Task 11.14's own ReferenceError concern: the exclusion is not a
+  // module-level helper getPageText()'s standalone compilation cannot see.
   ok(!/function isBrowzyOverlayNode/.test(contentSrc) && !/function excludeOverlay/.test(contentSrc),
-     "no new helper function was introduced for this exclusion — it is inline at the two real extraction sites (task 11.14)");
+     "no module-level overlay-exclusion helper exists — the exclusion is inside the extraction walk (task 11.14)");
 }
 
 console.log(fail === 0 ? "\nALL OVERLAY BACKGROUND BRIDGE TESTS PASSED" : `\n${fail} FAILED`);

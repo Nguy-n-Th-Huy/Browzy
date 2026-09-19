@@ -202,6 +202,9 @@ export function normalizeProveReply(text) {
     index: Number.isInteger(outcome.index) ? outcome.index : index,
     ref: typeof outcome.ref === "string" ? outcome.ref : "",
     status: PROOF_STEP_STATUSES.includes(outcome.status) ? outcome.status : "failed",
+    // A no-click expansion is a successful step, but must stay distinguishable
+    // from a dispatched click in the panel and retained proof evidence.
+    ...(outcome.status === "ok" && outcome.state === "already_satisfied" ? { state: outcome.state } : {}),
     ...(typeof outcome.reason === "string" ? { reason: outcome.reason } : {}),
     ...(typeof outcome.note === "string" ? { note: outcome.note } : {}),
     ...(typeof outcome.url === "string" ? { url: outcome.url } : {}),

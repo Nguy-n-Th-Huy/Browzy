@@ -86,7 +86,9 @@ import { createBrowserMcpServer, SDK_MCP_SERVER_NAME } from "./tools/adapter.js"
 import { TabRiskRegistry } from "./threat/tab-risk.js";
 import { createAskUserTool, ASK_USER_TOOL_NAME } from "./tools/ask-the-user.js";
 import { createCreateDocumentTool, CREATE_DOCUMENT_TOOL_NAME } from "./tools/create-document.js";
+import { createPageSnapshotsTool, PAGE_SNAPSHOTS_TOOL_NAME } from "./tools/page-snapshots.js";
 import { DocumentStore } from "./documents/store.js";
+import { SnapshotStore } from "./snapshots/store.js";
 import { authorizeBorrowedTabMutation } from "./tools/mapping.js";
 import { buildIsolatedOptions, resolveProfileSnapshot, ProfileUnavailableError } from "./tools/query-options.js";
 import { buildEnhancePrompt, parseEnhanced, buildEnhanceOptions } from "./enhance-prompt.js";
@@ -223,6 +225,11 @@ const WORKFLOW_PROVE_TOOL = "workflow_prove";
  *  this catches the narrow race where a run takes the lease between that
  *  check and the bridge's own arbitration. The optional `Error:` prefix is
  *  tool-runtime.js's collapse of a transport error into result text. */
+// How many earlier turns of a conversation a Jev run may see. The projection
+// that rides the request bounds them again per field; this one keeps a long
+// conversation from being walked into memory twice.
+const TYPESAFE_CONVERSATION_TURNS = 4;
+
 const BRIDGE_BUSY_PATTERN = /^(?:Error:\s*)?Browser is busy\b/;
 
 // File extension per accepted MIME type for on-disk attachment bytes.
@@ -359,7 +366,7 @@ export class CompanionCore {
    *   network call. Additive: omitted, the op resolves the real module
    *   lazily.
    */
-  constructor({ toolBridge, sessionManager, lease, coerceArgs, sdk, profileProvider, settingsProvider, chatgptAuthProvider, chatgptUsageReader, artifactStore, attachmentStore, askUserToolFactory, documentStore, healProposals }) {
+  constructor({ toolBridge, sessionManager, lease, coerceArgs, sdk, profileProvider, settingsProvider, chatgptAuthProvider, chatgptUsageReader, artifactStore, attachmentStore, askUserToolFactory, documentStore, snapshotStore, healProposals }) {
     this.toolBridge = toolBridge;
     this.sessionManager = sessionManager;
     this.lease = lease;
@@ -373,6 +380,11 @@ export class CompanionCore {
     // bytes, documents are run output — see storage/paths.js on why the two
     // populations never share a path.
     this.documentStore = documentStore || new DocumentStore();
+    // Page snapshots (the page_snapshots tool). Deliberately NOT
+    // conversation-scoped like the document store above: snapshots are keyed
+    // by page URL under the agent root, because the monitoring pattern spans
+    // conversations (see host/agent/snapshots/store.js's own header).
+    this.snapshotStore = snapshotStore || new SnapshotStore();
     this.attachmentStore = attachmentStore || new UserAttachmentStore();
     this._settingsModulePromise = null;
     // ChatGPT auth provider: injected double (tests) or the real auth.js
@@ -2717,11 +2729,97 @@ export class CompanionCore {
           if (typeof envelope.profileId !== "string" || !envelope.profileId) {
             return fail("PROTOCOL_ERROR", "set_provider_type requires a profileId");
           }
-          if (providerType !== "anthropic" && providerType !== "chatgpt") {
+          // `typesafe` joins the known values (openspec/changes/add-typesafe-
+          // jev-provider design.md decision 1). profile.js's own
+          // isKnownProviderType gate remains the authority — this check only
+          // rejects the obviously-unknown before the store is touched.
+          if (providerType !== "anthropic" && providerType !== "chatgpt" && providerType !== "typesafe") {
             return fail("INVALID_PROFILE", `unknown provider type: ${JSON.stringify(providerType)}`);
           }
           const profile = await settings.setProviderType(envelope.profileId, providerType);
           return ok(this._assertAgentSettingsResultSecretFree(profile));
+        }
+        // TypeSafe (Jev) provider ops (openspec/changes/add-typesafe-jev-
+        // provider design.md decision 9). Both are direct delegations to
+        // host/agent/settings/profile.js's independently-tested helpers, and
+        // both are WRITE-ONLY with respect to credentials: the config op
+        // carries no key at all, and the credentials op accepts raw keys only
+        // INBOUND (the one place the trusted settings page may hold a
+        // just-entered value transiently — same rule set_credential follows)
+        // and replies with presence booleans only. Every reply passes
+        // `_assertAgentSettingsResultSecretFree`, the same fail-closed scan
+        // the ChatGPT ops use, so a future helper that echoed a key back
+        // would be refused rather than forwarded.
+        case "set_typesafe_config": {
+          if (typeof envelope.profileId !== "string" || !envelope.profileId) {
+            return fail("PROTOCOL_ERROR", "set_typesafe_config requires a profileId");
+          }
+          // The OpenAI-compatible text-model fields are required only while
+          // that source IS the decision model; on the Anthropic-standard
+          // sources the settings surface sends the decision fields instead.
+          // Shape-checked here; the VALUES (and which are required for the
+          // selected source) are validated by settings.setTypesafeConfig().
+          if (envelope.consultSources !== undefined && typeof envelope.consultSources !== "boolean") {
+            return fail("PROTOCOL_ERROR", "set_typesafe_config consultSources must be a boolean when present");
+          }
+          for (const field of ["textModelBaseUrl", "textModelId", "decisionSource", "decisionBaseUrl", "decisionModelId"]) {
+            if (envelope[field] !== undefined && typeof envelope[field] !== "string") {
+              return fail("PROTOCOL_ERROR", `set_typesafe_config ${field} must be a string when present`);
+            }
+          }
+          // The Jev source ("typesafe" | "vercel" | "openrouter"). Shape-checked here; the
+          // VALUE is validated by settings.setTypesafeConfig() so exactly one
+          // place owns the known list (profile-schema.js's TYPESAFE_SOURCES).
+          if (envelope.typesafeSource !== undefined && typeof envelope.typesafeSource !== "string") {
+            return fail("PROTOCOL_ERROR", "set_typesafe_config typesafeSource must be a string when present");
+          }
+          // The screenshot toggle (add-jev-run-screenshots): a plain boolean
+          // when present. An OMITTED field keeps the stored value (default
+          // enabled), so a settings page that does not know the field cannot
+          // flip it off by accident.
+          if (envelope.sendScreenshots !== undefined && typeof envelope.sendScreenshots !== "boolean") {
+            return fail("PROTOCOL_ERROR", "set_typesafe_config sendScreenshots must be a boolean when present");
+          }
+          const profile = await settings.setTypesafeConfig(envelope.profileId, {
+            ...(envelope.baseUrl !== undefined ? { baseUrl: envelope.baseUrl } : {}),
+            ...(envelope.typesafeSource !== undefined ? { typesafeSource: envelope.typesafeSource } : {}),
+            ...(envelope.sendScreenshots !== undefined ? { sendScreenshots: envelope.sendScreenshots } : {}),
+            textModelBaseUrl: envelope.textModelBaseUrl,
+            textModelId: envelope.textModelId,
+            decisionSource: envelope.decisionSource,
+            decisionBaseUrl: envelope.decisionBaseUrl,
+            decisionModelId: envelope.decisionModelId,
+            consultSources: envelope.consultSources
+          });
+          return ok(this._assertAgentSettingsResultSecretFree(profile));
+        }
+        case "set_typesafe_credentials": {
+          if (typeof envelope.profileId !== "string" || !envelope.profileId) {
+            return fail("PROTOCOL_ERROR", "set_typesafe_credentials requires a profileId");
+          }
+          for (const field of ["typesafeApiKey", "textModelApiKey"]) {
+            if (envelope[field] !== undefined && typeof envelope[field] !== "string") {
+              return fail("PROTOCOL_ERROR", `set_typesafe_credentials ${field} must be a string when present`);
+            }
+          }
+          if (envelope.memoryOnly !== undefined && typeof envelope.memoryOnly !== "boolean") {
+            return fail("PROTOCOL_ERROR", "set_typesafe_credentials memoryOnly must be a boolean when present");
+          }
+          const result = await settings.setTypesafeCredentials(envelope.profileId, {
+            ...(envelope.typesafeApiKey !== undefined ? { typesafeApiKey: envelope.typesafeApiKey } : {}),
+            ...(envelope.textModelApiKey !== undefined ? { textModelApiKey: envelope.textModelApiKey } : {}),
+            memoryOnly: envelope.memoryOnly === true
+          });
+          // Build the reply field-by-field: `storeSecret`'s backend label and
+          // the two presence booleans are the ONLY things that may cross the
+          // wire — never the raw values that came in.
+          return ok(
+            this._assertAgentSettingsResultSecretFree({
+              backend: result.backend,
+              hasTypesafeKey: result.hasTypesafeKey === true,
+              hasTextModelKey: result.hasTextModelKey === true
+            })
+          );
         }
         case "chatgpt_sign_in_start": {
           if (typeof envelope.profileId !== "string" || !envelope.profileId) {
@@ -3138,7 +3236,16 @@ export class CompanionCore {
     this.sessionManager.clearQueuePause(conversationId, "submission");
     let run;
     try {
-      run = this.sessionManager.startRun(conversationId, { tabScope: tabScope || "any" });
+      run = this.sessionManager.startRun(conversationId, {
+        tabScope: tabScope || "any",
+        submission,
+        // The immediate path owns the only copy of this message: unlike a
+        // queued one it has no `message_queued` event, so this is what makes
+        // the operator's own words part of the durable transcript and lets an
+        // old conversation reopen complete instead of showing a placeholder
+        // (see SessionManager.startRun's append).
+        recordSubmission: true
+      });
     } catch (err) {
       return makeEnvelope(AGENT_MESSAGE_TYPES.ERROR, {
         reason: "run_start_rejected",
@@ -3432,6 +3539,111 @@ export class CompanionCore {
     return binding;
   }
 
+  /**
+   * The `describe_ref` resolver a run's send-class gate classifies with.
+   * Extracted so BOTH decision engines use the identical wiring
+   * (openspec/changes/add-typesafe-jev-provider design.md decision 7: "The
+   * runtime additionally reuses createCanUseTool with the companion's
+   * existing resolveHint wiring"): the SDK path passes this into
+   * `createCanUseTool` and `buildIsolatedOptions`'s PreToolUse hook, and
+   * `_runTypesafe` passes it into its own `createCanUseTool`.
+   *
+   * Read-only, best-effort, and off the page's critical path: `describe_ref`
+   * is an internal handler the model cannot call, and any failure resolves to
+   * null, which is the conservative unknown path the classifier already has.
+   *
+   * @param {import("./session/run.js").Run} run
+   * @returns {(toolName: string, args: object) => Promise<object|null>}
+   */
+  _buildRunHintResolver(run) {
+    return async (toolName, args) => {
+      if ((toolName !== "computer" && toolName !== "form_input") || !args || typeof args.ref !== "string") return null;
+      if (typeof args.tabId !== "number") return null;
+      const { result } = await this.toolBridge.call(
+        "describe_ref",
+        { tabId: args.tabId, ref: args.ref },
+        run.describeRequestForWire()
+      );
+      const text = result?.content?.[0]?.text;
+      if (typeof text !== "string" || text === "null") return null;
+      try {
+        return JSON.parse(text);
+      } catch {
+        return null;
+      }
+    };
+  }
+
+  /**
+   * The tab a Jev run drives: the page the operator bound at submission
+   * (`context.tabId`), falling back to the only tab of a narrow run scope.
+   * Deliberately never widened and never guessed — v1 drives the run's bound
+   * tab (design.md Non-Goals), so an unbound run reports the named
+   * observation failure in `_runTypesafe` instead of picking a tab.
+   *
+   * @returns {number|null}
+   */
+  /**
+   * This conversation's earlier turns, as the Jev run may see them: the
+   * operator's prompt, the answer that turn produced, and how it ended.
+   *
+   * Only those three. No capture, no credential, no step record, no tool
+   * argument — a previous turn's steps are that turn's business, and a run is
+   * not a session. Bounded here as well as in the projection that rides the
+   * request, so a very long conversation never has to be walked twice.
+   *
+   * A turn with neither a prompt nor an answer is dropped: it carries nothing
+   * a later goal could refer to.
+   *
+   * @param {string} conversationId
+   * @returns {Array<{prompt: string, answer: string, outcome: string, reason: string|null}>}
+   */
+  _typesafeConversationTurns(conversationId) {
+    let events;
+    try {
+      events = this.sessionManager.store.allEvents(conversationId);
+    } catch {
+      // A conversation whose transcript cannot be read is a run without
+      // conversation context, never a failed run: this is advisory material.
+      return [];
+    }
+    const byRun = new Map();
+    const order = [];
+    const forRun = (runId) => {
+      if (!runId) return null;
+      if (!byRun.has(runId)) {
+        byRun.set(runId, { prompt: "", answer: "", outcome: "", reason: null });
+        order.push(runId);
+      }
+      return byRun.get(runId);
+    };
+    for (const event of Array.isArray(events) ? events : []) {
+      const turn = forRun(event?.runId);
+      if (!turn) continue;
+      if (event.type === "message_submitted") {
+        const text = event?.submission?.text;
+        if (typeof text === "string") turn.prompt = text;
+      } else if (event.type === "jev_result") {
+        if (typeof event.text === "string") turn.answer = turn.answer ? `${turn.answer}\n\n${event.text}` : event.text;
+      } else if (event.type === "jev_end") {
+        turn.outcome = typeof event.outcome === "string" ? event.outcome : "";
+        turn.reason = typeof event.reason === "string" ? event.reason : null;
+      }
+    }
+    return order
+      .map((runId) => byRun.get(runId))
+      .filter((turn) => turn && (turn.prompt || turn.answer))
+      .slice(-TYPESAFE_CONVERSATION_TURNS);
+  }
+
+  _typesafeTabId(run, context) {
+    if (typeof context?.tabId === "number") return context.tabId;
+    if (Array.isArray(run.tabScope) && run.tabScope.length === 1 && typeof run.tabScope[0] === "number") {
+      return run.tabScope[0];
+    }
+    return null;
+  }
+
   async _runAfterLeaseGranted(run, { profileId, modelId, prompt, context, attachmentRefs = [], elementRecord = null, effort = null, newSdkSession = false }) {
     const conversationId = run.conversationId;
     const granted = await run.begin();
@@ -3484,16 +3696,8 @@ export class CompanionCore {
       return;
     }
 
-    let skills;
-    try {
-      skills = await this._bindSkillsForRun(conversationId);
-    } catch (err) {
-      const reason = err instanceof SkillSnapshotMismatchError ? "skills_snapshot_unavailable" : "skills_binding_failed";
-      run.emit({ type: "run_error", reason, detail: err.message });
-      run.stop(reason);
-      this.sessionManager.finishRun(conversationId, run);
-      return;
-    }
+    // Skills are bound below, AFTER the snapshot resolves — see the binding
+    // block that follows `run.releaseGatewayToken`'s assignment.
 
     // Application-side authorization gate, enforced BEFORE anything reaches
     // the SDK (design.md section 7: "SDK-discovered metadata is not itself
@@ -3510,34 +3714,10 @@ export class CompanionCore {
     // (specs/agent-skills/spec.md "Rejected dispatch reaches nothing").
     let queryPrompt = prompt;
     const slashCommand = extractSlashCommand(prompt);
-    if (slashCommand) {
-      // The run's approved built-in set (design.md decision 3/5): the
-      // persisted advertised-command record intersected with the
-      // application allowlist. Reading here (not once at process start)
-      // means a record written by an earlier run/connection test is picked
-      // up by the very next dispatch, with no companion restart required.
-      const approvedBuiltins = deriveApprovedBuiltinCommands(readAdvertisedCommands());
-      let dispatched;
-      try {
-        dispatched = assertSlashDispatchAllowed(slashCommand, skills.catalogSnapshot, approvedBuiltins);
-      } catch (err) {
-        if (!(err instanceof SkillDispatchError)) throw err;
-        run.emit({ type: "run_error", reason: "slash_dispatch_rejected", code: err.code, detail: err.message });
-        run.stop("slash_dispatch_rejected");
-        this.sessionManager.finishRun(conversationId, run);
-        return;
-      }
-      // A built-in must reach the SDK exactly as typed (it is a real SDK
-      // slash command); only a skill match is translated into the Skill-tool
-      // conveyance instruction (design.md decision 1 and decision 3). The
-      // panel composer/transcript already show the operator's literal text
-      // regardless (panel-controller.js's addLocalUserMessage runs before
-      // this ever executes) - this translation affects only what query()
-      // receives.
-      if (dispatched.kind === "skill") {
-        queryPrompt = buildSkillDispatchPrompt(slashCommand);
-      }
-    }
+    // The slash gate runs further down — after the snapshot resolves, after a
+    // `typesafe` run has branched away, and after skills binding has produced
+    // the catalog snapshot the gate consults (`skills.catalogSnapshot`),
+    // none of which exists yet at this point in the flow.
 
     let snapshot;
     try {
@@ -3557,6 +3737,33 @@ export class CompanionCore {
     // `_releaseRunGatewayToken()`, regardless of which one this run actually
     // reaches.
     run.releaseGatewayToken = typeof snapshot.releaseGatewayToken === "function" ? snapshot.releaseGatewayToken : null;
+
+    // Skills for this run. A `typesafe` run binds NO skills (design.md
+    // decision 1: "Skills binding is skipped entirely for these runs") — the
+    // Jev runtime has no skills, slash commands, or SDK session schema, so a
+    // binding's failure modes cannot apply to it, and it must not materialize
+    // a workspace it can never use. For every other runtime the binding
+    // happens here, after the snapshot resolved: nothing in it depends on the
+    // snapshot, but its ORDER does — `snapshot.runtime` is the single input
+    // to the skip, so this file never reads the ambient settings store to
+    // guess a provider type (a guess that would disagree with the injected
+    // profile provider every embedded caller and test supplies).
+    let skills = null;
+    if (snapshot.runtime !== "typesafe") {
+      try {
+        skills = await this._bindSkillsForRun(conversationId);
+      } catch (err) {
+        const reason = err instanceof SkillSnapshotMismatchError ? "skills_snapshot_unavailable" : "skills_binding_failed";
+        run.emit({ type: "run_error", reason, detail: err.message });
+        run.stop(reason);
+        // The snapshot may already hold a chatgpt gateway token; a binding
+        // failure must release it exactly like every other failure from here
+        // on (idempotent — null for anthropic/typesafe snapshots).
+        this._releaseRunGatewayToken(run);
+        this.sessionManager.finishRun(conversationId, run);
+        return;
+      }
+    }
 
     // Tasks.md 2.4: resume-compatibility gate, run BEFORE any SDK call is
     // made (before options are even built) — decision 2.4: "reject
@@ -3611,6 +3818,77 @@ export class CompanionCore {
       this.sessionManager.finishRun(conversationId, run);
       return;
     }
+    // A `typesafe` run never reaches the SDK path (design.md decision 1 /
+    // tasks.md 6.1): it branches here — immediately after
+    // `resolveProfileSnapshot()` and the identity-compatibility gate above,
+    // so identity rules and the conversation binding apply to it exactly as
+    // they do to every other provider, and before ANY SDK object (tool
+    // server, canUseTool, options, resume id) is built. `_runTypesafe`
+    // rejects the inputs only the SDK path can honor, binds the
+    // conversation's identity with the same object the gate just compared,
+    // and drives the bounded observe→choose→act loop.
+    if (snapshot.runtime === "typesafe") {
+      await this._runTypesafe(run, {
+        conversationId,
+        prompt,
+        context,
+        snapshot,
+        attachments,
+        elementRecord,
+        uploadGrants,
+        identity: currentIdentityForCompat
+      });
+      return;
+    }
+
+    // Application-side slash-dispatch authorization gate, enforced BEFORE
+    // anything reaches the SDK (design.md section 7: "SDK-discovered metadata
+    // is not itself an authorization list"; specs/agent-skills.md: "the
+    // companion rejects it before SDK dispatch ... even if the SDK itself
+    // could discover that command"). A disabled/unknown/not-user-invocable
+    // command never reaches query() at all, manually typed or not.
+    // `queryPrompt` is the wire prompt that actually reaches _runQuery():
+    // the operator's own text for everything that is not an authorized
+    // skill dispatch, and design.md decision 1's fixed conveyance wrapper
+    // for one that is. Never mutated before the gate resolves - a
+    // rejected dispatch returns before this is ever touched, so no
+    // conveyed form is constructed and no model call is made for it
+    // (specs/agent-skills/spec.md "Rejected dispatch reaches nothing").
+    // Only SDK runs reach this point (`skills` is non-null): a `typesafe`
+    // run branched away above and rejects slash dispatch inside its own
+    // runtime with `unsupported_in_typesafe_mode`.
+    if (slashCommand) {
+      // The run's approved built-in set (design.md decision 3/5): the
+      // persisted advertised-command record intersected with the
+      // application allowlist. Reading here (not once at process start)
+      // means a record written by an earlier run/connection test is picked
+      // up by the very next dispatch, with no companion restart required.
+      const approvedBuiltins = deriveApprovedBuiltinCommands(readAdvertisedCommands());
+      let dispatched;
+      try {
+        dispatched = assertSlashDispatchAllowed(slashCommand, skills.catalogSnapshot, approvedBuiltins);
+      } catch (err) {
+        if (!(err instanceof SkillDispatchError)) throw err;
+        run.emit({ type: "run_error", reason: "slash_dispatch_rejected", code: err.code, detail: err.message });
+        run.stop("slash_dispatch_rejected");
+        // The snapshot resolved above may hold a chatgpt gateway token; the
+        // rejection must release it like every other settle path.
+        this._releaseRunGatewayToken(run);
+        this.sessionManager.finishRun(conversationId, run);
+        return;
+      }
+      // A built-in must reach the SDK exactly as typed (it is a real SDK
+      // slash command); only a skill match is translated into the Skill-tool
+      // conveyance instruction (design.md decision 1 and decision 3). The
+      // panel composer/transcript already show the operator's literal text
+      // regardless (panel-controller.js's addLocalUserMessage runs before
+      // this ever executes) - this translation affects only what query()
+      // receives.
+      if (dispatched.kind === "skill") {
+        queryPrompt = buildSkillDispatchPrompt(slashCommand);
+      }
+    }
+
     // The session id THIS turn should ask the SDK to resume, or null to run
     // a fresh SDK session (tasks.md 2.5: never retried automatically once a
     // ref is MISSING/RESUME_FAILED — see SessionManager.getResumeSessionId's
@@ -3637,6 +3915,19 @@ export class CompanionCore {
       conversationId,
       store: this.documentStore
     });
+    // Page snapshots: save/compare over time. Bound to THIS run and this
+    // conversation for provenance and for the report document it files, while
+    // the snapshots themselves live under the agent root keyed by page URL —
+    // a baseline must outlive the conversation that captured it. Registered on
+    // the same server as the other two, and named alongside them in
+    // extraToolNames below; the four must move together or the tool is
+    // registered but invisible to the model.
+    const pageSnapshotsTool = await createPageSnapshotsTool({
+      run,
+      conversationId,
+      store: this.snapshotStore,
+      reportStore: this.documentStore
+    });
     // Rerunnable workflows + self-healing: the heal proposal tool, bound to
     // THIS conversation (never to a conversation id taken from tool args —
     // a proposal is filed in the review surface the drift was seen in), and
@@ -3654,7 +3945,7 @@ export class CompanionCore {
       toolBridge: this.toolBridge,
       coerceArgs: this.coerceArgs,
       run,
-      extraTools: [askUserTool, createDocumentTool, proposeHealTool],
+      extraTools: [askUserTool, createDocumentTool, pageSnapshotsTool, proposeHealTool],
       // CRITICAL fix: this conversation's OWN TabRiskRegistry (see
       // _tabRiskRegistryFor()'s own comment), not the per-run default
       // buildSdkTools() would otherwise construct — this is what makes a
@@ -3712,22 +4003,7 @@ export class CompanionCore {
     // unresolved, so a credential-field `form_input` call could never be
     // classified as protected in production: `hintIsSecretField(null)` is
     // always false, so the category never fired no matter what the field was.
-    const resolveHint = async (toolName, args) => {
-      if ((toolName !== "computer" && toolName !== "form_input") || !args || typeof args.ref !== "string") return null;
-      if (typeof args.tabId !== "number") return null;
-      const { result } = await this.toolBridge.call(
-        "describe_ref",
-        { tabId: args.tabId, ref: args.ref },
-        run.describeRequestForWire()
-      );
-      const text = result?.content?.[0]?.text;
-      if (typeof text !== "string" || text === "null") return null;
-      try {
-        return JSON.parse(text);
-      } catch {
-        return null;
-      }
-    };
+    const resolveHint = this._buildRunHintResolver(run);
     const canUseTool = createCanUseTool({
       run,
       approvals: run.approvals,
@@ -3780,7 +4056,12 @@ export class CompanionCore {
         // Registered on the same server just above as an extraTool; named here
         // so the model can actually see and call it. The two must move
         // together — see buildIsolatedOptions' note on extraToolNames.
-        extraToolNames: [ASK_USER_TOOL_NAME, CREATE_DOCUMENT_TOOL_NAME, PROPOSE_WORKFLOW_HEAL_TOOL_NAME],
+        extraToolNames: [
+          ASK_USER_TOOL_NAME,
+          CREATE_DOCUMENT_TOOL_NAME,
+          PAGE_SNAPSHOTS_TOOL_NAME,
+          PROPOSE_WORKFLOW_HEAL_TOOL_NAME
+        ],
         effort,
         resume: resumeSessionId || undefined
       });
@@ -3817,6 +4098,188 @@ export class CompanionCore {
     }
 
     await this._runQuery(run, queryPrompt, options, attachments, { resumeAttempted: Boolean(resumeSessionId), elementRecord });
+  }
+
+  /**
+   * The `typesafe` (TypeSafe Jev) run path — openspec/changes/add-typesafe-
+   * jev-provider design.md decision 1 and tasks.md 6.1. Reached from
+   * `_runAfterLeaseGranted` immediately after the snapshot resolves and the
+   * identity-compatibility gate has passed; it never builds an SDK query.
+   *
+   * Order of operations, each one load-bearing:
+   *   (a) inputs only the SDK path can honor are rejected FIRST, with the
+   *       single named reason `unsupported_in_typesafe_mode` naming the
+   *       field — attachments, an element record, a skill/slash dispatch,
+   *       and upload grants present. Rejecting rather than ignoring is the
+   *       honest outcome: silently dropping an attachment or an authorized
+   *       upload would make the transcript imply something that never
+   *       reached the page.
+   *   (b) skills are skipped for this run — the branch in
+   *       `_runAfterLeaseGranted` never binds skills when
+   *       `snapshot.runtime === "typesafe"` (the sole input to that skip),
+   *       so no workspace is materialized for a run that can never use one.
+   *   (c) the conversation's app-profile binding is written with the SAME
+   *       identity object the compatibility gate compared — the marker
+   *       `typesafe:jev` endpoint rides in `snapshot.env.ANTHROPIC_BASE_URL`
+   *       precisely so this shared machinery records a stable conversation
+   *       identity without any key.
+   *   (d) the runtime is constructed with the same approval machinery the
+   *       SDK path wires (this run's ApprovalRegistry, the companion's
+   *       request-id tracker, and the identical `describe_ref` resolver),
+   *       so a send-class action suspends on the same card with the same
+   *       binding requirements, and every dispatch passes the shared
+   *       dispatch checks.
+   *   (e) terminal outcomes are emitted exactly like every other run: `done`
+   *       → markDone (run_done), `blocked` → stop with the blocked reason
+   *       (run_stopped, never labelled complete), `stopped` → nothing (the
+   *       user's Stop already emitted it), `error` → run_error with the
+   *       classified reason plus stop. The runtime itself emits the durable
+   *       `jev_step`/`jev_end` records.
+   *
+   * @param {import("./session/run.js").Run} run
+   * @param {object} opts
+   * @param {object} opts.snapshot - the resolved typesafe profile snapshot
+   * @param {object|null} opts.identity - the compatibility gate's current identity
+   */
+  async _runTypesafe(run, { conversationId, prompt, context, snapshot, attachments = [], elementRecord = null, uploadGrants = [], identity = null }) {
+    const unsupportedField =
+      attachments.length > 0
+        ? "attachments"
+        : elementRecord
+          ? "elementRecord"
+          : extractSlashCommand(prompt)
+            ? "slash_command"
+            : uploadGrants.length > 0
+              ? "upload_grants"
+              : null;
+    if (unsupportedField) {
+      run.emit({
+        type: "run_error",
+        reason: "unsupported_in_typesafe_mode",
+        field: unsupportedField,
+        detail: `a TypeSafe (Jev) run cannot honor ${unsupportedField}; start a new turn without it, or switch this profile's provider type`
+      });
+      run.stop("unsupported_in_typesafe_mode");
+      this.sessionManager.finishRun(conversationId, run);
+      return;
+    }
+
+    // (c) Same identity object the gate above compared — never a second
+    // derivation. `permissionPolicy` is null: no SDK Options were built for
+    // this run, so there is no policy identity to record (and inventing one
+    // would make a later SDK run in this conversation compare against
+    // something that never applied).
+    try {
+      this.sessionManager.bindConversationAppSnapshot(conversationId, {
+        appProfile: identity?.appProfile ?? null,
+        sessionSchemaIdentity: identity?.sessionSchemaIdentity ?? null,
+        permissionPolicy: null
+      });
+    } catch {
+      // Bookkeeping only — never block a run over it (same rule the SDK
+      // path's binding follows).
+    }
+
+    const tabId = this._typesafeTabId(run, context);
+    if (tabId === null) {
+      // No bound page tab: a named observation failure before any request or
+      // dispatch, never a guessed tab (design.md Non-Goals: v1 drives the
+      // run's bound tab).
+      run.emit({ type: "jev_end", outcome: "error", reason: "observation_failed", steps: 0, doneIsDecided: false });
+      run.emit({
+        type: "run_error",
+        reason: "observation_failed",
+        detail: "this run has no bound page tab, so there is nothing for the Jev runtime to observe"
+      });
+      run.stop("observation_failed");
+      this.sessionManager.finishRun(conversationId, run);
+      return;
+    }
+
+    // (d) The same approval wiring the SDK path builds: the identical
+    // resolver (one implementation, see _buildRunHintResolver), this run's
+    // registry, and this companion's pending-decision tracker, so Allow/Deny
+    // and the 5-minute timeout behave identically whichever engine asked.
+    const resolveHint = this._buildRunHintResolver(run);
+    const canUseTool = createCanUseTool({
+      run,
+      approvals: run.approvals,
+      requestIdTracker: this._pendingApprovals,
+      resolveHint,
+      approvalContext: {
+        ...(context?.hostname ? { domain: context.hostname } : {}),
+        ...((context?.tabId != null || context?.url) ? { docIdentity: { ...(context.tabId != null ? { tabId: context.tabId } : {}), ...(context.url ? { url: context.url } : {}) } } : {}),
+        ...(snapshot.credentialRevision != null ? { credentialRevision: snapshot.credentialRevision } : {})
+      },
+      policySnapshot: () => this._permissionPolicySnapshot()
+    });
+
+    const { runTypesafeRun } = await import("./jev/runtime.js");
+    let result;
+    try {
+      result = await runTypesafeRun({
+        run,
+        toolBridge: this.toolBridge,
+        coerceArgs: this.coerceArgs,
+        canUseTool,
+        provider: {
+          source: snapshot.typesafe.source,
+          endpoint: snapshot.typesafe.endpoint,
+          apiKey: snapshot.typesafe.apiKey,
+          model: snapshot.model,
+          textModel: snapshot.textModel,
+          // The screenshot toggle (openspec/changes/add-jev-run-screenshots
+          // design.md §4): the runtime treats `provider.sendScreenshots ===
+          // true` as enabled, and the profile's default — a profile stored
+          // before the field existed loads ENABLED — is resolved HERE, so the
+          // runtime never reads a profile and an absent/unknown value can
+          // never silently turn captures on.
+          sendScreenshots: snapshot.sendScreenshots !== false,
+          // Whether this run may read documents beyond the page it drives.
+          // Resolved on the profile, so an absent/unknown value can never turn
+          // the fetch on by accident here.
+          consultSources: snapshot.consultSources !== false,
+          // Only a capability test that passed puts this at true; an absent
+          // or unknown value is false, so a run never declares a tool the
+          // configuration was not proven to accept.
+          searchSources: snapshot.searchSources === true,
+          // The operator's own prompt is the goal; page content never is.
+          goal: prompt,
+          // The turns before this one, bounded (spec `typesafe-jev-provider`,
+          // "Run plan and context held by the configured model"). Built here
+          // because this is where the transcript lives: the run loop never
+          // reads stored conversations, so one place decides what a run is
+          // allowed to know about its own past.
+          conversation: this._typesafeConversationTurns(conversationId),
+          tabId
+        }
+      });
+    } catch (err) {
+      // A runtime bug must still end the turn honestly rather than leaving
+      // it running forever — the classified per-step failures are already
+      // reported by the runtime's own run_error paths.
+      result = { outcome: "error", reason: "jev_runtime_failed", steps: 0, error: { code: "jev_runtime_failed", message: (err && err.message) || String(err) } };
+    }
+
+    // (e) Terminal settlement. `run.stop()` on the error/blocked paths also
+    // releases the lease and invalidates outstanding approvals, exactly as
+    // it does for the SDK path's failure modes.
+    if (result.outcome === "done") {
+      run.markDone();
+    } else if (result.outcome === "stopped") {
+      // The user's Stop already emitted run_stopped and released the lease
+      // (Run.stop()); re-stopping would only double-emit.
+    } else if (result.outcome === "blocked") {
+      run.stop(result.reason || "jev_blocked");
+    } else {
+      run.emit({
+        type: "run_error",
+        reason: result.reason || "jev_error",
+        ...(result.error?.message ? { detail: result.error.message } : {})
+      });
+      run.stop(result.reason || "jev_error");
+    }
+    this.sessionManager.finishRun(conversationId, run);
   }
 
   /**

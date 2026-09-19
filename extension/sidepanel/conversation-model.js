@@ -1,3 +1,4 @@
+import { PHASE_LABELS, cleanEvidence } from "./run-feedback.js";
 // Pure, DOM-free state machine for one conversation's transcript + tool
 // activity + observable run phase (spec: "Observable run states" — empty,
 // connecting, ready, queued, streaming, waiting-for-permission, stopping,
@@ -43,9 +44,32 @@
 //    (`bindRunToLastUserMessage`/`seedLocalPrompts`), so a reopened
 //    conversation can still show what was asked. See the "Known gaps"
 //    section of reports/05-panel-evidence.md.
+//
+// 5. The TypeSafe Jev runtime (openspec/changes/add-typesafe-jev-provider,
+//    design.md §8) needs no new machinery here: one `jev_step` becomes one
+//    toolRows entry carrying the decision record (`row.jev`) and one
+//    `jev_end` becomes the turn's terminal outcome line. Both events are
+//    durable, so decision 3's full-rebuild rule covers them unchanged — a
+//    reconnect replays the same steps and outcome instead of merging a second
+//    copy of them — and neither fabricates assistant text, because a Jev run
+//    produces none. openspec/changes/add-jev-run-context extends the same
+//    treatment to one more durable event, `jev_memory` (the run's plan, each
+//    context revision, and each stall recovery: one row carrying
+//    `row.jevMemory`, keyed by the event's own 1-based index so a rebuild
+//    reproduces it exactly), and to two fields the runtime already records:
+//    the `DONE` step's `verification` (the completion check's verdict) and
+//    `jev_end`'s `doneVerified`, which the outcome copy discloses as a
+//    verified completion versus the decision model's judgment alone. Its
+//    labour-split rework (design.md §10) reshapes the step record this model
+//    copies verbatim: `operation`/`intent` are the configured model's step
+//    decision, `target`/`targetProbability`/`confidence`/`latencies.selectionMs`
+//    are the TypeSafe endpoint's element selection, and `operationProbability`
+//    no longer exists in those historical records. Decision-layer records
+//    instead attribute actions to Jev and preserve explicit action scores and
+//    independent monitor metadata; absence retains the old attribution.
 
 import { RUN_PHASE } from "./run-states.js";
-import { humanToolLabel, humanToolLabelRunning, summarizeArgsForDetail } from "./tool-labels.js";
+import { humanToolLabel, humanToolLabelRunning, summarizeArgsForDetail, jevStepLabel, jevStepDetail, jevMemoryLabel, jevMemoryDetail } from "./tool-labels.js";
 
 // The host's transient live-fragment event type (host/agent/protocol.js's
 // STREAM_PARTIAL_EVENT_TYPE), hand-synced here for the same reason
@@ -410,6 +434,32 @@ export class ConversationModel {
     return this._highSeq;
   }
 
+  /**
+   * The operator's own messages this model learned from the DURABLE transcript
+   * rather than from its own Send — one `{runId, text}` per replayed
+   * `message_submitted` event, oldest first.
+   *
+   * Exposed for the panel's local prompt cache (history-store.js's `prompts`,
+   * keyed by runId): that cache is what titles a conversation and matches it
+   * in search, and it is bounded and local, so a fresh panel document — or a
+   * cleared cache — would otherwise hold no preview for a conversation whose
+   * transcript plainly contains its questions. Seeding it from the replay is
+   * what keeps "the first thing I asked" true for a conversation this panel
+   * instance never sent.
+   *
+   * @returns {Array<{runId: string, text: string}>}
+   */
+  submittedPrompts() {
+    const out = [];
+    for (const event of this._windowEvents) {
+      if (!event || event.type !== "message_submitted") continue;
+      const submission = event.submission && typeof event.submission === "object" ? event.submission : {};
+      if (typeof submission.text !== "string" || !submission.text) continue;
+      out.push({ runId: event.runId != null ? String(event.runId) : null, text: submission.text });
+    }
+    return out;
+  }
+
   /** Whether the host reported (or eviction produced) events below the
    * rendered window — the signal a UI uses to offer "load earlier". */
   hasOlderEvents() {
@@ -515,7 +565,7 @@ export class ConversationModel {
       turns: new Map(
         [...this._turnsByRunId].map(([runId, turn]) => [
           runId,
-          { lifecycle: turn.lifecycle, complete: turn.complete, errorInfo: turn.errorInfo, ts: turn.ts, lastContentKind: turn.lastContentKind }
+          { lifecycle: turn.lifecycle, complete: turn.complete, errorInfo: turn.errorInfo, ts: turn.ts, endedAt: turn.endedAt, lastContentKind: turn.lastContentKind }
         ])
       )
     };
@@ -529,6 +579,7 @@ export class ConversationModel {
       turn.complete = saved.complete;
       turn.errorInfo = saved.errorInfo;
       turn.ts = saved.ts;
+      turn.endedAt = saved.endedAt;
       turn.lastContentKind = saved.lastContentKind;
     }
     if (carry.pendingApproval) this.pendingApproval = carry.pendingApproval;
@@ -720,6 +771,7 @@ export class ConversationModel {
         questionAnswers: [],
         lifecycle: "created", // created|queued|running|stopping|stopped|done|error|interrupted
         complete: false,
+        endedAt: null,
         errorInfo: null,
         lastContentKind: null, // "text"|"tool_use"|null -- most recently applied content block kind (see isBusy())
         // Wall-clock anchor for the busy indicator's elapsed count. On live
@@ -792,6 +844,61 @@ export class ConversationModel {
         // handles binding a still-pending local echo either way.
         this._turnFor(event.runId, { createIfMissing: true, ts: event.ts });
         break;
+      // The operator's own message, recorded host-side when the run was
+      // created (SessionManager.startRun's `message_submitted` append). An
+      // IMMEDIATE send has no other durable copy of its text — its queued
+      // sibling carries `submission.text` inside `message_queued` — so this
+      // event is the only reason a reopened OLD conversation can show what
+      // was asked instead of a placeholder bubble.
+      //
+      // Never duplicated with the live echo: the panel pushes its own bubble
+      // at Send time (`addLocalUserMessage`), and `_ensureUserItemForRun()`
+      // already produced a placeholder item for this runId during the
+      // `run_created`/`run_queued` replay just above. Both are found here and
+      // REPLACED in place — same bubble, same position, real text instead of
+      // "[Nội dung tin nhắn trước đó không có sẵn]".
+      case "message_submitted": {
+        const submission = event.submission && typeof event.submission === "object" ? event.submission : {};
+        const text = typeof submission.text === "string" ? submission.text : null;
+        const attachments = (Array.isArray(submission.attachments) ? submission.attachments : [])
+          .filter((a) => a && a.id)
+          .map((a) => ({ id: a.id, mimeType: a.mimeType, fileName: a.name }));
+        const existing = this.items.find((it) => it.kind === "user" && it.runId === event.runId);
+        if (!existing) {
+          // Recorded for a run whose own lifecycle events this panel has not
+          // replayed yet (a bounded window can start mid-run): bind it to the
+          // run rather than leaving the run to invent a placeholder later.
+          const echo = this._pendingUser();
+          if (echo && text != null) {
+            echo.text = text;
+            echo.isPlaceholder = false;
+            this._bindItemToRun(echo, event.runId);
+            if (attachments.length) echo.attachments = attachments;
+            this._pendingUserIndex = null;
+          } else if (text != null) {
+            this.items.push({
+              kind: "user",
+              text,
+              isPlaceholder: false,
+              attachments,
+              ts: typeof event.ts === "number" && event.ts > 0 ? event.ts : Date.now(),
+              runId: event.runId
+            });
+          }
+          break;
+        }
+        if (text == null) break;
+        // A placeholder is corrected by the durable record; a real prompt is
+        // left exactly as it is (it can only be the local prompt echo, which
+        // is the same text) — never a second bubble, never a rewrite of what
+        // the operator actually typed.
+        if (existing.isPlaceholder) {
+          existing.text = text;
+          existing.isPlaceholder = false;
+        }
+        if (attachments.length && !(existing.attachments || []).length) existing.attachments = attachments;
+        break;
+      }
       case "run_queued": {
         const turn = this._turnFor(event.runId, { createIfMissing: true, ts: event.ts });
         turn.lifecycle = "queued";
@@ -804,6 +911,7 @@ export class ConversationModel {
       }
       case "run_stopped": {
         const turn = this._turnFor(event.runId, { createIfMissing: true, ts: event.ts });
+        turn.endedAt ??= typeof event.ts === "number" && event.ts > 0 ? event.ts : Date.now();
         // host/agent/companion.js's _runAfterLeaseGranted() emits run_error
         // THEN calls run.stop() for an internal failure (e.g. an
         // unavailable provider profile) — reusing the stop path for lease
@@ -829,6 +937,7 @@ export class ConversationModel {
       }
       case "run_done": {
         const turn = this._turnFor(event.runId, { createIfMissing: true, ts: event.ts });
+        turn.endedAt ??= typeof event.ts === "number" && event.ts > 0 ? event.ts : Date.now();
         turn.lifecycle = "done";
         turn.complete = true;
         this._dropPartialBuffers(event.runId);
@@ -837,6 +946,7 @@ export class ConversationModel {
       }
       case "run_error": {
         const turn = this._turnFor(event.runId, { createIfMissing: true, ts: event.ts });
+        turn.endedAt ??= typeof event.ts === "number" && event.ts > 0 ? event.ts : Date.now();
         turn.lifecycle = "error";
         turn.complete = false;
         turn.errorInfo = { reason: event.reason || "run_error", detail: event.detail };
@@ -846,6 +956,7 @@ export class ConversationModel {
       }
       case "run_interrupted_by_restart": {
         const turn = this._turnFor(event.runId, { createIfMissing: true, ts: event.ts });
+        turn.endedAt ??= typeof event.ts === "number" && event.ts > 0 ? event.ts : Date.now();
         turn.lifecycle = "interrupted";
         turn.complete = false;
         for (const row of turn.toolRows) {
@@ -1017,6 +1128,261 @@ export class ConversationModel {
             resultSummary: "Không rõ kết quả — mất kết nối trước khi nhận phản hồi. Không tự động thử lại."
           });
         }
+        break;
+      }
+      // ---- TypeSafe Jev runtime (openspec/changes/add-typesafe-jev-provider,
+      // design.md §8; extended by openspec/changes/add-jev-run-context,
+      // design.md §7/§8) ---------------------------------------------------
+      //
+      // These events are DURABLE (persisted by the host's transcript store and
+      // replayed by a resume/snapshot — NOT transient like stream_partial), so
+      // they simply join the rendered event window: a reconnect rebuilds the
+      // step rows, the memory rows, and the outcome from the same events it
+      // replays, which is what makes them survive a reopen "in order and
+      // without duplication". An event kind this model does not know is
+      // ignored by the switch's default branch, so a newer host's rows stay
+      // additive rather than fatal to an older panel.
+      //
+      // One row per decision step, built from the event's own fields only. The
+      // row is named `jev_<operation>` and keeps the decision record verbatim
+      // on `row.jev`; toolRowDisplay() renders label/detail from it (the
+      // Vietnamese copy lives in tool-labels.js). Historical records have
+      // two owners (add-jev-run-context design.md §10): the operation, its
+      // `intent`, and its `evaluation` of the step before it are the
+      // configured model's step decision, while `target`, `targetProbability`,
+      // `confidence`, `targetAbstained`/`runnerUpProbability`, and
+      // `latencies.selectionMs` are the TypeSafe endpoint's element selection
+      // — no `operationProbability` exists, because Jev is never asked about
+      // operations in that protocol. New decisionSource:"jev" records identify
+      // Jev action probabilities and independent advisory monitors explicitly.
+      // A step that dispatched nothing carries the runtime's
+      // `skippedReason` and is marked `skipped` here — a status the renderer
+      // labels "Không thực thi" — so it can never be read as an action that
+      // ran. `targetAbstained` marks the one `target_unresolved` case where a
+      // selection WAS received and validated but named no clear winner, kept
+      // distinguishable from the plain "no compatible candidate" case that
+      // carries no such flag. No fabricated SDK messages: the only
+      // prose a Jev run can carry is its own `jev_result` report (the next
+      // case) — synthesized by the run's small model from the final page text
+      // — and absent that, its steps and memory rows are the whole record.
+      case "jev_phase": {
+        if (!Object.hasOwn(PHASE_LABELS, event.phase)) break;
+        const turn = this._turnFor(event.runId, { createIfMissing: true, ts: event.ts });
+        if (["done", "stopped", "error", "interrupted"].includes(turn.lifecycle)) break;
+        turn.jevPhase = { phase: event.phase, step: Number.isInteger(event.step) ? event.step : null };
+        break;
+      }
+      case "jev_step": {
+        const turn = this._turnFor(event.runId, { createIfMissing: true, ts: event.ts });
+        // Deterministic, unlike the counter-generated `nextKey` ids used for
+        // SDK rows: the step number IS the identity within the run, so a live
+        // step and its replayed twin must produce the identical row (the
+        // full-rebuild equality this model's suites assert). The fallback only
+        // fires for a malformed event, and it is order-derived, so it is just
+        // as reproducible under a replay.
+        const step = Number.isInteger(event.step) ? event.step : turn.toolRows.length + 1;
+        const operation = typeof event.operation === "string" && event.operation ? event.operation : "UNKNOWN";
+        turn.toolRows.push({
+          key: `jev_${step}`,
+          toolName: `jev_${operation.toLowerCase()}`,
+          args: {},
+          status: event.dispatched === true && (event.actionOutcome === "unknown" || event.skippedReason === "result_unknown") ? "unknown" : event.dispatched === true && event.actionOutcome === "failed" ? "failed" : event.skippedReason ? "skipped" : "succeeded",
+          startedAt: null,
+          endedAt: null,
+          resultSummary: null,
+          jev: {
+            step,
+            dispatched: typeof event.dispatched === "boolean" ? event.dispatched : null,
+            actionOutcome: ["succeeded", "failed", "unknown"].includes(event.actionOutcome) ? event.actionOutcome : null,
+            actionError: event.actionError && typeof event.actionError === "object" ? { code: typeof event.actionError.code === "string" ? event.actionError.code.slice(0, 40) : null, message: typeof event.actionError.message === "string" ? event.actionError.message.slice(0, 200) : null } : null,
+            evidence: cleanEvidence(event.evidence),
+            operation: event.operation != null ? event.operation : null,
+            // Additive decision-layer metadata; old transcripts keep their attribution.
+            decisionSource: event.decisionSource === "jev" ? "jev" : null,
+            actionKey: typeof event.actionKey === "string" ? event.actionKey : null,
+            actionProbability: event.actionProbability ?? null,
+            actionConfidence: event.actionConfidence ?? null,
+            goalDone: typeof event.goalDone === "boolean" ? event.goalDone : null,
+            stuck: typeof event.stuck === "boolean" ? event.stuck : null,
+            monitors: event.monitors && typeof event.monitors === "object"
+              ? Object.fromEntries(["goalDone", "stuck"].map((name) => {
+                  const head = event.monitors[name];
+                  return [name, head && typeof head === "object"
+                    ? { choice: head.choice, confidence: head.confidence, probability: head.probability } : null];
+                })) : null,
+            // The configured model's step decision carries a short
+            // plain-language intent naming the element it wants (design.md
+            // §10); it is what Jev's selection is asked to resolve. Copied
+            // like every other field, so an older record without one simply
+            // renders without the line.
+            intent: event.intent != null ? event.intent : null,
+            // The decision's own bounded reading of the step before it —
+            // what that step was meant to achieve and whether this
+            // observation shows it did (protocol.js's `evaluation`). Copied
+            // verbatim like `intent`: never interpreted, merged, or
+            // rewritten here, and an older record without one simply
+            // renders without the line.
+            evaluation: typeof event.evaluation === "string" && event.evaluation ? event.evaluation : null,
+            target:
+              event.target && typeof event.target === "object"
+                ? { index: event.target.index != null ? event.target.index : null, label: event.target.label != null ? event.target.label : null }
+                : null,
+            targetProbability: event.targetProbability != null ? event.targetProbability : null,
+            confidence: event.confidence != null ? event.confidence : null,
+            tool: event.tool != null ? event.tool : null,
+            argsSummary: event.argsSummary != null ? event.argsSummary : null,
+            textField: event.textField != null ? event.textField : null,
+            skippedReason: event.skippedReason != null ? event.skippedReason : null,
+            // A `target_unresolved` skip whose selection WAS received and
+            // validated but named no clear winner — its confidence was below
+            // the run's floor, or its chosen candidate stood within the
+            // margin of the runner-up (protocol.js's `targetAbstained`/
+            // `runnerUpProbability`). Absent this flag, the same
+            // `target_unresolved` reason means the observation offered no
+            // compatible candidate at all — the two must stay distinguishable
+            // on the row (panel spec "A low-confidence skip reads as a skip").
+            targetAbstained: event.targetAbstained === true ? true : null,
+            runnerUpProbability: event.runnerUpProbability != null ? event.runnerUpProbability : null,
+            // The recorded observation digest — what the model was looking
+            // at, bounded: element count, what the bound cut, and a sample of
+            // the offered names. Copied under the same explicit-field
+            // discipline as everything above so a live step and its replayed
+            // twin stay byte-identical.
+            observed:
+              event.observed && typeof event.observed === "object"
+                ? {
+                    url: typeof event.observed.url === "string" ? event.observed.url : null,
+                    elements: Number.isFinite(event.observed.elements) ? event.observed.elements : null,
+                    omitted:
+                      event.observed.omitted && typeof event.observed.omitted === "object"
+                        ? {
+                            elements: Number.isFinite(event.observed.omitted.elements) ? event.observed.omitted.elements : 0,
+                            selectOptions: Number.isFinite(event.observed.omitted.selectOptions) ? event.observed.omitted.selectOptions : 0
+                          }
+                        : null,
+                    sample: Array.isArray(event.observed.sample) ? event.observed.sample.filter((s) => typeof s === "string").slice(0, 12) : []
+                  }
+                : null,
+            latencies:
+              event.latencies && typeof event.latencies === "object"
+                ? {
+                    decisionMs: event.latencies.decisionMs != null ? event.latencies.decisionMs : null,
+                    // Jev's element-selection call, present only for a
+                    // target-bearing step (design.md §7). The old `textMs`
+                    // stage is gone with the separate value request: a typed
+                    // value is a field of the step decision now, so its cost
+                    // is inside `decisionMs`.
+                    selectionMs: event.latencies.selectionMs != null ? event.latencies.selectionMs : null,
+                    dispatchMs: event.latencies.dispatchMs != null ? event.latencies.dispatchMs : null
+                  }
+                : null,
+            // Tri-state on purpose: absent means the runtime recorded nothing,
+            // and the detail line must not then claim "the page did not
+            // change" as if it had been observed.
+            pageChanged: typeof event.pageChanged === "boolean" ? event.pageChanged : null,
+            // The completion check's verdict on a `DONE` step (design.md §7):
+            // `achieved` is true/false, or null when the check could not be
+            // made — in which case the optional `error` names why. Copied the
+            // same explicit way as every field above, so a live step and its
+            // replayed twin stay byte-identical.
+            verificationTrigger: event.verificationTrigger === "repeated_submission" ? "repeated_submission" : null,
+            verification:
+              event.verification && typeof event.verification === "object"
+                ? {
+                    achieved: event.verification.achieved === true ? true : event.verification.achieved === false ? false : null,
+                    error: typeof event.verification.error === "string" && event.verification.error ? event.verification.error : null
+                  }
+                : null
+          }
+        });
+        break;
+      }
+      // One row per run-memory event (openspec/changes/add-jev-run-context,
+      // design.md §7/§8): the plan produced after the first observation, each
+      // context revision, and each stall recovery. The event's own 1-based
+      // `index` is the row key — the runtime's identity for the record, not a
+      // counter here — so a reconnect rebuild reproduces the same rows, in the
+      // same order, without duplication (decision 3's full-rebuild rule). The
+      // model writes the memory; this row carries it verbatim for
+      // toolRowDisplay() to label (the copy is tool-labels.js's
+      // jevMemoryLabel/jevMemoryDetail), and a memory row never fabricates
+      // assistant text or an action: it records only that the context was
+      // planned, revised, or recovered.
+      case "jev_memory": {
+        const turn = this._turnFor(event.runId, { createIfMissing: true, ts: event.ts });
+        // The fallback only fires for a malformed event, and it is
+        // order-derived, so it is just as reproducible under a replay.
+        const index = Number.isInteger(event.index) ? event.index : turn.toolRows.filter((row) => row.jevMemory).length + 1;
+        turn.toolRows.push({
+          key: `jev_memory_${index}`,
+          toolName: "jev_memory",
+          args: {},
+          status: "succeeded",
+          startedAt: null,
+          endedAt: null,
+          resultSummary: null,
+          jevMemory: {
+            index,
+            kind: typeof event.kind === "string" && event.kind ? event.kind : null,
+            trigger: typeof event.trigger === "string" && event.trigger ? event.trigger : null,
+            memory:
+              event.memory && typeof event.memory === "object"
+                ? {
+                    plan: typeof event.memory.plan === "string" && event.memory.plan ? event.memory.plan : null,
+                    doneWhen: typeof event.memory.doneWhen === "string" && event.memory.doneWhen ? event.memory.doneWhen : null,
+                    notes: typeof event.memory.notes === "string" && event.memory.notes ? event.memory.notes : null
+                  }
+                : null,
+            latencyMs: Number.isFinite(event.latencyMs) ? event.latencyMs : null
+          }
+        });
+        break;
+      }
+      case "jev_result": {
+        // The run's own report of what it achieved: the decision model cannot
+        // write prose, so the run's configured small model synthesizes it
+        // from the final page text under a strict no-invention instruction.
+        // It becomes the turn's answer text — the deliverable a finished run
+        // owes the operator. Durable, so a rebuild replays it identically.
+        const turn = this._turnFor(event.runId, { createIfMissing: true, ts: event.ts });
+        if (typeof event.text === "string" && event.text.trim()) {
+          turn.text = turn.text ? `${turn.text}\n\n${event.text}` : event.text;
+          turn.lastContentKind = "text";
+        }
+        break;
+      }
+      case "jev_end": {
+        const turn = this._turnFor(event.runId, { createIfMissing: true, ts: event.ts });
+        // The terminal line rendered under the turn (sidepanel.js's
+        // renderJevOutcomeHtml). The turn's own lifecycle still ends through
+        // the run_done/run_stopped/run_error events the companion emits
+        // independently — this record is what makes the END distinguishable
+        // (verified completion / the decision model's judgment alone / blocked
+        // with its reason / stopped / failed) and it is stored as reported,
+        // never merged with the lifecycle. `doneVerified` (design.md §7) is
+        // the completion check's verdict: true = confirmed, false = the check
+        // could not be made. It is tri-state here on purpose — a record from a
+        // host that predates the field keeps `null`, and the outcome line then
+        // falls back to the older done-as-decided disclosure instead of
+        // describing the record as verified. `summaryError` is the check's own
+        // recorded failure (the confirmation produced no usable report, or the
+        // check could not be made) — carried for the outcome line's
+        // disclosure; its raw text is never rendered.
+        turn.jevOutcome = {
+          outcome: typeof event.outcome === "string" ? event.outcome : "",
+          reason: typeof event.reason === "string" && event.reason ? event.reason : null,
+          needsOperator: typeof event.needsOperator === "boolean" ? event.needsOperator : null,
+          steps: Number.isInteger(event.steps) ? event.steps : null,
+          doneIsDecided: typeof event.doneIsDecided === "boolean" ? event.doneIsDecided : null,
+          doneVerified: typeof event.doneVerified === "boolean" ? event.doneVerified : null,
+          summaryError: typeof event.summaryError === "string" && event.summaryError ? event.summaryError : null,
+          // Whether the run produced an answer at all. A finished run is
+          // expected to carry one on every outcome now, so a turn without one
+          // must read as a disclosed absence rather than as a blank reply. A
+          // record from a host that predates the field keeps `null`, and the
+          // outcome line then says nothing about it.
+          hasResult: typeof event.hasResult === "boolean" ? event.hasResult : null
+        };
         break;
       }
       case "stream_message":
@@ -2144,6 +2510,11 @@ export class ConversationModel {
   // the collapsed timeline summary uses: the turn's recorded creation instant
   // (`turn.ts`), which on a snapshot replay is restored from the original
   // stored-event `ts`, not reset to the reconnect time.
+  busyLabel() {
+    if (!this.isBusy()) return null;
+    return PHASE_LABELS[this._latestTurn()?.jevPhase?.phase] || null;
+  }
+
   busyElapsedSeconds(now = Date.now()) {
     const turn = this._latestTurn();
     if (!turn) return 0;
@@ -2191,6 +2562,19 @@ function queueMessageId(event, storedSeq) {
 }
 
 export function toolRowDisplay(row) {
+  // A Jev step row carries its own decision record (`row.jev`) instead of an
+  // SDK tool name/args pair: the operation, target, probabilities, executed
+  // tool and per-stage latencies are what an operator judges it by, and
+  // tool-labels.js's jev section is the single place that copy lives. A Jev
+  // memory row (`row.jevMemory`) gets the same treatment: its label names the
+  // plan/revision/recovery and what triggered it, and its detail is the
+  // model-written context verbatim. Rows of every other kind are unchanged.
+  if (row && row.jev) {
+    return { ...row, label: jevStepLabel(row.jev), detail: jevStepDetail(row.jev) };
+  }
+  if (row && row.jevMemory) {
+    return { ...row, label: jevMemoryLabel(row.jevMemory), detail: jevMemoryDetail(row.jevMemory) };
+  }
   return {
     ...row,
     label: row.status === "running" ? humanToolLabelRunning(row.toolName, row.args) : humanToolLabel(row.toolName, row.args),

@@ -128,6 +128,38 @@ Extension không tìm thấy native host. Chạy lại `./install.sh` (hoặc `.
 
 Companion đã đăng ký nhưng không khởi động được. Chạy `browzy doctor` — nguyên nhân hay gặp nhất là đăng ký trỏ vào một đường dẫn không còn tồn tại, do thư mục repo bị di chuyển hoặc đổi tên sau khi cài. Chạy lại installer là xong.
 
+### Panel báo "Lỗi mạng / TLS" hoặc "Kiểm tra kết nối thất bại"
+
+Trang Cài đặt chỉ hiện **một dòng ngắn** cho mọi lỗi dạng truyền tải, nên rất nhiều nguyên nhân khác nhau đều đọc ra thành "kiểm tra Base URL, chứng chỉ TLS và kết nối mạng". Thực tế hay gặp nhất **không phải** lỗi mạng: gateway trả HTTP 5xx khi **model id không tồn tại** (thay vì 404), và dòng đó không phân biệt được hai thứ này.
+
+Chạy lệnh này trên **chính máy đang lỗi** để lấy nguyên nhân thật:
+
+```bash
+node host/bin/browzy.js provider-test
+```
+
+Nó chạy đúng đường code mà trang Cài đặt chạy, nhưng in ra thứ giao diện giấu đi: HTTP status, body của nhà cung cấp, phân loại thật của từng phép thử, **danh sách model mà endpoint thực sự có**, và một kết luận nêu đúng nguyên nhân. Credential **không bao giờ** được in ra (đã redact), nên dán output vào đâu cũng được.
+
+```bash
+node host/bin/browzy.js provider-test --network-only   # chỉ kiểm tra mạng/TLS, không đọc key, không tốn token
+node host/bin/browzy.js provider-test --model <id>     # thử một model cụ thể
+node host/bin/browzy.js provider-test --all-models     # thử mọi model trong profile
+node host/bin/browzy.js provider-test --json           # bản máy đọc được
+```
+
+Cách đọc kết luận:
+
+| Kết luận | Nghĩa là | Sửa gì |
+|---|---|---|
+| `network_or_tls` | Không mở được TLS tới Base URL | DNS / proxy / chứng chỉ TLS / máy offline |
+| `credential_rejected` | Endpoint trả lời, nhưng từ chối API key | Nhập lại key (copy mới), hoặc cấp key khác |
+| `model_unavailable` | Endpoint từ chối **model id** | Chọn một id trong danh sách model mà lệnh in ra |
+| `not_anthropic_compatible` | Endpoint không nói Anthropic Messages API | Trỏ Base URL vào nhánh Anthropic-compatible (thường có `/v1`) |
+| `endpoint_5xx_or_transport` | Nhà cung cấp trả 5xx (hay gặp: model id lạ) | Thử model khác trong danh sách; nếu mọi model đều 5xx thì gateway lỗi |
+| `ok` | Mọi phép thử đều đạt trên máy này | Không có gì phải sửa |
+
+> Lưu ý về thứ tự: **lưu được cài đặt** và **kiểm tra kết nối đạt** là hai việc khác nhau. Trang Cài đặt cho lưu kể cả khi đang offline (spec: "Saving is allowed offline"), nên profile và key vẫn vào đĩa dù kết nối chưa đạt — bấm Lưu lần nữa không sửa được lỗi kết nối. Xem dòng trạng thái trên cùng trang: nếu nó ghi "Đã lưu API key" thì phần lưu đã xong.
+
 ### Đã di chuyển thư mục repo
 
 Đăng ký ghi **đường dẫn tuyệt đối**. Di chuyển hay đổi tên thư mục là đăng ký hỏng. Chạy lại installer ở vị trí mới.

@@ -25,7 +25,11 @@
 //     is arriving, collapsed once the run is not live, an explicit override
 //     honored in either direction;
 //   * a streamed-then-completed turn renders exactly the same content as the
-//     same final state reached with no fragments at all (no duplicated text).
+//     same final state reached with no fragments at all (no duplicated text);
+//   * a Jev run (openspec/changes/add-typesafe-jev-provider, design.md §8)
+//     renders its step rows and its terminal outcome line under the turn, with
+//     no assistant text anywhere, and its busy indicator resolves through the
+//     run's own lifecycle rather than through any text arriving.
 //
 // Run: node test/sidepanel-streaming-render.test.mjs
 
@@ -36,8 +40,11 @@ import { fileURLToPath } from "node:url";
 import { extractFunction, compile } from "./_extract.mjs";
 import { createDocument } from "./_fake-dom.mjs";
 import { escapeHtml, renderMarkdownLite } from "../extension/sidepanel/markdown-lite.js";
+import { renderReport, evidenceHtml } from "../extension/sidepanel/run-feedback.js";
 import { iconMarkup } from "../extension/ui/icons.js";
-import { ConversationModel } from "../extension/sidepanel/conversation-model.js";
+import { ConversationModel, toolRowDisplay } from "../extension/sidepanel/conversation-model.js";
+import { jevOutcomeLineVi } from "../extension/sidepanel/tool-labels.js";
+import { RUN_PHASE } from "../extension/sidepanel/run-states.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SIDEPANEL_FILE = path.join(ROOT, "extension", "sidepanel", "sidepanel.js");
@@ -50,6 +57,33 @@ function ok(cond, msg) {
   if (!cond) fail++;
 }
 
+console.log("== completed run durations stay frozen when a second run starts and history replays ==");
+{
+  let clockMs = 38_000;
+  const duration = compile(extract("timelineDurationLabel"), { Date: { now: () => clockMs } }, "timelineDurationLabel");
+  for (const terminal of ["run_done", "run_stopped", "run_error", "run_interrupted_by_restart"]) {
+    const model = new ConversationModel(`timing-${terminal}`);
+    const events = [
+      { type: "run_started", runId: "first", ts: 1000 },
+      { type: "jev_step", runId: "first", step: 1, operation: "CLICK", tool: "computer", ts: 2000 },
+      { type: terminal, runId: "first", ts: 38_000 }
+    ];
+    events.forEach((event) => model.applyEvent(event));
+    const first = () => model.items.find((item) => item.kind === "assistant_turn" && item.runId === "first");
+    ok(duration(first()) === "37s", `${terminal} captures the actual 37-second duration`);
+    clockMs = 160_000;
+    events.push({ type: "run_started", runId: "second", ts: clockMs });
+    model.applyEvent(events.at(-1));
+    ok(duration(first()) === "37s", `${terminal} stays 37s after a second-run event`);
+    model.applySnapshot({ conversationId: `timing-${terminal}`, meta: {}, lastSeq: events.length, firstSeq: 1, hasOlder: false,
+      events: events.map((event, index) => ({ ...event, seq: index + 1 })) });
+    ok(duration(first()) === "37s", `${terminal} restores the persisted end time on replay`);
+    clockMs = 38_000;
+  }
+  ok(duration({ lifecycle: "done", ts: 1000, toolRows: [{ endedAt: null }] }) === "", "historical turns without any end timestamp never show today's age");
+  ok(duration({ lifecycle: "running", ts: 1000, toolRows: [{ endedAt: null }] }) === "37s", "active turns retain a live elapsed timer");
+}
+
 // The turn-rendering bundle. Unrelated sub-renderers (timeline, warnings,
 // documents, cards, busy indicator) are injected as empty-string collaborators
 // because every turn below has none of them; the streaming tail, the thinking
@@ -57,6 +91,7 @@ function ok(cond, msg) {
 const turnRender = compile(
   [
     extract("turnStatusNote"),
+    extract("renderJevOutcomeHtml"),
     extract("thinkingIsExpanded"),
     extract("renderProseHtml"),
     extract("renderThinkingBlockHtml"),
@@ -65,7 +100,9 @@ const turnRender = compile(
   {
     escapeHtml,
     renderMarkdownLite,
+    renderReport,
     iconMarkup,
+    jevOutcomeLineVi,
     SKILL_ERROR_TITLES_VI: {},
     renderBusyIndicator: () => "",
     renderTimelineCollapsed: () => "",
@@ -77,7 +114,16 @@ const turnRender = compile(
     thinkingExpandedRuns: new Map(), // UI-only, injected for the extracted bundle
     panel: { currentModel: () => null }
   },
-  "{ turnStatusNote, thinkingIsExpanded, renderProseHtml, renderThinkingBlockHtml, renderTurnHtml }"
+  "{ turnStatusNote, renderJevOutcomeHtml, thinkingIsExpanded, renderProseHtml, renderThinkingBlockHtml, renderTurnHtml }"
+);
+
+// The shipped per-row markup (toolRowHtml + statusWordVi), so a Jev step row's
+// label and its "nothing was dispatched" pill are asserted against the real
+// renderer rather than a copy.
+const toolRowRender = compile(
+  [extract("toolRowHtml"), extract("statusWordVi")].join("\n\n"),
+  { escapeHtml, iconMarkup, toolRowDisplay, evidenceHtml },
+  "{ toolRowHtml, statusWordVi }"
 );
 
 const paintBundle = compile(
@@ -374,6 +420,275 @@ console.log("== streamed-then-completed renders the same content as a full rende
   const plainHtml = turnRender.renderTurnHtml(plainTurn, { isLatestStreaming: false, busy: false, elapsedVisible: false });
   ok(streamedHtml === plainHtml, "and it renders byte-for-byte the same as a full render of that final state");
   ok(streamedHtml.includes(renderMarkdownLite("Xin chào bạn!")), "...through the normal markdown answer renderer");
+}
+
+console.log("== a Jev run renders its steps and outcome with no assistant text, and resolves its busy state ==");
+{
+  const RUN = "rv";
+  const seed = (m) => {
+    m.addLocalUserMessage("đăng nhập giúp tôi");
+    m.bindRunToLastUserMessage(RUN);
+    m.applyEvent({ type: "run_created", runId: RUN });
+    m.applyEvent({ type: "run_started", runId: RUN });
+  };
+  const stepEvent = (step, operation, target, over = {}) => ({
+    type: "jev_step",
+    runId: RUN,
+    step,
+    operation,
+    intent: "phần tử theo ý định của mô hình",
+    target,
+    targetProbability: 0.9,
+    confidence: 0.85,
+    tool: "computer",
+    argsSummary: "action: left_click",
+    latencies: { decisionMs: 400, selectionMs: 250, dispatchMs: 80 },
+    pageChanged: true,
+    ...over
+  });
+  const turnOf = (m) => m.items.find((i) => i.kind === "assistant_turn");
+  const renderOpts = { isLatestStreaming: false, busy: false, elapsedVisible: false };
+
+  // Mid-run: the loop is working, no assistant text has been produced, and the
+  // busy indicator is what the operator sees (the model's own isBusy() is the
+  // shipped condition the renderer reads).
+  const live = new ConversationModel("conv-jev");
+  seed(live);
+  live.applyEvent(stepEvent(1, "CLICK", { index: 1, label: "Nút Đăng nhập" }));
+  ok(live.isBusy() === true, "a text-less Jev run in progress reports busy — the working indicator is accurate, not a stall");
+  ok(live.derivePhase({ connectionStatus: "ok" }) === RUN_PHASE.STREAMING, "…and its phase is streaming while the loop runs");
+
+  const liveHtml = turnRender.renderTurnHtml(turnOf(live), { isLatestStreaming: true, busy: true, elapsedVisible: false });
+  ok(!liveHtml.includes("stream-cursor"), "no answer cursor is drawn for a run that produces no answer text");
+
+  // The run ends: the busy indicator resolves through the run's own lifecycle,
+  // with no text ever having arrived. This jev_end predates the completion
+  // check's `doneVerified` field on purpose — a transcript recorded by an
+  // older host — so it also pins the backward-compatible disclosure below;
+  // the verified and unverified-new shapes are asserted in their own block.
+  live.applyEvent({ type: "jev_end", runId: RUN, outcome: "done", reason: null, steps: 1, doneIsDecided: true });
+  live.applyEvent({ type: "run_done", runId: RUN });
+  const doneTurn = turnOf(live);
+  ok(live.isBusy() === false, "the busy indicator resolves on run_done for a text-less Jev run — nothing waits for assistant text");
+  ok(live.derivePhase({ connectionStatus: "ok" }) === RUN_PHASE.COMPLETED, "the panel reports completed");
+  ok(doneTurn.text === "" && doneTurn.toolRows.length === 1, "the turn shows its step and no invented answer");
+
+  const doneHtml = turnRender.renderTurnHtml(doneTurn, renderOpts);
+  ok(doneHtml.includes('data-jev-outcome="done"'), "the terminal outcome line is rendered under the turn");
+  ok(doneHtml.includes("Đã xong") && doneHtml.includes("chưa được kiểm chứng độc lập"), "…as done-as-decided, with the disclosure that it was the model's own judgment");
+  ok(/<div class="prose"[^>]*><\/div>/.test(doneHtml), "the answer body is empty — no fabricated assistant prose for a Jev run");
+
+  // Rebuilt: the same transcript through a snapshot renders byte-identically.
+  const events = [
+    { seq: 1, type: "run_created", runId: RUN },
+    { seq: 2, type: "run_started", runId: RUN },
+    { seq: 3, type: "jev_step", runId: RUN, step: 1, operation: "CLICK", intent: "phần tử theo ý định của mô hình", target: { index: 1, label: "Nút Đăng nhập" }, targetProbability: 0.9, confidence: 0.85, tool: "computer", argsSummary: "action: left_click", latencies: { decisionMs: 400, selectionMs: 250, dispatchMs: 80 }, pageChanged: true },
+    { seq: 4, type: "jev_end", runId: RUN, outcome: "done", reason: null, steps: 1, doneIsDecided: true },
+    { seq: 5, type: "run_done", runId: RUN }
+  ];
+  const rebuilt = new ConversationModel("conv-jev");
+  rebuilt.seedLocalPrompts(new Map([[RUN, "đăng nhập giúp tôi"]]));
+  rebuilt.applySnapshot({ conversationId: "conv-jev", meta: {}, lastSeq: 5, firstSeq: 1, hasOlder: false, events });
+  const rebuiltHtml = turnRender.renderTurnHtml(turnOf(rebuilt), renderOpts);
+  ok(turnOf(rebuilt).toolRows.length === 1, "the rebuilt transcript restores the step rows exactly once");
+  ok(rebuiltHtml === doneHtml, "live and rebuilt render byte-identical markup (step rows, labels and the outcome line alike)");
+
+  // A late jev_end (after the run's own terminal event) must still reach the
+  // DOM — it is part of the structure signature for exactly this reason.
+  const late = new ConversationModel("conv-jev-late");
+  seed(late);
+  const beforeEnd = structureSignature(late, { busy: false });
+  late.applyEvent({ type: "jev_end", runId: RUN, outcome: "blocked", reason: "no_progress", steps: 4, doneIsDecided: false });
+  ok(structureSignature(late, { busy: false }) !== beforeEnd, "the outcome line is part of the structure signature, so a jev_end renders even when nothing else changed");
+
+  // Stopped: labelled distinctly, never as a completion.
+  const stopped = new ConversationModel("conv-jev-stop");
+  seed(stopped);
+  stopped.applyEvent(stepEvent(1, "CLICK", { index: 2, label: "Áp dụng" }));
+  stopped.applyEvent({ type: "run_stopped", runId: RUN, reason: "user_stop" });
+  stopped.applyEvent({ type: "jev_end", runId: RUN, outcome: "stopped", reason: "stopped", steps: 1, doneIsDecided: false });
+  const stoppedHtml = turnRender.renderTurnHtml(turnOf(stopped), renderOpts);
+  ok(stoppedHtml.includes('data-jev-outcome="stopped"') && stoppedHtml.includes("Đã dừng"), "a stopped Jev run is labelled stopped");
+  ok(stoppedHtml.includes("lượt chạy đã bị dừng"), "…with the runtime's own stop reason translated, never the raw token");
+  ok(!stoppedHtml.includes(">stopped<") && !/lý do: stopped/.test(stoppedHtml), "…and no raw reason token is shown");
+  ok(!stoppedHtml.includes("chưa được kiểm chứng độc lập"), "…and is never labelled as a decided completion");
+  ok(stoppedHtml.includes("câu trả lời chưa hoàn chỉnh"), "the run-lifecycle note still applies alongside it");
+
+  // Failed: distinctly labelled as a failure, coloured as an error.
+  const failed = new ConversationModel("conv-jev-fail");
+  seed(failed);
+  failed.applyEvent({ type: "run_error", runId: RUN, reason: "invalid_decision", detail: "probabilities do not sum to 1" });
+  failed.applyEvent({ type: "jev_end", runId: RUN, outcome: "error", reason: "invalid_decision", steps: 0, doneIsDecided: false });
+  const failedHtml = turnRender.renderTurnHtml(turnOf(failed), renderOpts);
+  ok(failedHtml.includes('data-jev-outcome="error"') && failedHtml.includes("Thất bại"), "a failed Jev run is labelled as a failure");
+  ok(failedHtml.includes("câu trả lời của TypeSafe không hợp lệ"), "…with the invalid decision translated, not the raw reason token");
+  ok(!failedHtml.includes("invalid_decision"), "…so the runtime's English identifier never reaches the operator");
+  ok(/class="turn-status-note is-error"[^>]*data-jev-outcome="error"/.test(failedHtml), "…in the error treatment, so it reads as an error and not as a quieter outcome");
+  ok(turnRender.renderJevOutcomeHtml({ toolRows: [] }) === "", "a turn with no Jev outcome renders no outcome line at all (every LLM turn is unchanged)");
+}
+
+console.log("== a Jev done is labelled as verified or as the decision model's judgment alone ==");
+{
+  const RUN = "rv";
+  const seed = (m) => {
+    m.addLocalUserMessage("đăng nhập giúp tôi");
+    m.bindRunToLastUserMessage(RUN);
+    m.applyEvent({ type: "run_created", runId: RUN });
+    m.applyEvent({ type: "run_started", runId: RUN });
+  };
+  const renderOpts = { isLatestStreaming: false, busy: false, elapsedVisible: false };
+  const turnOf = (m) => m.items.find((i) => i.kind === "assistant_turn");
+
+  // Verified: the completion check confirmed the goal (add-jev-run-context
+  // design.md §7/§8) — the terminal line says so and never reads as the
+  // decision model's judgment alone.
+  const verified = new ConversationModel("conv-jev-verified");
+  seed(verified);
+  verified.applyEvent({
+    type: "jev_step",
+    runId: RUN,
+    step: 1,
+    operation: "DONE",
+    tool: null,
+    target: null,
+    latencies: { decisionMs: 250 },
+    pageChanged: false,
+    skippedReason: "done",
+    verification: { achieved: true }
+  });
+  verified.applyEvent({ type: "jev_end", runId: RUN, outcome: "done", reason: null, steps: 1, doneIsDecided: true, doneVerified: true });
+  verified.applyEvent({ type: "run_done", runId: RUN });
+  const verifiedHtml = turnRender.renderTurnHtml(turnOf(verified), renderOpts);
+  ok(verifiedHtml.includes('data-jev-outcome="done"') && verifiedHtml.includes('data-jev-verified="true"'), "a done the completion check confirmed is marked verified");
+  ok(verifiedHtml.includes("kiểm tra hoàn thành đã xác nhận"), "…and the terminal line says the check confirmed it");
+  ok(!verifiedHtml.includes("chưa được kiểm chứng độc lập"), "…never also reading as the decision model's judgment alone");
+
+  // Judgment alone: the check could not be made, so the run still ends done
+  // with the older disclosure — and the DOM says which case this is.
+  const judged = new ConversationModel("conv-jev-judged");
+  seed(judged);
+  judged.applyEvent({ type: "jev_end", runId: RUN, outcome: "done", reason: null, steps: 2, doneIsDecided: true, doneVerified: false });
+  judged.applyEvent({ type: "run_done", runId: RUN });
+  const judgedHtml = turnRender.renderTurnHtml(turnOf(judged), renderOpts);
+  ok(judgedHtml.includes('data-jev-verified="false"'), "a done with no completion check is marked unverified");
+  ok(judgedHtml.includes("theo quyết định của mô hình, chưa được kiểm chứng độc lập"), "…and keeps the judgment-alone disclosure");
+
+  // The two disclosed check failures are distinguishable in the rendered line
+  // too, and neither prints the raw error text (add-jev-run-context §7/§8).
+  const noReport = new ConversationModel("conv-jev-no-report");
+  seed(noReport);
+  noReport.applyEvent({
+    type: "jev_end",
+    runId: RUN,
+    outcome: "done",
+    reason: null,
+    steps: 1,
+    doneIsDecided: true,
+    doneVerified: true,
+    summaryError: "the completion check confirmed the goal but produced no report"
+  });
+  noReport.applyEvent({ type: "run_done", runId: RUN });
+  const noReportHtml = turnRender.renderTurnHtml(turnOf(noReport), renderOpts);
+  ok(noReportHtml.includes('data-jev-verified="true"') && noReportHtml.includes("không tạo được báo cáo"), "a confirmed completion whose report failed says so");
+  ok(!noReportHtml.includes("produced no report"), "…without leaking the raw error text into the panel");
+  ok(!noReportHtml.includes("chưa được kiểm chứng"), "…and still reads as confirmed");
+
+  const checkFailed = new ConversationModel("conv-jev-check-failed");
+  seed(checkFailed);
+  checkFailed.applyEvent({
+    type: "jev_end",
+    runId: RUN,
+    outcome: "done",
+    reason: null,
+    steps: 2,
+    doneIsDecided: true,
+    doneVerified: false,
+    summaryError: "HTTP 503"
+  });
+  checkFailed.applyEvent({ type: "run_done", runId: RUN });
+  const checkFailedHtml = turnRender.renderTurnHtml(turnOf(checkFailed), renderOpts);
+  ok(
+    checkFailedHtml.includes('data-jev-verified="false"') && checkFailedHtml.includes("không thực hiện được kiểm tra hoàn thành"),
+    "a done whose check could not be made names that failure"
+  );
+  ok(checkFailedHtml.includes("chưa được kiểm chứng độc lập") && !checkFailedHtml.includes("HTTP 503"), "…on the judgment-alone line, with no raw error text");
+  ok(!judgedHtml.includes("không thực hiện được kiểm tra hoàn thành"), "…while a record without summaryError keeps the older line exactly");
+
+  // Disputed to the bound: blocked with the unverified-completion reason, never
+  // rendered as a done.
+  const disputed = new ConversationModel("conv-jev-disputed");
+  seed(disputed);
+  disputed.applyEvent({
+    type: "jev_step",
+    runId: RUN,
+    step: 1,
+    operation: "DONE",
+    tool: null,
+    target: null,
+    latencies: { decisionMs: 250 },
+    pageChanged: false,
+    skippedReason: "completion_rejected",
+    verification: { achieved: false }
+  });
+  disputed.applyEvent({ type: "jev_end", runId: RUN, outcome: "blocked", reason: "completion_unverified", steps: 1, doneIsDecided: false });
+  disputed.applyEvent({ type: "run_done", runId: RUN });
+  const disputedHtml = turnRender.renderTurnHtml(turnOf(disputed), renderOpts);
+  ok(disputedHtml.includes('data-jev-outcome="blocked"'), "a completion the check kept disputing is rendered as blocked");
+  ok(disputedHtml.includes("kiểm tra hoàn thành chưa xác nhận hoặc không thực hiện được"), "…with the unverified-completion reason translated");
+  ok(!disputedHtml.includes("data-jev-verified"), "…and no verified marker is claimed for a blocked outcome");
+  ok(!disputedHtml.includes("Đã xong"), "…so it is never presented as a completion");
+}
+
+console.log("== a Jev step row renders its own label, and a step that was never dispatched says so ==");
+{
+  const model = new ConversationModel("conv-jev-rows");
+  model.addLocalUserMessage("mua vé");
+  model.bindRunToLastUserMessage("rr");
+  model.applyEvent({ type: "run_created", runId: "rr" });
+  model.applyEvent({ type: "run_started", runId: "rr" });
+  model.applyEvent({ type: "jev_step", runId: "rr", step: 1, operation: "TYPE_TEXT", intent: "ô nhập email", target: { index: 5, label: "Email" }, targetProbability: 0.9, confidence: 0.9, tool: "form_input", argsSummary: "ref: ref_5", textField: "Email", latencies: { decisionMs: 300, selectionMs: 220, dispatchMs: 60 }, pageChanged: false });
+  model.applyEvent({ type: "jev_step", runId: "rr", step: 2, operation: "CLICK", intent: "nút Thanh toán", target: { index: 6, label: "Thanh toán" }, targetProbability: 0.7, confidence: 0.7, tool: null, argsSummary: null, skippedReason: "action_denied", latencies: { decisionMs: 320, selectionMs: 210, dispatchMs: 0 }, pageChanged: false });
+  const rows = model.items.find((i) => i.kind === "assistant_turn").toolRows;
+
+  const executedHtml = toolRowRender.toolRowHtml(rows[0]);
+  ok(
+    executedHtml.includes("Đã nhập văn bản (mô hình quyết định) — Jev chọn: Email"),
+    `an executed step reads as the model's operation and the element Jev selected (got "${toolRowDisplay(rows[0]).label}")`
+  );
+  ok(executedHtml.includes("ý định: ô nhập email"), "…naming the intent the element was selected for");
+  ok(!executedHtml.includes("xác suất thao tác"), "…with no operation-probability copy anywhere");
+  ok(!executedHtml.includes("Không thực thi"), "…with no skipped pill");
+  ok(executedHtml.includes("trường văn bản: Email") && executedHtml.includes("chọn phần tử 220ms"), "the expandable detail names the text field and Jev's selection latency");
+
+  const skippedHtml = toolRowRender.toolRowHtml(rows[1]);
+  ok(skippedHtml.includes('data-status="skipped"'), "a step that dispatched nothing carries the skipped status");
+  ok(skippedHtml.includes("Không thực thi"), "…and is labelled as not executed, never as a success");
+  ok(skippedHtml.includes("Chưa gửi thao tác nào"), "…stating in the row itself that nothing was sent");
+  ok(!skippedHtml.includes("Đã click"), "…and never implying the click happened");
+  ok(toolRowRender.statusWordVi("skipped") === "Không thực thi", "the status word for the shipped renderer is Vietnamese");
+
+  // A run-memory row (add-jev-run-context design.md §8) renders through the
+  // same real row renderer: its label names the record and what triggered it,
+  // and its detail carries the model's context verbatim.
+  const memoryModel = new ConversationModel("conv-jev-memory");
+  memoryModel.applyEvent({ type: "run_started", runId: "rm" });
+  memoryModel.applyEvent({
+    type: "jev_memory",
+    runId: "rm",
+    index: 1,
+    kind: "plan",
+    trigger: "start",
+    memory: { plan: "Mở trang danh sách rồi lọc theo tỉnh", doneWhen: "Danh sách đã lọc hiển thị", notes: "Bắt đầu" },
+    latencyMs: 800
+  });
+  const memoryRow = memoryModel.items.find((i) => i.kind === "assistant_turn").toolRows[0];
+  const memoryHtml = toolRowRender.toolRowHtml(memoryRow);
+  ok(memoryHtml.includes("Kế hoạch lượt chạy — khi bắt đầu"), "a memory row renders its own label in the timeline");
+  ok(
+    memoryHtml.includes("kế hoạch: Mở trang danh sách rồi lọc theo tỉnh") && memoryHtml.includes("điều kiện hoàn thành: Danh sách đã lọc hiển thị"),
+    "…with the model's context in its expandable detail"
+  );
+  ok(!memoryHtml.includes("Không thực thi"), "…and never the skipped pill: recording context is not an unexecuted action");
 }
 
 console.log(fail === 0 ? "\nALL SIDEPANEL STREAMING RENDER TESTS PASSED" : `\n${fail} FAILED`);

@@ -23,6 +23,20 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const OVERLAY_FILE = path.join(ROOT, "extension", "overlay", "pointer-overlay.js");
 const SRC = fs.readFileSync(OVERLAY_FILE, "utf8");
 
+/** The shipped `POINTER_ACTION_TYPES` object literal, parsed out of the source
+ * so a test and the extension can never disagree about which actions move the
+ * pointer. */
+function pointerActionTypesFromSource() {
+  const m = SRC.match(/var POINTER_ACTION_TYPES = \{([^}]*)\};/);
+  if (!m) throw new Error("POINTER_ACTION_TYPES not found in the overlay source");
+  const set = {};
+  for (const pair of m[1].split(",")) {
+    const key = pair.split(":")[0].trim();
+    if (key) set[key] = true;
+  }
+  return set;
+}
+
 let fail = 0;
 const ok = (c, m) => { console.log((c ? "  PASS " : "  FAIL ") + m); if (!c) fail++; };
 const extract = (name) => extractFunction(name, OVERLAY_FILE);
@@ -150,7 +164,10 @@ console.log("\n== reduceOverlayState: never fabricates, only reflects real dispa
 {
   const reduceOverlayState = compile(
     [extract("resolveViewportPoint"), extract("reduceOverlayState")].join("\n\n"),
-    {},
+    // The reducer reads the shipped pointer-action set (a hover hold ends at
+    // the next action that MOVES the pointer). Injected FROM the source rather
+    // than restated here, so a change to that set cannot slip past this test.
+    { POINTER_ACTION_TYPES: pointerActionTypesFromSource() },
     "reduceOverlayState"
   );
   const initial = {
@@ -244,11 +261,54 @@ console.log("\n== reduceOverlayState: never fabricates, only reflects real dispa
      "teardown preserves the step count/start time it already had (nothing left to show once inactive, but nothing corrupted either)");
 }
 
+console.log("\n== reduceOverlayState: a completed hover holds the pointer on the page ==");
+{
+  const reduceOverlayState = compile(
+    [extract("resolveViewportPoint"), extract("reduceOverlayState")].join("\n\n"),
+    { POINTER_ACTION_TYPES: pointerActionTypesFromSource() },
+    "reduceOverlayState"
+  );
+  const initial = {
+    lastEventAt: null, cursor: null, clickAt: null, dragHeld: false,
+    runId: null, conversationId: null, tabId: null, lastActionType: null,
+    stepCount: 0, startedAt: null, pendingApproval: null, actionInFlight: false, hoverHeld: false
+  };
+
+  let s = reduceOverlayState(initial, { kind: "start", runId: "r1", tabId: 7, action: { type: "hover" } }, 1000);
+  ok(s.hoverHeld === false, "a hover that has only STARTED holds nothing yet — its own dispatch already lifts the shield");
+  s = reduceOverlayState(s, { kind: "complete", runId: "r1", tabId: 7, action: { type: "hover" }, pointer: null }, 1100);
+  ok(s.hoverHeld === true, "a COMPLETED hover holds the pointer where the agent parked it");
+
+  // The calls that happen between two steps cannot move the pointer, so they
+  // must not take the hover off the page — this is the whole fix.
+  s = reduceOverlayState(s, { kind: "start", runId: "r1", tabId: 7, action: { type: "read", tool: "page_snapshot" } }, 1200);
+  ok(s.hoverHeld === true, "the observation between two steps never moved the pointer, so the hold survives it");
+  s = reduceOverlayState(s, { kind: "complete", runId: "r1", tabId: 7, action: { type: "read" }, pointer: null }, 1250);
+  ok(s.hoverHeld === true, "…and the observation's own completion does not end it either: only a pointer move does");
+  const afterRead = reduceOverlayState(s, { kind: "start", runId: "r1", tabId: 7, action: { type: "capture" } }, 1260);
+  ok(afterRead.hoverHeld === s.hoverHeld, "a capture cannot move the pointer, so it cannot end a hold");
+
+  // Only moving the pointer ends it.
+  const held = reduceOverlayState(
+    reduceOverlayState(initial, { kind: "start", runId: "r1", tabId: 7, action: { type: "hover" } }, 1300),
+    { kind: "complete", runId: "r1", tabId: 7, action: { type: "hover" }, pointer: null },
+    1310
+  );
+  const clicked = reduceOverlayState(held, { kind: "start", runId: "r1", tabId: 7, action: { type: "click" } }, 1400);
+  ok(clicked.hoverHeld === false, "the next action that MOVES the pointer ends the hold");
+  const clickDone = reduceOverlayState(clicked, { kind: "complete", runId: "r1", tabId: 7, action: { type: "click" }, pointer: null }, 1450);
+  ok(clickDone.hoverHeld === false, "…and a completed click holds nothing: the shield re-arms immediately after it");
+
+  // A hold belongs to the run that parked the pointer.
+  const tornDown = reduceOverlayState(held, { kind: "teardown" }, 1500);
+  ok(tornDown.hoverHeld === false, "teardown clears the hold — no page stays unshielded after the run that held it is gone");
+}
+
 console.log("\n== reduceOverlayState: task 7.7 riskUpdate — a real signal, never a fabricated category ==");
 {
   const reduceOverlayState = compile(
     [extract("resolveViewportPoint"), extract("reduceOverlayState")].join("\n\n"),
-    {},
+    { POINTER_ACTION_TYPES: pointerActionTypesFromSource() },
     "reduceOverlayState"
   );
   const initial = {
@@ -612,6 +672,7 @@ console.log("\n== wiring: state is updated the instant an event is handled, pain
     varBlock,
     extract("attach"),
     extract("setWaitCursorActive"),
+    extract("setInputShieldActive"),
     extract("stopCursorAnimation"),
     extract("stepCursorAnimation"),
     extract("ensureCursorAnimation"),
@@ -629,6 +690,15 @@ console.log("\n== wiring: state is updated the instant an event is handled, pain
 
   const scheduledTimeouts = [];
   const fakeSetTimeout = (fn) => scheduledTimeouts.push(fn);
+  // openspec/changes/fix-lock-suppresses-hover: a controllable clock. The
+  // shield's own truth table includes the heartbeat's expiry — a function of
+  // elapsed time with NO further event ever arriving — which is unreachable
+  // from one synchronous test block with the real Date.now(). Everything else
+  // in this harness behaves exactly as before at a frozen instant, because
+  // every event below already happens within the same millisecond; advancing
+  // it is an explicit, local act.
+  let nowMs = 1700000000000;
+  const FakeDate = { now: () => nowMs };
 
   const W = compile(
     wiringSrc,
@@ -658,10 +728,11 @@ console.log("\n== wiring: state is updated the instant an event is handled, pain
         "paste", "drop"
       ],
       WAIT_CURSOR_CSS: "*, *::before, *::after { cursor: wait !important; }",
+      Date: FakeDate,
       ...computeRenderModelDeps,
       setTimeout: fakeSetTimeout
     },
-    "({ handleOverlayEvent, setCapturedHidden, handleCaptureMessage, " +
+    "({ handleOverlayEvent, setCapturedHidden, handleCaptureMessage, paintNow, " +
     "get state(){ return state; }, get refs(){ return refs; }, get capturedHiddenAt(){ return capturedHiddenAt; }, " +
     "get drawnCursor(){ return drawnCursor; }, get waitCursorStyleEl(){ return waitCursorStyleEl; } })"
   );
@@ -693,6 +764,12 @@ console.log("\n== wiring: state is updated the instant an event is handled, pain
   ok(W.refs.badgeEl.attrs["data-state"] === "running", "and the bar as 'running'");
   ok(W.refs.stopButtonEl.hidden === false, "...with the Stop control visible");
   ok(W.refs.openPanelButtonEl.hidden === true, "...and the Open-panel control hidden while running");
+
+  // openspec/changes/fix-lock-suppresses-hover: the shield is driven by the
+  // SAME predicate as the event suppression, so a real in-flight dispatch of
+  // the agent's own keeps the page answering the pointer.
+  ok(W.refs.shieldEl && W.refs.shieldEl.classList.contains("is-active") === false,
+     "shield off while the agent's own click is in flight — its dispatch must still reach the page (task 7.5/7.6)");
 
   // Task 7.7: the risk chip through the FULL wiring (handleOverlayEvent ->
   // reduceOverlayState -> computeRenderModel -> paintOverlay), not just the
@@ -742,12 +819,24 @@ console.log("\n== wiring: state is updated the instant an event is handled, pain
   ok(W.refs.openPanelButtonEl.hidden === false, "Open-panel is the ONLY visible control while waiting");
   ok(W.refs.textEl.textContent.indexOf("computer click (submit-type control)") !== -1,
      "the waiting text names the real action awaiting a decision, not a placeholder");
+  // openspec/changes/fix-lock-suppresses-hover: the approval window is the
+  // one time the operator MUST be able to read (and scroll) the page in
+  // question, so the shield is off for its whole duration — same predicate,
+  // same exemption as the event suppression (task 7.11).
+  ok(W.refs.shieldEl.classList.contains("is-active") === false,
+     "shield off while an approval is pending — the page being asked about stays readable and scrollable");
   // design.md D8/task 7.11: input blocking is lifted while an approval is
   // pending — the operator must be able to read the page before deciding.
   {
     const evtWhileWaiting = makeFakeEvent("click");
     dispatchWindowEvent("click", evtWhileWaiting);
     ok(!evtWhileWaiting._prevented, "a trusted event is NOT suppressed while an approval is pending (task 7.11)");
+    // …including the scroll-gesture exception: it is gated on the predicate,
+    // not on the event type alone, so the approval window stays scrollable
+    // through the very surface the shield would otherwise occupy.
+    const evtWheelWhileWaiting = makeFakeEvent("wheel", { target: W.refs.host });
+    dispatchWindowEvent("wheel", evtWheelWhileWaiting);
+    ok(!evtWheelWhileWaiting._prevented, "a wheel over the overlay's own surface is untouched while an approval is pending — the operator must be able to scroll the page being asked about");
   }
   // Exhaustively confirm no grant/deny control exists anywhere in the built
   // DOM at all — not just that the known ones are hidden, but that nothing
@@ -789,6 +878,44 @@ console.log("\n== wiring: state is updated the instant an event is handled, pain
   W.handleOverlayEvent({ kind: "complete", runId: "run_1", conversationId: "conv_1", tabId: 42, action: { type: "click" }, pointer: null, outcome: { status: "success", detail: null } });
   settle();
 
+  // openspec/changes/fix-lock-suppresses-hover — THE FIX ITSELF. A run
+  // holds the page, nothing of the agent's is in flight, no approval waits:
+  // the shield takes the whole viewport. This is what makes `:hover`,
+  // tooltips and hover-only menus impossible for the operator's pointer —
+  // no event suppression could ever do that, because the browser decides
+  // those from its own hit test.
+  ok(W.refs.shieldEl.classList.contains("is-active") === true,
+     "LOCKED AND IDLE: the shield is active — page content answers no hover, no tooltip, no hover menu, no click, no wheel, no selection");
+  ok(W.refs.host.style.pointerEvents === "none" && W.refs.shieldEl !== W.refs.host,
+     "…while the HOST itself stays pointer-events:none: the shield is a separate, deliberate exception, never the host (structural round-trip of task 2.1's host invariant)");
+
+  // THE HOVER HOLD. A hover-only menu exists only while the browser's hit test
+  // says the pointer is on the control. Re-arming the shield the instant the
+  // hover's own dispatch completed took that hit test back and closed the menu
+  // before the next step could click anything in it — seen live as a run that
+  // hovered a nav menu correctly seventeen times and never got into it.
+  W.handleOverlayEvent({ kind: "start", runId: "run_1", conversationId: "conv_1", tabId: 42, action: { type: "hover", tool: "computer", op: "hover" } });
+  W.handleOverlayEvent({ kind: "complete", runId: "run_1", conversationId: "conv_1", tabId: 42, action: { type: "hover" }, pointer: null, outcome: { status: "success", detail: null } });
+  settle();
+  ok(W.refs.shieldEl.classList.contains("is-active") === false,
+     "after a completed HOVER the shield stays off — the page keeps answering the pointer the agent parked on it");
+
+  // The observation between two steps cannot move the pointer, so it must not
+  // put the shield back either.
+  W.handleOverlayEvent({ kind: "start", runId: "run_1", conversationId: "conv_1", tabId: 42, action: { type: "read", tool: "page_snapshot", op: null } });
+  W.handleOverlayEvent({ kind: "complete", runId: "run_1", conversationId: "conv_1", tabId: 42, action: { type: "read" }, pointer: null, outcome: { status: "success", detail: null } });
+  settle();
+  ok(W.refs.shieldEl.classList.contains("is-active") === false,
+     "…and it survives the observation that follows, which never moved the pointer");
+
+  // The next pointer-moving action ends the hold: after it settles the page is
+  // shielded again, exactly as before this exception existed.
+  W.handleOverlayEvent({ kind: "start", runId: "run_1", conversationId: "conv_1", tabId: 42, action: { type: "click", tool: "computer", op: "left_click" } });
+  W.handleOverlayEvent({ kind: "complete", runId: "run_1", conversationId: "conv_1", tabId: 42, action: { type: "click" }, pointer: null, outcome: { status: "success", detail: null } });
+  settle();
+  ok(W.refs.shieldEl.classList.contains("is-active") === true,
+     "the click that follows ends the hold, and the shield re-arms the moment it settles");
+
   // design.md D8: the general blocking case — a trusted event aimed at page
   // content, no action in flight, a live run, no pending approval.
   {
@@ -813,6 +940,23 @@ console.log("\n== wiring: state is updated the instant an event is handled, pain
     dispatchWindowEvent("click", evtOnHost);
     ok(!evtOnHost._prevented, "an event whose target is the overlay's own host is exempt (task 7.4)");
 
+    // openspec/changes/fix-lock-suppresses-hover: the shield's own hit test
+    // means the operator's wheel RETARGETS to that same host, and Chrome's
+    // scroll chain runs from the hit-tested node to the document — verified
+    // in a real browser: with the shield covering the viewport, a wheel over
+    // it (and over the indicator) scrolled the page unless that wheel's own
+    // event was cancelled (`overflow:hidden` on the shield did not help
+    // either). Hit-testing alone therefore cannot deliver the lock's "no
+    // wheel scroll moves the page" — so the scroll gestures are the one
+    // family that does NOT get the host exemption while the lock holds.
+    const evtWheelOnHost = makeFakeEvent("wheel", { target: W.refs.host });
+    dispatchWindowEvent("wheel", evtWheelOnHost);
+    ok(evtWheelOnHost._prevented && evtWheelOnHost._stopped,
+       "a wheel aimed at the shield IS suppressed — otherwise the document scrolls under the lock, exactly as it did before this fix");
+    const evtTouchMoveOnHost = makeFakeEvent("touchmove", { target: W.refs.host });
+    dispatchWindowEvent("touchmove", evtTouchMoveOnHost);
+    ok(evtTouchMoveOnHost._prevented, "…and a touch drag the shield took, for the same reason");
+
     const evtTab = makeFakeEvent("keydown", { key: "Tab" });
     dispatchWindowEvent("keydown", evtTab);
     ok(!evtTab._prevented, "a Tab keydown is exempt — the operator's only keyboard route to Stop (task 7.4)");
@@ -829,9 +973,17 @@ console.log("\n== wiring: state is updated the instant an event is handled, pain
     ok(sentMessages.length === 1 && sentMessages[0].type === "browzyOverlayInputSuppressed",
        "a `start` for this run arriving shortly after a suppression reports it (task 7.7 — the delivery-race detector)");
     ok(sentMessages[0].runId === "run_1", "...carrying the run's own identity");
+    // openspec/changes/fix-lock-suppresses-hover: that same `start` is the
+    // moment the agent's own input needs the page — the shield drops on the
+    // very next paint, so the dispatch it announces is never shielded.
+    settle();
+    ok(W.refs.shieldEl.classList.contains("is-active") === false,
+       "a new action's own `start` takes the shield down again — the agent's upcoming dispatch must reach the page");
     // Settle this action again before the remaining blocking checks.
     W.handleOverlayEvent({ kind: "complete", runId: "run_1", conversationId: "conv_1", tabId: 42, action: { type: "click" }, pointer: null, outcome: { status: "success", detail: null } });
     settle();
+    ok(W.refs.shieldEl.classList.contains("is-active") === true,
+       "…and the shield re-arms the moment that action settles — the lock resumes (spec: \"the suppression resumes once the action settles\")");
     sentMessages.length = 0;
     const evtNotRaced = makeFakeEvent("click");
     dispatchWindowEvent("click", evtNotRaced);
@@ -844,9 +996,19 @@ console.log("\n== wiring: state is updated the instant an event is handled, pain
   // through, or the agent's own delayed dispatch would be suppressed.
   {
     W.handleOverlayEvent({ kind: "complete", runId: "run_1", conversationId: "conv_1", tabId: 42, action: { type: "scroll" }, pointer: null, outcome: { status: "success", detail: null } });
+    settle();
+    ok(W.refs.shieldEl.classList.contains("is-active") === false,
+       "shield off through the scroll tail — a delayed wheel event of the agent's own must still reach the page");
     const evtWheelTail = makeFakeEvent("wheel");
     dispatchWindowEvent("wheel", evtWheelTail);
     ok(!evtWheelTail._prevented, "a trailing wheel event right after a scroll action settles is NOT suppressed (task 7.6)");
+    // The tail's deadline is not a second timer of its own: the shield's own
+    // verdict is re-evaluated on the existing paint cadence, so the predicate
+    // naturally re-arms it once now >= scrollTailUntil.
+    nowMs += 300;
+    W.paintNow();
+    ok(W.refs.shieldEl.classList.contains("is-active") === true,
+       "once the scroll tail's deadline passes, the next paint re-arms the shield — re-evaluated, never latched");
   }
   // task 7.1: passive:false / capture:true registration — behavioral proof
   // that preventDefault() actually took effect above already covers the
@@ -859,11 +1021,33 @@ console.log("\n== wiring: state is updated the instant an event is handled, pain
   // left to guard once the heartbeat is hard-cleared (task 7.8/7.9).
   W.handleOverlayEvent({ kind: "teardown" });
   ok(W.state.lastEventAt === null, "the teardown synthetic event is handled through the exact same handleOverlayEvent path as a real one");
+  settle();
+  ok(W.refs.shieldEl.classList.contains("is-active") === false,
+     "teardown leaves no shield behind: the run is gone, so the page answers the operator again (the shield never outlives the lock)");
   {
     const evtAfterTeardown = makeFakeEvent("click");
     dispatchWindowEvent("click", evtAfterTeardown);
     ok(!evtAfterTeardown._prevented, "input blocking clears the instant the run tears down — no run left to guard (task 7.8/7.9)");
   }
+
+  // openspec/changes/fix-lock-suppresses-hover: the last transition that can
+  // take the shield down is the heartbeat's expiry — the case where NO
+  // further event ever arrives at all. It has no handler of its own: the
+  // predicate is re-evaluated on the existing paint cadence, exactly like the
+  // badge's own expiry, so the harness's own clock is what advances it here
+  // (the real file's 250ms re-check tick).
+  W.handleOverlayEvent({ kind: "start", runId: "run_2", conversationId: "conv_1", tabId: 42, action: { type: "read" } });
+  settle();
+  ok(W.refs.shieldEl.classList.contains("is-active") === false,
+     "run_2's own read action is in flight, so no shield yet — the shield tracks the predicate, not merely \"a run exists\"");
+  W.handleOverlayEvent({ kind: "complete", runId: "run_2", conversationId: "conv_1", tabId: 42, action: { type: "read" }, pointer: null, outcome: { status: "success", detail: null } });
+  settle();
+  ok(W.refs.shieldEl.classList.contains("is-active") === true,
+     "run_2, idle and locked: the shield is up again");
+  nowMs += 3001; // past HEARTBEAT_MAX_AGE_MS, with NO event arriving
+  W.paintNow();
+  ok(W.refs.shieldEl.classList.contains("is-active") === false,
+     "a heartbeat that expires with no further event still takes the shield down on the next paint — a dead host cannot leave the operator's page locked");
 }
 
 console.log("\n== structural: input blocking registration (task 7.1) ==");
@@ -885,6 +1069,107 @@ console.log("\n== structural: input blocking registration (task 7.1) ==");
      "registerInputBlockers() registers ONE named handler for every type, so removeInputBlockers() can remove the exact same function reference");
   ok(/window\.removeEventListener\(BLOCKABLE_EVENT_TYPES\[i\], handleBlockableEvent/.test(SRC),
      "removeInputBlockers() removes the SAME named handler — used by pagehide (task 7.12) and dispose (task 7.13)");
+}
+
+// =============================================================================
+// 7b. The locked-page input shield (openspec/changes/fix-lock-suppresses-hover):
+//     a full-viewport element inside the overlay's shadow root that takes
+//     hit-testing while, and only while, shouldBlockInput() says the
+//     operator's input to the page must be blocked. Event suppression cannot
+//     do this job at all: the browser decides `:hover`, tooltips and
+//     hover-only menus from its own hit test, not from a JS event a
+//     capture-phase listener could cancel.
+// =============================================================================
+console.log("\n== the locked-page input shield: structure, and the ONE predicate behind it ==");
+{
+  const shieldDocEl = makeFakeElement("html");
+  const shieldDoc = { documentElement: shieldDocEl, createElement: makeFakeElement };
+  const createOverlayHost = compile(
+    extract("createOverlayHost"),
+    { document: shieldDoc, OVERLAY_CSS: "/* test css */", CURSOR_SVG: "", CORNER_SVGS: "", BADGE_TRACE_SVG: "" },
+    "createOverlayHost"
+  );
+  const R = createOverlayHost(shieldDoc);
+
+  ok(!!R.shieldEl && R.shieldEl.className === "browzy-shield",
+     "the host builds a .browzy-shield element (task 1.1)");
+  ok(R.shadow.children.includes(R.shieldEl), "it lives inside the overlay's closed shadow root, with every other layer");
+  ok(R.shadow.children.indexOf(R.shieldEl) < R.shadow.children.indexOf(R.badgeEl),
+     "and beneath the badge in DOM order — matching the z-index order asserted below, so the badge's own controls are never covered");
+  ok(Object.keys(R.shieldEl.listeners).length === 0,
+     "it has no listener of its own: it is a hit-testing surface, not a script — the decision is the paint path's");
+  ok(R.shieldEl.classList.contains("is-active") === false,
+     "it is built inert, so a page is unshielded until shouldBlockInput() actually says the operator's input must be blocked");
+  ok(R.host.style.pointerEvents === "none" && R.shieldEl !== R.host,
+     "the HOST itself stays pointer-events:none — the shield is a separate element, never the host (task 2.1's invariant untouched)");
+
+  const cssMatch = SRC.match(/var OVERLAY_CSS =([\s\S]*?);\n\n\s*var CURSOR_SVG/);
+  ok(!!cssMatch, "found the OVERLAY_CSS string literal block in the shipped source");
+  const css = cssMatch[1];
+  ok(/\.browzy-shield\{[^}]*position:fixed/.test(css) && /\.browzy-shield\{[^}]*inset:0/.test(css),
+     "the shield is position:fixed/inset:0 — the whole viewport, and (being fixed) it adds no scrollbars and shifts no layout");
+  ok(/\.browzy-shield\{[^}]*pointer-events:none/.test(css),
+     "…inert by default: without .is-active it takes nothing, so an unlocked page behaves exactly as before");
+  ok(/\.browzy-shield\.is-active\{pointer-events:auto/.test(css),
+     "and ONLY .is-active takes the pointer — the single rule that makes the lock real for hit-testing");
+  ok(/\.browzy-shield\{[^}]*cursor:wait/.test(css),
+     "the wait cursor rides the shield, so the locked-page lesson survives on elements whose own CSS sets a different cursor");
+  ok(/\.browzy-shield\{[^}]*background:transparent/.test(css),
+     "transparent: the page stays fully readable behind it (approvals must stay readable, and a screenshot must be unaffected)");
+
+  function zIndexOf(selector) {
+    const m = css.match(new RegExp(selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\{[^}]*z-index:(\\d+)"));
+    return m ? Number(m[1]) : null;
+  }
+  const shieldZ = zIndexOf(".browzy-shield");
+  ok(shieldZ === 2147483644, `the shield's z-index is 2147483644 (got ${shieldZ}) — above realistic page content`);
+  const badgeZ = zIndexOf(".browzy-badge");
+  ok(badgeZ !== null && shieldZ < badgeZ,
+     `and BELOW the badge (${shieldZ} < ${badgeZ}), so Stop and Open-panel keep winning hit-testing while the shield is up`);
+  ok(shieldZ > zIndexOf(".browzy-glow"),
+     "…while staying above the purely decorative glow it should never be confused with");
+  // The two layers stacked ABOVE the shield (the frame and the click ripples)
+  // are pointer-events:none, which is exactly why 2147483644 is a safe place
+  // for it: everything higher in z-order than the shield is inert, so the
+  // shield still owns hit-testing for everything the page would otherwise get.
+  ok(/\.browzy-frame\{[^}]*pointer-events:none/.test(css) && /\.browzy-click-ring\{[^}]*pointer-events:none/.test(css),
+     "the layers stacked above the shield are all pointer-events:none — nothing else can steal the hit test the shield exists to take");
+
+  // "One predicate, two enforcement layers" (design.md decision 1): the
+  // shield must NOT get its own, subtly-different notion of "the page is
+  // locked", and it must never ride the broader `locked` render flag — that
+  // one stays true across the agent's OWN in-flight dispatch, exactly when
+  // the operator's pointer must reach the page.
+  ok((SRC.match(/function shouldBlockInput\(/g) || []).length === 1,
+     "exactly ONE shouldBlockInput() definition exists in the shipped source — the shield does not carry a second copy of the truth table");
+  ok(/setInputShieldActive\(shouldBlockInput\(state, now, HEARTBEAT_MAX_AGE_MS, scrollTailUntil\)\)/.test(SRC),
+     "paintNow() sets the shield from the SAME predicate, with the SAME arguments, handleBlockableEvent() applies to events (task 1.2)");
+  ok(!/setInputShieldActive\([^)]*model\.locked/.test(SRC),
+     "the shield never rides model.locked — that flag has no action-in-flight gate, so it would shield the agent's own dispatch");
+  const setInputShieldActiveSrc = extract("setInputShieldActive");
+  ok(/classList\.toggle\("is-active", !!active\)/.test(setInputShieldActiveSrc),
+     "setInputShieldActive(active) is a plain class toggle of the boolean it is handed — it never re-derives the decision itself");
+  ok(!SRC.replace(setInputShieldActiveSrc, "").includes("shieldEl.classList"),
+     "…and it is the ONLY place in the file that touches shieldEl.classList: one writer, no second path that could disagree");
+  ok(/if \(!refs \|\| !refs\.shieldEl \|\| !refs\.shieldEl\.classList\) return;/.test(setInputShieldActiveSrc),
+     "it is a no-op before attach() built the host — paintNow() legitimately runs with refs === null (the \"no host node\" verdict)");
+  ok(!/shield/.test(extract("paintOverlay")),
+     "paintOverlay() knows nothing about the shield: its `!model.active` early return would otherwise skip clearing it (the shield is cleared by paintNow(), which always runs)");
+
+  // Hit-testing alone cannot stop the SCROLL: Chrome's scroll chain runs from
+  // the hit-tested node to the document, so a wheel the shield takes still
+  // scrolls the page (measured in a real browser). The one event family that
+  // skips the host exemption is therefore the scroll gestures, and only while
+  // the predicate holds.
+  const handleBlockableEventSrc = extract("handleBlockableEvent");
+  ok(/var scrollGesture = event\.type === "wheel" \|\| event\.type === "touchmove";/.test(handleBlockableEventSrc),
+     "the host exemption skips exactly the scroll gestures (wheel/touchmove) — no other event type loses it, so Stop/Open-panel clicks still land");
+  ok(/event\.target === refs\.host && !\(blocked && scrollGesture\)/.test(handleBlockableEventSrc),
+     "…and only while `blocked` — the exception is the SAME predicate, not the event type alone");
+  ok((handleBlockableEventSrc.match(/shouldBlockInput\(/g) || []).length === 1,
+     "the predicate is evaluated ONCE per event (the shield's own verdict and the lock can never disagree within one dispatch)");
+  ok(!/shieldEl/.test(handleBlockableEventSrc),
+     "the listener reads the predicate, never the shield's DOM class — the class is an OUTPUT of the decision, never its source");
 }
 
 console.log("\n== eager mount (task 1.1-1.3): the host exists before any event is ever delivered ==");
@@ -1092,7 +1377,7 @@ console.log("\n== keepalive: the overlay stays up while the model thinks ==");
 {
   const reduceOverlayState = compile(
     [extract("resolveViewportPoint"), extract("reduceOverlayState")].join("\n\n"),
-    {},
+    { POINTER_ACTION_TYPES: pointerActionTypesFromSource() },
     "reduceOverlayState"
   );
   const computeRenderModel = compile(
@@ -1149,7 +1434,7 @@ console.log("\n== the cursor stops claiming an action once it settles, even acro
 {
   const reduceOverlayState = compile(
     [extract("resolveViewportPoint"), extract("reduceOverlayState")].join("\n\n"),
-    {},
+    { POINTER_ACTION_TYPES: pointerActionTypesFromSource() },
     "reduceOverlayState"
   );
   const computeRenderModel = compile(
@@ -1273,6 +1558,8 @@ console.log("\n== handleCaptureMessage: the correlated capture lease (design.md 
     extract("paintCursorPosition"),
     varBlock,
     extract("setWaitCursorActive"),
+    extract("setInputShieldActive"),
+    extract("shouldBlockInput"),
     extract("stopCursorAnimation"),
     extract("stepCursorAnimation"),
     extract("ensureCursorAnimation"),

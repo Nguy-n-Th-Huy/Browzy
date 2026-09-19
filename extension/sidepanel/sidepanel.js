@@ -17,6 +17,8 @@ import { HistoryListView, historyErrorText } from "./history-view.js";
 import { HistoryPrivacyControls } from "./history-privacy.js";
 import { normalizeExportFormat } from "./history-export.js";
 import { toolRowDisplay } from "./conversation-model.js";
+import { jevOutcomeLineVi } from "./tool-labels.js";
+import { renderReport, timelineCounts, evidenceHtml } from "./run-feedback.js";
 import { RUN_PHASE, PHASE_LABEL_VI, BUSY_LABEL_VI, phaseVisualClass, MESSAGE_QUEUE_LABEL_VI, QUEUE_FALLBACK_NOTE_VI, QUEUE_PAUSED_NOTE_VI } from "./run-states.js";
 import { renderMarkdownLite, escapeHtml } from "./markdown-lite.js";
 import { createPanelSkillsClient } from "./skills-client.js";
@@ -220,6 +222,7 @@ const historyStore = new HistoryStore();
 const profileCache = new ProfileCache();
 const recordingsClient = new RecordingsClient();
 const protocolClient = new ProtocolClient();
+const evidenceObjectUrls = new Set();
 
 // scope-conversation-restore-per-tab (design.md "Scope by the tab the panel
 // booted on, captured once"): this panel document's own restore scope, set
@@ -935,7 +938,11 @@ function renderQuestion() {
 
 function toolRowHtml(row) {
   const display = toolRowDisplay(row);
-  const statusPillMap = { running: "is-running", succeeded: null, failed: "is-failed", cancelled: "is-cancelled", unknown: "is-unknown" };
+  // `skipped` is the Jev step status for a decision that dispatched nothing
+  // (conversation-model.js's jev_step case): it gets a neutral pill reading
+  // "Không thực thi" — never a success check — so an unexecuted step can not
+  // be mistaken for an action that ran.
+  const statusPillMap = { running: "is-running", succeeded: null, failed: "is-failed", cancelled: "is-cancelled", unknown: "is-unknown", skipped: "is-cancelled" };
   const pillClass = statusPillMap[row.status];
   const durationLabel = row.endedAt && row.startedAt ? `${Math.max(0, Math.round((row.endedAt - row.startedAt) / 1000 || 0))}s` : "";
   return `
@@ -946,7 +953,7 @@ function toolRowHtml(row) {
         ${pillClass ? `<span class="status-pill ${pillClass}">${escapeHtml(statusWordVi(row.status))}</span>` : durationLabel ? `<span class="tool-row-meta">${escapeHtml(durationLabel)}</span>` : ""}
         <span class="tool-row-chevron">${iconMarkup("chevronRight", { size: 14 })}</span>
       </button>
-      <div class="tool-row-detail" hidden>${escapeHtml(display.detail || "")}${row.resultSummary ? `<div>${escapeHtml(String(row.resultSummary)).slice(0, 4000)}</div>` : ""}</div>
+      <div class="tool-row-detail" hidden>${escapeHtml(display.detail || "")}${row.resultSummary ? `<div>${escapeHtml(String(row.resultSummary)).slice(0, 4000)}</div>` : ""}${row.jev && (row.jev.dispatched === true || (row.jev.dispatched == null && !row.jev.skippedReason)) ? evidenceHtml(row.jev.evidence) : ""}</div>
     </ui-tool-row>`;
 }
 
@@ -991,7 +998,7 @@ function renderWarningsHtml(turn) {
 }
 
 function statusWordVi(status) {
-  return { running: "Đang chạy", failed: "Lỗi", cancelled: "Đã hủy", unknown: "Không rõ kết quả" }[status] || status;
+  return { running: "Đang chạy", failed: "Lỗi", cancelled: "Đã hủy", unknown: "Không rõ kết quả", skipped: "Không thực thi" }[status] || status;
 }
 
 // Skill-specific run_error reasons (host/agent/companion.js's
@@ -1068,7 +1075,7 @@ function renderProseHtml(turn, opts) {
   const marginTop = opts.marginTop || 0;
   const body = opts.live
     ? `<span class="stream-answer-text" data-run-id="${escapeHtml(String(turn.runId ?? ""))}">${escapeHtml(turn.text || "")}</span>`
-    : renderMarkdownLite(turn.text || "");
+    : renderReport(turn);
   return `<div class="prose" style="margin-top:${marginTop}px">${body}${cursor}</div>`;
 }
 
@@ -1099,6 +1106,33 @@ function renderThinkingBlockHtml(turn, opts) {
       </button>
       <div class="thinking-body" id="${escapeHtml(bodyId)}"${expanded ? "" : " hidden"}>${body}</div>
     </div>`;
+}
+
+// The terminal line of a TypeSafe Jev run (openspec/changes/
+// add-typesafe-jev-provider, design.md §8; extended by openspec/changes/
+// add-jev-run-context, design.md §8), rendered under the turn exactly
+// where the generic turn-status note sits. It is a deliberate SECOND source of
+// truth next to the turn's lifecycle rather than a replacement for it: the
+// lifecycle says how the RUN ended (done/stopped/error), while this line says
+// what the decision loop concluded (done — verified by the completion check or
+// the decision model's judgment alone — blocked with its reason, stopped,
+// failed) — a Jev run can end `run_done` while its own outcome is `blocked`. A
+// `failed` outcome is coloured like any other error line; blocked and stopped
+// stay in the quieter secondary treatment, never presented as a completion.
+// The two done states are distinguished twice over: in the copy
+// (tool-labels.js's jevOutcomeLineVi, the same module every other row label
+// comes from) and in `data-jev-verified` — "true" only when the run's own
+// `doneVerified` recorded that the check confirmed the completion, "false"
+// when the check could not be made and the outcome is the decision model's
+// judgment alone, and absent for anything else (including records that predate
+// the field), so the attribute never claims a verification the event did not.
+function renderJevOutcomeHtml(turn) {
+  if (!turn || !turn.jevOutcome) return "";
+  const end = turn.jevOutcome;
+  const cls = end.outcome === "error" ? " is-error" : "";
+  const verified = end.outcome !== "done" ? "" : end.doneVerified === true ? "true" : end.doneVerified === false ? "false" : "";
+  const verifiedAttr = verified ? ` data-jev-verified="${verified}"` : "";
+  return `<div class="turn-status-note${cls}" data-jev-outcome="${escapeHtml(String(end.outcome || ""))}"${verifiedAttr}>${escapeHtml(jevOutcomeLineVi(end))}</div>`;
 }
 
 function renderTurnHtml(turn, opts) {
@@ -1133,6 +1167,10 @@ function renderTurnHtml(turn, opts) {
   // right after the tool timeline (roughly where the tool call that
   // surfaced them ran), never mixed into the assistant's own prose.
   const warningsHtml = renderWarningsHtml(turn);
+  // A Jev run's own terminal line (see renderJevOutcomeHtml): it sits with the
+  // generic turn-status note, because both describe how the turn ended, and it
+  // renders even though a Jev run produces no assistant text at all.
+  const jevOutcomeHtml = renderJevOutcomeHtml(turn);
   // Model reasoning, subordinate to and above the answer (spec "Thinking is
   // subordinate to the answer"): collapsed by default once the turn is no
   // longer live, expanded while it is. A turn without thinking renders
@@ -1194,6 +1232,7 @@ function renderTurnHtml(turn, opts) {
         ${citationHtml}
         ${documentsHtml}
         ${busyHtml}
+        ${jevOutcomeHtml}
         ${note ? `<div class="turn-status-note ${note.cls}">${note.text}</div>` : ""}
         ${actionsHtml}
       </div>
@@ -1261,19 +1300,17 @@ function timelineDurationLabel(turn) {
   // (turn.ts): on a live run, "now"; on a snapshot rebuild, the original
   // recorded start instant is restored (see _turnFor's ts capture verb).
   const startMs = turn.ts || 0;
-  // End: the latest tool-row's `endedAt` if every row resolved, otherwise
-  // the wall-clock now (the run is still streaming or has a tool in flight).
-  // A turn that finished cleanly ends at its last tool row's endedAt; a
-  // streaming turn reads live now; an interrupted/stopped turn already has
-  // every still-running row cancelled to a terminal state via conversation-
-  // model.js's run_stopped/run_interrupted handlers.
-  let endMs = Date.now();
-  for (const r of turn.toolRows) {
-    if (r.endedAt && typeof r.endedAt === "number") endMs = Math.max(endMs, r.endedAt);
+  // A terminal run owns its end instant, including Jev's rows which have no
+  // tool timestamps. Opening another turn must never age completed work.
+  const terminal = ["done", "stopped", "error", "interrupted"].includes(turn.lifecycle);
+  let endMs = turn.endedAt;
+  if (!(typeof endMs === "number" && Number.isFinite(endMs) && endMs > 0)) {
+    if (!terminal) endMs = Date.now();
+    else {
+      endMs = Math.max(0, ...turn.toolRows.map((row) => Number.isFinite(row.endedAt) ? row.endedAt : 0));
+      if (!endMs) return "";
+    }
   }
-  // edge: a stale turn from snapshot replay before any tool rows closed at
-  // all would compute a meaningless (today - then) -- cap by start so we
-  // never report a negative or absurd age:
   const durMs = Math.max(0, endMs - startMs);
   const durSec = Math.round(durMs / 1000);
   if (durSec < 60) return `${durSec}s`;
@@ -1282,10 +1319,10 @@ function timelineDurationLabel(turn) {
 
 function renderTimelineCollapsed(turn) {
   const isExpanded = timelineExpandedRuns.has(turn.runId);
-  const count = turn.toolRows.length;
+  const counts = timelineCounts(turn.toolRows);
   // "Đã dùng Browzy · N thao tác · <thời lượng>" per spec/Approval/Main mockup.
   const productLabel = "Đã dùng Browzy";
-  const summaryLabel = `${productLabel} · ${count} thao tác · ${timelineDurationLabel(turn)}`;
+  const summaryLabel = `${productLabel}${counts.operations || !counts.legacy ? ` · ${counts.operations} thao tác trình duyệt` : ""}${counts.activity ? ` · ${counts.activity} lập kế hoạch/kiểm tra` : ""}${counts.legacy ? ` · ${counts.legacy} bản ghi chưa phân loại` : ""} · ${timelineDurationLabel(turn)}`;
   // The summary row is a <button> so Enter/Space activation is the browser's
   // default for free; aria-expanded and aria-controls convey the
   // expand/collapse state to assistive tech. The full ordered list is held
@@ -1389,7 +1426,7 @@ function queueStateDetail(item) {
 function renderBusyIndicator(model, { elapsedVisible } = {}) {
   const secs = model ? model.busyElapsedSeconds() : 0;
   const showElapsed = !!elapsedVisible && secs >= 3;
-  const label = BUSY_LABEL_VI;
+  const label = model && typeof model.busyLabel === "function" ? model.busyLabel() || BUSY_LABEL_VI : BUSY_LABEL_VI;
   const elapsed = showElapsed
     ? `<span class="busy-elapsed" aria-hidden="true">${formatBusyElapsed(secs)}</span>`
     : `<span class="busy-elapsed" aria-hidden="true" hidden></span>`;
@@ -1535,6 +1572,7 @@ const WORKFLOW_COPY = Object.freeze({
   enabledDetail: "Đã bật. Workflow sẽ được gợi ý khi bạn mở đúng trang.",
   draftRestoredDetail: "Đã lưu ở phiên trước — danh sách bước không còn trong cửa sổ hội thoại này; chạy thử vẫn kiểm chứng được bản đã lưu.",
   stepsHeading: "Các bước",
+  stepAlreadySatisfied: "Đã mở sẵn",
   noSteps: "Không có danh sách bước trong hội thoại này.",
   saveDraft: "Lưu bản nháp",
   saving: "Đang lưu…",
@@ -1681,14 +1719,22 @@ const WORKFLOW_STEP_STATE_VI = Object.freeze({
 function workflowStepLineHtml(step, index, outcome) {
   const kind = step && typeof step.kind === "string" ? step.kind : "?";
   const ref = step && typeof step.ref === "string" ? step.ref : "";
-  const display = ref ? toolRowDisplay({ toolName: ref, args: (step && step.args) || {}, status: "succeeded" }) : { label: kind, detail: "" };
+  const status = outcome ? outcome.status : "pending";
+  const succeeded = status === "ok";
+  const display = ref ? toolRowDisplay({ toolName: ref, args: (step && step.args) || {}, status: succeeded ? "succeeded" : status }) : { label: kind, detail: "" };
+  // The shared timeline helper supplies completed action labels. A workflow
+  // draft or unsuccessful step names the requested action without claiming it
+  // happened; a satisfied expansion succeeded without dispatching a click.
+  const label = succeeded
+    ? outcome.state === "already_satisfied" ? WORKFLOW_COPY.stepAlreadySatisfied : display.label
+    : display.label.replace(/^Đã /, "").replace(/^./u, (letter) => letter.toUpperCase());
   const stateText = outcome ? WORKFLOW_STEP_STATE_VI[outcome.status] || outcome.status : "";
   const reasonText = outcome && outcome.reason ? ` (${escapeHtml(String(outcome.reason))})` : "";
   const source = outcome ? workflowOutcomeSource(outcome) : "";
-  return `<li class="workflow-step" data-step-index="${escapeHtml(String(index))}" data-step-status="${escapeHtml(String(outcome ? outcome.status : "pending"))}">
+  return `<li class="workflow-step" data-step-index="${escapeHtml(String(index))}" data-step-status="${escapeHtml(String(status))}">
       <span class="workflow-step-index">${escapeHtml(String(index + 1))}</span>
       <span class="workflow-step-main">
-        <span class="workflow-step-label">${escapeHtml(display.label)}${ref && display.label !== ref ? ` <code>${escapeHtml(ref)}</code>` : ""}</span>
+        <span class="workflow-step-label">${escapeHtml(label)}${ref && label !== ref ? ` <code>${escapeHtml(ref)}</code>` : ""}</span>
         ${display.detail ? `<span class="workflow-step-detail">${escapeHtml(display.detail)}</span>` : ""}
         ${source ? `<span class="workflow-step-source">${escapeHtml(source)}</span>` : ""}
       </span>
@@ -2404,10 +2450,16 @@ function transcriptStructureSignature(model, opts) {
           item.text ? 1 : 0,
           item.thinking ? 1 : 0,
           item.redactedThinking ? 1 : 0,
+          item.jevPhase?.phase || "",
           (item.toolRows || []).map((r) => r.status).join("."),
           (item.warnings || []).map((w) => w.kind).join("."),
           (item.documents || []).map((d) => d.documentId).join("."),
-          (item.questionAnswers || []).length
+          (item.questionAnswers || []).length,
+          // A Jev run's terminal line (this change) is structural too: the
+          // `jev_end` event can arrive after the run's own lifecycle already
+          // settled the turn, so without this the outcome line would never
+          // reach the DOM in that ordering.
+          item.jevOutcome ? `${item.jevOutcome.outcome}:${item.jevOutcome.reason || ""}` : ""
         ].join(","));
         break;
       default:
@@ -2589,7 +2641,7 @@ function wireToolRowIcons(model) {
     const iconSpan = rowEl.querySelector(".tool-row-icon");
     const row = flat[i];
     if (iconSpan && row) {
-      const name = { running: "circleDot", succeeded: "checkCircle", failed: "xCircle", cancelled: "slashCircle", unknown: "helpCircle" }[row.status] || "circle";
+      const name = { running: "circleDot", succeeded: "checkCircle", failed: "xCircle", cancelled: "slashCircle", unknown: "helpCircle", skipped: "slashCircle" }[row.status] || "circle";
       iconSpan.innerHTML = iconMarkup(name, { size: 15 });
     }
   });
@@ -2623,22 +2675,9 @@ function wireTimelineToggles() {
       }
     });
   });
-  // Per-row detail toggling: each `<ui-tool-row>`'s `.tool-row-summary`
-  // button flips its sibling `.tool-row-detail`'s `hidden` and the button's
-  // own aria-expanded, in place. Pre-existing markup that already declared
-  // aria-expanded="false" but had no listener: this is the wiring that
-  // actually makes expansion work.
-  const rowButtons = el.transcript.querySelectorAll(".tool-row-summary");
-  rowButtons.forEach((b) => {
-    if (b.dataset.wired === "1") return;
-    b.dataset.wired = "1";
-    b.addEventListener("click", () => {
-      const detail = b.parentElement.querySelector(".tool-row-detail");
-      const open = b.getAttribute("aria-expanded") === "true";
-      b.setAttribute("aria-expanded", open ? "false" : "true");
-      if (detail) detail.hidden = open;
-    });
-  });
+  // UiToolRow in ui/behaviors.js owns each row's native button activation.
+  // A second listener here would toggle the detail closed again in the same
+  // click while leaving the component's expanded chevron visible.
 }
 
 function toggleTimelineSummary(btn) {
@@ -2691,10 +2730,29 @@ function toggleThinkingSummary(btn) {
 }
 
 function wireThumbButtons() {
-  // Screenshot preview affordance: placeholder-only in this environment
-  // (no live browser to actually capture/store an image this session) —
-  // see reports/05-panel-evidence.md. Intentionally not wired to a fake
-  // image to avoid claiming capability this task cannot exercise for real.
+  for (const url of evidenceObjectUrls) URL.revokeObjectURL(url);
+  evidenceObjectUrls.clear();
+  el.transcript.querySelectorAll(".evidence-image-button").forEach(button => {
+    const conversationId = panel.currentModel()?.conversationId;
+    button.addEventListener("click", async () => {
+      const slot = button.nextElementSibling;
+      const prior = slot.querySelector("img");
+      if (prior) { URL.revokeObjectURL(prior.src); evidenceObjectUrls.delete(prior.src); }
+      button.disabled = true;
+      slot.textContent = "Đang tải ảnh đã ghi…";
+      const result = await panel.artifacts.fetch({ conversationId, artifactId: button.dataset.artifactId });
+      if (!button.isConnected || panel.currentModel()?.conversationId !== conversationId) return;
+      button.disabled = false;
+      if (!result.found) { slot.textContent = "Ảnh lịch sử không khả dụng (chưa lưu, đã hết hạn hoặc kết nối bị ngắt). Bạn có thể thử tải lại."; return; }
+      const url = URL.createObjectURL(new Blob([result.bytes], { type: result.mimeType }));
+      evidenceObjectUrls.add(url);
+      const img = document.createElement("img");
+      img.alt = button.textContent;
+      img.src = url;
+      img.addEventListener("error", () => { slot.textContent = "Không đọc được ảnh lịch sử."; URL.revokeObjectURL(url); evidenceObjectUrls.delete(url); });
+      slot.replaceChildren(img);
+    });
+  });
 }
 
 // Clipboard write with legacy fallback (same convention as spec-ade's chat

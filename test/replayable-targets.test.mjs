@@ -22,6 +22,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { extractMethod, compile, BACKGROUND, ROOT } from "./_extract.mjs";
+import { createTargetWorld } from "./_workflow-target-fixture.mjs";
 
 let fail = 0;
 const ok = (cond, msg) => {
@@ -67,48 +68,54 @@ function extractFn(name, src) {
 // ==========================================================================
 console.log("== content.js: a frozen identity resolves to a LIVE element, strictly ==");
 {
-  const calls = { find: [], coords: [] };
-  const page = [
-    { ref: "ref_5", role: "link", name: "  Click để tìm kiếm\n   nâng cao " },
-    { ref: "ref_6", role: "div", name: "Click để tìm kiếm nâng cao" }
-  ];
-  const getTargetCoordinates = compile(
-    extractFn("getTargetCoordinates", contentSrc),
-    {
-      findElements: (query) => {
-        calls.find.push(query);
-        return { results: page, total: page.length };
-      },
-      getRefCoordinates: (ref, opts) => {
-        calls.coords.push({ ref, opts });
-        return { x: 639, y: 783, reachable: true, covering: null, scrolledFrom: null, proxiedFrom: null };
-      }
-    },
-    "{ getTargetCoordinates }"
-  ).getTargetCoordinates;
-
-  const hit = getTargetCoordinates({ role: "link", name: "Click để tìm kiếm nâng cao" });
-  ok(hit && hit.ref === "ref_5", "role+name resolves to the live element (whitespace-normalized equality)");
-  ok(hit && hit.x === 639 && hit.y === 783 && hit.reachable === true, "...and carries the resolved point back");
-  ok(
-    calls.coords.length === 1 && calls.coords[0].ref === "ref_5" && calls.coords[0].opts.scrollIntoView === true,
-    "the matched element goes through the SHIPPED getRefCoordinates (scroll into view included)"
-  );
-
-  const roleMismatch = getTargetCoordinates({ role: "button", name: "Click để tìm kiếm nâng cao" });
-  ok(roleMismatch && roleMismatch.ref === "ref_5", "role is preferred, not required — a re-roled control with the same name still resolves");
-
-  const miss = getTargetCoordinates({ role: "link", name: "Nút không tồn tại trên trang" });
+  const world = createTargetWorld();
+  const wrapper = world.doc.body.appendChild(world.element("div"));
+  const link = wrapper.appendChild(world.element("a", { text: "  Click để tìm kiếm\n   nâng cao ", rect: { x: 549, y: 283 } }));
+  const target = { role: "link", name: "Click để tìm kiếm nâng cao" };
+  const hit = world.resolve(target);
+  ok(hit && world.resolvedElement(hit.ref) === link, "role+name resolves to the live element (whitespace-normalized equality)");
+  ok(hit && hit.x === 639 && hit.y === 298 && hit.reachable === true, "...and carries the real DOM point back through shipped getRefCoordinates");
+  const button = world.doc.body.appendChild(world.element("button", { text: target.name, rect: { x: 10, y: 100 } }));
+  ok(world.resolvedElement(world.resolve({ ...target, role: "button" }).ref) === button, "the exact matching role wins over another control with the same exact name");
+  ok(world.resolvedElement(world.resolve({ ...target, role: "menuitem" }).ref) === link, "the established re-role fallback still requires exact name equality");
+  const miss = world.resolve({ role: "link", name: "Nút không tồn tại trên trang" });
   ok(miss === null, "no match is a real null — never a nearest-lookalike guess");
-
-  calls.find.length = 0;
-  ok(getTargetCoordinates({ name: "   " }) === null && calls.find.length === 0, "an empty identity never even searches");
+  ok(world.resolve({ role: "link", name: "Click để tìm kiếm" }) === null, "substring matches cannot satisfy a stable target");
+  world.queries.length = 0;
+  ok(world.resolve({ name: "   " }) === null && world.queries.length === 0, "an empty identity never even searches");
 
   ok(
     /msg\.type === "getTargetCoordinates"/.test(contentSrc) &&
       /getTargetCoordinates\(\s*\{ role: msg\.role, name: msg\.name \}/.test(contentSrc),
     "the message handler is wired in the shipped listener with the role/name pair"
   );
+}
+
+console.log("\n== uncapped exact search, shadow roots and excluded page UI ==");
+{
+  const world = createTargetWorld();
+  for (let i = 0; i < 30; i++) world.doc.body.appendChild(world.element("a", { text: `Open advanced search ${i}` }));
+  const exact = world.doc.body.appendChild(world.element("a", { text: "Open advanced search", rect: { y: 1200 } }));
+  const found = world.win.__unblockedChrome.findElements("Open advanced search");
+  ok(found.results.length === 20 && !found.results.some((r) => r.name === "Open advanced search"), "the shipped model-facing find cap can omit an exact offscreen identity behind 30 decoys");
+  const result = world.resolve({ role: "link", name: "Open advanced search" });
+  ok(result && world.resolvedElement(result.ref) === exact && result.reachable, "stable target lookup finds that exact element without the presentation cap and scrolls it into view");
+  ok(world.mutations.includes("scrollIntoView"), "normal coordinate resolution retains its real scroll behavior");
+}
+for (const mode of ["visible", "hidden", "aria-hidden", "inert", "overlay", "annotation", "opacity", "css-hidden"]) {
+  const world = createTargetWorld();
+  const host = world.doc.body.appendChild(world.element("section"));
+  const root = host.attachShadow();
+  const link = root.appendChild(world.element("a", { text: "Nested target" }));
+  if (mode === "hidden") host.attrs.hidden = "";
+  if (mode === "aria-hidden") host.attrs["aria-hidden"] = "true";
+  if (mode === "inert") host.attrs.inert = "";
+  if (mode === "overlay") host.attrs["data-browzy-overlay"] = "";
+  if (mode === "annotation") host.attrs.id = "browzy-annotation-layer";
+  if (mode === "opacity") host.style.opacity = "0";
+  if (mode === "css-hidden") host.style.display = "none";
+  const result = world.resolve({ role: "link", name: "Nested target" });
+  ok(mode === "visible" ? result && world.resolvedElement(result.ref) === link : result === null, `open shadow root respects ${mode} host state`);
 }
 
 // ==========================================================================

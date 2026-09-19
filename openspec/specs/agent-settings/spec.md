@@ -6,7 +6,8 @@ Allow users to configure Anthropic-compatible endpoints, credentials, and model 
 ## Requirements
 
 ### Requirement: Editable provider profile
-A provider profile SHALL have a provider type, `anthropic` or `chatgpt`. A profile persisted before provider types existed SHALL load as `anthropic` without any change to its other fields.
+
+A provider profile SHALL have a provider type, `anthropic`, `chatgpt`, or `typesafe`. A profile persisted before provider types existed SHALL load as `anthropic` without any change to its other fields.
 
 For an `anthropic` profile, settings SHALL expose Base URL, masked API key with replace/remove actions, editable model ID and display-name pairs, and exactly one default model. The initial Base URL SHALL be https://api.anthropic.com.
 
@@ -17,6 +18,14 @@ For a `chatgpt` profile, settings SHALL NOT expose Base URL or API key. Instead 
 - A "Sign out" action.
 - The same editable model list with exactly one default model, seeded on first sign-in with the Codex model ids known for the account's plan.
 - A disclosure that requests use the user's ChatGPT subscription through an unofficial backend that may change or stop working, and that OpenAI's terms apply.
+
+For a `typesafe` profile, settings SHALL NOT expose Base URL or API key for an Anthropic endpoint. Instead they SHALL expose:
+- An editable endpoint field for the provider's own requests: prefilled with the profile's current endpoint, labeled with the selected Jev source, its hint naming that source's documented default; a custom endpoint is kept when the source changes and can always be edited here.
+- A write-only API key field for the selected Jev source (TypeSafe API, or the Vercel AI Gateway key starting `vck_`) with replace/remove actions naming that source.
+- Write-only text-model fields: base URL, model ID, and API key with replace/remove actions.
+- The same editable model list with exactly one default model, seeded with the provider's documented `jev-latest` entry only when the list is empty at the moment the provider type is selected.
+- A screenshot toggle, enabled by default, controlling whether the configured model receives a page capture with its step decisions and completion check; a profile stored before the toggle existed SHALL load with it enabled.
+- A disclosure that runs through this provider make structured element-selection requests to TypeSafe and, against the configured text-model endpoint, requests for the run's plan, each step decision (including the page capture when screenshots are enabled), context revisions, the completion check, stall-recovery consultations, and generated text values, and that usage and billing follow those services' terms.
 
 Saving SHALL validate and atomically persist the profile without requiring a network call.
 
@@ -40,8 +49,25 @@ Saving SHALL validate and atomically persist the profile without requiring a net
 - **WHEN** a `chatgpt` profile in the signed-in state is open in Settings
 - **THEN** the account email and plan are shown together with the usage block and its refresh action, and no Base URL or API key field is present
 
+#### Scenario: Switching to TypeSafe
+- **WHEN** the user selects the `typesafe` provider type with an empty model list
+- **THEN** the Anthropic Base URL and API-key fields are hidden, the endpoint field (carrying the profile's current endpoint), the TypeSafe credential and text-model fields, and the screenshot toggle (enabled by default) are shown, and the model list is seeded once with `jev-latest` as the default
+
+#### Scenario: TypeSafe text-model fields are required
+- **WHEN** the TypeSafe provider is selected but the text-model base URL or model ID is empty
+- **THEN** saving and testing are blocked with a field-level error and no capability test request is sent
+
+#### Scenario: TypeSafe endpoint is editable
+- **WHEN** the operator edits the endpoint field on a `typesafe` profile (for example pointing it at a self-hosted gateway) and saves
+- **THEN** the profile persists the validated URL and subsequent capability tests and runs use exactly it; an invalid URL shows a field-level error and blocks the save, leaving the last saved endpoint in place
+
+#### Scenario: TypeSafe disclosure names what the model is asked for
+- **WHEN** the `typesafe` provider type is selected
+- **THEN** the disclosure states that runs make structured element-selection requests to TypeSafe and, to the configured text-model endpoint, requests for the run's plan, each step decision including the page capture when screenshots are enabled, context revisions, the completion check, stall-recovery consultations, and generated text values, and that usage and billing follow those services' terms
+
 ### Requirement: Explicit compatibility and connection testing
-Connection testing SHALL use the configured endpoint and selected model to verify Anthropic Messages streaming and a structured tool round trip, and SHALL report image-input support separately. For a `chatgpt` profile, the same test SHALL run through the companion's ChatGPT gateway with a test-scoped gateway token. The UI SHALL disclose that this test sends a small request and can incur API usage, or for a `chatgpt` profile that it counts against the ChatGPT usage limit. OpenAI Chat Completions-only endpoints configured as `anthropic` profiles SHALL not be reported as compatible.
+
+Connection testing SHALL use the configured endpoint and selected model to verify Anthropic Messages streaming and a structured tool round trip, and SHALL report image-input support separately. For a `chatgpt` profile, the same test SHALL run through the companion's ChatGPT gateway with a test-scoped gateway token. For a `typesafe` profile, the test SHALL issue one trivial structured-choice request to the configured TypeSafe endpoint, one minimal completion to the configured text model, and one minimal completion carrying a small embedded image to the same text-model endpoint, reporting their outcomes separately under the same result shape used for other providers; the image stage's outcome SHALL NOT decide the profile's runnability, so a model that rejects images remains runnable with screenshots disabled. The UI SHALL disclose that this test sends a small request and can incur API usage, or for a `chatgpt` profile that it counts against the ChatGPT usage limit, or for a `typesafe` profile that it calls both the TypeSafe and text-model endpoints. OpenAI Chat Completions-only endpoints configured as `anthropic` profiles SHALL not be reported as compatible.
 
 #### Scenario: Authentication or provider error
 - **WHEN** a check receives 401/403, an unavailable model, rate limiting, timeout, TLS/network failure, or incompatible protocol
@@ -55,8 +81,17 @@ Connection testing SHALL use the configured endpoint and selected model to verif
 - **WHEN** the user runs the test on a `chatgpt` profile with no stored credential or in the `SESSION_EXPIRED` state
 - **THEN** no request is sent and settings ask the user to sign in with ChatGPT
 
+#### Scenario: TypeSafe stages report distinctly
+- **WHEN** the TypeSafe question stage succeeds but the text-model or image stage fails, or the TypeSafe endpoint returns an invalid structured body
+- **THEN** settings identify the failed stage by name (`INVALID_RESPONSE` for a structurally invalid answer; the applicable connectivity code for a failed call) and the profile is not marked verified when a gating stage failed
+
+#### Scenario: TypeSafe image stage reports separately
+- **WHEN** the text-model completion succeeds but the image completion is rejected or fails
+- **THEN** settings name the image stage separately from the text-model stage, keep the profile runnable when the gating stages passed, and can point the operator at the screenshot toggle or a vision-capable model
+
 ### Requirement: Manual model catalog with optional discovery
-Users SHALL be able to add, edit, remove, reorder, and select models by exact provider model ID. Optional model refresh SHALL use the configured provider's model listing endpoint, handle pagination, and preserve manual entries. For a `chatgpt` profile, discovery SHALL report unsupported and the manual list SHALL remain editable. No model ID SHALL be invented from screenshot labels.
+
+Users SHALL be able to add, edit, remove, reorder, and select models by exact provider model ID. Optional model refresh SHALL use the configured provider's model listing endpoint, handle pagination, and preserve manual entries. For a `chatgpt` profile, discovery SHALL report unsupported and the manual list SHALL remain editable. For a `typesafe` profile, discovery SHALL likewise report unsupported and the manual list SHALL remain editable. No model ID SHALL be invented from screenshot labels.
 
 #### Scenario: Provider has no model listing
 - **WHEN** optional discovery is unsupported or fails
@@ -78,15 +113,16 @@ Credentials SHALL be stored by the native companion using the OS credential stor
 - **THEN** the companion cancels active runs using it, revokes its gateway tokens, removes the secret, clears in-memory copies as far as practical, and requires a new credential or sign-in before another request
 
 ### Requirement: No Claude product account required
-The extension SHALL be usable without Claude login, a Claude subscription, a preexisting Claude Code login, or the proprietary Claude in Chrome extension. It SHALL be usable either with a valid Anthropic-compatible Base URL, API key and model, or with a ChatGPT account the user explicitly signs in with. First-run onboarding SHALL request provider configuration, offering both provider types, rather than Claude account creation or sign-in. It SHALL explain that usage and billing depend on the configured provider or the ChatGPT plan, without promising free inference or universal gateway compatibility.
+
+The extension SHALL be usable without Claude login, a Claude subscription, a preexisting Claude Code login, or the proprietary Claude in Chrome extension. It SHALL be usable with a valid Anthropic-compatible Base URL, API key and model; with a ChatGPT account the user explicitly signs in with; or with a TypeSafe API key plus a text-model configuration. First-run onboarding SHALL request provider configuration, offering the supported provider types, rather than Claude account creation or sign-in. It SHALL explain that usage and billing depend on the configured provider or the ChatGPT plan, without promising free inference or universal gateway compatibility.
 
 #### Scenario: Fresh machine with provider credentials only
-- **WHEN** a user with no Claude product account, login state, subscription or official extension completes one-time installation and enters supported provider credentials or signs in with ChatGPT
+- **WHEN** a user with no Claude product account, login state, subscription or official extension completes one-time installation and enters supported provider credentials, signs in with ChatGPT, or enters TypeSafe and text-model credentials
 - **THEN** the assistant can chat, read the current page, control authorized browser actions and invoke enabled skills without opening a Claude login flow
 
 #### Scenario: Invalid provider credentials
-- **WHEN** provider authentication fails or a ChatGPT session expires
-- **THEN** the application offers correcting the endpoint or API key, or signing in to ChatGPT again. It never silently switches to Claude account login, a different provider type, or another account's session
+- **WHEN** provider authentication fails, a ChatGPT session expires, or the TypeSafe or text-model credential is rejected
+- **THEN** the application offers correcting the affected credential or endpoint, or signing in to ChatGPT again. It never silently switches to Claude account login, a different provider type, or another account's session
 
 ### Requirement: ChatGPT usage display
 

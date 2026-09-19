@@ -1,0 +1,15 @@
+# Tasks: fix-lock-suppresses-hover
+
+## 1. The shield
+
+- [x] 1.1 `extension/overlay/pointer-overlay.js`: add `.browzy-shield` (CSS: fixed inset 0, transparent, `cursor:wait`, `z-index:2147483644`, default `pointer-events:none`; `.is-active` → `pointer-events:auto`) and `shieldEl` in `createOverlayHost` (appended with the other layers, beneath the badge); expose it on `refs` — done (+107/-7; appended after the ring, before the badge; host stays `pointer-events:none`) ← (verify: host invariant untouched)
+- [x] 1.2 `extension/overlay/pointer-overlay.js`: a `setInputShieldActive(active)` helper and its call from `paintNow()` with `shouldBlockInput(state, now, HEARTBEAT_MAX_AGE_MS, scrollTailUntil)` — the same predicate `handleBlockableEvent` uses; every transition (heartbeat expiry, start/complete, scroll-tail deadline, approvals, teardown) already repaints on the existing cadence. Header comments updated — done: one predicate definition, two call sites; `setInputShieldActive` is the sole class writer; plus the implementation-time wheel/touchmove cancel inside `handleBlockableEvent` (host-exemption skip only for scroll gestures while blocked) — root-cause evidence in design.md §4: hit-testing alone let the wheel scroll (500 px), `preventDefault` stops it (0 px) ← (verify: predicate reused, not redefined)
+
+## 2. Tests
+
+- [x] 2.1 `test/overlay-pointer.test.mjs`: structural — the shield exists in the shadow DOM with `pointer-events:none` by default, `cursor:wait`, and a z-index below the badge's; the host's own `pointer-events:none` assertion stays green — done (358 PASS / 0 FAIL, 31 shield assertions) ← (verify: host invariant untouched)
+- [x] 2.2 `test/overlay-pointer.test.mjs`: the behavior matrix through the real wiring — locked and idle → shield active (`pointer-events:auto`); `actionInFlight` → off; scroll tail → off; pending approval → off; heartbeat expired → off; teardown → off. Update the harness's compile dependency list for any newly extracted helper — done (both harnesses updated; a controllable fake clock reaches heartbeat expiry with no event arriving). Independent verification reproduced the whole matrix in a real Chromium (elementFromPoint → shield; no `:hover`; hover-only menu stays `display:none`; page click not delivered; wheel 0 px; Stop still receives its click; computed cursor `wait`) ← (verify: predicate reused, not redefined)
+
+## 3. Focused suites and validation
+
+- [x] 3.1 `node test/overlay-pointer.test.mjs test/overlay-companion-sender.test.mjs test/extension-scripts-parse.test.mjs` green; `openspec validate fix-lock-suppresses-hover --strict` valid — done: all three green (the change's own surfaces). `test/overlay-background-bridge.test.mjs` is red for an unrelated, pre-existing reason — `ReferenceError: requestAnnotationClear is not defined at teardownOverlayForRun`, entirely inside extension/background.js's territory (another session's in-progress work, untracked in git); independent verification proved it pre-existing at HEAD with no relation to the shield files, so it is reported, not absorbed ← (verify: green; only the owned files edited)

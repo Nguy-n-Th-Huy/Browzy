@@ -6,8 +6,9 @@
 // discoverModels/exportProfile, plus the six ChatGPT subscription ops
 // setProviderType/chatgptSignInStart/chatgptDeviceStart/chatgptSignInStatus/
 // chatgptSignInCancel/chatgptSignOut and the account-usage read
-// chatgptUsage), so SettingsController never knows the difference — the same
-// class this test drives is the one settings-app.js instantiates in
+// chatgptUsage, plus the TypeSafe provider's setTypesafeConfig/
+// setTypesafeCredentials), so SettingsController never knows the difference —
+// the same class this test drives is the one settings-app.js instantiates in
 // production.
 //
 // This is intentionally SEPARATE from
@@ -46,7 +47,12 @@ export function createScriptedCompanion(initialProfile = null) {
     // the six-key display result — or any of the reader's failure codes
     // (SESSION_EXPIRED / NO_CREDENTIAL / RATE_LIMIT_ERROR / AUTH_ERROR /
     // NETWORK_ERROR / TIMEOUT_ERROR / USAGE_UNAVAILABLE) — without a network.
-    chatgptUsage: null // (profileId) => usage result | throws
+    chatgptUsage: null, // (profileId) => usage result | throws
+    // TypeSafe / Jev provider (add-typesafe-jev-provider task 5.5). Override to
+    // script a stale companion (PROTOCOL_ERROR) or a
+    // SECURE_STORAGE_UNAVAILABLE on the key save — neither needs a network.
+    setTypesafeConfig: null, // (profileId, config) => updated profile | throws
+    setTypesafeCredentials: null // (profileId, keys, opts) => { backend, hasTypesafeKey, hasTextModelKey } | throws
   };
 
   function requireProfile(profileId) {
@@ -65,7 +71,11 @@ export function createScriptedCompanion(initialProfile = null) {
 
     async saveProfile(profileId, patch) {
       calls.push({ op: "save_profile", profileId, patch: { ...patch } });
+      // Spread the existing profile first: the real host's save_profile
+      // replies with the WHOLE secret-free profile (loadProfile()'s shape),
+      // provider fields included, not just the four it was handed.
       profile = {
+        ...(profile || {}),
         profileId,
         baseUrl: patch.baseUrl,
         models: patch.models.map((m) => ({ ...m })),
@@ -199,6 +209,82 @@ export function createScriptedCompanion(initialProfile = null) {
         secondary: null,
         credits: null
       };
+    },
+
+    // --- TypeSafe / Jev provider (add-typesafe-jev-provider task 5.5) -----
+    // Same two op shapes settings-client.js's wire contract documents: the
+    // config op replies the whole updated secret-free profile; the credential
+    // op replies booleans plus the backend label and NEVER echoes a key. The
+    // default below mirrors host/agent/settings/profile.js's merge rule — an
+    // omitted key keeps its stored value, an explicit "" removes it, and
+    // `hasCredential` tracks "both halves present", which is what the page's
+    // first-run state reads.
+    async setTypesafeConfig(profileId, config) {
+      // Flat, exactly like the real client's `call("set_typesafe_config",
+      // { profileId, ...config })` — a nested copy here would let a test pass
+      // against a shape the companion never sees.
+      calls.push({ op: "set_typesafe_config", profileId, ...config });
+      profile = requireProfile(profileId);
+      if (scripts.setTypesafeConfig) return scripts.setTypesafeConfig(profileId, config);
+      // Mirrors host/agent/settings/profile.js's setTypesafeConfig() merge
+      // rule (task 3.6): an OMITTED key keeps the value already stored —
+      // load-bearing for "switching source does not discard configuration"
+      // tests, where the deselected source's fields must never be sent (see
+      // settings-controller.js's validateDecisionSourceFields()) and must
+      // therefore survive here exactly as the real host leaves them.
+      profile = {
+        ...profile,
+        ...(config.baseUrl ? { baseUrl: config.baseUrl } : {}),
+        typesafeSource: config.typesafeSource === undefined ? profile.typesafeSource : config.typesafeSource,
+        textModelBaseUrl: config.textModelBaseUrl === undefined ? profile.textModelBaseUrl : config.textModelBaseUrl,
+        textModelId: config.textModelId === undefined ? profile.textModelId : config.textModelId,
+        typesafeDecisionSource: config.decisionSource === undefined ? (profile.typesafeDecisionSource || "openai") : config.decisionSource,
+        typesafeDecisionBaseUrl: config.decisionBaseUrl === undefined ? profile.typesafeDecisionBaseUrl : config.decisionBaseUrl,
+        typesafeDecisionModelId: config.decisionModelId === undefined ? profile.typesafeDecisionModelId : config.decisionModelId,
+        // The screenshot toggle (add-jev-run-screenshots task 3.2): OMITTED
+        // keeps the stored value, exactly like the real host's
+        // setTypesafeConfig — so a test can tell "the page sent it" from "the
+        // page left it alone".
+        ...(config.sendScreenshots === undefined ? {} : { sendScreenshots: Boolean(config.sendScreenshots) }),
+        // The consult-sources toggle
+        // (jev-runs-consult-sources-beyond-the-page task 5.1/5.2): OMITTED
+        // keeps the stored value, exactly like the real host's
+        // setTypesafeConfig — same rule as sendScreenshots above.
+        ...(config.consultSources === undefined ? {} : { consultSources: Boolean(config.consultSources) }),
+        revision: (profile.revision || 0) + 1
+      };
+      return { ...profile, models: profile.models.map((m) => ({ ...m })) };
+    },
+
+    async setTypesafeCredentials(profileId, keys, opts) {
+      calls.push({
+        op: "set_typesafe_credentials",
+        profileId,
+        // Lengths, never the values: what a wire assertion needs is that the
+        // real secret travelled, not a copy of it in this test's own log.
+        typesafeKeyLength: typeof keys.typesafeApiKey === "string" ? keys.typesafeApiKey.length : null,
+        textModelKeyLength: typeof keys.textModelApiKey === "string" ? keys.textModelApiKey.length : null,
+        opts
+      });
+      profile = requireProfile(profileId);
+      if (scripts.setTypesafeCredentials) return scripts.setTypesafeCredentials(profileId, keys, opts);
+      const backend = opts && opts.memoryOnly ? "memory" : "windows-credential-manager";
+      const hasTypesafeKey = keys.typesafeApiKey === undefined
+        ? Boolean(profile.hasTypesafeKey)
+        : Boolean(keys.typesafeApiKey.trim());
+      const hasTextModelKey = keys.textModelApiKey === undefined
+        ? Boolean(profile.hasTextModelKey)
+        : Boolean(keys.textModelApiKey.trim());
+      profile = {
+        ...profile,
+        hasTypesafeKey,
+        hasTextModelKey,
+        hasCredential: hasTypesafeKey && hasTextModelKey,
+        memoryOnlyCredential: backend === "memory",
+        secretBackend: backend,
+        credentialRevision: (profile.credentialRevision || 0) + 1
+      };
+      return { backend, hasTypesafeKey, hasTextModelKey };
     }
   };
 

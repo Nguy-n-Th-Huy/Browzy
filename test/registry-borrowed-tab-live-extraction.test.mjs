@@ -215,16 +215,23 @@ function buildContentHarness() {
   );
 
   function fakeDocument({ title, bodyText }) {
+    // No article/main/etc. match -> falls back to document.body (plural
+    // querySelectorAll because getPageText ranks EVERY match of every
+    // selector by text length rather than taking the first one it finds).
+    // The body models what the live walk reads: a rendered element whose
+    // childNodes carry the text (no clone, no textContent shortcut).
+    const body = {
+      tagName: "BODY",
+      nodeType: 1,
+      childNodes: bodyText ? [{ nodeType: 3, nodeValue: bodyText }] : [],
+      style: {},
+      hasAttribute: () => false,
+      checkVisibility: () => true
+    };
     return {
       title,
-      // No article/main/etc. match -> falls back to document.body. Plural
-      // because getPageText ranks EVERY match of every selector by text length
-      // rather than taking the first one it finds.
       querySelectorAll: () => [],
-      body: {
-        tagName: "BODY",
-        cloneNode: () => ({ querySelectorAll: () => [], textContent: bodyText })
-      }
+      body
     };
   }
 

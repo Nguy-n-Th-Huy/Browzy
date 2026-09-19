@@ -148,9 +148,11 @@ const DESIGN_DOC_TOOL_LIST = [
 // genuine future regression — a preserved tool quietly dropped —
 // indistinguishable from an intentional addition). Added by
 // openspec/changes/consume-webmcp-page-tools (see that change's design.md
-// decision 5), openspec/changes/add-browser-batch-tool, and
+// decision 5), openspec/changes/add-browser-batch-tool,
 // openspec/changes/implement-stubbed-browser-tools (list_connected_browsers
-// plus select_browser); NOT part of the 26-operation preservation baseline —
+// plus select_browser), openspec/changes/add-sensitive-info-masking
+// (mask_sensitive_info), and openspec/changes/add-typesafe-jev-provider
+// (page_snapshot); NOT part of the 26-operation preservation baseline —
 // openspec/specs/agent-browser-runtime's "Preserve the browser capability
 // baseline" requirement is what calls for tracking additions this way.
 const POST_BASELINE_ADDITIONS = [
@@ -158,7 +160,9 @@ const POST_BASELINE_ADDITIONS = [
   "webmcp_call_tool",
   "browser_batch",
   "list_connected_browsers",
-  "select_browser"
+  "select_browser",
+  "mask_sensitive_info",
+  "page_snapshot"
 ];
 
 // Operations removed from the baseline, each naming its replacement, so a

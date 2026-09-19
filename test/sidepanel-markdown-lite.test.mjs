@@ -195,5 +195,28 @@ console.log("== a whole real answer, end to end ==");
   lacks(html, "###", "and none of the markup leaks through as literal text");
 }
 
+console.log("== browser report boundaries ==");
+{
+  const html = renderMarkdownLite("Nguồn: https://example.org/search?q=may%20tinh&filters[date]=2026. (https://example.org/a_(b)).");
+  has(html, 'href="https://example.org/search?q=may%20tinh&amp;filters[date]=2026"', "bare links preserve complete encoded query and bracket parameters");
+  has(html, 'href="https://example.org/a_(b)"', "balanced path parentheses remain in the URL");
+  has(html, '</a>).', "surrounding parentheses and sentence punctuation stay outside links");
+  has(renderMarkdownLite('[nguồn](https://example.org/a_(b)?x=1&y=2)'), 'href="https://example.org/a_(b)?x=1&amp;y=2" target="_blank" rel="noopener noreferrer">nguồn</a>', "descriptive Markdown links preserve balanced parentheses and query parameters");
+  has(renderMarkdownLite('<https://example.org/a>;'), '&lt;<a href="https://example.org/a"', "angle-delimited HTTP URLs remain safely escaped and clickable");
+  has(renderMarkdownLite('https://example.org/a; https://example.org/?q=a&'), '</a>; ', "sentence semicolon is outside the anchor");
+  has(renderMarkdownLite('https://example.org/?q=a&'), 'href="https://example.org/?q=a&amp;"', "escaping an ampersand never truncates its entity");
+  const protectedHtml = renderMarkdownLite("`https://example.org/code` [https://example.org/label](https://example.org/target)\n\n```\nhttps://example.org/fenced\n```");
+  ok((protectedHtml.match(/<a /g) ?? []).length === 1, "code and existing Markdown anchors are never autolinked again");
+  const hostile = renderMarkdownLite('https://example.org/" onclick="alert(1) <img src=x>\u00000\u0000 javascript:alert(1)');
+  has(hostile, 'href="https://example.org/" target=', "quote terminates an autolink before an untrusted attribute");
+  lacks(hostile, '<img', "hostile markup remains escaped after autolinking");
+  lacks(hostile, 'undefined', "input cannot forge held-span markers");
+  const numbered = renderMarkdownLite("1. Một\n   Mã: A\n\n2. Hai\n   Mã: B\n\n3. Ba\n\nĐoạn sau.");
+  has(numbered, '<ol><li>Một<br>Mã: A</li><li>Hai<br>Mã: B</li><li>Ba</li></ol>', "loose multiline results stay in a single numbered list");
+  has(numbered, '<p>Đoạn sau.</p>', "unindented text after a blank line leaves the list");
+  has(renderMarkdownLite("4. Bốn\n7. Bảy"), '<ol start="4"><li>Bốn</li><li value="7">Bảy</li></ol>', "explicit start and nonconsecutive item numbers survive");
+  has(renderMarkdownLite("1. One\n\n## Next\nText"), '</ol>\n<h2>Next</h2>', "a following heading is not swallowed by a list");
+}
+
 console.log(fail === 0 ? "\nALL SIDEPANEL MARKDOWN-LITE TESTS PASSED" : `\n${fail} FAILED`);
 process.exit(fail ? 1 : 0);

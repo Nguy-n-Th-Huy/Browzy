@@ -498,6 +498,10 @@ export class ProtocolClient {
     this._send(envelope(MSG.DOCUMENT_REQUEST, { conversationId, documentId, requestId }));
   }
 
+  actionArtifactRequest({ conversationId, artifactId, requestId }) {
+    this._send(envelope("action_artifact_request", { conversationId, artifactId, requestId }));
+  }
+
   enhancePrompt({ requestId, op, prompt, profileId, modelId }) {
     const payload = op === "cancel" ? { requestId, op } : { requestId, op, prompt, profileId, modelId };
     this._send(envelope(MSG.ENHANCE_PROMPT, payload));

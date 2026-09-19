@@ -4,7 +4,7 @@
   <em>Official Claude in Chrome gives you 58 blocked domains and two browsers.<br/>
   <strong>Browzy gives you the whole web.</strong></em>
   <br/>
-  <sub>Clean-room reimplementation of Anthropic's browser extension. No blocklist. Any Chromium browser. A 30-tool registry (25 preserved baseline + 5 post-baseline additions, with 1 removal recorded), with the specified flows tested against a real benchmark — not a guarantee of every proprietary feature (see <a href="#what-this-is-not">What this is not</a>).</sub>
+  <sub>Clean-room reimplementation of Anthropic's browser extension. No blocklist. Any Chromium browser. A 32-tool registry (25 preserved baseline + 7 post-baseline additions, with 1 removal recorded), with the specified flows tested against a real benchmark — not a guarantee of every proprietary feature (see <a href="#what-this-is-not">What this is not</a>).</sub>
   <br/>
   <sub><em>Independent project. Not affiliated with, endorsed by, or sponsored by Anthropic.</em></sub>
 </p>
@@ -20,7 +20,7 @@
 
 ---
 
-The official [Claude in Chrome](https://code.claude.com/docs/en/chrome) extension gives Claude Code full browser automation — as long as you stay within Anthropic's allowlist of "safe" sites. Browzy is a clean-room reimplementation that strips the restrictions, with a 30-tool browser registry (25 preserved baseline + 5 post-baseline additions, with 1 removal recorded; verified programmatically — see [Available Tools](#available-tools)) and turn/latency performance that a benchmark below found statistically indistinguishable from the official extension on the tested task set — not a guarantee of matching every proprietary feature (see [What this is not](#what-this-is-not)).
+The official [Claude in Chrome](https://code.claude.com/docs/en/chrome) extension gives Claude Code full browser automation — as long as you stay within Anthropic's allowlist of "safe" sites. Browzy is a clean-room reimplementation that strips the restrictions, with a 32-tool browser registry (25 preserved baseline + 7 post-baseline additions, with 1 removal recorded; verified programmatically — see [Available Tools](#available-tools)) and turn/latency performance that a benchmark below found statistically indistinguishable from the official extension on the tested task set — not a guarantee of matching every proprietary feature (see [What this is not](#what-this-is-not)).
 
 **Two ways to run it.** A **built-in browser side panel**, driven by the official [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk) through a local native companion — no Claude account, no terminal, no Claude Code client, just your own Anthropic-compatible Base URL/API key/model, configured once in Settings. Or the original **external MCP** entry point, unchanged and fully supported, for driving the same extension from a Claude Code session. Both share the one browser extension and one native companion; see [Quick start](#quick-start-two-ways-to-run-it) below. The side panel is the newer, actively-developing path — some of its screens (see [Side panel status](#side-panel-status) below) are still catching up to the external-MCP path's tool coverage.
 
@@ -31,7 +31,7 @@ The official [Claude in Chrome](https://code.claude.com/docs/en/chrome) extensio
 | **Domain blocklist** | 58 blocked domains across 11 categories | No blocklist. Navigate anywhere. |
 | **Browser support** | Chrome and Edge only | Any Chromium browser (Chrome, Edge, Brave, Arc, Opera, Vivaldi, etc.) |
 | **Source code** | Closed source | Open source (MIT) |
-| **Tools** | ~21 MCP tools (Anthropic's own count; not independently verified here) | 30 registry tools (verified: `test/registry-baseline.test.mjs`) — the 25-tool preserved baseline (19 with a named official equivalent, all implemented, see [Available Tools](#available-tools); 6 with no official equivalent) plus 5 post-baseline additions (`browser_batch`, `list_connected_browsers` and `select_browser` with official equivalents, and 2 experimental WebMCP page-tool operations with no official equivalent — `webmcp_list_tools`, `webmcp_call_tool`, see [WebMCP page tools](#webmcp-page-tools-experimental)), with `switch_browser` removed in favour of `select_browser` (recorded in the baseline's removals set), plus `execute_code` and the recording channel outside the core registry |
+| **Tools** | ~21 MCP tools (Anthropic's own count; not independently verified here) | 32 registry tools (verified: `test/registry-baseline.test.mjs`) — the 25-tool preserved baseline (19 with a named official equivalent, all implemented, see [Available Tools](#available-tools); 6 with no official equivalent) plus 7 post-baseline additions (`browser_batch`, `list_connected_browsers` and `select_browser` with official equivalents, `mask_sensitive_info` with no official equivalent, `page_snapshot` for structured observation with no official equivalent, and 2 experimental WebMCP page-tool operations with no official equivalent — `webmcp_list_tools`, `webmcp_call_tool`, see [WebMCP page tools](#webmcp-page-tools-experimental)), with `switch_browser` removed in favour of `select_browser` (recorded in the baseline's removals set), plus `execute_code` and the recording channel outside the core registry |
 | **Account required** | Claude account/subscription | Side panel: none — bring your own Anthropic-compatible API key. External MCP: a Claude Code session (its own auth, unrelated to this extension) |
 | **Performance** | Baseline | Statistically indistinguishable on the tested benchmark (external-MCP path, both cold — see below); the side panel has not been separately benchmarked |
 
@@ -140,7 +140,7 @@ you talk to them.
 | Setup, once | Load the extension, run the installer, open Settings and enter your provider credential | Load the extension, run the installer, `claude mcp add ...` |
 | Where to go | [SDK-first: browser side panel](#sdk-first-browser-side-panel-no-claude-account) | [External MCP: Claude Code (legacy)](#external-mcp-claude-code-legacy) |
 
-Both share the same 30-tool browser registry (25 preserved + 5 post-baseline additions, with 1 removal recorded), the same stable extension
+Both share the same 32-tool browser registry (25 preserved + 7 post-baseline additions, with 1 removal recorded), the same stable extension
 identity, and the same one-time installer. Neither disables or removes the
 other — running the installer sets both up, and which one you use day to day
 is just a matter of what you open (the browser's side panel, or a Claude Code
@@ -168,7 +168,7 @@ Side panel <--extension messaging--> background.js <--native messaging--> native
                                                                      Anthropic-compatible endpoint
                                                                                 |
                                                                     in-process SDK MCP server
-                                                                     (the same 30-tool registry)
+                                                                     (the same 32-tool registry)
                                                                                 |
                                                                     native-host.js <--native messaging--> Extension <--> Browser
 ```
@@ -203,7 +203,7 @@ Claude Code <--stdio MCP--> server-{codemode,hybrid}.js
 ```
 
 Components:
-1. **Extension** — Manifest V3 with CDP-based browser automation (30 registry tools: 25 preserved + 5 post-baseline additions, with 1 removal recorded), plus a side panel and settings UI
+1. **Extension** — Manifest V3 with CDP-based browser automation (32 registry tools: 25 preserved + 7 post-baseline additions, with 1 removal recorded), plus a side panel and settings UI
 2. **Native Messaging Host** (`host/native-host.js`) — bridges the extension to either the SDK companion or an external MCP server, and arbitrates the one shared browser lease between them
 3. **SDK companion** (`host/agent/`) — runs the Claude Agent SDK against your configured provider, exposing the same browser registry as in-process SDK tools; started automatically, supervised, no user-run MCP server
 4. **MCP Server** (`host/mcp-server.js`, external-MCP path) — Node.js process started by Claude Code, exposes the same tools via MCP
@@ -247,7 +247,7 @@ npm install --prefix host/codemode/worker
 ```
 
 `--legacy-peer-deps` is required: the pinned Claude Agent SDK declares a
-`zod@^4` peer, while this project's existing 30-tool registry depends on
+`zod@^4` peer, while this project's existing 32-tool registry depends on
 `zod@^3` (via `zod-to-json-schema`, which reads zod v3's internal shape) —
 bumping the shared `zod` to v4 would break that registry. The installed
 zod v3 release already implements the interface the SDK actually calls, so
@@ -323,13 +323,16 @@ No terminal and no Claude Code client are needed from here on for daily use.
 
 ### Configure your provider
 
-Settings has two provider types, chosen per profile under **Loại nhà cung cấp**
+Settings has three provider types, chosen per profile under **Loại nhà cung cấp**
 ("Provider type"): **API tương thích Anthropic** (an Anthropic-compatible Base
-URL and API key — the default, and what every existing profile uses) and **Tài
+URL and API key — the default, and what every existing profile uses), **Tài
 khoản ChatGPT** (your own ChatGPT Plus/Pro/Team subscription — see
-[Run it on a ChatGPT subscription](#run-it-on-a-chatgpt-subscription) below).
+[Run it on a ChatGPT subscription](#run-it-on-a-chatgpt-subscription) below),
+and **Jev — ultrafast** *(beta)* (TypeSafe's structured-choice model selecting the
+complete actions from an LLM-prepared plan — see
+[Run it on TypeSafe (Jev)](#run-it-on-typesafe-jev) below).
 The side panel, the tools, approvals, skills, and conversation history are
-identical either way; only where the model calls come from differs.
+identical whichever type you pick; only where the decisions come from differs.
 
 #### Anthropic-compatible API key (default)
 
@@ -442,6 +445,225 @@ them will find its session expired and be asked to sign in again.
 The external-MCP path is unaffected — it keeps using whatever model/auth your
 Claude Code session supplies.
 
+#### Run it on TypeSafe (Jev)
+
+> **Beta.** Jev — ultrafast is a beta integration: its behavior, quality, and
+> results may change between releases.
+
+A profile can drive the browser through TypeSafe's **Jev** structured-choice
+model. The configured **LLM prepares the plan**, completion criteria, exact
+field values and navigation URLs. Each routine cycle then observes the bound
+tab and asks Jev three independent questions: **which complete action to take**,
+**whether the goal may be complete**, and **whether progress is stuck**. Routine
+cycles do not require an LLM step-decision call. Jev receives bounded page text,
+the observed controls, plan and action history; screenshots go only to LLM
+consultations and completion checks.
+
+The host builds a fresh bounded action list from each snapshot. A choice binds
+an operation to its observed target and any prepared value, option or URL.
+Prepared text is tied to the existing document nonce and exact field identity,
+then consumed after dispatch. It cannot silently move to a different field or
+survive a replacement document. New fields can require fresh LLM preparation.
+After permission checks, the host observes again and skips stale choices.
+Low-confidence or near-tied action choices dispatch nothing and count toward
+the no-progress bound. Every mutation uses the existing permission and dispatch
+gates.
+
+Jev can choose click, hover, select, prepared typing/navigation, scrolling,
+waiting, replanning, asking the operator or requesting completion. Replanning
+is bounded and does not reset the run's action/decision budgets. Asking ends
+the run blocked with a question; it does not suspend and resume automatically.
+A positive completion monitor or DONE choice requires LLM verification before
+any further mutation. Monitor answers are advisory signals, not proof of success.
+
+The three-head request uses the profile's **Jev source**: TypeSafe's
+`POST /v1/systemone`, **Vercel AI Gateway**'s `POST /v4/ai/evaluation-model`,
+or **OpenRouter**'s `POST /api/alpha/decisions`. The host validates all heads,
+offered keys and probability distributions before using a response. This
+architecture makes no claim about measured live-model speed or task accuracy.
+
+1. In **Settings**, set the provider type to **Jev — ultrafast** and **Save**.
+   The Anthropic API-key field disappears and the endpoint field above it
+   becomes **Điểm cuối Jev** — prefilled with the profile's current endpoint
+   (the same `profile.baseUrl` value the provider's requests use), validated
+   like every other Base URL and editable at any time. The model list is
+   seeded once (only while it is empty — your own edits are never overwritten)
+   with `jev-latest` for the **TypeSafe API** source or `typesafe-ai/jev` for
+   the **Vercel AI Gateway** source.
+2. Choose the **Nguồn quyết định Jev** (Jev source): **TypeSafe API** uses a
+   key from console.typesafe.ai and calls the provider's endpoint directly;
+   **Vercel AI Gateway** uses an AI Gateway key (`vck_…`) and reaches the same
+   Jev model as `typesafe-ai/jev` through Vercel, which bills those evaluation
+   requests (Vercel's free tier rate-limits them until the account has paid
+   credits); **OpenRouter** uses an OpenRouter key and reaches the model as
+   `typesafe/jev-1.13` on that account's decision route, which the provider
+   publishes under `/api/alpha/` — an alpha route, so expect it to move. The
+   endpoint follows the source automatically — changing the source moves
+   **Điểm cuối Jev** to the new source's documented default
+   (`https://api.typesafe.ai`, `https://ai-gateway.vercel.sh`, or
+   `https://openrouter.ai`) while it is still one, and leaves any other
+   endpoint you typed exactly as it is, so a custom gateway is kept and stays
+   editable — and the capability test always proves whichever wire the selected
+   source uses.
+3. Choose where the **decision model** comes from. It can be your own
+   **Anthropic** endpoint and key, your **ChatGPT subscription** (signed in
+   exactly as a ChatGPT profile does, reached through the companion's local
+   gateway — no extra API key), or an **OpenAI-compatible text model** (base
+   URL, model ID, and API key), which keeps a local model or any other Chat
+   Completions host usable. Only the source you select has to be configured,
+   and switching sources keeps what you already entered for the other ones.
+   This LLM prepares content and plans, handles bounded revisions and verifies
+   completion; Jev chooses routine actions.
+4. Enter the **key for that source** and, when the decision model needs one,
+   its credential. All key/submit fields are write-only:
+   after saving, Settings shows only whether each key is stored, and clearing
+   the submitted value is immediate. Leave **Gửi ảnh chụp màn hình cho mô
+   hình quyết định** on (the default) to send page captures with LLM
+   consultations, or turn it off to keep every request text-only; a profile saved
+   before this toggle existed loads with it on.
+5. Click **Test connection**. This runs three small, real requests — one
+   three-head structured-choice decision request on the selected Jev
+   source's own route, one minimal decision-model completion on the selected
+   decision source's wire, and one minimal completion carrying a small embedded
+   image — and reports them separately (`TypeSafe` / `mô hình văn bản` /
+   `hình ảnh`), so a text-model problem is distinguishable from a
+   decision-endpoint problem, and an image problem from both. The assistant
+   will not run until the two gating stages (TypeSafe and the text model) pass
+   for the current endpoint/model/credential combination; the image stage never
+   blocks a run — if it fails, either choose a model that accepts image content
+   or turn the screenshot toggle off.
+6. **Usage and billing follow those services separately**: the
+   structured decision requests are billed by TypeSafe — or by Vercel or
+   OpenRouter, when that source is selected — and the decision model's provider
+   bills the
+   completions it makes for a run (plan/content preparation, bounded revisions,
+   completion checks, source consultation, reports and stall recovery per
+   run), under each service's own terms. The capture itself is local; the page
+   pixels travel only to that same user-configured text-model endpoint, and the
+   screenshot toggle is the cost and privacy control.
+
+**Every run answers you.** When the run ends — done, blocked, stopped by you, or
+failed — it writes one report and that text becomes the turn's answer, exactly
+where an answer from the other engines appears. It says what was accomplished,
+what was not, and why, from the material the run actually saw; it never claims
+an outcome the run did not reach. A confirmed completion keeps the completion
+check's own report (no second call); every other ending makes one final report
+call instead. Two runs produce no answer and say so on the terminal line: one
+that never managed an observation, and one whose decision model could not be
+reached — asking that same model for a report would only turn one provider
+failure into two. A failed report never changes the outcome and is never
+replaced by text the app wrote itself.
+
+**A follow-up understands the turn before it.** A run carries a bounded view of
+its own conversation — the earlier prompts, the answers those turns produced,
+and how they ended — so "mở cái thứ hai" resolves against what already
+happened. Text only: no capture, no credential, no step records, and nothing
+from another conversation. Like page text, it is data: it explains the goal and
+authorizes nothing.
+
+**When only you can resolve it, the run asks.** A run blocked by a login, a
+choice the goal does not decide, or a value it must not invent ends with that
+named as its reason, and its answer ends with the question — instead of a bare
+"no progress". It does not wait: your reply is the next turn, and the
+conversation view above is what makes that turn understand it.
+
+**Still different from an Anthropic/ChatGPT profile:** the answer arrives when
+the run ends rather than streaming as it is written, there is no free-form
+narration mid-run (every answer in this loop is a validated object, which is
+what keeps page content from steering it), and the loop's ten operations are
+not the SDK engine's tool surface — no `read_page`, `find`, `search`,
+documents, skills, workflows, or MCP servers.
+
+**What a Jev run does and does not do.** Every dispatch passes exactly the same
+host-side authorization an LLM run's tool call passes: run-state and lease
+checks, tab scope, the protected-action backstop, and the same approval card
+(with the same single-use, pre-dispatch grant) when a click could submit, send,
+pay, or confirm. A denied or timed-out approval prevents the dispatch and ends
+the run blocked naming the action; a lost response is reported as result unknown
+and never retried; Stop prevents every later dispatch. **Jev chooses each routine
+action, and every decision is validated strictly before
+anything acts**: a malformed answer, an unknown operation, or an unrecognised
+extra key ends the run with a named invalid-decision failure and dispatches
+nothing, and a step that needs an element the observation cannot offer is
+recorded as skipped and counts toward the no-progress bound instead of
+guessing. The run is bounded (60 executed actions, 120 decisions, and exactly
+one three-head Jev request per routine cycle), and three consecutive
+actions that change nothing — like a scroll streak that keeps offering the same
+controls — end it as blocked rather than spending more decisions, after at most
+two bounded recovery consultations per run have had the chance to put the loop
+back on track. A run of eight consecutive executed scrolls — either direction,
+and whether or not the element table changed — trips that same stall treatment,
+and after a recovery that followed such a trip one further executed scroll ends
+the run blocked with the no-progress reason; any other executed step clears it.
+When the goal names a site no visible control reaches, the step
+decision can carry a `NAVIGATE` operation with a URL written by the configured
+model, and the host accepts only an absolute `http(s)` URL before dispatching
+it through the same `navigate` operation an LLM run uses. The configured text
+model holds the run's **memory/context**: after the first observation it plans
+once — a short execution plan, the observable condition that means the goal is
+achieved, and running notes — and that memory rides in every request the model
+answers and in the decision request sent to Jev. Required preparation fails
+closed if its response is unavailable or invalid. Replans refresh content and
+guidance within explicit bounds; they cannot reset global action/decision budgets.
+**`DONE` is checked, not taken on faith**: the configured model makes exactly
+one completion check over the goal, the memory, the final page text, and — when
+the cycle has one — the step's own capture. A confirming verdict ends the run
+with the report and marks completion verified;
+a rejecting verdict records the rejection on the step, folds its guidance into
+the memory, and continues the loop — so a disputed completion is never
+presented as done, and repeated rejection ends the run blocked as
+`completion_unverified`. An unavailable or invalid completion check ends **blocked** with
+`completion_unverified`.
+
+**Screenshots are context, not a dependency.** With the toggle on, one capture
+per cycle can accompany an LLM consultation and the completion check reuses
+that same image — no cycle captures twice, and the Jev decision request
+never carries one. A capture that cannot be produced (the tab is gone, the
+document refuses it, the response is lost) never blocks, fails, or alters the
+run: that cycle proceeds text-only and a later cycle captures again, with no
+retry inside the cycle. Page pixels are private and go to the same
+user-configured text-model endpoint that already receives the page text; the
+capture is unannotated, is never written to disk by this feature, and the
+toggle is one click away — it is both the cost control (image tokens are billed
+by that provider) and the privacy control. Text-only models are served by that
+same toggle, and the connection test's `hình ảnh` stage surfaces an
+image-rejecting model before a run depends on it.
+
+Runs on this provider drive the tab bound to the conversation (navigation
+inside it is fine), take no attachments, element records, slash commands, or
+upload grants — asking for one of those ends the turn with a named
+`unsupported_in_typesafe_mode` error instead of silently ignoring it — and
+never use skills. Every decision request is fitted beneath the configured
+request byte budget and Choice option limit. Controls and prepared actions
+reserve space; remaining element actions share a deterministic bound and
+omissions are disclosed. An irreducibly oversized request fails locally;
+when the provider rejects a request, its
+own error text (`max_tokens_exceeded`, "TypeSafe Choice questions support at
+most 255 options", …) is surfaced verbatim instead of a bare status code.
+Typing and navigation candidates require validated prepared content. A new
+field needs fresh preparation; missing content never authorizes guessed typing.
+Only absolute `http(s)` navigation URLs are eligible.
+A run that ends `DONE` ends with a **result report** produced by the completion
+check itself: in Vietnamese and strictly from the final page text under a
+no-invention instruction, it states what the task achieved, which results are
+visible, and a short "Bước tiếp theo" analysis proposing two or three sensible
+follow-up actions (suggestions only — reply with one and it runs as the next
+goal). So a finished run delivers an answer, not only a terminal label, and the
+report always describes the same page the verdict was reached on. If the check
+confirms the goal but produces no usable report, no report is shown and the
+failure is recorded on the run's terminal record; if the check itself cannot be
+made, the run ends blocked with `completion_unverified`. The outcome line
+discloses the failed verification rather than claiming success.
+`anthropic`/`chatgpt` profiles are untouched by all of this:
+their runs, settings, and capability tests behave exactly as before, and
+switching a conversation's provider type still requires a new conversation.
+An extension older than this feature has no `page_snapshot`; a Jev run against
+it then fails with a named observation error telling you to update the
+extension — never a silent degradation.
+
+The external-MCP path is unaffected — it keeps using whatever model/auth your
+Claude Code session supplies.
+
 ### Use it
 
 Open the browser and click the toolbar icon (or use the keyboard shortcut) to
@@ -473,7 +695,20 @@ message queueing with run-now, per-message cancel, and a paused-drain resume
 control (`openspec/changes/add-message-queue-and-steering`; see below), and
 rerunnable workflows with self-healing — save a completed run as a workflow,
 prove it live, and repair it when the page drifts
-(`openspec/changes/add-workflow-materialization-and-heal`; see below).
+(`openspec/changes/add-workflow-materialization-and-heal`; see below), and Jev
+(TypeSafe) runs, whose decision steps, run memory, and terminal outcome appear
+in the turn like any other run — one row per step naming the action Jev
+selected, its target, action probability/confidence and advisory monitors, the
+browser action that followed (or why nothing was dispatched), and its result;
+one row for the run's plan and for
+each context revision or stall recovery; and a terminal line that distinguishes
+a verified completion, blocked with its reason, stopped, or failed. Historical
+records retain their original model/target attribution and verification status
+(`openspec/changes/add-typesafe-jev-provider`, extended by
+`openspec/changes/add-jev-run-context` and
+`openspec/changes/add-jev-run-screenshots` — the latter adds no new rows: a
+page capture surfaces in the action timeline exactly like any other capture;
+see [Run it on TypeSafe (Jev)](#run-it-on-typesafe-jev) above).
 
 **Live answer and thinking.** While a run is in flight the panel shows the
 assistant's answer text as it is produced into the same response being
@@ -575,7 +810,7 @@ required before recording, on either path:
 
 ### Add the server to Claude Code
 
-The **hybrid** server exposes everything: all 30 tools directly (25 preserved + 5 post-baseline additions), `execute_code`
+The **hybrid** server exposes everything: all 32 tools directly (25 preserved + 7 post-baseline additions), `execute_code`
 alongside (the model picks per call), and the recording channel.
 
 ```bash
@@ -795,12 +1030,12 @@ Code](#add-the-server-to-claude-code) is the superset and the one the install
 steps assume. Two leaner variants exist if you want them, and they can
 coexist — register more than one.
 
-**Default** — the 30 tools, nothing else:
+**Default** — the 32 tools, nothing else:
 ```bash
 claude mcp add browzy-in-chrome -- node /absolute/path/to/host/mcp-server.js
 ```
 
-**Code mode** — three tools: `execute_code`, `screenshot`, `zoom`. The model writes JS that calls `chrome.*` (the typed API for all 30 tools) in a sandboxed Cloudflare Worker, collapsing multi-step flows into one round trip:
+**Code mode** — three tools: `execute_code`, `screenshot`, `zoom`. The model writes JS that calls `chrome.*` (the typed API for all 32 tools) in a sandboxed Cloudflare Worker, collapsing multi-step flows into one round trip:
 ```bash
 claude mcp add browzy-in-chrome-codemode -- node /absolute/path/to/host/codemode/server-codemode.js
 ```
@@ -941,14 +1176,20 @@ If the model still uses direct tools on the second submission, that's a signal t
 
 ## Available Tools
 
-The core browser registry (`host/tool-definitions.js`) has **30** entries,
+The core browser registry (`host/tool-definitions.js`) has **32** entries,
 verified programmatically (`test/registry-baseline.test.mjs`,
 `reports/06-registry-baseline.md`) — the **25** preserved-baseline entries
 below (every table row through `select_browser` plus `update_plan` through
-`debug_timings`) plus the **5** post-baseline additions,
+`debug_timings`) plus the **7** post-baseline additions,
 `webmcp_list_tools`, `webmcp_call_tool` (see [WebMCP page
-tools](#webmcp-page-tools-experimental) below), `browser_batch`, and
-`list_connected_browsers` plus `select_browser` — each tracked as an
+tools](#webmcp-page-tools-experimental) below), `browser_batch`,
+`list_connected_browsers` plus `select_browser`, `mask_sensitive_info`, and
+`page_snapshot` (a bounded, structured, read-only page observation whose refs
+the click/form-input/scroll actions accept directly; its text is the page's
+rendered text, bounded at 10,000 characters — non-rendered chrome contributes
+nothing and a cut is disclosed — the Jev runtime's
+per-step observation, and equally usable by a model-driven run) — each
+tracked as an
 explicitly-enumerated addition on top of the 25-tool baseline, never folded
 into that count, so a future regression there is never indistinguishable
 from an intentional addition. `switch_browser` was removed in favour of
@@ -956,7 +1197,7 @@ from an intentional addition. `switch_browser` was removed in favour of
 reason. `execute_code` (codemode/hybrid servers) and
 `recording_ack` (the recording channel) sit outside that core registry and are
 listed here for completeness. Both the side panel and external MCP dispatch
-against the same 30-tool registry; the side panel does not yet expose
+against the same 32-tool registry; the side panel does not yet expose
 `execute_code` or `recording_ack` (those are external-MCP-only, see [Server
 variants](#server-variants)).
 
@@ -1004,6 +1245,8 @@ not](#what-this-is-not)):
 | `debug_timings` | Per-call timing diagnostics | |
 | `webmcp_list_tools` | List tools the visited page publishes via WebMCP (experimental, see below) | |
 | `webmcp_call_tool` | Call a page-published WebMCP tool (experimental, see below) | |
+| `mask_sensitive_info` | Mask password/payment/credential content so it stays out of screenshots and reads | |
+| `page_snapshot` | One bounded, structured, read-only observation of a tab's page state and actionable controls | |
 
 Notes on the divergences (✗):
 

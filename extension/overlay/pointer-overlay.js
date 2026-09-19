@@ -3,7 +3,11 @@
 // then repaired per openspec/changes/repair-overlay-mount-and-visibility
 // (eager mount, single visibility authority, correlated capture lease,
 // cursor easing, unscoped-run raise, extraction exclusion, operator-input
-// blocking, the wait cursor, the ambient glow, the larger cursor).
+// blocking, the wait cursor, the ambient glow, the larger cursor), then per
+// openspec/changes/fix-lock-suppresses-hover (the locked-page input shield:
+// hit-testing, not events, is what decides `:hover`, tooltips and hover-only
+// menus, so suppressing events alone left the page half-usable exactly where
+// the lock exists to prevent interference).
 //
 // Renders the agent's cursor and an active-control notice (with a Stop
 // button) on the page the agent is actually controlling. Driven ENTIRELY by
@@ -60,9 +64,21 @@
 // this file: exactly one function ever writes a given DOM property.
 // paintOverlay() owns everything except host.style.left/top (owned solely by
 // the cursor-easing loop's paintCursorPosition(), so the coalesced paint and
-// the per-frame easing never fight over the same two properties) and the
+// the per-frame easing never fight over the same two properties), the
 // page-level wait-cursor <style> element (owned solely by
-// setWaitCursorActive()).
+// setWaitCursorActive()), and the `.browzy-shield` class (owned solely by
+// setInputShieldActive()).
+//
+// THE HOST NEVER RECEIVES THE POINTER — ONE DELIBERATE EXCEPTION: the host
+// stays `pointer-events:none` for its whole life, and so does every
+// decorative layer in it. The single exception is the input shield, active
+// only while shouldBlockInput() says the operator's input to the page must
+// be blocked: it takes hit-testing for the viewport so that page content
+// answers NO pointer interaction at all — no `:hover` state, no tooltip, no
+// hover-only menu, no click, no wheel scroll, no selection — because those
+// are decided by the browser's hit test and cannot be stopped by
+// preventDefault(). The shield sits below the badge's z-index, so Stop and
+// Open-panel keep winning hit-testing and stay operable.
 
 (function () {
   // Same reasoning as extension/content.js's own disposer — see the long note
@@ -144,6 +160,29 @@
   // suppressed as if it were an unrelated operator scroll.
   var SCROLL_ACK_TAIL_MS = 300;
 
+  // The agent's HOVER exists to open something that only exists while the
+  // pointer rests on it: a hover-only menu, a tooltip. CSS `:hover` is decided
+  // by the browser's hit-testing at the pointer's CURRENT position, and the
+  // shield below takes that hit test — so re-arming it the instant the hover's
+  // own dispatch completes takes the hover state straight back off the page
+  // and the menu closes before the next step can click anything in it. Seen
+  // live: the agent hovered a nav menu correctly, the submenu opened, and the
+  // click that followed found nothing there — seventeen times in one run.
+  //
+  // So a completed hover HOLDS the shield off until the agent moves the
+  // pointer again. The hold survives the read-only calls that come between two
+  // steps (the observation, a capture) precisely because they cannot move the
+  // pointer; it ends at the next pointer-moving action, which lifts the shield
+  // through `actionInFlight` anyway.
+  //
+  // The operator's own pointer can hover page content during that window. That
+  // is the deliberate cost, and it is bounded: the capture-phase suppression
+  // still eats every click, wheel, key and paste, and the wait cursor
+  // (`model.locked`, a broader truth than this one) still says the page is
+  // held.
+  // The membership test is POINTER_ACTION_TYPES below — the same set, for the
+  // same reason: those are exactly the actions whose dispatch moves the pointer.
+
   // Action-label lookup (design.md D1): a static map from action.type to
   // display strings, applied in computeRenderModel() — never new data on
   // the event itself. Covers every extension/events/action-events.js
@@ -190,6 +229,8 @@
   // read/script/capture/type/etc. never moved the pointer, so the cursor's
   // OWN label falls back to the idle wording even while the bar's action
   // label (above) still reports what is really happening.
+  // Two readers: the cursor label below, and the hover hold above — both ask
+  // the same question, "did this action move the pointer?".
   var POINTER_ACTION_TYPES = { click: true, hover: true, scroll: true, drag: true };
   var CURSOR_ACTION_LABELS = { click: "click", hover: "di chuột", scroll: "cuộn", drag: "kéo" };
   var CURSOR_IDLE_LABEL = "đang nghĩ";
@@ -281,6 +322,7 @@
     if (state.pendingApproval) return false; // task 7.11 — lifted while the operator must be able to read the page
     var scrollTailActive = typeof scrollTailUntilMs === "number" && nowMs < scrollTailUntilMs;
     if (state.actionInFlight || scrollTailActive) return false; // task 7.5/7.6 — the agent itself is (or just was) acting
+    if (state.hoverHeld) return false; // the agent is deliberately parking the pointer — see the hover-hold note above
     return true;
   }
 
@@ -405,6 +447,9 @@
         startedAt: state.startedAt,
         pendingApproval: null,
         actionInFlight: false,
+        // A hold belongs to the run that parked the pointer; nothing may keep
+        // the page unshielded once that run is gone.
+        hoverHeld: false,
         // Task 7.7: the risk category is a fact about the PAGE, not the run
         // — teardown clears run-scoped state (pendingApproval, motion) but a
         // real navigation-driven reset arrives as its own `riskUpdate` event
@@ -430,6 +475,8 @@
         : state.startedAt,
       pendingApproval: state.pendingApproval || null,
       actionInFlight: state.actionInFlight || false,
+      // Carried, not re-derived: only the two branches below change it.
+      hoverHeld: state.hoverHeld || false,
       // Task 7.7: an ordinary dispatched action never carries or changes a
       // risk category — only a real `riskUpdate` event (handled above) does.
       riskCategory: state.riskCategory
@@ -437,6 +484,10 @@
     if (event.kind === "start") {
       next.stepCount = (state.stepCount || 0) + 1;
       next.actionInFlight = true;
+      // A hover's hold ends when the agent moves the pointer again — and only
+      // then. A read, a capture or a script running between two steps never
+      // moved it, so it must not take the hover off the page either.
+      if (POINTER_ACTION_TYPES[next.lastActionType]) next.hoverHeld = false;
     }
     // Only a `progress` event ever carries `pointer` (buildEvent() in
     // action-events.js enforces this at the source) — and ONLY for a
@@ -473,6 +524,12 @@
       // that follow before the next real `start` (spec: "a period with no
       // action in flight" must be a real, reachable cursor state).
       next.actionInFlight = false;
+      // A completed hover keeps the pointer where the agent put it, so the
+      // page must keep answering it until the agent moves on. Only a hover
+      // SETS the hold here: a read, a capture or a script settling between two
+      // steps never moved the pointer, so it must not clear it either — the
+      // `start` branch above is the only place a hold ends.
+      if (next.lastActionType === "hover") next.hoverHeld = true;
     }
     return next;
   }
@@ -718,6 +775,25 @@
     ".browzy-corner-tr{top:10px;right:10px;}" +
     ".browzy-corner-bl{bottom:10px;left:10px;}" +
     ".browzy-corner-br{bottom:10px;right:10px;}" +
+    // ---- Input shield (openspec/changes/fix-lock-suppresses-hover) --------
+    // While a run holds the page for the operator, hit-testing itself has to
+    // be taken away from page content: `:hover` state, tooltips and
+    // hover-only menus are decided by the browser's hit test, not by JS
+    // events, so suppressing mousemove/mouseover changes nothing about them.
+    // This is the one element that can take the pointer instead —
+    // full-viewport, transparent, above realistic page content (z-index
+    // 2147483644; the decorative frame/ripples are stacked above it but are
+    // pointer-events:none, so they cannot steal its hit test) and BELOW the
+    // badge (2147483647) so the indicator's own Stop/Open-panel controls
+    // keep winning hit-testing and stay operable. It is inert until the
+    // SAME predicate the event suppression uses (shouldBlockInput) says the
+    // operator's input to the page must be blocked; toggling `.is-active` is
+    // setInputShieldActive()'s job alone. The wait cursor rides the shield,
+    // so the locked-page lesson survives on elements whose own CSS sets a
+    // different cursor (design.md D10's wait cursor is kept as well).
+    ".browzy-shield{position:fixed;inset:0;pointer-events:none;z-index:2147483644;" +
+    "cursor:wait;background:transparent;}" +
+    ".browzy-shield.is-active{pointer-events:auto;}" +
     // ---- Status bar: anchored bottom-center (task 4.2), never a corner ----
     ".browzy-badge{position:fixed;left:50%;bottom:26px;transform:translateX(-50%);" +
     "display:flex;align-items:center;gap:0;height:46px;box-sizing:border-box;" +
@@ -924,7 +1000,17 @@
     ringEl.appendChild(rippleAEl);
     ringEl.appendChild(rippleBEl);
 
-    // 4. The status bar: anchored bottom-center (task 4.2), three states
+    // 4. The input shield (openspec/changes/fix-lock-suppresses-hover): the
+    // one layer that deliberately RECEIVES the pointer, and only while the
+    // page is locked for the operator (see this file's header and
+    // setInputShieldActive()). Appended with the other layers, beneath the
+    // badge in both DOM order and z-index, so the badge's own controls keep
+    // winning hit-testing while it is up. Created inert — the paint path
+    // turns it on; nothing here ever does.
+    var shieldEl = doc.createElement("div");
+    shieldEl.className = "browzy-shield";
+
+    // 5. The status bar: anchored bottom-center (task 4.2), three states
     // (task 4.6) — running/waiting/idle — with NO grant/deny control ever
     // (task 5.5 / design.md D6 / spec "Blocked-on-approval is visible on
     // the controlled page").
@@ -1014,6 +1100,7 @@
     shadow.appendChild(frameEl);
     shadow.appendChild(cursorEl);
     shadow.appendChild(ringEl);
+    shadow.appendChild(shieldEl);
     shadow.appendChild(badgeEl);
 
     var parent = doc.documentElement || doc.body;
@@ -1027,6 +1114,7 @@
       cursorEl: cursorEl,
       cursorActionEl: cursorActionEl,
       ringEl: ringEl,
+      shieldEl: shieldEl,
       badgeEl: badgeEl,
       riskEl: riskEl,
       textEl: textEl,
@@ -1265,6 +1353,21 @@
     waitCursorStyleEl = null;
   }
 
+  /** openspec/changes/fix-lock-suppresses-hover: the shield layer's sole
+   * writer. `active` is ALWAYS the caller's own evaluation of
+   * shouldBlockInput() — the identical predicate handleBlockableEvent()
+   * applies to capture-phase events — so the two enforcement layers can
+   * never disagree about whether the operator's pointer is blocked right
+   * now (one truth table, two layers: hit-testing here, event suppression
+   * there as defence in depth). A no-op before attach() has built the host:
+   * the shield is created together with the host, so there is nothing to
+   * toggle yet, and paintNow() legitimately runs with `refs === null` (the
+   * "no host node" verdict). */
+  function setInputShieldActive(active) {
+    if (!refs || !refs.shieldEl || !refs.shieldEl.classList) return;
+    refs.shieldEl.classList.toggle("is-active", !!active);
+  }
+
   /** design.md D5: stop the cursor-easing loop. Cancels the pending frame
    * only — callers decide separately whether `drawnCursor` should survive
    * (a capture hide: yes, resume from here) or be dropped (teardown/expiry:
@@ -1331,12 +1434,40 @@
    *      targets, focus could not otherwise cross from page content into
    *      the shadow root, stranding a keyboard-only operator with no way to
    *      reach Stop (task 7.4).
-   * Everything else is decided by the pure shouldBlockInput() predicate. */
+   * Everything else is decided by the pure shouldBlockInput() predicate.
+   *
+   * This listener is no longer the only enforcement of D8: while the
+   * predicate holds, the input shield has already taken hit-testing away
+   * from page content (see setInputShieldActive()), which is the ONLY thing
+   * that can stop `:hover`, tooltips and hover-only menus. The listeners
+   * stay as defence in depth — the keyboard, and any pointer event that
+   * races the class toggle by a frame (openspec/changes/
+   * fix-lock-suppresses-hover). */
   function handleBlockableEvent(event) {
     if (!event || event.isTrusted !== true) return;
-    if (refs && event.target === refs.host) return;
+    var blocked = shouldBlockInput(state, Date.now(), HEARTBEAT_MAX_AGE_MS, scrollTailUntil);
+    // Exemption 2 above, with ONE exception, and only while blocking is in
+    // force: the scroll gestures (`wheel`, `touchmove`). Chrome's scroll
+    // chain runs from the hit-tested node up through the document, so a
+    // wheel that the shield takes still scrolls the page — verified in a real
+    // browser: with the shield covering the viewport and pointer-events:auto,
+    // a wheel over it moved the document (and over the indicator too), and
+    // only cancelling that wheel's own event stopped the scroll.
+    // `overflow:hidden` on the shield does not stop it either. So hit-testing
+    // alone cannot deliver the lock's "no wheel scroll moves the page"; this
+    // is the same predicate, applied to the event the shield itself
+    // receives. Every other type keeps the exemption, so a click on Stop /
+    // Open-panel still lands while the page is locked (verified in the same
+    // browser pass) — and the touch leg is the same reasoning rather than a
+    // separate measurement: a retargeted `touchmove` is cancelable, and
+    // cancelling it stops the scroll without cancelling the tap's click.
+    // Neither leg can touch the AGENT's own dispatch: the shield is down
+    // (and `blocked` false) whenever anything of the agent's is in flight,
+    // including the scroll-tail window that exists for Brave's late wheel.
+    var scrollGesture = event.type === "wheel" || event.type === "touchmove";
+    if (refs && event.target === refs.host && !(blocked && scrollGesture)) return;
     if (event.type === "keydown" && event.key === "Tab") return;
-    if (!shouldBlockInput(state, Date.now(), HEARTBEAT_MAX_AGE_MS, scrollTailUntil)) return;
+    if (!blocked) return;
     event.preventDefault();
     event.stopImmediatePropagation();
     lastSuppressedAt = Date.now();
@@ -1394,6 +1525,16 @@
     }
     paintOverlay(refs, model, window.innerWidth, window.innerHeight);
     setWaitCursorActive(!!model.locked);
+    // openspec/changes/fix-lock-suppresses-hover: the shield is toggled by
+    // the SAME predicate, with the SAME arguments, that handleBlockableEvent()
+    // applies to capture-phase events — never a second, separately-derived
+    // notion of "locked" (model.locked is deliberately broader: it stays true
+    // across the agent's own in-flight dispatch, when the operator's pointer
+    // MUST reach the page). Every transition repaints on an existing cadence:
+    // start/complete/approval/teardown events, the 250ms heartbeat re-check
+    // (heartbeat expiry), and the scroll tail's own deadline — so the shield
+    // re-arms without any timer of its own.
+    setInputShieldActive(shouldBlockInput(state, now, HEARTBEAT_MAX_AGE_MS, scrollTailUntil));
     if (!model.active) {
       stopCursorAnimation();
       drawnCursor = null;

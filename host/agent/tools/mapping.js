@@ -900,13 +900,15 @@ export function fingerprintNormalizedArgs(normalized) {
 
 // --- Mutating vs. read-only classification, by legacy tool name -----------
 //
-// A closed, exhaustive classification of all 30 registry tools — the 25
-// preserved-baseline entries plus the 5 post-baseline additions (the 2 WebMCP
+// A closed, exhaustive classification of all 32 registry tools — the 25
+// preserved-baseline entries plus the 7 post-baseline additions (the 2 WebMCP
 // page-tool operations from openspec/changes/consume-webmcp-page-tools,
-// browser_batch from openspec/changes/add-browser-batch-tool, and
+// browser_batch from openspec/changes/add-browser-batch-tool,
 // list_connected_browsers plus select_browser from
 // openspec/changes/implement-stubbed-browser-tools, which also removed
-// switch_browser; `computer`
+// switch_browser, mask_sensitive_info from
+// openspec/changes/add-sensitive-info-masking, and page_snapshot from
+// openspec/changes/add-typesafe-jev-provider; `computer`
 // is classified per-action instead of as a whole, since a single call can be
 // a screenshot or a click). A registry-baseline-style test asserts this
 // classification's two sets plus "computer" account for every TOOLS entry,
@@ -928,7 +930,21 @@ const READ_ONLY_LEGACY_TOOLS = new Set([
   "update_plan",
   // Reads the passively-maintained per-tab page-tool table
   // (extension/background.js) only — no page or browser side effect.
-  "webmcp_list_tools"
+  "webmcp_list_tools",
+  // Presentation- and text-level masking of sensitive page content
+  // (openspec/changes/add-sensitive-info-masking): it writes no input value,
+  // dispatches no events, and is reversed by its own unmask — the protective
+  // counterpart of the read tools above, which is exactly where it must stay
+  // usable on a borrowed tab (the bound page is where credentials are most
+  // likely on screen). See that change's design.md D4.
+  "mask_sensitive_info",
+  // One bounded, structured read of the current page state
+  // (openspec/changes/add-typesafe-jev-provider design.md decision 2): it
+  // assigns refs from the same ref space the read/action tools use but sends
+  // no input, dispatches no events, and mutates nothing — a read, and the
+  // one the Jev runtime observes with every step, including on the borrowed
+  // bound tab.
+  "page_snapshot"
 ]);
 
 const MUTATING_LEGACY_TOOLS = new Set([
@@ -1003,6 +1019,8 @@ const TAB_TARGET_ARG_KEYS = {
   form_input: ["tabId"],
   get_page_text: ["tabId"],
   javascript_tool: ["tabId"],
+  mask_sensitive_info: ["tabId"],
+  page_snapshot: ["tabId"],
   read_console_messages: ["tabId"],
   read_network_requests: ["tabId"],
   read_page: ["tabId"],

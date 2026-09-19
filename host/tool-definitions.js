@@ -1,10 +1,12 @@
-// The 30 browzy-in-chrome tool definitions (25 preserved-baseline operations
-// plus 5 post-baseline operations — the 2 WebMCP page tools added by
+// The 32 browzy-in-chrome tool definitions (25 preserved-baseline operations
+// plus 7 post-baseline operations — the 2 WebMCP page tools added by
 // openspec/changes/consume-webmcp-page-tools, browser_batch added by
-// openspec/changes/add-browser-batch-tool, and list_connected_browsers plus
-// select_browser added by openspec/changes/implement-stubbed-browser-tools;
-// that same change removed switch_browser, recorded in the baseline's
-// removals set naming select_browser as its replacement; see
+// openspec/changes/add-browser-batch-tool, list_connected_browsers plus
+// select_browser added by openspec/changes/implement-stubbed-browser-tools
+// (that same change also removed switch_browser, recorded in the baseline's
+// removals set naming select_browser as its replacement), and
+// mask_sensitive_info added by openspec/changes/add-sensitive-info-masking,
+// and page_snapshot added by openspec/changes/add-typesafe-jev-provider; see
 // test/registry-baseline.test.mjs's DESIGN_DOC_TOOL_LIST /
 // POST_BASELINE_ADDITIONS / REMOVED_BASELINE_OPERATIONS split, and the
 // "Preserve the browser capability baseline" requirement in
@@ -347,6 +349,29 @@ export const TOOLS = [
         .number()
         .describe(
           "Tab ID to execute the code in. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."
+        )
+    }
+  },
+  {
+    name: "mask_sensitive_info",
+    description:
+      "Mask sensitive information on the current page so it stays out of screenshots and page reads. Detection covers password fields, payment inputs (card number, CVC, expiry), one-time-code fields, and fields named or labelled for credential, payment, identity, bank, or token content, using precise patterns rather than broad words; pass selectors for anything the heuristics miss. A masked form control renders as dots; masked text is replaced with a placeholder; read_page and get_page_text return the masked form. Masking changes no input value, dispatches no events, preserves layout, and is undone with action 'unmask'. It applies to the current document only — a navigation or a rerender can drop it, so re-apply before the next capture. Use it whenever a page you are about to screenshot or read may display credentials, card or account numbers, or other personal data. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
+    paramShape: {
+      action: z
+        .enum(["mask", "unmask"])
+        .describe(
+          "'mask' finds and masks sensitive elements on the page; 'unmask' restores everything this tool masked on the current document."
+        ),
+      tabId: z
+        .number()
+        .describe(
+          "Tab ID to operate on. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."
+        ),
+      selectors: z
+        .array(z.string())
+        .optional()
+        .describe(
+          "Extra CSS selectors to mask beyond the built-in heuristics (e.g. '#iban', '.account-number'). Every element matching any selector is masked, along with its descendant form controls."
         )
     }
   },
@@ -762,6 +787,18 @@ export const TOOLS = [
         )
         .min(1)
         .describe("Ordered list of tool calls to run sequentially. At least one item. Batches cannot be nested.")
+    }
+  },
+  {
+    name: "page_snapshot",
+    description:
+      "Take one bounded, structured snapshot of a tab's current page state: the URL and title, viewport and scroll position, an ordered table of the currently visible, enabled interactive controls (each with the reference other tools accept, its role, accessible name, current value/state, and options for a native select), and a bounded extract of the visible text, with explicit disclosure when either the element table or the text was truncated. This is a READ-ONLY observation: it changes no page or browser state, dispatches no input, and is safe on a borrowed tab. References it returns are the SAME refs read_page/find return and are accepted by computer (clicks), form_input, and scroll_to on the same document. Prefer it when you need a structured, bounded view of what is actionable right now; use read_page/get_page_text when you need page prose.",
+    paramShape: {
+      tabId: z
+        .number()
+        .describe(
+          "Tab ID to snapshot. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."
+        )
     }
   }
 ];

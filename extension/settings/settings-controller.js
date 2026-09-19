@@ -14,22 +14,27 @@
 // Secret handling (spec "Secret isolation" — the headline assertion this
 // whole module is built around): the raw API key is NEVER mirrored into
 // `this.state` at all (not even transiently while the user types) — unlike
-// every other field here, the settings page's key `<input>` is deliberately
-// left UNCONTROLLED by controller state. `save(secretInput)` takes the raw
-// value as a plain function argument, read live from the DOM by
-// settings-app.js at the moment Save is clicked, so it is never broadcast
+// every other field here, the settings page's key `<input>`s are deliberately
+// left UNCONTROLLED by controller state. `save(secretInput, typesafeSecrets)`
+// takes the raw values as plain function arguments, read live from the DOM by
+// settings-app.js at the moment Save is clicked, so they are never broadcast
 // through `onChange`/`getState()` on every keystroke the way a controlled
-// field would. The only place a raw key value is EVER held by this class is
-// `#pendingSecretForRetry`, a true private class field (never enumerable,
-// never included in `getState()`'s plain-object snapshot, never logged). It
-// exists only to let an explicit, user-confirmed memory-only retry proceed
-// after a SECURE_STORAGE_UNAVAILABLE failure without forcing the user to
-// retype the key they just submitted; it is cleared (`= null`) after every
-// save attempt's outcome, on `init()`/`switchProfile()`, and on
-// `removeCredential()`.
+// field would. That is all three keys of the page — the Anthropic one
+// (`secretInput`) and the two a `typesafe` profile uses (`typesafeSecrets`,
+// add-typesafe-jev-provider task 5.5) — on one rule, with the same clearing
+// behavior in the DOM layer. The only place a raw key value is EVER held by
+// this class is `#pendingSecretForRetry`, a true private class field (never
+// enumerable, never included in `getState()`'s plain-object snapshot, never
+// logged). It holds either the Anthropic key string or a `typesafe` profile's
+// `{ typesafeApiKey, textModelApiKey }` pair, and exists only to let an
+// explicit, user-confirmed memory-only retry proceed after a
+// SECURE_STORAGE_UNAVAILABLE failure without forcing the user to retype the
+// key(s) they just submitted; it is cleared (`= null`) after every save
+// attempt's outcome, on `init()`/`switchProfile()`, and on
+// `removeCredential()`/`removeTypesafeKey()`.
 
-import { validateBaseUrl, validateModelsList, DEFAULT_BASE_URL } from "./settings-validation.js";
-import { describeErrorCode } from "./errors-ui.js";
+import { validateBaseUrl, validateModelsList, validateTextModelBaseUrl, DEFAULT_BASE_URL } from "./settings-validation.js";
+import { describeErrorCode, typesafeStageLabel } from "./errors-ui.js";
 
 const DEFAULT_PROFILE_ID = "default";
 
@@ -89,6 +94,61 @@ function emptyState(profileId) {
     switchingProviderType: false,
     signingOut: false,
     signIn: emptySignInState(),
+    // TypeSafe / Jev provider (add-typesafe-jev-provider task 5.5). The five
+    // non-secret fields this page receives from
+    // host/agent/settings/profile.js's loadProfile() for a `typesafe` profile:
+    // the text-model base URL and model ID (draft + saved, exactly like
+    // `baseUrl`/`baseUrlDraft` above), the two has-key booleans, and the Jev
+    // source choice. The key VALUES are never readable — they live in the OS
+    // credential store and come back from the companion as booleans only (see
+    // settings-client.js's wire contract), which is why the key inputs stay
+    // uncontrolled like the Anthropic one (file header).
+    textModelBaseUrl: "",
+    textModelBaseUrlDraft: "",
+    textModelId: "",
+    textModelIdDraft: "",
+    hasTypesafeKey: false,
+    hasTextModelKey: false,
+    // The Jev source ("typesafe" | "vercel"). The literal pair is hand-synced
+    // from profile-schema.js's TYPESAFE_SOURCES for the same reason the panel
+    // hand-syncs protocol literals: the extension cannot import a host
+    // module. An unrecognized stored value loads as the default in
+    // _applyProfile; setTypesafeSource() refuses anything else.
+    typesafeSource: "typesafe",
+    // The decision-model source (task 3.6) and its own two fields — the
+    // pair `anthropic` uses (base URL + the profile's existing Anthropic
+    // key, reused verbatim through #key-input/hasCredential below rather
+    // than a new op) and the model ID both `anthropic` and `chatgpt` need
+    // (host/agent/settings/profile.js's setTypesafeConfig() requires a
+    // nonempty typesafeDecisionModelId for either non-openai source). The
+    // literal triple is hand-synced from profile-schema.js's
+    // TYPESAFE_DECISION_SOURCES for the same reason typesafeSource above is.
+    // `openai` is the documented default; the openai case keeps using the
+    // text-model fields above rather than these two.
+    typesafeDecisionSource: "openai",
+    decisionBaseUrl: "",
+    decisionBaseUrlDraft: "",
+    decisionModelId: "",
+    decisionModelIdDraft: "",
+    // The screenshot toggle (add-jev-run-screenshots task 3.2; design.md
+    // decision 4): whether a run captures the bound tab once per cycle and
+    // attaches it to the configured model's step decision. A non-secret
+    // profile field persisted by save() through set_typesafe_config, enabled
+    // by default — an absent field (a profile stored before the toggle
+    // existed, or a companion that predates it) loads as enabled, which is
+    // the documented default, so the initial state here is that same `true`.
+    sendScreenshots: true,
+    // The consult-sources toggle (jev-runs-consult-sources-beyond-the-page
+    // task 5.2; specs/agent-settings "The TypeSafe provider discloses and
+    // controls source consultation"): whether a run may fetch, read-only, at
+    // most 3 URLs it saw on the driven page or that the goal named. A
+    // non-secret profile field persisted by save() through
+    // set_typesafe_config, enabled by default — an absent field (a profile
+    // stored before the toggle existed, or a companion that predates it)
+    // loads as enabled, the documented default
+    // (host/agent/settings/profile-schema.js's resolveConsultSources()), so
+    // the initial state here is that same `true`.
+    consultSources: true,
     // ChatGPT account usage (add-chatgpt-usage-check design.md decision 6).
     // Display-only: `usage` is the companion's display-shaped result (the
     // exact six-key reply — see settings-client.js's wire contract) and is
@@ -103,7 +163,7 @@ function emptyState(profileId) {
     discovering: false,
     removingCredential: false,
 
-    fieldErrors: { baseUrl: null, models: null },
+    fieldErrors: { baseUrl: null, models: null, textModelBaseUrl: null, textModelId: null, decisionBaseUrl: null, decisionModelId: null },
     banner: null, // { kind: "error"|"info"|"success", title, message, action, code }
     connectionStatus: null, // { status: "testing"|"pass"|"fail", capabilities, errors, timestamp, modelId, textOnly }
 
@@ -113,6 +173,151 @@ function emptyState(profileId) {
 
 function deepClone(value) {
   return JSON.parse(JSON.stringify(value));
+}
+
+// --- TypeSafe source facts and copy (add-typesafe-endpoint-field) ----------
+//
+// A `typesafe` profile's endpoint IS `profile.baseUrl`, defaulted per Jev
+// source and remapped on a source change only while it is still a KNOWN
+// default (host/agent/settings/profile.js's endpointForProviderSwitch /
+// setTypesafeConfig). The two documented endpoints below are hand-synced from
+// profile-schema.js's DEFAULT_TYPESAFE_BASE_URL /
+// DEFAULT_TYPESAFE_GATEWAY_BASE_URL, for the same reason the source literals
+// in `emptyState()` are: the extension page cannot import a host module. The
+// page mirrors that rule in the endpoint draft (see `setTypesafeSource`) and
+// names the selected source on every source-dependent surface of the TypeSafe
+// block — the endpoint field, the key field, and the key's remove action — all
+// of which read this one table.
+//
+// It lives here rather than in settings-app.js because that file touches
+// `document` at module scope and cannot be imported by the plain-Node suites
+// (file header): these are the strings the tests pin, and the source-name
+// derivation they all share.
+const TYPESAFE_SOURCE_COPY = Object.freeze({
+  typesafe: Object.freeze({
+    endpointDefault: "https://api.typesafe.ai",
+    endpointLabel: "Điểm cuối Jev — TypeSafe API",
+    endpointHint: "Mặc định của TypeSafe API là https://api.typesafe.ai. Khi đổi nguồn, điểm cuối chỉ được đặt lại nếu nó vẫn đang là mặc định; điểm cuối bạn tự nhập (gateway riêng, proxy) được giữ nguyên.",
+    keyLabel: "API key TypeSafe",
+    keyRemoveLabel: "Xóa key TypeSafe"
+  }),
+  vercel: Object.freeze({
+    endpointDefault: "https://ai-gateway.vercel.sh",
+    endpointLabel: "Điểm cuối Jev — Vercel AI Gateway",
+    endpointHint: "Mặc định của Vercel AI Gateway là https://ai-gateway.vercel.sh. Khi đổi nguồn, điểm cuối chỉ được đặt lại nếu nó vẫn đang là mặc định; điểm cuối bạn tự nhập (gateway riêng, proxy) được giữ nguyên.",
+    keyLabel: "API key Vercel AI Gateway",
+    keyRemoveLabel: "Xóa key Vercel AI Gateway"
+  }),
+  // OpenRouter (task 2.3): its decision route lives under `/api/alpha/`
+  // (host/agent/jev/client.js), so this is the one source the settings page
+  // must label alpha wherever it is selected — the endpoint hint and the
+  // provider's own disclosure both name it, matching the spec sentence "A
+  // source published as alpha SHALL be labeled as such where it is selected."
+  openrouter: Object.freeze({
+    endpointDefault: "https://openrouter.ai",
+    endpointLabel: "Điểm cuối Jev — OpenRouter (alpha)",
+    endpointHint: "Mặc định của OpenRouter là https://openrouter.ai. OpenRouter công bố tuyến quyết định dưới /api/alpha/, nên giao thức có thể thay đổi giữa các bản cập nhật. Khi đổi nguồn, điểm cuối chỉ được đặt lại nếu nó vẫn đang là mặc định; điểm cuối bạn tự nhập (gateway riêng, proxy) được giữ nguyên.",
+    keyLabel: "API key OpenRouter",
+    keyRemoveLabel: "Xóa key OpenRouter"
+  })
+});
+
+/** The two documented endpoints in one place: what the page's source-change
+ * rule treats as "still a known default, safe to move". */
+const KNOWN_TYPESAFE_ENDPOINTS = new Set(
+  Object.values(TYPESAFE_SOURCE_COPY).map((entry) => entry.endpointDefault)
+);
+
+/** The copy and documented endpoint for one Jev source. An unknown source
+ * falls back to the documented default source, matching
+ * `resolveTypesafeSource()` host-side — state.typesafeSource can never hold
+ * one anyway (_applyProfile coerces, setTypesafeSource refuses). */
+export function typesafeSourceCopy(source) {
+  if (source === "vercel") return TYPESAFE_SOURCE_COPY.vercel;
+  if (source === "openrouter") return TYPESAFE_SOURCE_COPY.openrouter;
+  return TYPESAFE_SOURCE_COPY.typesafe;
+}
+
+// --- Decision-model source facts and copy (task 3.6) -----------------------
+//
+// A `typesafe` profile's DECISION model (the one that plans, decides every
+// step, revises memory and judges completion — Jev only ever answers the
+// element-selection question) comes from one of three sources, hand-synced
+// from profile-schema.js's TYPESAFE_DECISION_SOURCES for the same reason the
+// Jev source literals above are: the extension page cannot import a host
+// module. `openai` is the documented default (a profile saved before this
+// choice existed loads as `openai` with its text-model fields unchanged), and
+// the picker shows only the selected source's own fields
+// (specs/typesafe-jev-provider "Provider type and configuration surface").
+const TYPESAFE_DECISION_SOURCE_COPY = Object.freeze({
+  openai: Object.freeze({
+    optionLabel: "Mô hình văn bản (tương thích OpenAI)",
+    // The phrase the disclosure/test-disclosure builders below splice in —
+    // "mô hình văn bản" is the exact phrase existing tests
+    // (test/settings-connection-gate.test.mjs, test/settings-ui-controller.
+    // test.mjs) already pin for this, the documented default, source.
+    targetName: "điểm cuối mô hình văn bản bạn cấu hình"
+  }),
+  anthropic: Object.freeze({
+    optionLabel: "Điểm cuối & khóa Anthropic",
+    targetName: "điểm cuối Anthropic bạn cấu hình"
+  }),
+  chatgpt: Object.freeze({
+    optionLabel: "Tài khoản ChatGPT (qua companion)",
+    targetName: "gói đăng ký ChatGPT của bạn, qua cổng cục bộ của companion"
+  })
+});
+
+/** The copy for one decision-model source. An unrecognized value falls back
+ * to the documented default (`openai`), matching
+ * `resolveTypesafeDecisionSource()` host-side. */
+export function typesafeDecisionSourceCopy(source) {
+  if (source === "anthropic") return TYPESAFE_DECISION_SOURCE_COPY.anthropic;
+  if (source === "chatgpt") return TYPESAFE_DECISION_SOURCE_COPY.chatgpt;
+  return TYPESAFE_DECISION_SOURCE_COPY.openai;
+}
+
+/** The provider's own disclosure (specs/agent-settings "TypeSafe disclosure
+ * names what is sent where"): names TypeSafe (the element-selection wire)
+ * and, separately, the selected decision-model source — the operator's
+ * Anthropic endpoint, their ChatGPT subscription through the local gateway,
+ * or the configured text-model endpoint. */
+export function typesafeDisclosureText(decisionSource) {
+  const { targetName } = typesafeDecisionSourceCopy(decisionSource);
+  return (
+    `Chạy qua nhà cung cấp này gửi các yêu cầu chọn phần tử có cấu trúc tới TypeSafe và, tới ${targetName}: ` +
+    "kế hoạch ngữ cảnh, từng quyết định bước (kèm ảnh chụp màn hình khi bật, giá trị văn bản và URL khi cần), " +
+    "cập nhật ngữ cảnh, kiểm tra hoàn thành, gỡ bế tắc. Hai dịch vụ tính phí (hoặc giới hạn sử dụng) riêng theo điều khoản của từng dịch vụ."
+  );
+}
+
+/** The connection test's own disclosure (specs/agent-settings "Explicit
+ * compatibility and connection testing": "for a typesafe profile that it
+ * calls both the TypeSafe endpoint and the selected decision-model source").
+ * The ChatGPT source reads differently on purpose — it counts against the
+ * subscription's usage limit, not an API bill. */
+export function typesafeTestDisclosureText(decisionSource) {
+  if (decisionSource === "chatgpt") {
+    return (
+      "Kiểm tra kết nối gửi một yêu cầu nhỏ tới TypeSafe, và tính vào giới hạn sử dụng của tài khoản ChatGPT cho mô hình quyết định " +
+      "— trong đó có một yêu cầu mang ảnh nhỏ để chứng minh mô hình nhận được nội dung hình ảnh."
+    );
+  }
+  const { targetName } = typesafeDecisionSourceCopy(decisionSource);
+  return (
+    `Kiểm tra kết nối gửi một yêu cầu nhỏ tới cả TypeSafe và ${targetName} ` +
+    "— trong đó có một yêu cầu mang ảnh nhỏ để chứng minh mô hình nhận được nội dung hình ảnh — và có thể phát sinh chi phí API ở cả hai dịch vụ."
+  );
+}
+
+/** Whether `value` is one of the two documented endpoints — judged on the
+ * NORMALIZED form, the string a Save would actually send (validateBaseUrl),
+ * so a trailing slash or a terminal `/v1` cannot make the page and the host
+ * disagree about whether the endpoint is still a known default. */
+function isKnownTypesafeEndpoint(value) {
+  if (typeof value !== "string") return false;
+  const result = validateBaseUrl(value);
+  return result.ok && KNOWN_TYPESAFE_ENDPOINTS.has(result.normalized);
 }
 
 export class SettingsController {
@@ -194,6 +399,49 @@ export class SettingsController {
     s.providerType = profile.providerType || "anthropic";
     s.chatgptAccount = profile.chatgptAccount || null;
     s.chatgptSessionState = profile.chatgptSessionState || "signed_out";
+    // TypeSafe / Jev provider (add-typesafe-jev-provider task 5.5): the
+    // text-model fields and the two has-key booleans, taken verbatim from the
+    // companion's secret-free profile. Absent (an anthropic/chatgpt profile,
+    // or one saved before this provider existed) means empty/false, never a
+    // stale value carried over from a previously displayed profile — this
+    // runs on a fresh state after every init()/switchProfile(), but also
+    // after setProviderType()/save() replies, where it must overwrite
+    // whatever the previous provider type left behind.
+    s.textModelBaseUrl = typeof profile.textModelBaseUrl === "string" ? profile.textModelBaseUrl : "";
+    s.textModelBaseUrlDraft = s.textModelBaseUrl;
+    s.textModelId = typeof profile.textModelId === "string" ? profile.textModelId : "";
+    s.textModelIdDraft = s.textModelId;
+    s.hasTypesafeKey = Boolean(profile.hasTypesafeKey);
+    s.hasTextModelKey = Boolean(profile.hasTextModelKey);
+    s.typesafeSource =
+      profile.typesafeSource === "vercel" ? "vercel" : profile.typesafeSource === "openrouter" ? "openrouter" : "typesafe";
+    // The decision-model source (task 3.6) and its own two non-secret
+    // fields. Absent (a profile saved before the choice existed, or an
+    // anthropic/chatgpt profile, which never sets them) loads as the
+    // documented `openai` default with empty drafts — resolveTypesafeDecisionSource()'s
+    // host-side rule, mirrored here for the same reason every other TypeSafe
+    // default is.
+    s.typesafeDecisionSource =
+      profile.typesafeDecisionSource === "anthropic" || profile.typesafeDecisionSource === "chatgpt"
+        ? profile.typesafeDecisionSource
+        : "openai";
+    s.decisionBaseUrl = typeof profile.typesafeDecisionBaseUrl === "string" ? profile.typesafeDecisionBaseUrl : "";
+    s.decisionBaseUrlDraft = s.decisionBaseUrl;
+    s.decisionModelId = typeof profile.typesafeDecisionModelId === "string" ? profile.typesafeDecisionModelId : "";
+    s.decisionModelIdDraft = s.decisionModelId;
+    // The screenshot toggle (add-jev-run-screenshots task 3.2). The companion
+    // resolves the default and sends a boolean, but an ABSENT field — a
+    // profile stored before the toggle existed, or a companion older than the
+    // setting — loads as enabled, which is the documented default (design.md
+    // decision 4: "a profile stored before the field existed loads as
+    // enabled"). Only an explicit `false` disables it.
+    s.sendScreenshots = profile.sendScreenshots === undefined ? true : Boolean(profile.sendScreenshots);
+    // The consult-sources toggle (jev-runs-consult-sources-beyond-the-page
+    // task 5.2). Same rule as the screenshot toggle above: an ABSENT field —
+    // a profile stored before the toggle existed, or a companion older than
+    // the setting — loads as enabled, the documented default. Only an
+    // explicit `false` disables it.
+    s.consultSources = profile.consultSources === undefined ? true : Boolean(profile.consultSources);
     // A chatgpt profile whose session expired host-side (auth.js's refresh
     // saw `invalid_grant`/`refresh_token_reused` → recordChatgptSessionExpired)
     // has no other way to tell the user from a cold load: the side panel shows
@@ -202,11 +450,12 @@ export class SettingsController {
     // banner"). Set only when nothing more specific is already being shown —
     // every caller below assigns its own banner AFTER _applyProfile, so this
     // never clobbers a just-performed action's result.
-    if (
-      s.providerType === "chatgpt" &&
-      s.chatgptSessionState === "session_expired" &&
-      !s.banner
-    ) {
+    // A typesafe profile whose decision-model source is `chatgpt` reuses the
+    // exact same sign-in state (task 3.6: "the same sign-in, account, usage,
+    // and sign-out controls a chatgpt profile exposes"), so an expired
+    // session needs the same banner here too.
+    const chatgptFieldsShown = s.providerType === "chatgpt" || (s.providerType === "typesafe" && s.typesafeDecisionSource === "chatgpt");
+    if (chatgptFieldsShown && s.chatgptSessionState === "session_expired" && !s.banner) {
       s.banner = { kind: "error", code: "SESSION_EXPIRED", ...describeErrorCode("SESSION_EXPIRED") };
     }
     // First-run is about whether a WORKING configuration exists yet (no
@@ -215,8 +464,13 @@ export class SettingsController {
     // test/settings-ui-controller.test.mjs "profile switching" for why
     // tying this to the default Base URL specifically was wrong: a partially
     // configured profile (custom endpoint, no key/model yet) is still
-    // first-run onboarding, not a "returning user" state.
-    s.isFirstRun = !s.hasCredential && s.models.length === 0;
+    // first-run onboarding, not a "returning user" state. A `typesafe`
+    // profile's credential is the PAIR of keys, so one saved half is still a
+    // first run (add-typesafe-jev-provider task 5.5).
+    const providerConfigured = s.providerType === "typesafe"
+      ? s.hasTypesafeKey && this._typesafeDecisionSourceConfigured(s)
+      : s.hasCredential;
+    s.isFirstRun = !providerConfigured && s.models.length === 0;
 
     // ChatGPT usage (add-chatgpt-usage-check design.md decision 6): a
     // signed-in `chatgpt` profile starts one read; every other state clears
@@ -224,8 +478,11 @@ export class SettingsController {
     // "ChatGPT usage display" — not signed in / expired reads nothing). The
     // read happens once per profile application, never on a timer;
     // refreshUsage() de-duplicates against a read already in flight, so a
-    // profile application arriving mid-read does not double the request.
-    if (s.providerType === "chatgpt" && s.chatgptSessionState === "signed_in") {
+    // profile application arriving mid-read does not double the request. A
+    // typesafe profile whose decision-model source is `chatgpt` reads the
+    // same block for the same reason it shares every other ChatGPT control
+    // (task 3.6) — see _usageReadable() below, which this mirrors.
+    if (this._usageReadable()) {
       this.refreshUsage();
     } else {
       s.usage = { status: "idle", usage: null, error: null };
@@ -284,12 +541,13 @@ export class SettingsController {
   // methods below, and setCredential/removeCredential are never called for
   // it.
 
-  /** Switch between `anthropic` and `chatgpt`. Never touches the model list
-   * or (for `chatgpt`) a previously signed-in account — switching back and
-   * forth is nondestructive (mirrors host/agent/settings/profile.js's own
-   * setProviderType() doc comment). */
+  /** Switch between `anthropic`, `chatgpt`, and `typesafe`. Never touches the
+   * model list or (for `chatgpt`) a previously signed-in account — switching
+   * back and forth is nondestructive (mirrors host/agent/settings/profile.js's
+   * own setProviderType() doc comment, which also seeds the TypeSafe endpoint
+   * and, for an empty list, the provider's documented `jev-latest` entry). */
   async setProviderType(providerType) {
-    if (providerType !== "anthropic" && providerType !== "chatgpt") {
+    if (providerType !== "anthropic" && providerType !== "chatgpt" && providerType !== "typesafe") {
       return { ok: false, error: `unknown provider type: ${providerType}` };
     }
     if (providerType === this.state.providerType) return { ok: true };
@@ -516,11 +774,29 @@ export class SettingsController {
   // in settings-client.js's wire contract — never a token, never an account
   // identity) plus this block's own loading/error state.
 
-  /** True for the one state that has a usage block to read: a signed-in
-   * `chatgpt` profile. An `anthropic` profile, a signed-out one, and a
-   * session-expired one all read nothing (specs "ChatGPT usage display"). */
+  /** True for the two states that have a usage block to read: a signed-in
+   * `chatgpt` profile, and a `typesafe` profile whose decision-model source
+   * is `chatgpt` (task 3.6 — it reuses the same sign-in/account/usage/
+   * sign-out controls a `chatgpt` profile exposes, usage block included). An
+   * `anthropic` profile, a signed-out one, and a session-expired one all read
+   * nothing (specs "ChatGPT usage display"). */
   _usageReadable() {
-    return this.state.providerType === "chatgpt" && this.state.chatgptSessionState === "signed_in";
+    const s = this.state;
+    const chatgptFieldsShown = s.providerType === "chatgpt" || (s.providerType === "typesafe" && s.typesafeDecisionSource === "chatgpt");
+    return chatgptFieldsShown && s.chatgptSessionState === "signed_in";
+  }
+
+  /** The active decision-model source's own key/session presence — key-only,
+   * mirroring the prior `hasTypesafeKey && hasTextModelKey` predicate's
+   * shape (task 3.6): `openai` needs its saved text-model key, `anthropic`
+   * needs the profile's own saved Anthropic key (reused verbatim — see
+   * #key-input below), and `chatgpt` needs a completed sign-in. Used only for
+   * `isFirstRun`; save()/testConnection() validate the full field shape
+   * separately (validateDecisionSourceFields()/_notUsableBanner()). */
+  _typesafeDecisionSourceConfigured(s) {
+    if (s.typesafeDecisionSource === "anthropic") return Boolean(s.hasCredential);
+    if (s.typesafeDecisionSource === "chatgpt") return s.chatgptSessionState === "signed_in";
+    return Boolean(s.hasTextModelKey);
   }
 
   /**
@@ -640,6 +916,214 @@ export class SettingsController {
     return result;
   }
 
+  // --- TypeSafe text-model fields (add-typesafe-jev-provider task 5.5) ----
+  //
+  // The non-secret half of a `typesafe` profile. Both fields have the same
+  // draft/saved split as the Base URL above (an uncontrolled render must not
+  // fight the input the user is typing in), and both are validated with the
+  // shared helpers rather than a third set of rules: the base URL through
+  // settings-validation.js's validateTextModelBaseUrl (which, unlike
+  // validateBaseUrl, PRESERVES a terminal /v1 — the companion's text helper
+  // POSTs to `{baseUrl}/chat/completions`), the model ID through the same
+  // nonempty/trimmed rule the model catalog uses.
+
+  setTextModelBaseUrlDraft(value) {
+    this.state.textModelBaseUrlDraft = value;
+    this.state.fieldErrors.textModelBaseUrl = null;
+    this._notify();
+  }
+
+  /** Validate the draft without saving; used for live field feedback. */
+  validateTextModelBaseUrlField() {
+    const result = validateTextModelBaseUrl(this.state.textModelBaseUrlDraft);
+    this.state.fieldErrors.textModelBaseUrl = result.ok ? null : result.error;
+    this._notify();
+    return result;
+  }
+
+  setTextModelIdDraft(value) {
+    this.state.textModelIdDraft = value;
+    this.state.fieldErrors.textModelId = null;
+    this._notify();
+  }
+
+  /** The text-model model ID's own rule: a nonempty, trimmed string. The
+   * companion's text helper sends it verbatim as the request's `model`, so
+   * there is nothing here to normalize beyond whitespace (the same treatment
+   * settings-validation.js's model catalog gives every provider model ID). */
+  _validateTextModelIdDraft() {
+    const trimmed = typeof this.state.textModelIdDraft === "string" ? this.state.textModelIdDraft.trim() : "";
+    return trimmed
+      ? { ok: true, normalized: trimmed }
+      : { ok: false, error: "model ID của mô hình văn bản không được để trống" };
+  }
+
+  /** The Jev source select ("typesafe" | "vercel"). Local state like every
+   * other field on this page; save() persists it through the
+   * set_typesafe_config op.
+   *
+   * Changing it ALSO mirrors the host's own endpoint rule in the draft
+   * (add-typesafe-endpoint-field design.md decision 2): a source change moves
+   * the endpoint to the new source's documented default only while the draft
+   * is still a KNOWN default, and leaves any other value untouched —
+   * exactly what profile.js's setTypesafeConfig does to the stored endpoint
+   * when the source changes. The page shows what a Save will persist, so the
+   * endpoint field can never display one value while the profile ends up with
+   * another. Unknown values are refused here, so the state the select renders
+   * from can never hold one. */
+  setTypesafeSource(source) {
+    if (source !== "typesafe" && source !== "vercel" && source !== "openrouter") {
+      return { ok: false, error: `unknown TypeSafe source: ${source}` };
+    }
+    if (source !== this.state.typesafeSource && isKnownTypesafeEndpoint(this.state.baseUrlDraft)) {
+      this.state.baseUrlDraft = typesafeSourceCopy(source).endpointDefault;
+      this.state.fieldErrors.baseUrl = null;
+    }
+    this.state.typesafeSource = source;
+    this._notify();
+    return { ok: true };
+  }
+
+  /** The screenshot toggle (add-jev-run-screenshots task 3.2). Local state
+   * like the Jev source above: save() is the only writer, and it persists the
+   * value through the same `set_typesafe_config` op (the field is profile
+   * state, not a per-conversation switch). No validation can fail here — the
+   * DOM layer feeds it a checkbox's boolean, and every value is coerced to
+   * the profile's own boolean type so nothing else can ride into the field. */
+  setSendScreenshots(enabled) {
+    this.state.sendScreenshots = Boolean(enabled);
+    this._notify();
+    return { ok: true };
+  }
+
+  /** The consult-sources toggle (jev-runs-consult-sources-beyond-the-page
+   * task 5.2). Local state exactly like setSendScreenshots() above: save() is
+   * the only writer, and it persists the value through the same
+   * `set_typesafe_config` op. No validation can fail here — the DOM layer
+   * feeds it a checkbox's boolean, and every value is coerced to the
+   * profile's own boolean type so nothing else can ride into the field. */
+  setConsultSources(enabled) {
+    this.state.consultSources = Boolean(enabled);
+    this._notify();
+    return { ok: true };
+  }
+
+  /** Both text-model fields at once, as save()/testConnection() need them.
+   * @returns {{ ok: true, baseUrl: string, modelId: string } | { ok: false, error: string, field: "textModelBaseUrl"|"textModelId" }} */
+  validateTextModelFields() {
+    const urlResult = validateTextModelBaseUrl(this.state.textModelBaseUrlDraft);
+    if (!urlResult.ok) {
+      return { ok: false, error: urlResult.error, field: "textModelBaseUrl" };
+    }
+    const idResult = this._validateTextModelIdDraft();
+    if (!idResult.ok) {
+      return { ok: false, error: idResult.error, field: "textModelId" };
+    }
+    return { ok: true, baseUrl: urlResult.normalized, modelId: idResult.normalized };
+  }
+
+  // --- Decision-model source & its own fields (task 3.6) ------------------
+  //
+  // A `typesafe` profile's decision model — the one that plans, decides
+  // every step, revises memory and judges completion — comes from one of
+  // three sources. Only the SELECTED source's fields are shown, validated,
+  // and sent; a deselected source's stored configuration is left alone (see
+  // validateDecisionSourceFields() below, and save()'s use of its `payload`).
+  //
+  // The `anthropic` source's key is NOT a new field: it is the profile's
+  // EXISTING Anthropic credential — the same #key-input/setCredential/
+  // removeCredential/hasCredential surface an `anthropic` profile uses
+  // (specs/agent-settings "Editable provider profile": "for anthropic, a
+  // base URL and a write-only key with replace/remove actions" — the key
+  // half is the pre-existing one, only the base URL and the picker are new).
+  // The `chatgpt` source reuses the entire existing sign-in/account/usage/
+  // sign-out block (#chatgpt-fields) rather than building a second one — see
+  // _usageReadable()/settings-app.js's renderProvider().
+
+  /** Switch the decision-model source. Local state like the Jev source above
+   * (setTypesafeSource) — save() is the only writer. Does not touch any
+   * field's draft: switching away and back must show exactly what was there
+   * before (specs/typesafe-jev-provider "Switching source does not discard
+   * configuration"), and the drafts already hold whatever _applyProfile last
+   * loaded or the user last typed. */
+  setTypesafeDecisionSource(source) {
+    if (source !== "openai" && source !== "anthropic" && source !== "chatgpt") {
+      return { ok: false, error: `unknown decision-model source: ${source}` };
+    }
+    this.state.typesafeDecisionSource = source;
+    // A field error from the PREVIOUSLY selected source must not linger on a
+    // field the page no longer shows.
+    this.state.fieldErrors.textModelBaseUrl = null;
+    this.state.fieldErrors.textModelId = null;
+    this.state.fieldErrors.decisionBaseUrl = null;
+    this.state.fieldErrors.decisionModelId = null;
+    this._notify();
+    return { ok: true };
+  }
+
+  setDecisionBaseUrlDraft(value) {
+    this.state.decisionBaseUrlDraft = value;
+    this.state.fieldErrors.decisionBaseUrl = null;
+    this._notify();
+  }
+
+  /** Validate the draft without saving; used for live field feedback. Same
+   * rule the Anthropic Base URL field uses (validateBaseUrl) — this is
+   * another Anthropic-standard endpoint, not the OpenAI-compatible text
+   * model's, whose terminal `/v1` must be preserved instead. */
+  validateDecisionBaseUrlField() {
+    const result = validateBaseUrl(this.state.decisionBaseUrlDraft);
+    this.state.fieldErrors.decisionBaseUrl = result.ok ? null : result.error;
+    this._notify();
+    return result;
+  }
+
+  setDecisionModelIdDraft(value) {
+    this.state.decisionModelIdDraft = value;
+    this.state.fieldErrors.decisionModelId = null;
+    this._notify();
+  }
+
+  /** The decision model's own model ID rule — nonempty, trimmed, exactly
+   * like the text-model model ID's own rule above. Required for BOTH the
+   * `anthropic` and `chatgpt` sources (host/agent/settings/profile.js's
+   * setTypesafeConfig(): "the decision model's model ID must be a nonempty
+   * model id" whenever the source is not `openai`). */
+  _validateDecisionModelIdDraft() {
+    const trimmed = typeof this.state.decisionModelIdDraft === "string" ? this.state.decisionModelIdDraft.trim() : "";
+    return trimmed
+      ? { ok: true, normalized: trimmed }
+      : { ok: false, error: "model ID của mô hình quyết định không được để trống" };
+  }
+
+  /** Validate the ACTIVE decision-model source's own required fields and
+   * build exactly the `set_typesafe_config` payload fragment for it — the
+   * single place that decides which of textModelBaseUrl/textModelId/
+   * decisionSource/decisionBaseUrl/decisionModelId travel on a Save, so a
+   * deselected source's fields are never sent (and therefore never
+   * overwrite what the companion already has stored for it — specs/
+   * typesafe-jev-provider "Switching source does not discard configuration").
+   * @returns {{ok:true, payload: object} | {ok:false, error:string, field:string}}
+   */
+  validateDecisionSourceFields() {
+    const source = this.state.typesafeDecisionSource;
+    if (source === "anthropic") {
+      const urlResult = validateBaseUrl(this.state.decisionBaseUrlDraft);
+      if (!urlResult.ok) return { ok: false, error: urlResult.error, field: "decisionBaseUrl" };
+      const idResult = this._validateDecisionModelIdDraft();
+      if (!idResult.ok) return { ok: false, error: idResult.error, field: "decisionModelId" };
+      return { ok: true, payload: { decisionSource: "anthropic", decisionBaseUrl: urlResult.normalized, decisionModelId: idResult.normalized } };
+    }
+    if (source === "chatgpt") {
+      const idResult = this._validateDecisionModelIdDraft();
+      if (!idResult.ok) return { ok: false, error: idResult.error, field: "decisionModelId" };
+      return { ok: true, payload: { decisionSource: "chatgpt", decisionModelId: idResult.normalized } };
+    }
+    const textResult = this.validateTextModelFields();
+    if (!textResult.ok) return textResult;
+    return { ok: true, payload: { decisionSource: "openai", textModelBaseUrl: textResult.baseUrl, textModelId: textResult.modelId } };
+  }
+
   // --- Model catalog (local, unsaved-until-Save; see file header) --------
 
   addModel({ id, label }) {
@@ -732,8 +1216,19 @@ export class SettingsController {
    * @param {string} [secretInput] the raw key value read LIVE from the DOM
    *   input at the moment Save was clicked (settings-app.js's job) — never
    *   stored on `this.state` before or after this call. Omit/empty when the
-   *   user did not type a new key this time. */
-  async save(secretInput) {
+   *   user did not type a new key this time.
+   * @param {{ typesafeApiKey?: string, textModelApiKey?: string }} [typesafeSecrets]
+   *   the two raw TypeSafe key values, read LIVE from their own DOM inputs at
+   *   the same moment and handled exactly like `secretInput` above: a bare
+   *   argument, never assigned to `this.state`, only ever sent. Read only for
+   *   a `typesafe` profile; an omitted/empty half keeps whatever the companion
+   *   already stores for it (see settings-client.js's wire contract).
+   *   Defaulted rather than positional on purpose: the second argument is not
+   *   another handle on the profile — the no-conversation-leak assertion
+   *   "save() takes at most one parameter" (test/settings-ui-no-conversation-
+   *   leak.test.mjs) stays literally true (`Function#length` is 1 with a
+   *   default) and there is still no way to pass a conversation through here. */
+  async save(secretInput, typesafeSecrets = {}) {
     const urlResult = validateBaseUrl(this.state.baseUrlDraft);
     if (!urlResult.ok) {
       this.state.fieldErrors.baseUrl = urlResult.error;
@@ -749,19 +1244,108 @@ export class SettingsController {
       return { ok: false, error: modelsResult.error };
     }
 
+    // TypeSafe / Jev provider: the text-model fields are part of this profile's
+    // required configuration (specs/agent-settings "TypeSafe text-model fields
+    // are required" — "saving and testing are blocked with a field-level
+    // error"). Validated before anything is sent, exactly like the two blocks
+    // above, so an invalid pair never reaches the companion and never leaves
+    // the page looking saved. Which provider the user was looking at when they
+    // clicked Save governs every branch below — captured once, because the
+    // replies that land mid-save replace the whole state.
+    const isTypesafe = this.state.providerType === "typesafe";
+    // The Jev source and the screenshot toggle are captured here, with
+    // everything else the ops below send: the saveProfile reply lands
+    // mid-save and replaces the whole state (see the comment above), so
+    // reading them after that reply would silently revert a toggle or source
+    // the user just changed to whatever the companion still has stored.
+    const pendingTypesafeSource = this.state.typesafeSource;
+    const pendingSendScreenshots = this.state.sendScreenshots;
+    const pendingConsultSources = this.state.consultSources;
+    // Only the ACTIVE decision-model source's fields are validated and sent
+    // (task 3.6; specs/typesafe-jev-provider "Switching source does not
+    // discard configuration") — validateDecisionSourceFields() branches on
+    // `typesafeDecisionSource` and builds exactly that source's payload
+    // fragment; a deselected source's own fields never ride this call.
+    let decisionFields = null;
+    if (isTypesafe) {
+      decisionFields = this.validateDecisionSourceFields();
+      if (!decisionFields.ok) {
+        this.state.fieldErrors.textModelBaseUrl = null;
+        this.state.fieldErrors.textModelId = null;
+        this.state.fieldErrors.decisionBaseUrl = null;
+        this.state.fieldErrors.decisionModelId = null;
+        this.state.fieldErrors[decisionFields.field] = decisionFields.error;
+        this.state.banner = {
+          kind: "error",
+          title: "Cấu hình mô hình quyết định chưa hợp lệ",
+          message: decisionFields.error,
+          action: "Sửa cấu hình mô hình quyết định ở mục Nhà cung cấp, rồi bấm Lưu lại."
+        };
+        this._notify();
+        return { ok: false, error: decisionFields.error };
+      }
+      this.state.fieldErrors.textModelBaseUrl = null;
+      this.state.fieldErrors.textModelId = null;
+      this.state.fieldErrors.decisionBaseUrl = null;
+      this.state.fieldErrors.decisionModelId = null;
+    }
+
     this.state.fieldErrors.baseUrl = null;
     this.state.fieldErrors.models = null;
     this.state.saving = true;
     this.state.banner = null;
     this._notify();
 
+    // Which op a failure came from, for the error copy below. Only the two
+    // TypeSafe ops need it (a companion that predates the provider answers
+    // them with its own unknown-op PROTOCOL_ERROR, which reads as "update the
+    // companion" — see errors-ui.js's TYPESAFE_OPS); it is recorded rather
+    // than inferred, so it stays right whichever half fails.
+    let inFlightOp = null;
     try {
+      inFlightOp = "save_profile";
       const saved = await this.client.saveProfile(this.state.profileId, {
         baseUrl: urlResult.normalized,
         models: modelsResult.models,
         defaultModelId: modelsResult.defaultModelId
       });
       this._applyProfile(saved);
+
+      // TypeSafe half, part 1: the non-secret text-model configuration. Its
+      // own op (design.md decision 9) and its own reply shape — the updated
+      // secret-free profile — which is applied so the page shows exactly what
+      // the companion now holds (including a base URL the companion
+      // normalized differently).
+      if (decisionFields) {
+        inFlightOp = "set_typesafe_config";
+        const config = await this.client.setTypesafeConfig(this.state.profileId, {
+          // The endpoint is deliberately NOT sent, even though the page now
+          // shows it (add-typesafe-endpoint-field): the endpoint IS
+          // `profile.baseUrl`, which saveProfile above just persisted from the
+          // same draft, and the rule this op applies — move a still-known-
+          // default endpoint to the selected source's default, leave any other
+          // one alone — is mirrored in that draft by setTypesafeSource().
+          // Sending it here too would make one value have two writers.
+          typesafeSource: pendingTypesafeSource,
+          // The screenshot toggle rides the same non-secret config op
+          // (add-jev-run-screenshots task 3.2): the host persists it on the
+          // profile, and its reply — applied just below — echoes the stored
+          // value back, so the page ends up showing exactly what a run will do.
+          sendScreenshots: pendingSendScreenshots,
+          // The consult-sources toggle rides the same non-secret config op
+          // (jev-runs-consult-sources-beyond-the-page task 5.2): the host
+          // persists it on the profile, and its reply — applied just below —
+          // echoes the stored value back, so the page ends up showing exactly
+          // what a run will do.
+          consultSources: pendingConsultSources,
+          // Only the active decision-model source's own fields
+          // (decisionSource plus textModelBaseUrl/textModelId OR
+          // decisionBaseUrl/decisionModelId, whichever it built) — see
+          // validateDecisionSourceFields()'s doc comment.
+          ...decisionFields.payload
+        });
+        this._applyProfile(config);
+      }
 
       // Credential half — only touched if the caller actually passed a
       // freshly-typed value. `secretInput` is a bare function argument, never
@@ -796,6 +1380,54 @@ export class SettingsController {
         }
       }
 
+      // TypeSafe half, part 2: the two write-only keys. Sent as ONE op
+      // (they share one merged secret host-side), only when the caller
+      // actually typed at least one of them, and only with the halves they
+      // typed: an OMITTED key keeps the stored value, while an explicit ""
+      // REMOVES it (see settings-client.js's wire contract). An untouched
+      // input is therefore left out of the payload entirely — sending its ""
+      // would silently delete a key the user never asked to remove, and the
+      // only removal path is each field's own "Xóa key" action. The reply is
+      // booleans plus the storage backend; nothing key-shaped comes back.
+      if (isTypesafe) {
+        const typedTypesafeKey = typeof typesafeSecrets.typesafeApiKey === "string" ? typesafeSecrets.typesafeApiKey.trim() : "";
+        const typedTextModelKey = typeof typesafeSecrets.textModelApiKey === "string" ? typesafeSecrets.textModelApiKey.trim() : "";
+        const keys = {};
+        if (typedTypesafeKey) keys.typesafeApiKey = typedTypesafeKey;
+        if (typedTextModelKey) keys.textModelApiKey = typedTextModelKey;
+        if (typedTypesafeKey || typedTextModelKey) {
+          try {
+            const result = await this.client.setTypesafeCredentials(this.state.profileId, keys);
+            this.state.hasTypesafeKey = Boolean(result.hasTypesafeKey);
+            this.state.hasTextModelKey = Boolean(result.hasTextModelKey);
+            this.state.hasCredential = Boolean(result.hasTypesafeKey && result.hasTextModelKey);
+            this.state.memoryOnlyCredential = result.backend === "memory";
+            this.state.secretBackend = result.backend;
+            // Any key change invalidates a previously recorded capability
+            // result host-side; the page must not keep showing the old pass.
+            this.state.connectionStatus = null;
+            this.#pendingSecretForRetry = null;
+            this.state.pendingMemoryOnlyOffer = false;
+            this.state.memoryOnlyOfferKind = null;
+          } catch (err) {
+            if (err.code === "SECURE_STORAGE_UNAVAILABLE") {
+              // Same explicit, labeled memory-only offer as the API-key path
+              // above (specs/agent-settings "Secret isolation"), carrying the
+              // pair rather than one string.
+              this.#pendingSecretForRetry = keys;
+              this.state.pendingMemoryOnlyOffer = true;
+              this.state.memoryOnlyOfferKind = "typesafe_credentials";
+              this.state.banner = { kind: "error", code: err.code, ...describeErrorCode(err.code) };
+            } else {
+              this.#pendingSecretForRetry = null;
+              this.state.pendingMemoryOnlyOffer = false;
+              this.state.memoryOnlyOfferKind = null;
+              this.state.banner = { kind: "error", code: err.code, ...describeErrorCode(err.code, { op: "set_typesafe_credentials" }) };
+            }
+          }
+        }
+      }
+
       this.state.saving = false;
       if (!this.state.banner) {
         this.state.banner = { kind: "success", title: "Đã lưu", message: "Đã lưu cài đặt.", action: "" };
@@ -804,7 +1436,11 @@ export class SettingsController {
       return { ok: true };
     } catch (err) {
       this.state.saving = false;
-      this.state.banner = { kind: "error", code: err.code, ...describeErrorCode(err.code) };
+      // `inFlightOp` is set for every call this half makes, so the copy that
+      // reaches the user describes the failure that actually happened. Only
+      // the two TypeSafe ops change the copy (see errors-ui.js's
+      // TYPESAFE_OPS); everything else reads exactly as it always has.
+      this.state.banner = { kind: "error", code: err.code, ...describeErrorCode(err.code, { op: inFlightOp }) };
       this._notify();
       return { ok: false, error: err.message, code: err.code };
     }
@@ -834,18 +1470,36 @@ export class SettingsController {
 
   /** Explicit, user-confirmed retry after a SECURE_STORAGE_UNAVAILABLE
    * offer — the only path that ever persists a credential with
-   * `memoryOnly: true`. */
+   * `memoryOnly: true`. Two shapes reach the private field: a bare string (an
+   * Anthropic API key) and `{ typesafeApiKey, textModelApiKey }` (the two
+   * TypeSafe keys, offered as one because they share one merged secret
+   * host-side). Which one is pending is decided by its own type, not by
+   * `state.providerType` — a provider switch mid-offer must not send the
+   * wrong shape to the wrong op. */
   async confirmMemoryOnlyCredential() {
     if (!this.#pendingSecretForRetry) {
       return { ok: false, error: "no pending credential to retry" };
     }
-    const secretToSend = this.#pendingSecretForRetry;
+    const pending = this.#pendingSecretForRetry;
+    const isTypesafePair = typeof pending === "object";
     this.#pendingSecretForRetry = null;
     this.state.pendingMemoryOnlyOffer = false;
     this.state.memoryOnlyOfferKind = null;
     this._notify();
     try {
-      const result = await this.client.setCredential(this.state.profileId, secretToSend, { memoryOnly: true });
+      if (isTypesafePair) {
+        const result = await this.client.setTypesafeCredentials(this.state.profileId, pending, { memoryOnly: true });
+        this.state.hasTypesafeKey = Boolean(result.hasTypesafeKey);
+        this.state.hasTextModelKey = Boolean(result.hasTextModelKey);
+        this.state.hasCredential = Boolean(result.hasTypesafeKey && result.hasTextModelKey);
+        this.state.memoryOnlyCredential = true;
+        this.state.secretBackend = result.backend;
+        this.state.connectionStatus = null;
+        this.state.banner = { kind: "success", title: "Đã lưu (chỉ trong bộ nhớ)", message: "Khóa sẽ mất khi companion khởi động lại.", action: "" };
+        this._notify();
+        return { ok: true };
+      }
+      const result = await this.client.setCredential(this.state.profileId, pending, { memoryOnly: true });
       this.state.hasCredential = true;
       this.state.memoryOnlyCredential = true;
       this.state.secretBackend = result.backend;
@@ -854,7 +1508,7 @@ export class SettingsController {
       this._notify();
       return { ok: true };
     } catch (err) {
-      this.state.banner = { kind: "error", code: err.code, ...describeErrorCode(err.code) };
+      this.state.banner = { kind: "error", code: err.code, ...describeErrorCode(err.code, isTypesafePair ? { op: "set_typesafe_credentials" } : undefined) };
       this._notify();
       return { ok: false, error: err.message };
     }
@@ -894,11 +1548,66 @@ export class SettingsController {
 
   // --- Connection test --------------------------------------------------
 
+  /** Remove ONE half of a `typesafe` profile's stored keys — the "remove"
+   * action each write-only key field carries (specs/agent-settings "Editable
+   * provider profile"). An explicit empty string is the wire's removal signal
+   * (see settings-client.js's wire contract); the other half is omitted, so
+   * it keeps its stored value. The reply's booleans then drive the page, so a
+   * removal that the companion refused cannot leave the UI claiming the key
+   * is gone.
+   *
+   * @param {"typesafe"|"textModel"} which
+   */
+  async removeTypesafeKey(which) {
+    const field = which === "textModel" ? "textModelApiKey" : "typesafeApiKey";
+    const flag = which === "textModel" ? "hasTextModelKey" : "hasTypesafeKey";
+    this.state.removingCredential = true;
+    this._notify();
+    try {
+      const result = await this.client.setTypesafeCredentials(this.state.profileId, { [field]: "" });
+      this.state.hasTypesafeKey = Boolean(result.hasTypesafeKey);
+      this.state.hasTextModelKey = Boolean(result.hasTextModelKey);
+      this.state.hasCredential = Boolean(result.hasTypesafeKey && result.hasTextModelKey);
+      // With both halves gone there is no stored credential left to describe,
+      // so the storage-backend fields are cleared exactly as
+      // removeCredential() clears them for the Anthropic key (one half still
+      // stored keeps them: they describe the store that half lives in).
+      if (!this.state.hasTypesafeKey && !this.state.hasTextModelKey) {
+        this.state.memoryOnlyCredential = false;
+        this.state.secretBackend = null;
+      }
+      this.state.connectionStatus = null; // credential changed -> prior results invalidated (host-side truth)
+      this.#pendingSecretForRetry = null;
+      this.state.pendingMemoryOnlyOffer = false;
+      this.state.memoryOnlyOfferKind = null;
+      this.state.banner = {
+        kind: "info",
+        title: which === "textModel" ? "Đã xóa API key mô hình văn bản" : "Đã xóa API key TypeSafe",
+        message: "Cần nhập lại API key trước khi kiểm tra kết nối.",
+        action: ""
+      };
+      this.state.removingCredential = false;
+      this._notify();
+      return { ok: true, [flag]: false };
+    } catch (err) {
+      this.state.removingCredential = false;
+      this.state.banner = { kind: "error", code: err.code, ...describeErrorCode(err.code, { op: "set_typesafe_credentials" }) };
+      this._notify();
+      return { ok: false, error: err.message, code: err.code };
+    }
+  }
+
   /** The "not usable yet" banner for the CURRENT provider type — NO_CREDENTIAL
    * ("enter an API key") is only ever correct for an `anthropic` profile. A
    * `chatgpt` profile's missing credential means "sign in with ChatGPT", and a
    * session that expired host-side says so explicitly (specs/agent-settings
-   * "ChatGPT profile not signed in"; tasks.md 5.3's SESSION_EXPIRED banner).
+   * "ChatGPT profile not signed in"; tasks.md 5.3's SESSION_EXPIRED banner). A
+   * `typesafe` profile needs three things, each named separately
+   * (add-typesafe-jev-provider task 5.5; specs/agent-settings "TypeSafe
+   * text-model fields are required"): both saved keys and a valid text-model
+   * base URL + model ID. A config problem also lands on its own field, so the
+   * page shows the error next to the field to fix rather than only in a
+   * banner.
    * @returns {{ kind: string, code?: string, title?: string, message?: string, action?: string }|null}
    *   null when the profile IS usable (caller proceeds), otherwise the banner
    *   to show and return a failure with. */
@@ -914,6 +1623,61 @@ export class SettingsController {
         message: "Đăng nhập với tài khoản ChatGPT trước khi dùng thao tác này.",
         action: "Bấm \"Đăng nhập với ChatGPT\" ở mục Nhà cung cấp phía trên."
       };
+    }
+    if (this.state.providerType === "typesafe") {
+      if (!this.state.hasTypesafeKey) {
+        return {
+          kind: "error",
+          title: "Chưa lưu API key TypeSafe",
+          message: "Lưu API key TypeSafe trước khi dùng thao tác này.",
+          action: "Nhập API key TypeSafe ở mục Nhà cung cấp rồi bấm Lưu."
+        };
+      }
+      // Only the SELECTED decision-model source's own credential is required
+      // (task 3.6; specs/typesafe-jev-provider "Only the selected decision-
+      // model source is required") — the other two sources' stored
+      // configuration is left untouched and unchecked.
+      const source = this.state.typesafeDecisionSource;
+      if (source === "openai" && !this.state.hasTextModelKey) {
+        return {
+          kind: "error",
+          title: "Chưa lưu API key mô hình văn bản",
+          message: "Lưu API key của mô hình văn bản trước khi dùng thao tác này.",
+          action: "Nhập API key mô hình văn bản ở mục Nhà cung cấp rồi bấm Lưu."
+        };
+      }
+      if (source === "anthropic" && !this.state.hasCredential) {
+        return {
+          kind: "error",
+          title: "Chưa lưu API key Anthropic",
+          message: "Lưu API key Anthropic cho mô hình quyết định trước khi dùng thao tác này.",
+          action: "Nhập API key Anthropic ở mục Nhà cung cấp rồi bấm Lưu."
+        };
+      }
+      if (source === "chatgpt") {
+        if (this.state.chatgptSessionState === "session_expired") {
+          return { kind: "error", code: "SESSION_EXPIRED", ...describeErrorCode("SESSION_EXPIRED") };
+        }
+        if (this.state.chatgptSessionState !== "signed_in") {
+          return {
+            kind: "error",
+            title: "Chưa đăng nhập ChatGPT",
+            message: "Đăng nhập với tài khoản ChatGPT (mô hình quyết định) trước khi dùng thao tác này.",
+            action: "Bấm \"Đăng nhập với ChatGPT\" ở mục Nhà cung cấp phía trên."
+          };
+        }
+      }
+      const fields = this.validateDecisionSourceFields();
+      if (!fields.ok) {
+        this.state.fieldErrors[fields.field] = fields.error;
+        return {
+          kind: "error",
+          title: "Cấu hình mô hình quyết định chưa hợp lệ",
+          message: fields.error,
+          action: "Sửa cấu hình mô hình quyết định ở mục Nhà cung cấp, rồi bấm Lưu."
+        };
+      }
+      return null;
     }
     if (!this.state.hasCredential) {
       return { kind: "error", code: "NO_CREDENTIAL", ...describeErrorCode("NO_CREDENTIAL") };
@@ -934,19 +1698,70 @@ export class SettingsController {
       this._notify();
       return { ok: false };
     }
+    // A `typesafe` capability test reports three stages: the two gating
+    // services (the TypeSafe structured question and the text-model
+    // completion) and — separately reported, never gating — the `image`
+    // stage, which asks the same text-model endpoint to accept image content
+    // (add-jev-run-screenshots task 3.2; design.md decision 5). `status` is
+    // decided by the two gating stages alone, so a model that rejects the
+    // capture still leaves the profile runnable; the page's job is to say so
+    // and point at the two ways out (a vision-capable model, or the
+    // screenshot toggle). The shape is otherwise the same
+    // `{ status, capabilities, errors, timestamp }`, so only the keys read
+    // below differ — `textOnly` has no meaning here (there is no tool/vision
+    // stage to be missing) and every failure names the stage it came from.
+    const isTypesafe = this.state.providerType === "typesafe";
     this.state.testing = true;
     this.state.connectionStatus = { status: "testing", modelId: model };
     this.state.banner = null;
     this._notify();
     try {
       const result = await this.client.testCapability(this.state.profileId, model);
-      const textOnly = result.capabilities.text === "pass" && (result.capabilities.tool !== "pass" || result.capabilities.vision !== "pass");
+      const textOnly = !isTypesafe && result.capabilities.text === "pass" && (result.capabilities.tool !== "pass" || result.capabilities.vision !== "pass");
       this.state.connectionStatus = { ...result, modelId: model, textOnly };
       if (result.status !== "pass") {
-        const firstFailedCode = Object.values(result.errors)[0]?.code;
+        const stages = Object.keys(result.errors || {});
+        const firstFailedStage = stages[0];
+        const firstFailedCode = result.errors[firstFailedStage]?.code;
+        const stageLabel = isTypesafe ? typesafeStageLabel(firstFailedStage) : null;
         this.state.banner = firstFailedCode
-          ? { kind: "error", code: firstFailedCode, ...describeErrorCode(firstFailedCode) }
-          : { kind: "error", title: "Kiểm tra thất bại", message: "Điểm cuối không vượt qua kiểm tra khả năng.", action: "" };
+          ? { kind: "error", code: firstFailedCode, stage: isTypesafe ? firstFailedStage : undefined, ...describeErrorCode(firstFailedCode, isTypesafe ? { stage: firstFailedStage } : undefined) }
+          : {
+              kind: "error",
+              title: stageLabel ? `Kiểm tra thất bại ở ${stageLabel}` : "Kiểm tra thất bại",
+              message: "Điểm cuối không vượt qua kiểm tra khả năng.",
+              action: ""
+            };
+      } else if (isTypesafe) {
+        // Gating stages passed. The image stage is reported separately and
+        // never gates runnability (design.md decision 5) — but a failure there
+        // is exactly the condition the screenshot toggle exists for, so it is
+        // surfaced as its own non-alarm banner instead of being swallowed by a
+        // plain success line. The same rule holds in the other direction: a
+        // reply with NO verdict for the stage (a stored result recorded before
+        // the stage existed, or an older companion that predates it) must not
+        // be reported as "all three passed" — the pills already render that
+        // state as "hình ảnh: chưa kiểm tra", so the banner must say the same
+        // thing rather than contradict the page's own detail line.
+        const imageVerdict = result.capabilities ? result.capabilities.image : undefined;
+        const imageFailed = imageVerdict === "fail" || Boolean(result.errors && result.errors.image);
+        this.state.banner = imageFailed
+          ? {
+              kind: "info",
+              code: result.errors && result.errors.image ? result.errors.image.code : "VISION_ERROR",
+              stage: "image",
+              title: "Đã kiểm tra kết nối — giai đoạn “hình ảnh” không đạt",
+              message: "Hai dịch vụ bắt buộc đều phản hồi (TypeSafe và mô hình văn bản), nhưng mô hình văn bản không nhận nội dung hình ảnh, nên ảnh chụp màn hình sẽ không gửi được. Hồ sơ vẫn chạy được.",
+              action: "Chọn một mô hình văn bản nhận được hình ảnh, hoặc tắt “Gửi ảnh chụp màn hình cho mô hình quyết định” ở mục Nhà cung cấp để mọi yêu cầu chỉ còn văn bản."
+            }
+          : imageVerdict === "pass"
+            ? { kind: "success", title: "Đã kiểm tra kết nối", message: "Cả ba giai đoạn đều đạt: TypeSafe (câu hỏi có cấu trúc), mô hình văn bản và hình ảnh.", action: "" }
+            : {
+                kind: "success",
+                title: "Đã kiểm tra kết nối",
+                message: "Hai giai đoạn bắt buộc đều đạt: TypeSafe (câu hỏi có cấu trúc) và mô hình văn bản. Giai đoạn “hình ảnh” chưa kiểm tra trên companion này, nên chưa xác nhận được ảnh chụp màn hình.",
+                action: "Bấm “Kiểm tra kết nối” lại để chạy giai đoạn “hình ảnh”."
+              };
       } else {
         this.state.banner = { kind: "success", title: "Đã kiểm tra kết nối", message: "Điểm cuối tương thích đầy đủ (văn bản, công cụ, hình ảnh).", action: "" };
       }
@@ -1036,6 +1851,39 @@ export class SettingsController {
     this.state.baseUrlDraft = typeof imported.baseUrl === "string" ? imported.baseUrl : this.state.baseUrlDraft;
     this.state.models = Array.isArray(imported.models) ? imported.models.map((m) => ({ ...m })) : this.state.models;
     this.state.defaultModelId = imported.defaultModelId ?? this.state.defaultModelId;
+    // The exported document is the companion's secret-free profile, so a
+    // `typesafe` profile's text-model fields ride in it too — staged the same
+    // way the Base URL above is (as drafts, applied only by the next Save).
+    if (typeof imported.textModelBaseUrl === "string") {
+      this.state.textModelBaseUrlDraft = imported.textModelBaseUrl;
+    }
+    if (typeof imported.textModelId === "string") {
+      this.state.textModelIdDraft = imported.textModelId;
+    }
+    // The decision-model source and its own two fields (task 3.6) ride the
+    // same secret-free document, staged as drafts the same way — only the
+    // next Save writes them back.
+    if (imported.typesafeDecisionSource === "anthropic" || imported.typesafeDecisionSource === "chatgpt" || imported.typesafeDecisionSource === "openai") {
+      this.state.typesafeDecisionSource = imported.typesafeDecisionSource;
+    }
+    if (typeof imported.typesafeDecisionBaseUrl === "string") {
+      this.state.decisionBaseUrlDraft = imported.typesafeDecisionBaseUrl;
+    }
+    if (typeof imported.typesafeDecisionModelId === "string") {
+      this.state.decisionModelIdDraft = imported.typesafeDecisionModelId;
+    }
+    // The screenshot toggle rides the same secret-free document
+    // (add-jev-run-screenshots task 3.2); staged like the fields above, so the
+    // next Save — and only it — writes it back.
+    if (typeof imported.sendScreenshots === "boolean") {
+      this.state.sendScreenshots = imported.sendScreenshots;
+    }
+    // The consult-sources toggle rides the same secret-free document
+    // (jev-runs-consult-sources-beyond-the-page task 5.2); staged like the
+    // field above, so the next Save — and only it — writes it back.
+    if (typeof imported.consultSources === "boolean") {
+      this.state.consultSources = imported.consultSources;
+    }
     this.state.banner = {
       kind: "info",
       title: "Đã nhập cài đặt (chưa lưu)",

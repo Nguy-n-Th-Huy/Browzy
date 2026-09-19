@@ -3,17 +3,21 @@
 // — design.md decisions 1-3, spec "Materialization from a completed run").
 //
 // Why the trail and not the model's memory (decision 1): the derivation input
-// must be a record anyone can re-read and check. Two recorded sources exist
+// must be a record anyone can re-read and check. Three recorded sources exist
 // and they are NOT equivalent:
 //
 //   1. The transcript's stored `stream_message` events — the SDK's own
-//      assistant messages. This is the only reliable source of a run's tool
+//      assistant messages. This is the SDK source of a run's tool
 //      calls WITH their arguments: storage/transcript-store.js stores each
 //      assistant message verbatim, and the panel already replays
 //      `block.type === "tool_use"` / `block.input` from exactly these events
 //      (extension/sidepanel/conversation-model.js's _applyStreamMessage), so
 //      the draft is derived from the same bytes the operator watched.
-//   2. storage/action-timeline.js's sanitized `action_event` records. They
+//   2. Jev's `jev_step` events record the dispatched tool and argsSummary.
+//      Only actual actions count; observations and skipped decisions do not.
+//      TYPE_TEXT deliberately omits its value, so it is incomplete. Element
+//      identity belongs to each step, never to a run-global ref map.
+//   3. storage/action-timeline.js's sanitized `action_event` records. They
 //      are secret-redacted by construction, but they carry a tool NAME and a
 //      summary — never the dispatched arguments. A definition derived from
 //      them alone cannot be complete, so they are the FALLBACK only, and a
@@ -49,8 +53,11 @@ import { hostOfUrl } from "./workflows-match.js";
 /** Bumped only if the derivation's own record shape ever changes (the draft
  *  it produces is a workflow definition validated by the registry schema,
  *  which owns its own version). v2: recorded refs are frozen as stable
- *  targets (see extractRunTargetIdentities/freezeStableTargets). */
-export const MATERIALIZE_VERSION = 2;
+ *  targets (see extractRunTargetIdentities/freezeStableTargets).
+ *  v3: Jev's recorded steps are a separate, screened action source.
+ *  v4: Jev requires a complete, screened starting URL before a non-navigation
+ *  action; full replay URLs are distinct from the legacy display digest. */
+export const MATERIALIZE_VERSION = 4;
 
 // --- Keep / exclude rule (frozen by the change's task contract) ------------
 //
@@ -503,6 +510,103 @@ export function runTrailWindow({ conversationEvents, runId }) {
   return { ok: true, startSeq, endSeq };
 }
 
+const JEV_ACTIONS = Object.freeze({
+  CLICK: { tool: "computer", action: "left_click" },
+  HOVER: { tool: "computer", action: "hover" },
+  TYPE_TEXT: { tool: "form_input" },
+  SELECT: { tool: "form_input" },
+  NAVIGATE: { tool: "navigate" },
+  SCROLL_UP: { tool: "computer", action: "scroll" },
+  SCROLL_DOWN: { tool: "computer", action: "scroll" },
+  WAIT: { tool: "computer", action: "wait" }
+});
+const REDACTED_VALUE_PATTERN = /^(?:\[(?:redacted|masked|hidden)\]|<(?:redacted|masked|hidden)>|\*{3,})$/i;
+
+function containsRedactedValue(value) {
+  if (typeof value === "string") return REDACTED_VALUE_PATTERN.test(value.trim());
+  if (Array.isArray(value)) return value.some(containsRedactedValue);
+  return isPlainObject(value) && Object.values(value).some(containsRedactedValue);
+}
+
+// Match runtime.js's durable capture bound without importing the runtime and
+// its provider/dispatch dependencies into this pure derivation module.
+const MAX_JEV_REPLAY_URL_CHARS = 8192;
+const REDACTED_URL_PART_PATTERN = /\[(?:redacted|masked|hidden)\]|<(?:redacted|masked|hidden)>|\*{3,}|•{3,}/i;
+
+// A current capture records replayUrl and explicit completeness metadata.
+// Legacy observed.url was capped at 200: a value at that cap may be only a
+// prefix. Missing/invalid modern metadata must never fall back to that digest.
+function recordedJevUrl(observed) {
+  const refuse = (reason) => ({ url: null, reason });
+  const modern = isPlainObject(observed) && ("replayUrl" in observed || "replayUrlTruncated" in observed);
+  if (modern && observed.replayUrlTruncated === true) {
+    return refuse(`the recorded page URL exceeded the ${MAX_JEV_REPLAY_URL_CHARS}-character capture limit and was not retained in full`);
+  }
+  if (modern && observed.replayUrlTruncated !== false) return refuse("the recorded page URL has no completeness confirmation");
+  const url = modern ? observed.replayUrl : observed?.url;
+  if (url == null || url === "") return refuse("the starting page URL is missing from the recorded action");
+  if (typeof url !== "string") return refuse("the recorded page URL is not a valid absolute HTTP(S) URL");
+  if (url.length > MAX_JEV_REPLAY_URL_CHARS) return refuse(`the recorded page URL exceeds the ${MAX_JEV_REPLAY_URL_CHARS}-character replay limit`);
+  if (!modern && url.length >= 200) return refuse("the legacy page URL reached the 200-character display cap and may be truncated; the complete starting URL is unavailable");
+  let decoded;
+  try {
+    decoded = decodeURIComponent(url);
+  } catch {
+    return refuse("the recorded page URL contains invalid URL encoding");
+  }
+  if (observed?.redaction?.applied === true || REDACTED_URL_PART_PATTERN.test(decoded)) {
+    return refuse("the recorded page URL contains redacted values that cannot be reused");
+  }
+  if (!/^https?:\/\//i.test(url) || /[\s\\]/.test(url) || !hostOfUrl(url)) return refuse("the recorded page URL is not a valid absolute HTTP(S) URL");
+  const screened = screenTrailArgs({ url });
+  if (!screened.ok) return refuse(screened.reasons.join("; "));
+  return { url, reason: null };
+}
+
+/** Jev's hand-built summary is exact for each operation except TYPE_TEXT.
+ * Validate that contract before accepting it; an omitted argument is not a
+ * default, and a SELECT option's label is not its control's identity. */
+function jevCall(event) {
+  const name = registryToolRef(event.tool) || "jev_step";
+  const input = isPlainObject(event.argsSummary) ? event.argsSummary : null;
+  const observed = recordedJevUrl(event.observed);
+  const call = {
+    name, input, seq: event.seq, toolUseId: null, source: "jev_steps",
+    observedUrl: observed.url, observedUrlIssue: observed.reason, argsResolved: Boolean(input), issues: []
+  };
+  const refuse = (reason) => { call.issues.push(reason); return call; };
+  if (event.skippedReason === "result_unknown") return refuse("the dispatched action's result is unknown; its completion cannot be confirmed");
+  if (event.operation === "TYPE_TEXT") {
+    return refuse('TYPE_TEXT does not retain the typed value in the durable trail; argument "args.value" must be supplied before this step can be reused');
+  }
+  const expected = JEV_ACTIONS[event.operation];
+  if (!expected || name !== expected.tool) return refuse("the recorded Jev operation and tool do not identify a supported action");
+  if (!input) return call;
+  if (event.redaction?.applied === true || containsRedactedValue(input)) return refuse("the recorded arguments contain redacted values that cannot be reused");
+  if (expected.action && input.action !== expected.action) return refuse('the recorded argument "args.action" is missing or inconsistent with the operation');
+  const nonempty = (value) => typeof value === "string" && Boolean(value.trim());
+  const missing = (key) => refuse(`the recorded argument "args.${key}" is missing or invalid`);
+  if (event.operation === "NAVIGATE" && (!nonempty(input.url) || !/^https?:\/\//i.test(input.url) || !hostOfUrl(input.url))) return missing("url");
+  if (event.operation === "WAIT" && !(Number.isFinite(input.duration) && input.duration > 0)) return missing("duration");
+  if (event.operation === "SCROLL_UP" || event.operation === "SCROLL_DOWN") {
+    if (!Array.isArray(input.coordinate) || input.coordinate.length !== 2 || !input.coordinate.every(Number.isFinite)) return missing("coordinate");
+    if (input.scroll_direction !== (event.operation === "SCROLL_UP" ? "up" : "down")) return missing("scroll_direction");
+    if (!(Number.isFinite(input.scroll_amount) && input.scroll_amount > 0)) return missing("scroll_amount");
+  }
+  if (["CLICK", "HOVER", "SELECT"].includes(event.operation)) {
+    if (typeof input.ref !== "string" || !REF_ARG_VALUE_PATTERN.test(input.ref)) return missing("ref");
+    if (event.operation === "SELECT" && typeof input.value !== "string") return missing("value");
+    const label = event.operation === "SELECT" ? event.target?.elementLabel : event.target?.label;
+    if (!nonempty(label) || containsRedactedValue(label)) return refuse("the recorded target's control name is unavailable for replay");
+    // Screen the whole recorded label before normalization; never truncate a
+    // secret-bearing suffix away and then accept its prefix as an identity.
+    const identity = screenTrailArgs({ target: { name: label, ...(nonempty(event.target?.role) ? { role: event.target.role } : {}) } });
+    if (!identity.ok) { call.issues.push(...identity.reasons); return call; }
+    call.identities = new Map([[input.ref, { ...identity.args.target, name: label.replace(/\s+/g, " ").trim() }]]);
+  }
+  return call;
+}
+
 /**
  * Read one run's tool calls out of its conversation's stored event log.
  *
@@ -552,6 +656,37 @@ export function extractRunToolCalls({ conversationEvents, runId }) {
     }
   }
   if (!calls.length) {
+    const steps = events.filter((event) => event?.type === "jev_step" && event.runId === runId &&
+      typeof event.seq === "number" && event.seq > startSeq && event.seq <= endSeq).sort((a, b) => a.seq - b.seq);
+    if (steps.length) {
+      const seenSteps = new Map();
+      for (const event of steps) {
+        // A refused decision reuses the next executed step number. Filter it
+        // BEFORE deduplication. result_unknown did dispatch and must block a
+        // draft instead of silently removing a possibly completed mutation.
+        if (event.operation === "DONE" || event.operation === "BLOCKED") continue;
+        if (event.skippedReason && event.skippedReason !== "result_unknown") continue;
+        const call = jevCall(event);
+        if (Number.isInteger(event.step) && event.step > 0) {
+          const fingerprint = JSON.stringify([event.operation, event.tool, event.argsSummary, event.target, event.skippedReason,
+            call.observedUrl, call.observedUrlIssue]);
+          if (seenSteps.has(event.step)) {
+            if (seenSteps.get(event.step) !== fingerprint) {
+              call.issues.push("conflicting records for the same Jev action cannot be resolved");
+              calls.push(call);
+            }
+            continue;
+          }
+          seenSteps.set(event.step, fingerprint);
+        }
+        calls.push(call);
+      }
+      // Even a Jev run that only observed or skipped has an authoritative
+      // step trail. Never fall back to its auxiliary action timeline.
+      return calls.length
+        ? { ok: true, calls, startSeq, endSeq, source: "jev_steps", startUrl: calls[0].observedUrl, startUrlIssue: calls[0].observedUrlIssue }
+        : { ok: false, reason: "no_trail" };
+    }
     // Fallback (frozen contract): the SANITIZED action timeline. It is the
     // secret-free record, and it names the tools a run dispatched — but it
     // never carries the dispatched arguments (only a redacted summary), so a
@@ -590,8 +725,10 @@ function recordedHosts(calls) {
   const hosts = [];
   for (const call of calls) {
     const url = call.input && typeof call.input.url === "string" ? call.input.url : null;
-    const host = url ? hostOfUrl(url) : null;
-    if (host && !hosts.includes(host)) hosts.push(host);
+    for (const recordedUrl of [call.observedUrl, url]) {
+      const host = recordedUrl ? hostOfUrl(recordedUrl) : null;
+      if (host && !hosts.includes(host)) hosts.push(host);
+    }
   }
   return hosts;
 }
@@ -690,6 +827,10 @@ export function deriveRunDraft({ conversationEvents, runId, metaHostname = null,
       );
       continue;
     }
+    if (call.issues?.length) {
+      for (const reason of call.issues) incomplete.push(`step ${stepNumber} (${call.name}): ${reason}`);
+      continue;
+    }
     if (!call.argsResolved) {
       incomplete.push(`step ${stepNumber} (${call.name}): the recorded arguments could not be resolved from the transcript`);
       continue;
@@ -702,7 +843,7 @@ export function deriveRunDraft({ conversationEvents, runId, metaHostname = null,
     // A recorded ref is a handle into one document's memory; freeze the
     // element's identity beside it instead so a replay can re-resolve the
     // step against the live page. Unmapped refs stay exactly as recorded.
-    const frozen = freezeStableTargets(screened.args, identities);
+    const frozen = freezeStableTargets(screened.args, call.source === "jev_steps" ? call.identities : identities);
     events.push({ kind: "tool", ref: call.name, params: frozen.args });
   }
   if (!events.length && !incomplete.length) {
@@ -711,7 +852,17 @@ export function deriveRunDraft({ conversationEvents, runId, metaHostname = null,
     return { ok: false, reason: "no_trail" };
   }
 
+  // Only a leading navigation establishes state before the first action.
+  // A hostname, a later observation or a later navigate cannot recover the
+  // exact page that an earlier click needed. Refuse the whole draft instead
+  // of silently making those clicks run on whichever page is currently open.
+  if (extracted.source === "jev_steps" && extracted.calls[0].name !== "navigate" && !extracted.startUrl) {
+    incomplete.push(`starting page: ${extracted.startUrlIssue || "the complete starting page URL is unavailable"}`);
+  }
+
   const hosts = recordedHosts(extracted.calls);
+  const jevStartHost = extracted.startUrl ? hostOfUrl(extracted.startUrl) : null;
+  if (jevStartHost && !hosts.includes(jevStartHost)) hosts.unshift(jevStartHost);
   const domain = hosts[0] || (typeof metaHostname === "string" && metaHostname.trim() ? metaHostname.trim().toLowerCase() : null);
   if (!domain) incomplete.push("the run's recorded trail names no page host, so no domain binding can be derived");
   if (incomplete.length) return { ok: false, incomplete };
@@ -723,8 +874,16 @@ export function deriveRunDraft({ conversationEvents, runId, metaHostname = null,
   // first tab listing recorded that starting URL and the trail itself never
   // navigates, the replay gets an explicit first step back to it; a trail
   // that does navigate already says where it goes and is left alone.
-  const trailNavigates = extracted.calls.some((call) => call.name === "navigate");
-  const startUrl = trailNavigates ? null : recordedStartUrl({ conversationEvents, runId, calls: extracted.calls });
+  const trailNavigates = extracted.source === "jev_steps"
+    ? extracted.calls[0].name === "navigate"
+    : extracted.calls.some((call) => call.name === "navigate");
+  const startUrl = trailNavigates ? null : extracted.source === "jev_steps"
+    ? extracted.startUrl
+    : recordedStartUrl({ conversationEvents, runId, calls: extracted.calls });
+  if (startUrl) {
+    const screenedStart = screenTrailArgs({ url: startUrl });
+    if (!screenedStart.ok) return { ok: false, incomplete: screenedStart.reasons.map((reason) => `starting page: ${reason}`) };
+  }
   if (startUrl) events.unshift({ kind: "tool", ref: "navigate", params: { url: startUrl } });
   const startHost = startUrl ? hostOfUrl(startUrl) : null;
 

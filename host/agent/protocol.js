@@ -470,6 +470,145 @@ export const THREAT_EVENT_TYPES = Object.freeze({
   TAB_RISK_UPDATE: "tab_risk_update"
 });
 
+// --- Jev runtime event types (add-typesafe-jev-provider design.md §8;
+// extended by add-jev-run-context design.md §7) ------------------------------
+//
+// The inner `event.type` values a TypeSafe (Jev) run records through
+// `Run.emit()` — ordinary STREAM_EVENT payloads, exactly like every event
+// above, and DURABLE: none of them is in TRANSIENT_EVENT_TYPES below, so each
+// is appended to the conversation's transcript and survives a panel reconnect
+// and a conversation reopen (the panel's rebuild reads the stored events,
+// never a live-only cache — see extension/sidepanel/
+// conversation-model.js's jev cases). `host/agent/jev/runtime.js` is the only
+// emitter; the panel and the transcript are the only readers — no decision
+// anywhere reads them back, because they are a record of what happened, not
+// an input to what happens next.
+export const JEV_EVENT_TYPES = Object.freeze({
+  // One per decision cycle that dispatched OR skipped an action, plus the
+  // cycles that ended the run (a `DONE` claim, a `BLOCKED` decision, a
+  // refused step). Payload:
+  //   { step: number,
+  //     operation: "CLICK"|"TYPE_TEXT"|"SELECT"|"NAVIGATE"|"SCROLL_UP"|
+  //                "SCROLL_DOWN"|"WAIT"|"DONE"|"BLOCKED",
+  //                               // Jev chooses the complete action when
+  //                               // decisionSource === "jev"; older records
+  //                               // attribute operations to the configured LLM.
+  //     decisionSource?: "jev", actionKey?: string,
+  //     actionProbability?: number, actionConfidence?: number,
+  //     monitors?: { goalDone: { choice, probability, confidence },
+  //                  stuck: { choice, probability, confidence } },
+  //                               // independent advisory heads, not proof of
+  //                               // completion or permission to dispatch
+  //     intent?: string,          // the model's plain-language name for the
+  //                               // element the step interacts with
+  //                               // (CLICK/TYPE_TEXT/SELECT)
+  //     target: { index, label }|null,
+  //                               // the element TYPESAFE selected for it —
+  //                               // the offered key ("3", or "3:2" for an
+  //                               // element's second dropdown option) and its
+  //                               // observed label; null when nothing was
+  //                               // selected
+  //     targetProbability: number|null, confidence: number|null,
+  //                               // the selection's probability and confidence
+  //     tool: string|null,        // the executed browser tool, null when none
+  //     argsSummary: string,      // normalized dispatch summary — NEVER a
+  //                               // TYPE_TEXT value (the panel renders this
+  //                               // verbatim into the durable transcript);
+  //                               // the value's field is carried by
+  //                               // `textField`
+  //     textField?: string,       // the field a TYPE_TEXT value was typed into
+  //     evaluation?: string,      // the decision's own bounded reading of the
+  //                               // step before it: what that step was meant
+  //                               // to achieve and whether this page shows it
+  //                               // did. Recorded as written, never rewritten
+  //     skippedReason?: string,   // why nothing dispatched, when nothing did;
+  //                               // "completion_rejected" marks a DONE claim
+  //                               // the completion check disputed (recorded as
+  //                               // a skip, never as a completion), and
+  //                               // "target_unresolved" a well-formed step the
+  //                               // observation offered no candidate for — or,
+  //                               // with `targetAbstained`, one whose answer named
+  //                               // no clear winner
+  //     targetAbstained?: true,   // the selection answered, was validated, and
+  //                               // still did not resolve: its confidence was
+  //                               // below the run's floor, or its chosen
+  //                               // candidate stood within the margin of the
+  //                               // runner-up. `confidence`,
+  //                               // `targetProbability` and
+  //                               // `runnerUpProbability` carry the numbers
+  //                               // that caused it, so an abstention is
+  //                               // distinguishable from an empty table
+  //     runnerUpProbability?: number,
+  //     verification?: { achieved: true|false|null, error?: string },
+  //                               // a DONE step's completion-check outcome:
+  //                               // true = confirmed, false = rejected,
+  //                               // null + error = the check could not be made
+  //     latencies: { decisionMs: number, selectionMs?: number,
+  //                  dispatchMs?: number },
+  //                               // the step-decision call, the element
+  //                               // selection when one was made, and the
+  //                               // dispatch when one ran
+  //     pageChanged: boolean|null }
+  // `pageChanged` is null exactly when no observation followed the action
+  // (result-unknown, stop), so the field never claims the page did not
+  // change when that was not observed.
+  STEP: "jev_step",
+  // One per successful run-memory write (openspec/changes/add-jev-run-context
+  // design.md §7): the run's plan, each context revision, and each stall
+  // recovery. Payload:
+  //   { index: number,          // 1-based per run — the panel's row key is
+  //                             // `jev_memory_<index>`, so a reconnect
+  //                             // rebuild reproduces the rows exactly
+  //     kind: "plan"|"update"|"recovery",
+  //     trigger: "start"|"navigated"|"cadence"|"stall"|"verification",
+  //     memory: { plan: string, doneWhen: string, notes: string },
+  //     latencyMs: number }
+  // `kind` is what the call was (the plan, a revision, a recovery) and
+  // `trigger` is what caused it. A failed advisory call records nothing.
+  MEMORY: "jev_memory",
+  // The operator-facing report a confirmed completion produces: one
+  // model-written synthesis of what the task achieved and the results
+  // visible in the final page text, grounded in that text by its own
+  // instruction (never invented; the decision model itself cannot produce
+  // prose). Payload:
+  //   { text: string, latencyMs: number }
+  // Emitted at most ONCE per run, and on every outcome — not only a confirmed
+  // completion. A confirmed DONE's report comes from the completion check
+  // itself, against the same view of the page its verdict used; every other
+  // ending — blocked, stopped, failed, or done without a usable report —
+  // produces one final report made after the outcome is decided, so it can
+  // say what stopped the run rather than describe a page. Two runs produce
+  // none: one that never observed anything, and one whose terminal failure is
+  // that the decision model could not be reached (asking that same model
+  // again would turn one provider failure into two); both disclose the
+  // absence on `jev_end` instead. Durable like jev_step.
+  RESULT: "jev_result",
+  // The loop's terminal record, emitted on every terminal path — done,
+  // blocked, stopped, or a classified failure — carrying the outcome kind,
+  // the reason, and the step count the durable transcript needs to show
+  // "done as decided" versus "blocked/stopped/failed" without inventing
+  // anything. Payload:
+  //   { outcome: "done"|"blocked"|"stopped"|"error", reason: string|null,
+  //     steps: number,
+  //     doneIsDecided: boolean,   // true only for outcome "done"
+  //     doneVerified?: boolean,   // done outcomes only: true when the
+  //                               // completion check confirmed the goal,
+  //                               // false when the check could not be made
+  //                               // and the outcome is the decision model's
+  //                               // judgment alone
+  //     summaryError?: string,
+  //     hasResult: boolean }     // whether this run produced an answer at all
+  // `doneIsDecided` is the disclosure requirement's carrier; `doneVerified`
+  // splits that judgment into verified versus unverified, and `summaryError`
+  // carries a failed completion check's message, a failed final report's
+  // message, or both joined — the run's outcome is never changed by either.
+  // `hasResult` is what lets a turn without an answer read as a disclosed
+  // absence rather than as a blank reply.
+  // needsOperator?: true marks an ASK terminal outcome. The run has ended
+  // blocked; the flag does not imply suspended execution or automatic resume.
+  END: "jev_end"
+});
+
 // --- Transient live-fragment event type (add-live-streaming-and-thinking) --
 //
 // The inner `event.type` a raw SDK partial-message event carries once the

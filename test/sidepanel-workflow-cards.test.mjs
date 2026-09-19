@@ -77,7 +77,7 @@ const RENDER = compile(
   ].join("\n\n"),
   { escapeHtml, iconMarkup, toolRowDisplay, WORKFLOW_COPY, WORKFLOW_REFUSAL_REASON_VI, WORKFLOW_DRIFT_REASON_VI, WORKFLOW_STEP_STATE_VI },
   `{ renderWorkflowDraftItemHtml, renderWorkflowDriftItemHtml, renderWorkflowHealItemHtml,
-     workflowDraftRefusalText, workflowRefusalText, workflowOutcomeSource, formatClockVi }`
+     workflowDraftRefusalText, workflowRefusalText, workflowOutcomeSource, workflowStepLineHtml, formatClockVi }`
 );
 
 const affordanceRunId = compile(extract("workflowAffordanceRunId"), {}, "workflowAffordanceRunId");
@@ -106,6 +106,7 @@ const turnRender = compile(
     timelineDurationLabel: () => "3s",
     renderTimelineCollapsed: () => "",
     renderWarningsHtml: () => "",
+    renderJevOutcomeHtml: () => "",
     renderThinkingBlockHtml: () => "",
     renderUserItemHtml: () => "",
     renderProseHtml: () => "<p>câu trả lời</p>",
@@ -342,6 +343,33 @@ console.log("== draft card: review -> save -> prove -> enable ==");
   const enabled = RENDER.renderWorkflowDraftItemHtml(model.workflowDraftItem({ workflowId: "wf-orders" }));
   ok(enabled.includes(WORKFLOW_COPY.draftEnabledTitle), "the enabled stage is its own state");
   ok(!enabled.includes(`data-workflow-action="prove"`) && !enabled.includes(`data-workflow-action="enable"`), "with nothing left to decide");
+}
+
+console.log("\n== step labels report only the action outcome that actually occurred ==");
+{
+  const step = {
+    kind: "tool",
+    ref: "computer",
+    args: { action: "left_click", target: { role: "link", name: "Click để tìm kiếm nâng cao" } }
+  };
+  const pending = RENDER.workflowStepLineHtml(step, 0);
+  ok(pending.includes('data-step-status="pending"') && pending.includes('>Click <code>computer</code>'), "an unproved click is a neutral action, never a completed click");
+  ok(!pending.includes("Đã click"), "a pending step cannot claim a click was dispatched");
+
+  for (const status of ["failed", "unexecutable"]) {
+    const html = RENDER.workflowStepLineHtml(step, 0, { status, reason: "target_no_longer_resolves", state: "already_satisfied" });
+    ok(html.includes('>Click <code>computer</code>') && !html.includes("Đã click") && !html.includes("Đã mở sẵn"), `${status} stays neutral even with an inconsistent success-only state`);
+    ok(html.includes(WORKFLOW_STEP_STATE_VI[status]) && html.includes("target_no_longer_resolves"), `${status} keeps the actual verdict and reason`);
+  }
+
+  const clicked = RENDER.workflowStepLineHtml(step, 0, { status: "ok" });
+  ok(clicked.includes('>Đã click <code>computer</code>') && clicked.includes('data-step-status="ok"'), "a successful dispatched click retains its completed label");
+  const alreadyOpen = RENDER.workflowStepLineHtml(step, 0, { status: "ok", state: "already_satisfied", note: "Expansion already satisfied; no click dispatched." });
+  ok(alreadyOpen.includes('>Đã mở sẵn <code>computer</code>') && !alreadyOpen.includes("Đã click"), "a successful expansion that dispatched no click reads as already open");
+  ok(alreadyOpen.includes('data-step-status="ok"') && alreadyOpen.includes(WORKFLOW_STEP_STATE_VI.ok), "already open still satisfies the workflow step");
+  for (const html of [pending, clicked, alreadyOpen]) {
+    ok(html.includes("action: left_click") && html.includes("target:") && html.includes("Click để tìm kiếm nâng cao"), "action and target detail survive the outcome-specific label");
+  }
 }
 
 console.log("\n== draft card: a refused save and a failed proof keep the workflow disabled ==");

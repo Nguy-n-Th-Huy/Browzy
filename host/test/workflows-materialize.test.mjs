@@ -628,6 +628,269 @@ console.log("\n== a replay starts where the run started ==");
   });
 }
 
+function jevStep(overrides = {}) {
+  return {
+    type: "jev_step", runId: RUN_ID, step: 1, operation: "CLICK", tool: "computer",
+    argsSummary: { action: "left_click", ref: "ref_1", tabId: 7 },
+    target: { index: "1", label: "Orders" },
+    observed: { url: "https://shop.example.com/", elements: 3, sample: ["Page output must not be saved"] },
+    ...overrides
+  };
+}
+
+function jevTrail(steps) {
+  return [
+    { type: "run_created", runId: RUN_ID }, ...steps,
+    { type: "run_done", runId: RUN_ID }
+  ].map((event, index) => ({ ...event, seq: index + 1 }));
+}
+
+console.log("\n== Jev recorded actions ==");
+
+await check("Jev: six clicks and two scrolls materialize once, without the auxiliary timeline", () => {
+  const rows = [];
+  for (let step = 1; step <= 8; step++) {
+    for (const tool of ["page_snapshot", "computer", "describe_ref"]) {
+      for (const kind of ["start", "complete"]) {
+        rows.push({ type: "action_event", event: { runId: RUN_ID, kind, actionId: `${step}-${tool}`, action: { tool } } });
+      }
+    }
+    if (step === 3) rows.push(jevStep({ step, skippedReason: "repeated_no_change", tool: null, argsSummary: null }));
+    const action = [3, 6].includes(step)
+      ? jevStep({ step, operation: "SCROLL_DOWN", target: null, argsSummary: { action: "scroll", coordinate: [400, 300], scroll_direction: "down", scroll_amount: 3, tabId: 7 } })
+      : jevStep({ step, target: { index: "1", label: `Page ${step}` }, observed: { url: `https://shop.example.com/page-${step}` } });
+    rows.push(action);
+    if (step === 2) rows.push({ ...action }); // a redelivered actual step
+  }
+  rows.push(jevStep({ step: 9, operation: "DONE", skippedReason: "done", tool: null, argsSummary: null }));
+  const events = jevTrail(rows);
+  const extracted = materialize.extractRunToolCalls({ conversationEvents: events, runId: RUN_ID });
+  assert(extracted.source === "jev_steps" && extracted.calls.length === 8, JSON.stringify(extracted));
+  const derived = materialize.deriveRunDraft({ conversationEvents: events, runId: RUN_ID });
+  assert(derived.ok, JSON.stringify(derived));
+  const steps = derived.draft.steps;
+  assert(steps.length === 9 && steps[0].args.url === "https://shop.example.com/page-1", "eight actions plus the recorded starting page");
+  assert(steps.filter((step) => step.args.action === "left_click").length === 6, "six clicks");
+  assert(steps.filter((step) => step.args.action === "scroll").length === 2, "two scrolls");
+  assert(steps[1].args.target.name === "Page 1" && steps[2].args.target.name === "Page 2", "the same ref is bound to each call's own name");
+  assert(steps.every((step) => step.args.tabId === undefined && step.args.ref === undefined), "no stale tab or element handles");
+  assert(!JSON.stringify(derived).includes("Page output must not be saved"), "observation output is excluded");
+  const valid = schema.validateWorkflowRecord({ id: derived.draft.workflowId, name: derived.draft.name, owner: "local-operator", domainConstraints: derived.draft.domains, steps });
+  assert(valid.steps.length === 9, "the draft passes the registry unchanged");
+});
+
+await check("Jev: seq ordering and the run window exclude sibling and late actions", () => {
+  const events = [
+    { seq: 2, type: "run_created", runId: RUN_ID },
+    { ...jevStep({ step: 2, target: { label: "Second" } }), seq: 5 },
+    { ...jevStep({ step: 1, target: { label: "First" } }), seq: 3 },
+    { ...jevStep(), seq: 4, runId: "run_other" },
+    { ...jevStep(), seq: 1 },
+    { seq: 6, type: "run_done", runId: RUN_ID },
+    { ...jevStep(), seq: 7 }
+  ];
+  const derived = materialize.deriveRunDraft({ conversationEvents: events, runId: RUN_ID });
+  assert(derived.ok && derived.draft.steps.length === 3, JSON.stringify(derived));
+  assert(derived.draft.steps[1].args.target.name === "First" && derived.draft.steps[2].args.target.name === "Second", "recorded sequence determines order");
+  assert(materialize.deriveRunDraft({ conversationEvents: events.filter((e) => e.type !== "run_done"), runId: RUN_ID }).reason === "run_not_completed", "unfinished runs stay unavailable");
+});
+
+await check("Jev: skipped and terminal decisions never fall back to observation tool calls", () => {
+  const events = jevTrail([
+    ...["target_unresolved", "repeated_no_change", "action_denied", "stopped"].map((skippedReason) => jevStep({ skippedReason })),
+    jevStep({ operation: "DONE", tool: null, argsSummary: null }),
+    jevStep({ operation: "BLOCKED", tool: null, argsSummary: null }),
+    { type: "action_event", event: { runId: RUN_ID, action: { tool: "page_snapshot" } } }
+  ]);
+  assert(materialize.deriveRunDraft({ conversationEvents: events, runId: RUN_ID }).reason === "no_trail", "nothing actually executed");
+});
+
+await check("Jev: unknown dispatch outcomes block the whole draft", () => {
+  const derived = materialize.deriveRunDraft({ conversationEvents: jevTrail([jevStep(), jevStep({ step: 2, skippedReason: "result_unknown" })]), runId: RUN_ID });
+  assert(!derived.ok && derived.incomplete.some((r) => /result is unknown/.test(r)), JSON.stringify(derived));
+  assert(!derived.draft, "the possibly completed mutation must not disappear from a partial workflow");
+});
+
+await check("Jev: missing required arguments are reasons, never defaults or dropped steps", () => {
+  for (const override of [
+    { argsSummary: null },
+    { argsSummary: { ref: "ref_1" } },
+    { argsSummary: { action: "left_click" } },
+    { target: null },
+    { operation: "SELECT", tool: "form_input", argsSummary: { ref: "ref_1" }, target: { elementLabel: "Country", label: "Canada" } },
+    { operation: "NAVIGATE", tool: "navigate", argsSummary: {} },
+    { operation: "SCROLL_DOWN", argsSummary: { action: "scroll", coordinate: [10, 20], scroll_direction: "down" } },
+    { operation: "WAIT", argsSummary: { action: "wait" } },
+    { operation: "NEW_OPERATION" }
+  ]) {
+    const derived = materialize.deriveRunDraft({ conversationEvents: jevTrail([jevStep(), jevStep({ step: 2, ...override })]), runId: RUN_ID });
+    assert(!derived.ok && derived.incomplete.length && !derived.draft, JSON.stringify({ override, derived }));
+  }
+});
+
+await check("Jev: redacted arguments and identities cannot become workflow constants", () => {
+  for (const override of [
+    { argsSummary: { action: "left_click", ref: "[REDACTED]" } },
+    { target: { label: "[REDACTED]" } },
+    { redaction: { applied: true } },
+    { operation: "SELECT", tool: "form_input", argsSummary: { ref: "ref_1", value: "[REDACTED]" }, target: { elementLabel: "Country", label: "Canada" } }
+  ]) {
+    const derived = materialize.deriveRunDraft({ conversationEvents: jevTrail([jevStep(override)]), runId: RUN_ID });
+    assert(!derived.ok && derived.incomplete.length && !JSON.stringify(derived).includes("[REDACTED]"), JSON.stringify(derived));
+  }
+});
+
+await check("Jev: credentials are screened in arguments, call-local identity and the recorded starting URL", () => {
+  const secret = "9f3c1a7e5b2d8046ac1f7b93de05a2c4";
+  for (const override of [
+    { target: { label: secret } },
+    { argsSummary: { action: "left_click", ref: "ref_1", password: secret } },
+    { operation: "SELECT", tool: "form_input", argsSummary: { ref: "ref_1", value: secret }, target: { elementLabel: "Country", label: "Canada" } },
+    { operation: "NAVIGATE", tool: "navigate", argsSummary: { url: `https://shop.example.com/?token=${secret}` } },
+    { observed: { url: `https://shop.example.com/?token=${secret}` } }
+  ]) {
+    const derived = materialize.deriveRunDraft({ conversationEvents: jevTrail([jevStep(override)]), runId: RUN_ID });
+    assert(!derived.ok && derived.incomplete.length && !JSON.stringify(derived).includes(secret), JSON.stringify(derived));
+  }
+});
+
+await check("Jev: TYPE_TEXT explains the intentionally absent value without consulting output or intent", () => {
+  const events = jevTrail([jevStep({
+    operation: "TYPE_TEXT", tool: "form_input", argsSummary: { ref: "ref_1", tabId: 7 },
+    target: { label: "Search" }, textField: "Search", intent: "Type secret-output-value",
+    observed: { url: "https://shop.example.com/", sample: ["secret-output-value"] }
+  })]);
+  const derived = materialize.deriveRunDraft({ conversationEvents: events, runId: RUN_ID });
+  assert(!derived.ok && derived.incomplete.some((r) => /TYPE_TEXT.*args.value/.test(r)), JSON.stringify(derived));
+  assert(!JSON.stringify(derived).includes("secret-output-value"), "no reconstruction from page output, intent or textField");
+});
+
+await check("Jev: SELECT uses the control identity, preserves empty option values, and refuses legacy option-only identity", () => {
+  const selection = jevStep({ operation: "SELECT", tool: "form_input", argsSummary: { ref: "ref_1", value: "", tabId: 7 }, target: { index: "1:1", label: "All countries", elementLabel: "Country", role: "combobox" } });
+  const derived = materialize.deriveRunDraft({ conversationEvents: jevTrail([selection]), runId: RUN_ID });
+  assert(derived.ok, JSON.stringify(derived));
+  const args = derived.draft.steps[1].args;
+  assert(args.target.name === "Country" && args.target.role === "combobox" && args.value === "" && args.ref === undefined, JSON.stringify(args));
+  const legacy = materialize.deriveRunDraft({ conversationEvents: jevTrail([{ ...selection, target: { label: "All countries" } }]), runId: RUN_ID });
+  assert(!legacy.ok && legacy.incomplete.some((r) => /control name/.test(r)), "an option name cannot identify its select control");
+});
+
+await check("Jev: HOVER and CLICK freeze their own target identity across reused refs", () => {
+  const events = jevTrail([
+    jevStep({ operation: "HOVER", argsSummary: { action: "hover", ref: "ref_1" }, target: { label: " Menu ", role: "button" } }),
+    jevStep({ step: 2, target: { label: "Open orders", role: "link" } })
+  ]);
+  const derived = materialize.deriveRunDraft({ conversationEvents: events, runId: RUN_ID });
+  assert(derived.ok, JSON.stringify(derived));
+  assert(derived.draft.steps[1].args.target.name === "Menu" && derived.draft.steps[1].args.target.role === "button", "hover identity");
+  assert(derived.draft.steps[2].args.target.name === "Open orders" && derived.draft.steps[2].args.target.role === "link", "click identity");
+});
+
+await check("Jev: start navigation respects the first action and includes every recorded host", () => {
+  const navigation = jevStep({ operation: "NAVIGATE", tool: "navigate", argsSummary: { url: "https://other.example.com/", tabId: 7 } });
+  const first = materialize.deriveRunDraft({ conversationEvents: jevTrail([navigation]), runId: RUN_ID });
+  assert(first.ok && first.draft.steps.length === 1 && first.draft.steps[0].args.url === "https://other.example.com/", JSON.stringify(first));
+  const later = materialize.deriveRunDraft({ conversationEvents: jevTrail([jevStep({ skippedReason: "target_unresolved" }), jevStep(), { ...navigation, step: 2 }]), runId: RUN_ID });
+  assert(later.ok && later.draft.steps.length === 3 && later.draft.steps[0].args.url === "https://shop.example.com/", JSON.stringify(later));
+  assert(later.draft.domains.join(",") === "shop.example.com,other.example.com", "observed and navigated hosts are bound");
+});
+
+await check("Jev: a capped or missing starting URL blocks the draft even when a hostname is known", () => {
+  const capped = "https://shop.example.com/".padEnd(200, "x");
+  for (const [url, reason] of [[capped, /200-character.*truncated/], ["", /missing/], [undefined, /missing/], ["not a URL", /valid absolute/]]) {
+    const derived = materialize.deriveRunDraft({ conversationEvents: jevTrail([jevStep({ observed: { url } })]), runId: RUN_ID, metaHostname: "shop.example.com" });
+    assert(!derived.ok && !derived.draft && derived.incomplete.some((r) => r.startsWith("starting page:") && reason.test(r)), JSON.stringify(derived));
+  }
+});
+
+await check("Jev: full replay URLs survive beyond the display cap, including the exact capture limit", () => {
+  const urls = [
+    "https://shop.example.com/".padEnd(200, "x"),
+    `https://shop.example.com/search?keyword=${"dau+thau+".repeat(40)}&location=H%E1%BA%A3i+Ph%C3%B2ng#results`,
+    "https://shop.example.com/".padEnd(8192, "x")
+  ];
+  for (const replayUrl of urls) {
+    const observed = { url: replayUrl.slice(0, 200), replayUrl, replayUrlTruncated: false };
+    const derived = materialize.deriveRunDraft({ conversationEvents: jevTrail([jevStep({ observed })]), runId: RUN_ID });
+    assert(derived.ok && derived.draft.steps.length === 2, JSON.stringify(derived));
+    assert(derived.draft.steps[0].ref === "navigate" && derived.draft.steps[0].args.url === replayUrl, "the full address, query and fragment survive verbatim");
+  }
+  const legacy = "https://shop.example.com/".padEnd(199, "x");
+  const derived = materialize.deriveRunDraft({ conversationEvents: jevTrail([jevStep({ observed: { url: legacy } })]), runId: RUN_ID });
+  assert(derived.ok && derived.draft.steps[0].args.url === legacy, "legacy below-cap recordings stay compatible");
+});
+
+await check("Jev: unusable full replay URLs have specific reasons and never fall back to the display URL", () => {
+  const safeDisplay = "https://shop.example.com/";
+  const cases = [
+    [{ replayUrl: null, replayUrlTruncated: true }, /capture limit.*not retained in full/],
+    [{ replayUrl: safeDisplay, replayUrlTruncated: true }, /capture limit.*not retained in full/],
+    [{ replayUrl: safeDisplay.padEnd(8193, "x"), replayUrlTruncated: false }, /replay limit/],
+    [{ replayUrl: null, replayUrlTruncated: false }, /missing/],
+    [{ replayUrl: safeDisplay }, /completeness confirmation/],
+    [{ replayUrl: 42, replayUrlTruncated: false }, /valid absolute/],
+    ...["not a URL", "ftp://shop.example.com/", "https://", "https://shop.example.com/a b"].map((replayUrl) => [{ replayUrl, replayUrlTruncated: false }, /valid absolute/]),
+    [{ replayUrl: "https://shop.example.com/%broken", replayUrlTruncated: false }, /invalid URL encoding/],
+    ...["[REDACTED]", "https://shop.example.com/?q=%5BREDACTED%5D", "https://shop.example.com/***", "https://shop.example.com/%E2%80%A2%E2%80%A2%E2%80%A2"].map((replayUrl) => [{ replayUrl, replayUrlTruncated: false }, /redacted values/]),
+    [{ replayUrl: safeDisplay, replayUrlTruncated: false, redaction: { applied: true } }, /redacted values/]
+  ];
+  for (const [metadata, reason] of cases) {
+    const derived = materialize.deriveRunDraft({ conversationEvents: jevTrail([jevStep({ observed: { url: safeDisplay, ...metadata } })]), runId: RUN_ID, metaHostname: "shop.example.com" });
+    assert(!derived.ok && !derived.draft && derived.incomplete.some((r) => r.startsWith("starting page:") && reason.test(r)), JSON.stringify(derived));
+    assert(!JSON.stringify(derived).includes(safeDisplay), "the diagnostic names the problem without echoing the URL");
+  }
+});
+
+await check("Jev: the complete replay URL is screened before any suffix can reach a reusable definition", () => {
+  const secret = "9f3c1a7e5b2d8046ac1f7b93de05a2c4";
+  const replayUrl = `https://shop.example.com/search?q=${"ordinary+search+".repeat(30)}&access_token=${secret}`;
+  const derived = materialize.deriveRunDraft({ conversationEvents: jevTrail([jevStep({ observed: { url: replayUrl.slice(0, 200), replayUrl, replayUrlTruncated: false } })]), runId: RUN_ID, metaHostname: "shop.example.com" });
+  assert(!derived.ok && !derived.draft && derived.incomplete.some((r) => /starting page:.*cannot be frozen/.test(r)), JSON.stringify(derived));
+  assert(!JSON.stringify(derived).includes(secret), "a secret beyond the display cap never reaches the draft or its reason");
+});
+
+await check("Jev: only a leading navigation establishes starting state when the recorded initial page is unavailable", () => {
+  const navigation = jevStep({ operation: "NAVIGATE", tool: "navigate", argsSummary: { url: "https://shop.example.com/orders" }, observed: null });
+  const first = materialize.deriveRunDraft({ conversationEvents: jevTrail([navigation, jevStep({ step: 2 })]), runId: RUN_ID });
+  assert(first.ok && first.draft.steps.length === 2 && first.draft.steps[0].args.url === navigation.argsSummary.url, JSON.stringify(first));
+  const later = materialize.deriveRunDraft({ conversationEvents: jevTrail([
+    jevStep({ observed: { url: "https://shop.example.com/".padEnd(200, "x") } }),
+    { ...navigation, step: 2 }, jevStep({ step: 3 })
+  ]), runId: RUN_ID });
+  assert(!later.ok && !later.draft && later.incomplete.some((r) => /starting page:.*truncated/.test(r)), JSON.stringify(later));
+});
+
+await check("Jev: the starting page belongs to the first actual action, not a skipped or later observation", () => {
+  const good = materialize.deriveRunDraft({ conversationEvents: jevTrail([
+    jevStep({ skippedReason: "target_unresolved", observed: { url: "" } }), jevStep()
+  ]), runId: RUN_ID });
+  assert(good.ok && good.draft.steps[0].args.url === "https://shop.example.com/", JSON.stringify(good));
+  const missing = materialize.deriveRunDraft({ conversationEvents: jevTrail([
+    jevStep({ skippedReason: "target_unresolved" }), jevStep({ observed: null }), jevStep({ step: 2 })
+  ]), runId: RUN_ID });
+  assert(!missing.ok && !missing.draft && missing.incomplete.some((r) => /starting page:.*missing/.test(r)), JSON.stringify(missing));
+});
+
+await check("Jev: conflicting starting URLs in retransmissions cannot silently select a page", () => {
+  const derived = materialize.deriveRunDraft({ conversationEvents: jevTrail([
+    jevStep(), jevStep({ observed: { url: "https://shop.example.com/another-page" } })
+  ]), runId: RUN_ID });
+  assert(!derived.ok && derived.incomplete.some((r) => /conflicting records/.test(r)), JSON.stringify(derived));
+});
+
+await check("Jev: conflicting retransmissions cannot hide a different mutation", () => {
+  const derived = materialize.deriveRunDraft({ conversationEvents: jevTrail([jevStep(), jevStep({ target: { label: "Another action" } })]), runId: RUN_ID });
+  assert(!derived.ok && derived.incomplete.some((r) => /conflicting records/.test(r)), JSON.stringify(derived));
+});
+
+await check("SDK regression: SDK calls remain authoritative when a transcript also has Jev records", () => {
+  const events = jevTrail([jevStep(), assistantEvent(0, [toolUse("find", { query: "Invoice" })])]);
+  const extracted = materialize.extractRunToolCalls({ conversationEvents: events, runId: RUN_ID });
+  assert(extracted.source === "transcript_messages" && extracted.calls.length === 1 && extracted.calls[0].name === "find", JSON.stringify(extracted));
+  const derived = materialize.deriveRunDraft({ conversationEvents: events, runId: RUN_ID, metaHostname: "shop.example.com" });
+  assert(derived.ok && derived.draft.steps.length === 1 && derived.draft.steps[0].args.query === "Invoice", JSON.stringify(derived));
+});
+
 const failed = results.filter((r) => !r.ok);
 console.log(`\n${results.length - failed.length}/${results.length} passed`);
 if (failed.length) {

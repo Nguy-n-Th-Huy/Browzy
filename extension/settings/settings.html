@@ -64,6 +64,25 @@
   .provider-type-option { display: inline-flex; align-items: center; gap: var(--space-1); font-size: var(--font-size-small); cursor: pointer; }
   .provider-type-option input[type="radio"] { accent-color: var(--color-accent); }
   #chatgpt-fields > * + * { margin-top: var(--space-2); }
+  /* Same vertical rhythm for the third provider type's block
+     (add-typesafe-jev-provider task 5.5). */
+  #typesafe-fields > * + * { margin-top: var(--space-2); }
+  #typesafe-fields .field-hint code { font-family: var(--font-mono); }
+  /* Beta disclosure for the Jev — ultrafast provider (add-jev-beta-notice):
+     one small pill beside the provider-type choice and one notice line at the
+     top of the provider's own section, both built from existing tokens. */
+  .beta-badge {
+    display: inline-flex; align-items: center;
+    padding: 0 var(--space-1);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+    background: var(--color-surface-sunken);
+    color: var(--color-text-secondary);
+    font-size: var(--font-size-small);
+    font-weight: 600;
+    letter-spacing: .04em;
+    text-transform: uppercase;
+  }
   /* ChatGPT usage block (add-chatgpt-usage-check tasks.md 4.3): a compact,
      read-only summary — plan, one line per window the account actually has,
      credits only when it has them. Sunken surface so it reads as information
@@ -236,14 +255,27 @@
               <input type="radio" name="provider-type" id="provider-type-chatgpt" value="chatgpt" />
               Tài khoản ChatGPT
             </label>
+            <!-- Third provider type (add-typesafe-jev-provider task 5.5). The
+                 label is the provider's own product name (design.md decision
+                 9); the fields it reveals are TypeSafe's API key plus the
+                 text-model endpoint the run's text values come from. -->
+            <label class="provider-type-option">
+              <input type="radio" name="provider-type" id="provider-type-typesafe" value="typesafe" />
+              Jev — ultrafast <span class="beta-badge">Beta</span>
+            </label>
           </div>
         </div>
       </div>
 
-      <!-- Anthropic-compatible API fields: hidden entirely for a `chatgpt` profile (tasks.md 5.3). -->
-      <div class="field-group-item" id="anthropic-baseurl-item">
+      <!-- The provider's own endpoint: hidden entirely for a `chatgpt` profile
+           (tasks.md 5.3). It is an `anthropic` profile's Base URL and, for a
+           `typesafe` profile, that provider's Jev endpoint — one
+           `profile.baseUrl` value under the label its provider type gives it
+           (add-typesafe-endpoint-field; settings-app.js paints the label,
+           placeholder and hint from the selected Jev source). -->
+      <div class="field-group-item" id="provider-baseurl-item">
         <div class="field" style="margin-bottom:0">
-          <label class="field-label" for="base-url">Base URL</label>
+          <label class="field-label" for="base-url" id="base-url-label">Base URL</label>
           <input class="input" id="base-url" type="text" autocomplete="off" spellcheck="false" />
           <p class="field-hint" id="base-url-hint">Origin có thể kèm tiền tố cổng gateway. Bắt buộc HTTPS trừ điểm cuối loopback dành cho phát triển.</p>
           <p class="field-hint" id="base-url-error" role="alert" hidden style="color:var(--color-status-danger)"></p>
@@ -251,7 +283,11 @@
       </div>
       <div class="field-group-item" id="anthropic-key-item">
         <div class="field" style="margin-bottom:0">
-          <label class="field-label" for="key-input">API key</label>
+          <!-- Reused verbatim as the `typesafe` provider's `anthropic`
+               decision-model source's key (task 3.6): "the same credential op
+               an anthropic profile uses" — no new field, no new op, only the
+               label changes (settings-app.js) to say which key it now is. -->
+          <label class="field-label" for="key-input" id="key-input-label">API key</label>
           <input class="input" id="key-input" type="password" autocomplete="off" placeholder="Nhập API key mới…" />
           <p class="field-hint">Được lưu trong kho bảo mật của hệ điều hành. Không bao giờ hiển thị lại khóa đã lưu; trang chỉ giữ giá trị vừa nhập tạm thời để gửi đi, và xóa ngay sau khi gửi.</p>
         </div>
@@ -327,6 +363,189 @@
         </div>
       </div>
 
+      <!-- TypeSafe / Jev provider (add-typesafe-jev-provider task 5.5;
+           design.md decision 9, specs/agent-settings "Editable provider
+           profile"). Shown only for a `typesafe` profile, in place of the
+           Anthropic API-key field above — while the endpoint field above is
+           shown for this provider type too, relabeled for it
+           (add-typesafe-endpoint-field). Both key inputs are
+           uncontrolled exactly like #key-input: their values are read once, at
+           Save time, and cleared then — see settings-app.js's save handler and
+           settings-controller.js's file header. That endpoint field is the
+           provider's own endpoint: the selected Jev source names it, its
+           documented default is the placeholder, and its hint states the rule
+           that governs a source change — a still-default endpoint follows the
+           source, any other endpoint is kept. That rule is the host's own
+           (profile.js's setTypesafeConfig), mirrored in the page by
+           settings-controller.js's setTypesafeSource so the field always shows
+           what a Save will persist. The text-model fields below
+           configure the model that decides every step, holds the run's
+           context, writes the text values and URLs a step carries, makes the
+           completion check, and answers the stall-recovery consultations
+           (add-jev-run-context, reworked by the labour split): TypeSafe is
+           asked only for the element selection of an already-decided step.
+           The hints and the disclosure say so, and no field or op changed with
+           that role. -->
+      <div class="field-group-item" id="typesafe-fields" hidden>
+        <!-- Beta disclosure (add-jev-beta-notice): the provider-type choice
+             carries the badge, this line carries the statement; the spec
+             sentence lives in typesafe-jev-provider's "Provider type and
+             configuration surface" requirement. -->
+        <p class="field-hint" id="typesafe-beta-notice">
+          Jev — ultrafast đang ở giai đoạn beta: hành vi, chất lượng và kết quả có thể thay đổi giữa các bản cập nhật.
+        </p>
+
+        <div class="field">
+          <label class="field-label" for="typesafe-source-select">Nguồn quyết định Jev</label>
+          <select class="select" id="typesafe-source-select">
+            <option value="typesafe">TypeSafe API</option>
+            <option value="vercel">Vercel AI Gateway</option>
+            <!-- OpenRouter (task 2.3): its decision route lives under
+                 /api/alpha/ (host/agent/jev/client.js), so it is labeled
+                 alpha right on the option, and again on the endpoint field's
+                 own label/hint once selected (typesafeSourceCopy). -->
+            <option value="openrouter">OpenRouter (alpha)</option>
+          </select>
+          <p class="field-hint">TypeSafe API dùng khóa từ console.typesafe.ai và gọi trực tiếp điểm cuối System One. Vercel AI Gateway dùng khóa AI Gateway (bắt đầu bằng <code>vck_</code>) và gọi model <code>typesafe-ai/jev</code> qua cổng Vercel. OpenRouter dùng khóa OpenRouter và gọi tuyến quyết định <code>/api/alpha/decisions</code> — tuyến này ở giai đoạn alpha nên giao thức có thể thay đổi giữa các bản cập nhật. Khi đổi nguồn, điểm cuối tương ứng sẽ được đặt lại nếu điểm cuối hiện tại vẫn đang là mặc định.</p>
+        </div>
+
+        <p class="field-hint" id="typesafe-disclosure">
+          Chạy qua nhà cung cấp này gửi các yêu cầu chọn phần tử có cấu trúc tới TypeSafe và, tới điểm cuối mô hình văn bản bạn cấu hình: kế hoạch ngữ cảnh, từng quyết định bước (kèm ảnh chụp màn hình khi bật, giá trị văn bản và URL khi cần), cập nhật ngữ cảnh, kiểm tra hoàn thành, gỡ bế tắc. Hai dịch vụ tính phí riêng theo điều khoản của từng dịch vụ.
+        </p>
+
+        <div class="field">
+          <label class="field-label" for="typesafe-key-input" id="typesafe-key-label">API key TypeSafe</label>
+          <input class="input" id="typesafe-key-input" type="password" autocomplete="off" placeholder="Nhập API key mới…" />
+          <p class="field-hint">Được lưu trong kho bảo mật của hệ điều hành. Không bao giờ hiển thị lại khóa đã lưu; trang chỉ giữ giá trị vừa nhập tạm thời để gửi đi, và xóa ngay sau khi gửi.</p>
+          <div class="field-row">
+            <p class="field-hint" id="typesafe-key-status-text" style="flex:1">Chưa lưu API key TypeSafe</p>
+            <div class="field-row-actions">
+              <button class="btn btn-ghost btn-sm" type="button" id="btn-remove-typesafe-key" hidden>Xóa key TypeSafe</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Decision-model source picker (task 3.6; specs/typesafe-jev-
+             provider "Provider type and configuration surface"). Jev
+             (TypeSafe/Vercel/OpenRouter above) answers only the per-step
+             element-selection question; this picks who plans the run, decides
+             every step, revises memory and judges completion. Only the
+             selected source's own fields show below — settings-app.js's
+             renderProvider() gates each block by this value, and
+             settings-controller.js's validateDecisionSourceFields()
+             validates and sends only that source's fields on Save. -->
+        <div class="field">
+          <label class="field-label" for="decision-source-select">Nguồn mô hình quyết định</label>
+          <select class="select" id="decision-source-select">
+            <option value="openai">Mô hình văn bản (tương thích OpenAI)</option>
+            <option value="anthropic">Điểm cuối &amp; khóa Anthropic</option>
+            <option value="chatgpt">Tài khoản ChatGPT (qua companion)</option>
+          </select>
+          <p class="field-hint">Mô hình quyết định lập kế hoạch, quyết định từng bước, cập nhật ngữ cảnh, kiểm tra hoàn thành và gỡ bế tắc — TypeSafe chỉ chọn phần tử để thao tác cho bước đã được quyết định. Chọn một nguồn đã cấu hình sẵn (khóa Anthropic hiện có, gói ChatGPT đã đăng nhập) để không cần thêm khóa mới, hoặc dùng một mô hình văn bản tương thích OpenAI riêng. Chỉ cấu hình của nguồn đang chọn là bắt buộc; cấu hình của hai nguồn còn lại vẫn được giữ nguyên khi đổi qua lại.</p>
+        </div>
+
+        <!-- `anthropic` decision source: its own endpoint, plus the model ID
+             both this source and `chatgpt` need
+             (host/agent/settings/profile.js's setTypesafeConfig() requires a
+             nonempty typesafeDecisionModelId for either). The KEY is not a
+             new field — it is #anthropic-key-item below, the profile's
+             existing Anthropic credential, shown here too when this source is
+             selected. -->
+        <div class="field-group-item" id="decision-anthropic-fields" hidden>
+          <div class="field" style="margin-bottom:0">
+            <label class="field-label" for="decision-base-url">Base URL mô hình quyết định (Anthropic)</label>
+            <input class="input" id="decision-base-url" type="text" autocomplete="off" spellcheck="false" placeholder="vd: https://api.anthropic.com" />
+            <p class="field-hint">Điểm cuối tương thích Anthropic Messages API dùng riêng cho mô hình quyết định — độc lập với điểm cuối Jev ở trên. Bắt buộc HTTPS trừ điểm cuối loopback dành cho phát triển.</p>
+            <p class="field-hint" id="decision-base-url-error" role="alert" hidden style="color:var(--color-status-danger)"></p>
+          </div>
+        </div>
+
+        <div class="field-group-item" id="decision-model-id-item" hidden>
+          <div class="field" style="margin-bottom:0">
+            <label class="field-label" for="decision-model-id" id="decision-model-id-label">Model ID mô hình quyết định</label>
+            <input class="input" id="decision-model-id" type="text" autocomplete="off" spellcheck="false" placeholder="vd: claude-sonnet-5" />
+            <p class="field-hint" id="decision-model-id-hint">Model ID là chuỗi do nhà cung cấp định nghĩa — trang này không tự đoán hay sửa ID.</p>
+            <p class="field-hint" id="decision-model-id-error" role="alert" hidden style="color:var(--color-status-danger)"></p>
+          </div>
+        </div>
+
+        <!-- `openai` decision source (the documented default): the pre-
+             existing text-model fields, now shown only for this source. -->
+        <div id="decision-openai-fields">
+          <div class="field">
+            <label class="field-label" for="text-model-base-url">Base URL của mô hình văn bản</label>
+            <input class="input" id="text-model-base-url" type="text" autocomplete="off" spellcheck="false" placeholder="vd: https://api.openai.com/v1" />
+            <p class="field-hint">Điểm cuối tương thích OpenAI Chat Completions. Giữ nguyên phần đường dẫn bạn nhập, kể cả <code>/v1</code> — ứng dụng nối thêm <code>/chat/completions</code> vào sau giá trị này. Bắt buộc HTTPS trừ điểm cuối loopback dành cho phát triển.</p>
+            <p class="field-hint" id="text-model-base-url-error" role="alert" hidden style="color:var(--color-status-danger)"></p>
+          </div>
+
+          <div class="field">
+            <label class="field-label" for="text-model-id">Model ID của mô hình văn bản</label>
+            <input class="input" id="text-model-id" type="text" autocomplete="off" spellcheck="false" placeholder="vd: gpt-5-mini" />
+            <p class="field-hint">Mô hình này quyết định mọi bước của lượt chạy: lập kế hoạch ngữ cảnh sau lần quan sát đầu tiên, chọn thao tác kế tiếp (kèm giá trị cần nhập và URL khi bước đó cần), cập nhật ngữ cảnh khi trang đổi hoặc đủ số thao tác, kiểm tra hoàn thành khi bước được chọn là báo xong, và gỡ bế tắc trước khi lượt chạy bị chặn. TypeSafe chỉ chọn phần tử để thao tác cho bước đã được quyết định. Model ID là chuỗi do nhà cung cấp định nghĩa — trang này không tự đoán hay sửa ID.</p>
+            <p class="field-hint" id="text-model-id-error" role="alert" hidden style="color:var(--color-status-danger)"></p>
+          </div>
+
+          <div class="field" style="margin-bottom:0">
+            <label class="field-label" for="text-model-key-input">API key của mô hình văn bản</label>
+            <input class="input" id="text-model-key-input" type="password" autocomplete="off" placeholder="Nhập API key mới…" />
+            <p class="field-hint">Được lưu trong kho bảo mật của hệ điều hành, cùng cách với API key TypeSafe ở trên.</p>
+            <div class="field-row">
+              <p class="field-hint" id="text-model-key-status-text" style="flex:1">Chưa lưu API key mô hình văn bản</p>
+              <div class="field-row-actions">
+                <button class="btn btn-ghost btn-sm" type="button" id="btn-remove-text-model-key" hidden>Xóa key mô hình văn bản</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Screenshot toggle (add-jev-run-screenshots task 3.2; design.md
+             decision 4). A non-secret profile field persisted by Save through
+             set_typesafe_config; enabled by default, and a profile stored
+             before this field existed loads enabled. On: each run cycle
+             captures the bound tab once and sends the capture with the
+             step-decision request (the completion check reuses the same
+             capture). The hint names the requirement the connection test's
+             own “hình ảnh” stage proves, and the toggle is the cost and
+             privacy control. The switch row follows the same markup as the
+             skills page's two switches (extension/settings/skills.html), so
+             no page-local CSS is needed — only the shared .switch component. -->
+        <div class="field-row">
+          <span class="status-main" style="flex:1;min-width:0">
+            <span class="field-label" style="display:block">Gửi ảnh chụp màn hình cho mô hình quyết định</span>
+            <span class="field-hint">Mỗi vòng chạy chụp tab đang điều khiển một lần rồi gửi kèm cho quyết định bước (lần kiểm tra hoàn thành dùng lại chính ảnh đó). Mô hình văn bản phải nhận được nội dung hình ảnh — nút Kiểm tra kết nối chứng minh điều này ở giai đoạn “hình ảnh”. Tắt để mọi yêu cầu chỉ còn văn bản.</span>
+          </span>
+          <label class="switch">
+            <input type="checkbox" id="send-screenshots" checked aria-label="Gửi ảnh chụp màn hình cho mô hình quyết định" />
+            <span class="switch-track"></span>
+            <span class="switch-thumb"></span>
+          </label>
+        </div>
+
+        <!-- Consult-sources toggle. A non-secret profile field
+             persisted by Save through set_typesafe_config, beside the
+             screenshot toggle above — same op, same "enabled by default, a
+             profile stored before the field existed loads enabled" rule
+             (host/agent/settings/profile-schema.js's resolveConsultSources()).
+             The hint states the concrete, true capability: at most 3 URLs the
+             decision model could see on the driven page or that the goal
+             named, fetched read-only by the companion with no cookie or
+             credential, never rendered and never executed — deliberately NOT
+             "trợ lý có thể duyệt web", which the spec forbids because it does
+             not say what a run can and cannot do. -->
+        <div class="field-row">
+          <span class="status-main" style="flex:1;min-width:0">
+            <span class="field-label" style="display:block">Cho phép lượt chạy đọc nguồn ngoài trang đang điều khiển</span>
+            <span class="field-hint">Khi câu trả lời cần thông tin mà trang đang điều khiển không có, lượt chạy có thể lấy nội dung của tối đa 3 URL — chỉ những URL xuất hiện trên trang đang đọc hoặc được nêu trong mục tiêu. Companion tải nội dung bằng một yêu cầu HTTP GET chỉ-đọc, không gửi cookie hay thông tin đăng nhập nào, không hiển thị và không thực thi bất kỳ nội dung nào; máy chủ tại các URL đó sẽ nhận được yêu cầu này. Đây không phải duyệt web: không có tab nào được mở, không có điều hướng nào xảy ra. Tắt để lượt chạy chỉ dùng nội dung của trang đang điều khiển, không báo lỗi.</span>
+          </span>
+          <label class="switch">
+            <input type="checkbox" id="consult-sources" checked aria-label="Cho phép lượt chạy đọc nguồn ngoài trang đang điều khiển" />
+            <span class="switch-track"></span>
+            <span class="switch-thumb"></span>
+          </label>
+        </div>
+      </div>
+
       <div class="field-group-item">
         <div class="field-row">
           <span class="connection-state" id="connection-state"><span class="connection-dot"></span> Chưa kiểm tra kết nối</span>
@@ -338,6 +557,12 @@
         </div>
         <p class="field-hint test-disclosure" id="test-disclosure-anthropic">Kiểm tra kết nối gửi một yêu cầu nhỏ tới nhà cung cấp và có thể phát sinh chi phí API.</p>
         <p class="field-hint test-disclosure" id="test-disclosure-chatgpt" hidden>Kiểm tra kết nối sẽ tính vào giới hạn sử dụng của tài khoản ChatGPT.</p>
+        <!-- add-typesafe-jev-provider: a `typesafe` test makes one request to
+             each of the two services, so the disclosure names both rather than
+             reusing the Anthropic single-request line. add-jev-run-screenshots
+             adds the image stage's own call to the same text-model endpoint,
+             so it is named too. -->
+        <p class="field-hint" id="test-disclosure-typesafe" hidden>Kiểm tra kết nối gửi một yêu cầu nhỏ tới cả TypeSafe và điểm cuối mô hình văn bản — trong đó có một yêu cầu mang ảnh nhỏ để chứng minh mô hình nhận được nội dung hình ảnh — và có thể phát sinh chi phí API ở cả hai dịch vụ.</p>
         <p class="field-hint" id="key-status-text">Chưa lưu API key</p>
         <!-- Why the two test controls ("Kiểm tra lại" above, "Kiểm tra kết
              nối" here) are disabled, when the reason is one this page can

@@ -1,0 +1,17 @@
+## 1. Prepared plan and action protocol
+
+- [x] 1.1 Extend `host/agent/jev/text-helper.js` with strictly validated bounded planning/content preparation and replan requests, including screenshot and conversation context; preserve completion/report/source behavior and add focused helper tests. Verified: helper suite 96/96, including both transports, retries, invalid bindings, bounds and blank startup.
+- [x] 1.2 Extend `host/agent/jev/questions.js` with fresh complete-action candidate maps, exact single-use prepared-content binding, reserved control choices, deterministic caps/byte fitting, three independent Choice heads and strict validation; add protocol/binding/budget tests.
+- [x] 1.3 Integrate the decision-layer response through `host/agent/jev/client.js` for all existing transports and update `host/agent/jev/capability.js` to probe all three heads, preserving classified errors; test wire normalization and capability failures. (verify: all supported transport fixtures and three-head capability tests pass.)
+
+## 2. Runtime and outcomes
+
+- [x] 2.1 Integrate initial preparation and routine Jev action decisions in `host/agent/jev/runtime.js`; remove mandatory per-cycle NEXT_STEP and prose target selection, validate refreshed target identity, consume/invalidate prepared content and preserve dispatch gates. Verified focused runtime tests cover multi-action/no-NEXT_STEP, new-field replan, stale approval state and consumed/revised preparation.
+- [x] 2.2 Implement bounded REPLAN/ASK/WAIT and independent goal/stuck handling with stop precedence, existing no-progress/scroll/unknown-result protections, and completion-check failures ending blocked. Verified focused runtime tests cover monitors, limits, stop, lost results, ASK metadata and failed/rejected completion.
+- [x] 2.3 Verify source consultation, final reports, optional screenshots, conversation context and non-Jev runtime compatibility through integration tests. Verified: migrated runtime suite 119/119 (including 34 screenshot/context/report/source cases), companion integration 9/9, settings compatibility 20/20.
+
+## 3. Presentation and verification
+
+- [x] 3.1 Expose the existing document identity nonce in `extension/content.js` page_snapshot with snapshot tests; update directly affected event/protocol/panel labels and README/comments to describe Jev action decisions and LLM planning/verification accurately; retain rendering for prior records and add appropriate presentation checks. Verified: surface worker's four affected suites pass, including nonce persistence/replacement and old/new decision rendering.
+- [x] 3.2 Add end-to-end mocked run coverage proving several routine Jev decisions execute without per-step LLM calls; test new-field replan, hover/new targets, stale/consumed content, monitor disagreement, limits, approval/stop and completion failure. Verified: runtime suite 119/119, focused decision runtime 31/31, protocol 13/13; mocks establish protocol and guard behavior, not live model accuracy or speed.
+- [x] 3.3 Run affected suites and repository-required checks, validate this OpenSpec change and record results without claiming unmeasured live model accuracy or speed. Verified: runtime 119/119, focused decision runtime 31/31, protocol 13/13, and other 16-file suites passed; coordinator ran required `npm --prefix host test` (22 passed); strict OpenSpec validation passed. Independent verification reported 0 critical findings, 0 warnings and 0 suggestions. No live provider calls or quality/speed measurements were performed.

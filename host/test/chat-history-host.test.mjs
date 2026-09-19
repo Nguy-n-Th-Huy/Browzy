@@ -255,7 +255,67 @@ async function main() {
     ok(new Set(concatenated).size === concatenated.length, "no page overlaps another (no duplicate events)");
   }
 
-  console.log("== 1.3 delete: confirmed, tombstoned, idempotent — and a missing conversation never reports success ==");
+  console.log("== the operator's own message is part of the durable transcript (so an old conversation reopens complete) ==");
+  {
+    const core = buildCore();
+    await handshake(core);
+    const created = await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.NEW, { meta: {} }));
+    const conversationId = created.conversationId;
+
+    const prompt = "vì sao hội thoại cũ mở ra lại không thấy câu hỏi?";
+    const started = await core.handleEnvelope(
+      makeEnvelope(AGENT_MESSAGE_TYPES.START, {
+        conversationId,
+        prompt,
+        profileId: "default",
+        modelId: "fake-model",
+        tabScope: "any",
+        mode: "queue",
+        idempotencyKey: "send-1",
+        context: { hostname: "vinades.org", tabId: 42 }
+      })
+    );
+    ok(started.type === AGENT_MESSAGE_TYPES.START && !!started.runId, "the send is accepted with a run id");
+
+    const stored = core.sessionManager.store.allEvents(conversationId);
+    const submitted = stored.find((e) => e.type === "message_submitted");
+    ok(!!submitted, "the transcript records a message_submitted event");
+    ok(submitted && submitted.runId === started.runId, "...bound to the run that answers it, not to the conversation in general");
+    ok(submitted && submitted.submission && submitted.submission.text === prompt, "...carrying the operator's own text verbatim");
+    ok(
+      stored.findIndex((e) => e.type === "run_created") < stored.findIndex((e) => e.type === "message_submitted"),
+      "...appended AFTER run_created, so a replay has the run id before the message that belongs to it"
+    );
+
+    const replayed = core.sessionManager.snapshotSince(conversationId, 0).events;
+    const inSnapshot = replayed.find((e) => e.type === "message_submitted");
+    ok(inSnapshot && inSnapshot.submission.text === prompt, "a resume/snapshot replay therefore carries the question, not just the answer");
+
+    // The page context captured at submission stays OUT of the durable user
+    // bubble: it is trusted metadata the run was launched with, and the panel
+    // renders it as a chip from its own state, never as prose the operator
+    // "said".
+    ok(inSnapshot && !("context" in inSnapshot.submission), "...without smuggling the bound page context into the user's words");
+
+    // A retry of the same send (same idempotency key) must not append a second
+    // copy: one message, one durable record.
+    await core.handleEnvelope(
+      makeEnvelope(AGENT_MESSAGE_TYPES.START, {
+        conversationId,
+        prompt,
+        profileId: "default",
+        modelId: "fake-model",
+        tabScope: "any",
+        mode: "queue",
+        idempotencyKey: "send-1",
+        context: { hostname: "vinades.org", tabId: 42 }
+      })
+    );
+    const after = core.sessionManager.store.allEvents(conversationId).filter((e) => e.type === "message_submitted");
+    ok(after.length === 1, "a duplicate delivery of the same send resolves to the existing record instead of a second bubble");
+  }
+
+  console.log("== deletion: confirmed, tombstoned, idempotent — and a missing conversation never reports success ==");
   {
     const core = buildCore();
     await handshake(core);

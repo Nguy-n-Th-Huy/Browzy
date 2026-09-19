@@ -216,6 +216,38 @@ await test("draft_request: a completed run derives draft + review from the recor
   assert(reply.review.steps.length === 2 && reply.review.domain === "shop.example.com", "the review surface mirrors the draft");
 });
 
+await test("draft_request/save: Jev actions reach the review and disabled registry without auxiliary calls or stale handles", async () => {
+  store._clearWorkflowsForTests();
+  const { core, sessionManager, calls } = buildCore();
+  await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.HELLO, {}));
+  const conversationId = await conversation(core); // derive the host from the recorded observation
+  const runId = "run_jev_workflow";
+  const rows = [
+    { type: "run_created" },
+    { type: "action_event", event: { runId, actionId: "snapshot", action: { tool: "page_snapshot" } } },
+    { type: "jev_step", step: 1, operation: "CLICK", tool: "computer", argsSummary: { action: "left_click", ref: "ref_1", tabId: 7 }, target: { index: "1", label: "Orders" }, observed: { url: "https://shop.example.com/" } },
+    { type: "jev_step", step: 2, operation: "HOVER", tool: "computer", argsSummary: { action: "hover", ref: "ref_1", tabId: 7 }, target: { index: "1", label: "Details", role: "button" }, observed: { url: "https://shop.example.com/orders" } },
+    { type: "jev_step", step: 3, operation: "DONE", tool: null, argsSummary: null, skippedReason: "done" },
+    { type: "run_done" },
+    { type: "action_event", event: { runId, actionId: "snapshot", action: { tool: "page_snapshot" } } }
+  ];
+  for (const row of rows) sessionManager.store.appendEvent(conversationId, { ...row, runId });
+  const reply = await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.WORKFLOW_DRAFT_REQUEST, { conversationId, runId }));
+  assert(reply.ok && reply.draft.steps.length === 3, JSON.stringify(reply));
+  assert(reply.draft.steps[0].args.url === "https://shop.example.com/", "the run's own starting page is retained");
+  assert(reply.draft.steps[1].args.target.name === "Orders" && reply.draft.steps[2].args.target.name === "Details", "ref reuse never overwrites a call's target");
+  assert(reply.draft.steps.every((step) => step.args.ref === undefined && step.args.tabId === undefined), "no ephemeral bindings reach review");
+  assert(reply.draft.domain === "shop.example.com" && reply.review.steps.length === 3, "domain and review are derived from the same trail");
+  const saved = await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.WORKFLOW_DRAFT_SAVE, {
+    conversationId, runId,
+    definition: { id: "wf-jev-derived", name: reply.draft.name, domainConstraints: reply.draft.domains, steps: reply.draft.steps }
+  }));
+  assert(saved.ok && saved.version === 1, JSON.stringify(saved));
+  const record = store.getWorkflow("wf-jev-derived");
+  assert(record.enabled === false && record.steps.length === 3 && record.provenance.materializedFromRun === runId, "registry validation and provenance use the existing save path");
+  assert(calls.length === 0, "derivation and saving do not execute the workflow");
+});
+
 await test("draft_request: a trail with no URL-bearing call falls back to the conversation's recorded hostname", async () => {
   // The common case the live bug hit (2026-09-14): a find/read-only run has
   // no URL anywhere in its tool calls, so the domain MUST come from the
@@ -431,6 +463,43 @@ await test("prove: runs through the existing bridge with no lease meta, writes e
   assert(evidence.outcomes.length === 2 && evidence.ranAt, "evidence keeps every step outcome");
   const event = sessionManager.store.allEvents(conversationId).find((e) => e.type === "workflow_proof");
   assert(event && event.ok === true && event.version === 1 && /nguồn:/.test(event.summary), "the transcript records the proof with its source summary");
+});
+
+await test("prove: already-satisfied expansion reaches the panel and retained evidence without claiming a click", async () => {
+  store._clearWorkflowsForTests();
+  const outcome = { index: 0, ref: "computer", status: "ok", state: "already_satisfied", note: "Expansion already satisfied; no click dispatched." };
+  const { core } = buildCore({
+    callTool: async () => ({ content: [{ type: "text", text: JSON.stringify({ ok: true, outcomes: [outcome], finalUrl: "https://shop.example.com/cart" }) }] })
+  });
+  await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.HELLO, {}));
+  const conversationId = await conversation(core);
+  store.createWorkflow({
+    ...DEFINITION,
+    enabled: false,
+    steps: [{ kind: "tool", ref: "computer", args: { action: "left_click", target: { role: "button", name: "Advanced search" } } }]
+  });
+  const reply = await core.handleEnvelope(
+    makeEnvelope(AGENT_MESSAGE_TYPES.WORKFLOW_PROVE, { conversationId, workflowId: DEFINITION.id, version: 1, tabId: 42 })
+  );
+  assert(reply.ok === true && reply.allOk === true, "an already-open expansion satisfies its proof step");
+  assert(reply.outcomes[0].state === "already_satisfied" && reply.outcomes[0].note === outcome.note, "the panel receives the explicit no-click outcome");
+  const evidence = proof.readProofEvidence(DEFINITION.id, 1);
+  assert(evidence && JSON.stringify(evidence.outcomes[0]) === JSON.stringify(reply.outcomes[0]), "the evidence roundtrip retains the same status, state and explanation as the panel reply");
+});
+
+await test("prove normalization: already-satisfied state requires a successful step and unsupported states are dropped", async () => {
+  const normalized = proof.normalizeProveReply(JSON.stringify({
+    outcomes: [
+      { status: "ok", state: "already_satisfied" },
+      { status: "failed", state: "already_satisfied", reason: "target_no_longer_resolves" },
+      { status: "unexecutable", state: "already_satisfied" },
+      { status: "unknown", state: "already_satisfied" },
+      { status: "ok", state: "future_unrecognized_state" }
+    ]
+  }));
+  assert(normalized.ok && normalized.outcomes[0].state === "already_satisfied", "only the supported success state survives normalization");
+  assert(normalized.outcomes.slice(1).every((outcome) => !("state" in outcome)), "failure, unexecutable, invalid status and unsupported state cannot claim already satisfied");
+  assert(normalized.outcomes[1].status === "failed" && normalized.outcomes[1].reason === "target_no_longer_resolves", "an inconsistent state never erases a real failure");
 });
 
 await test("prove: failure modes keep their own reasons (unknown workflow, extension refusal, busy bounce, garbage)", async () => {

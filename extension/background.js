@@ -688,6 +688,13 @@ function createAgentSettingsRelay(opts) {
     // profile-cache mirror would gain nothing from re-writing the profile a
     // usage read never touched.
     "chatgpt_usage",
+    // TypeSafe / Jev provider (add-typesafe-jev-provider task 5.5). The
+    // settings page's third provider type rides these two ops; omitted here,
+    // saving the text-model configuration or either key answers with the
+    // local unknown-op PROTOCOL_ERROR above, so the TypeSafe fields would
+    // look saved in the form while nothing reached the companion.
+    "set_typesafe_config",
+    "set_typesafe_credentials",
     // Permission modes + remembered-site management
     // (add-permission-modes-and-threat-signals, task 7.1): the sidepanel's
     // mode badge and the settings > permissions page ride these ops over
@@ -920,6 +927,16 @@ const chatgptSignInProfileById = new Map();
  * of which are in the status reply itself). `chatgpt_sign_in_start`/
  * `chatgpt_device_start` never touch the mirror on their own — nothing about
  * the profile changes until the sign-in actually completes.
+ *
+ * TypeSafe ops (add-typesafe-jev-provider) split the same way, for the same
+ * reason: `set_typesafe_config` replies the full updated profile (mirrored
+ * directly), while `set_typesafe_credentials` replies only the two presence
+ * booleans a write-only credential op is allowed to return — the profile's
+ * `hasTypesafeKey`/`hasTextModelKey`/`credentialRevision`/`lastCapabilityTest`
+ * all changed host-side, so that one re-fetches the authoritative profile
+ * rather than hand-patching a guess from the narrow reply. Without this, the
+ * settings page would show the saved TypeSafe state while the sidepanel's
+ * cached copy kept reporting a missing key.
  * @param {{ op?: string, profileId?: string, signInId?: string }} request
  * @param {{ ok: boolean, result?: any }} response
  */
@@ -928,11 +945,17 @@ async function syncProfileCacheAfterAgentSettings(request, response) {
   const op = request && request.op;
   const profileId = (request && request.profileId) || AGENT_SETTINGS_DEFAULT_PROFILE_ID;
 
-  if (op === "get_profile" || op === "save_profile" || op === "set_provider_type" || op === "chatgpt_sign_out") {
+  if (op === "get_profile" || op === "save_profile" || op === "set_provider_type" || op === "chatgpt_sign_out" || op === "set_typesafe_config") {
     await writeProfileCacheMirror(response.result);
     return;
   }
-  if (op === "set_credential" || op === "remove_credential" || op === "test_capability" || op === "discover_models") {
+  if (
+    op === "set_credential" ||
+    op === "remove_credential" ||
+    op === "test_capability" ||
+    op === "discover_models" ||
+    op === "set_typesafe_credentials"
+  ) {
     await refreshProfileCacheMirror(profileId);
     return;
   }
@@ -2934,29 +2957,22 @@ const RESTRICTED_URL_PATTERN =
  * @returns {Promise<{content: Array}|null>} an explicit result to return
  *   as-is, or null when the tab is open and (as far as its URL says) readable.
  */
-async function checkTabReadableForExtraction(tabId) {
+async function checkTabReadableForExtraction(tabId, options) {
+  const structured = options?.structured === true;
+  const refuse = (reason, url, message) => ({
+    content: [{ type: "text", text: structured ? JSON.stringify({ v: 1, available: false, reason, tabId, url }) : message }],
+    ...(structured ? { isError: true } : {})
+  });
   let tab;
   try {
     tab = await chrome.tabs.get(tabId);
   } catch {
-    return {
-      content: [
-        {
-          type: "text",
-          text: `Stale context: tab ${tabId} is no longer open. The page bound to this run is gone — do not retry against a different or newly active tab; report this to the user and ask them to reopen the page or bind a new one.`
-        }
-      ]
-    };
+    return refuse("stale_context", null,
+      `Stale context: tab ${tabId} is no longer open. The page bound to this run is gone — do not retry against a different or newly active tab; report this to the user and ask them to reopen the page or bind a new one.`);
   }
   if (tab.url && RESTRICTED_URL_PATTERN.test(tab.url)) {
-    return {
-      content: [
-        {
-          type: "text",
-          text: `Restricted page: tab ${tabId} (${tab.url}) is a browser-internal or store page that cannot be read by content scripts. Identify this limitation to the user rather than guessing its content or opening a different tab.`
-        }
-      ]
-    };
+    return refuse("restricted_page", tab.url,
+      `Restricted page: tab ${tabId} (${tab.url}) is a browser-internal or store page that cannot be read by content scripts. Identify this limitation to the user rather than guessing its content or opening a different tab.`);
   }
   return null;
 }
@@ -3437,6 +3453,24 @@ async function resolveTargetToCoordinates(tabId, target, opts = {}) {
     scrollIntoView: opts.scrollIntoView !== false
   });
   return resp?.result || null;
+}
+
+// Used only by saved workflow expansion clicks. Unknown state (including an
+// older content script or a refused tab) must retain ordinary exact targeting.
+async function queryWorkflowReplayTargetState(tabId, target) {
+  try {
+    if (!(await isInGroup(tabId))) return null;
+    const resp = await sendContentMessage(tabId, {
+      type: "getWorkflowReplayTargetState",
+      role: target && typeof target.role === "string" ? target.role : null,
+      name: target && typeof target.name === "string" ? target.name : ""
+    });
+    const state = resp?.result;
+    return state?.alreadySatisfied === true && state.state === "expanded" &&
+      state.evidence === "paired_search_labels_visible_panel" ? state : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Human name for a step's recorded target identity, for failure texts and
@@ -5038,6 +5072,9 @@ function validateWorkflowProveArgs(args) {
 // omits tabId inherits the tab the shortcut was addressed to; a step that
 // names one keeps it, and the callee's own scope check still applies. Mirrors
 // host/agent/tools/mapping.js's TAB_TARGET_ARG_KEYS without importing it.
+// page_snapshot belongs here for exactly the reason read_page does: it is a
+// structured read of the tab it names (openspec/changes/
+// add-typesafe-jev-provider, design.md section 2).
 const SHORTCUT_TAB_SCOPED_TOOLS = new Set([
   "navigate",
   "computer",
@@ -5045,9 +5082,11 @@ const SHORTCUT_TAB_SCOPED_TOOLS = new Set([
   "form_input",
   "get_page_text",
   "javascript_tool",
+  "mask_sensitive_info",
   "read_console_messages",
   "read_network_requests",
   "read_page",
+  "page_snapshot",
   "resize_window",
   "set_tab_focus",
   "upload_image",
@@ -5157,12 +5196,12 @@ async function shortcutStepTabUrl(tabId) {
 }
 
 /** Whether this step returns live page content — a read (`read_page`,
- * `get_page_text`), a `find`, or a `computer` screenshot/zoom capture. Written
- * as direct comparisons rather than a Set literal so the function stays
- * SELF-CONTAINED: test/shortcut-prove-handler.test.mjs extracts it on its own,
- * and it allocates nothing per call. */
+ * `get_page_text`, `page_snapshot`), a `find`, or a `computer`
+ * screenshot/zoom capture. Written as direct comparisons rather than a Set
+ * literal so the function stays SELF-CONTAINED: the shortcut-prove test
+ * extracts it on its own, and it allocates nothing per call. */
 function shortcutStepProducesContent(ref, args) {
-  if (ref === "read_page" || ref === "get_page_text" || ref === "find") return true;
+  if (ref === "read_page" || ref === "get_page_text" || ref === "page_snapshot" || ref === "find") return true;
   if (ref !== "computer") return false;
   const action = args && typeof args.action === "string" ? args.action : "";
   return action === "screenshot" || action === "zoom";
@@ -5196,6 +5235,7 @@ function shortcutResultMarkerLine(outcomes, drift) {
       const out = { index: s.index, ref: s.ref, status: s.status };
       if (s.reason) out.reason = flat(s.reason);
       if (s.note) out.note = flat(s.note);
+      if (s.state) out.state = flat(s.state);
       if (s.url) out.url = flat(s.url);
       if (s.fetchedAt) out.fetchedAt = flat(s.fetchedAt);
       return out;
@@ -5249,6 +5289,7 @@ async function runShortcutToolSteps(definition, tabId, options) {
   const classifyDrift = typeof shortcutDriftReason === "function" ? shortcutDriftReason : null;
   const contentStep = typeof shortcutStepProducesContent === "function" ? shortcutStepProducesContent : null;
   const buildMarker = typeof shortcutResultMarkerLine === "function" ? shortcutResultMarkerLine : null;
+  const readReplayState = typeof queryWorkflowReplayTargetState === "function" ? queryWorkflowReplayTargetState : null;
 
   const lines = [];
   const outcomes = [];
@@ -5350,6 +5391,23 @@ async function runShortcutToolSteps(definition, tabId, options) {
     const isContentStep = contentStep ? contentStep(step.ref, stepArgs) : false;
     const outcome = { index: k, ref: step.ref, status: "ok" };
     try {
+      // A saved expansion is a desired state. Skip only after the content
+      // script proves this supported widget is already expanded; a missing
+      // identity by itself is never success. Normal computer calls and all
+      // other actions still go straight through their existing handlers.
+      if (readReplayState && step.ref === "computer" && stepArgs.action === "left_click" && stepArgs.target &&
+          stepArgs.ref == null && stepArgs.coordinate == null && stepArgs.start_coordinate == null &&
+          (stepArgs.modifiers == null || stepArgs.modifiers === "")) {
+        const state = await readReplayState(stepArgs.tabId, stepArgs.target);
+        if (state?.alreadySatisfied === true && state.state === "expanded" &&
+            state.evidence === "paired_search_labels_visible_panel") {
+          outcome.state = "already_satisfied";
+          outcome.note = "Expansion already satisfied: the advanced-search panel is visible; no click dispatched.";
+          outcomes.push(outcome);
+          lines.push(`step ${k + 1} (${step.ref}): ok — ${outcome.note}`);
+          continue;
+        }
+      }
       const res = await handler(stepArgs);
       const first = res && Array.isArray(res.content) ? res.content[0] : null;
       const note = first
@@ -6489,6 +6547,35 @@ const toolHandlers = {
     return { content: [{ type: "text", text: tree }] };
   },
 
+  // Structured, bounded, read-only observation (openspec/changes/
+  // add-typesafe-jev-provider, design.md section 2 / specs/
+  // agent-browser-runtime.md "Page snapshot operation"): the tab's visible,
+  // enabled interactive controls with the refs `computer`/`form_input`/
+  // `scroll_to` already resolve, plus bounded page text, as ONE JSON text.
+  //
+  // The pre-dispatch checks are deliberately IDENTICAL to read_page's — group
+  // membership (or, on the SDK path, the run's own validated wire scope via
+  // isInGroup) and the readable-tab check — because this IS a read on the same
+  // basis: no new authorization surface, and a borrowed/bound tab reads here
+  // exactly as it does through get_page_text. The only thing ever sent to the
+  // page is this one read message; the handler never types, clicks, scrolls,
+  // focuses, or evaluates anything.
+  async page_snapshot(args) {
+    const { tabId } = args;
+    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    const staleOrRestricted = await checkTabReadableForExtraction(tabId, { structured: true });
+    if (staleOrRestricted) return staleOrRestricted;
+
+    const resp = await sendContentMessage(tabId, { type: "pageSnapshot" });
+    if (!resp?.result) {
+      return { content: [{ type: "text", text: `Error: Could not produce a page snapshot for tab ${tabId}` }] };
+    }
+    // The tool's text IS the observation contract as JSON: one serialization,
+    // so the host parses exactly what the page reported rather than a
+    // re-shaped copy that could disagree with it.
+    return { content: [{ type: "text", text: JSON.stringify(resp.result) }] };
+  },
+
   async get_page_text(args) {
     const { tabId } = args;
     if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
@@ -6553,6 +6640,53 @@ const toolHandlers = {
     } catch {
       return { content: [{ type: "text", text: resp.result }] };
     }
+  },
+
+  // Mask sensitive information on the page (openspec/changes/add-sensitive-
+  // info-masking). The content-script route — the same one read_page and
+  // get_page_text use — so it works wherever a read works, including on the
+  // borrowed/bound tab (read-only classification in
+  // host/agent/tools/mapping.js), and so the injection-recovery path
+  // (sendContentMessage) is shared rather than re-implemented.
+  async mask_sensitive_info(args) {
+    const { action, tabId, selectors } = args;
+    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    const staleOrRestricted = await checkTabReadableForExtraction(tabId);
+    if (staleOrRestricted) return staleOrRestricted;
+
+    const wantUnmask = action === "unmask";
+    const resp = await sendContentMessage(
+      tabId,
+      wantUnmask ? { type: "unmaskSensitiveInfo" } : { type: "maskSensitiveInfo", selectors }
+    );
+    const r = resp?.result;
+    if (!r || r.ok !== true) {
+      return { content: [{ type: "text", text: `Error: Could not ${wantUnmask ? "unmask" : "mask"} sensitive information on this page.` }] };
+    }
+
+    if (wantUnmask) {
+      const restored = Number(r.restored) || 0;
+      if (restored === 0) return { content: [{ type: "text", text: "Nothing was masked on this page; there is nothing to unmask." }] };
+      return { content: [{ type: "text", text: `Unmasked ${restored} element(s) on the current page.` }] };
+    }
+
+    const masked = Number(r.masked) || 0;
+    const already = Number(r.already) || 0;
+    if (masked === 0 && already === 0) {
+      return { content: [{ type: "text", text: "Nothing matched the built-in sensitive-field detection on this page. If sensitive content is present, pass its CSS selector(s) in `selectors` (e.g. '#iban', '.card-number')." }] };
+    }
+    const cats = r.categories || {};
+    const catText = Object.keys(cats)
+      .map((k) => `${k}: ${cats[k]}`)
+      .join(", ");
+    let text = `Masked ${masked} element(s) on the current page` + (already ? ` (${already} already masked)` : "") + ".";
+    if (catText) text += ` Categories — ${catText}.`;
+    if (r.capped) text += " Stopped early at the per-page element budget — mask the rest with explicit selectors.";
+    if (Array.isArray(r.invalidSelectors) && r.invalidSelectors.length) {
+      text += ` Invalid selector(s) ignored: ${r.invalidSelectors.join(", ")}.`;
+    }
+    text += " No field value was changed and layout is preserved; unmask restores the page. Masking applies to the current document only — re-apply after navigation.";
+    return { content: [{ type: "text", text }] };
   },
 
   async find(args) {

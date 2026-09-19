@@ -271,10 +271,19 @@ export class SessionManager {
    *   `claimedByRunId` BEFORE this call, so a crash between the two halves is
    *   decidable from durable records alone (design.md decision 2). Every other
    *   caller omits it and the Run mints its own.
+   * @param {object} [opts.submission] - the message this run is answering, in
+   *   the same stored shape a `message_queued` event carries (`text`,
+   *   `attachmentRefs`, …). Recorded into the log as a `message_submitted`
+   *   event; see that append below for why the operator's own words have to
+   *   be part of the durable transcript.
+   * @param {boolean} [opts.recordSubmission] - whether `opts.submission` must
+   *   be appended. False for a QUEUED message's drain: its own
+   *   `message_queued` event already holds the text, and appending it twice
+   *   would replay the operator's question twice on every reopen.
    * @throws if the conversation already has an active run (spec: "prevent
    *   more than one active run per conversation").
    */
-  startRun(conversationId, { tabScope = "any", runId } = {}) {
+  startRun(conversationId, { tabScope = "any", runId, submission = null, recordSubmission = false } = {}) {
     if (!this.store.loadMeta(conversationId)) throw new Error(`unknown conversation: ${conversationId}`);
     if (this.hasActiveRun(conversationId)) {
       throw new Error(`conversation ${conversationId} already has an active run`);
@@ -310,6 +319,39 @@ export class SessionManager {
     this._activeRuns.set(conversationId, run);
     this.store.updateMeta(conversationId, { activeRunId: run.runId, interrupted: false });
     this.store.appendEvent(conversationId, { type: "run_created", runId: run.runId, tabScope });
+    // The operator's OWN message belongs in the durable transcript, and this is
+    // the only moment it can be recorded: the submission is in hand, the run
+    // id it belongs to already exists, and nothing can have completed yet, so
+    // the seq order (run_created -> message_submitted -> run_queued ->
+    // stream_message…) is the order a replay has to see.
+    //
+    // Without this, restoring an OLD conversation could not show what was
+    // asked. The host stored the answer but never the question, so
+    // conversation-model.js fell back to a placeholder bubble
+    // ("[Nội dung tin nhắn trước đó không có sẵn]") and the only copy of the
+    // question was a bounded LOCAL preview cache (history-store.js's
+    // `prompts`) that a fresh panel document, a profile switch or a cleared
+    // cache loses for good — measured on a real profile (2026-09-17): 165
+    // cached conversations, 5 of them still holding any prompt text, every
+    // older one rendering that placeholder. A queued message never had this
+    // problem because its `message_queued` event carries `submission.text`;
+    // this event gives the immediate path the same durability.
+    //
+    // Appended through the store directly, exactly like `run_created` above:
+    // the wrapped `run.emit` sink (companion.js's runAsForkedChild) does not
+    // carry either of them live, so a connected panel is untouched — its own
+    // Send already echoed the bubble locally, and a REOPENING panel rebuilds
+    // from the snapshot this event is now part of.
+    if (recordSubmission && submission && typeof submission.text === "string" && submission.text.trim()) {
+      this.store.appendEvent(conversationId, {
+        type: "message_submitted",
+        runId: run.runId,
+        submission: {
+          text: submission.text,
+          attachments: Array.isArray(submission.attachmentRefs) ? submission.attachmentRefs : []
+        }
+      });
+    }
     return run;
   }
 

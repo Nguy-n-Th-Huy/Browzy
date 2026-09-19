@@ -61,7 +61,7 @@ export const EVENT_KINDS = Object.freeze({
 // renderer can localize without re-deriving the classification.
 export const ACTION_TYPES = Object.freeze({
   OPEN_PAGE: "open_page", // navigate
-  READ: "read", // read_page, get_page_text
+  READ: "read", // read_page, get_page_text, page_snapshot
   FIND: "find", // find
   CLICK: "click", // computer left_click/right_click/double_click/triple_click
   HOVER: "hover", // computer hover
@@ -131,9 +131,13 @@ export function classifyAction(tool, args) {
     return { type: (op && COMPUTER_OP_TYPE[op]) || ACTION_TYPES.OTHER, op };
   }
   if (tool === "navigate") return { type: ACTION_TYPES.OPEN_PAGE, op: null };
-  if (tool === "read_page" || tool === "get_page_text") return { type: ACTION_TYPES.READ, op: null };
+  if (tool === "read_page" || tool === "get_page_text" || tool === "page_snapshot") return { type: ACTION_TYPES.READ, op: null };
   if (tool === "find") return { type: ACTION_TYPES.FIND, op: null };
   if (tool === "javascript_tool") return { type: ACTION_TYPES.SCRIPT, op: null };
+  // A protective page transform, not a script run: the masked result is the
+  // point, and it wants no pointer payload (ACTION_TYPES.OTHER keeps it out
+  // of POINTER_ACTION_TYPES).
+  if (tool === "mask_sensitive_info") return { type: ACTION_TYPES.OTHER, op: null };
   return { type: ACTION_TYPES.OTHER, op: null };
 }
 
@@ -234,8 +238,12 @@ export function summarize(tool, args) {
   if (tool === "navigate") return plain(`Open ${safeUrl(a.url)}`);
   if (tool === "read_page") return plain("Read page");
   if (tool === "get_page_text") return plain("Read page text");
+  if (tool === "page_snapshot") return plain("Read page snapshot");
   if (tool === "find") return plain(`Find ${safeQuery(a.query)}`);
   if (tool === "javascript_tool") return redactedLength("Run page script", a.text);
+  if (tool === "mask_sensitive_info") {
+    return plain(a.action === "unmask" ? "Unmask sensitive info on the page" : "Mask sensitive info on the page");
+  }
   return plain(tool);
 }
 

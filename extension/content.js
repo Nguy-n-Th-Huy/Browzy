@@ -4,6 +4,7 @@
 // - Element ref mapping with WeakRef (persistent across calls)
 // - Form input handling
 // - Page text extraction
+// - Sensitive-info masking (mask_sensitive_info: mask/unmask)
 // - Element finding by text/attributes
 // - SPA route/document-identity tracking for live-extraction staleness
 //   (design.md 5b / task 5.6: "Track URL/route changes and document
@@ -287,10 +288,62 @@
     // Direct text content (only for leaf-ish elements)
     const tag = el.tagName.toLowerCase();
     if (["a", "button", "h1", "h2", "h3", "h4", "h5", "h6", "li", "summary", "label", "th", "td", "span"].includes(tag)) {
+      // A combobox widget (select2 and friends) carries its CURRENT VALUE as
+      // its own text — "Chưa phân loại", the selected chip — so that text is
+      // not the control's name. Verified live on DauThau.info's province
+      // filter: the control the operator calls "Nơi thực hiện" appeared in
+      // the observation as a combobox named by its placeholder value, and the
+      // run hunted for a control by that name and never found it. The
+      // context label beside the control names it correctly; only when there
+      // is none does the text stand in.
+      if (el.getAttribute("role") === "combobox") {
+        const context = contextLabelOf(el);
+        if (context) return context;
+      }
       const text = el.textContent?.trim();
       if (text && text.length < 200) return text;
     }
 
+    // Context fallback — see contextLabelOf below.
+    return contextLabelOf(el) || "";
+  }
+
+  /** The visible label sitting BESIDE a control rather than being linked to
+   * it — a bootstrap-style "form-group" with its own <label> that carries no
+   * `for=`, and often a styled widget (select2 and friends) drawn over the
+   * real, aria-hidden control. Without this the name is empty, and a
+   * text-only reader cannot tell what the control is: verified on a real
+   * advanced-search form (DauThau.info), where all twelve filter controls —
+   * including the "Nơi thực hiện" province selector — resolved to "", and
+   * with this fallback all twelve resolve to their visible labels.
+   *
+   * Bounded on purpose: at most six ancestors — a select2-style widget inserts
+   * two wrapper levels of its own, so the label sits deeper for the widget
+   * than for the raw control (measured live: the province filter's widget is
+   * five levels below its form-group label while the underlying select is
+   * three) — and at each level, only DIRECT children are considered, a child
+   * that itself holds a form control is skipped (it is a sibling control's
+   * own label), and the accepted text must be short. The label-ish test
+   * covers <label>/<legend>/<th> and the common label classes; anything
+   * longer is never invented as a name. */
+  function contextLabelOf(el) {
+    let scope = el.parentElement;
+    for (let depth = 0; depth < 6 && scope; depth++, scope = scope.parentElement) {
+      for (const child of scope.children) {
+        if (child === el || child.contains(el)) continue;
+        if (child.querySelector("input, select, textarea, button, [role='combobox'], [role='textbox']")) continue;
+        const childTag = child.tagName.toLowerCase();
+        const childClass = typeof child.className === "string" ? child.className : "";
+        const labelish =
+          childTag === "label" ||
+          childTag === "legend" ||
+          childTag === "th" ||
+          /(^|[\s_-])(control-label|field-label|form-label|label)([\s_-]|$)/i.test(childClass);
+        if (!labelish) continue;
+        const text = child.textContent?.trim();
+        if (text && text.length <= 80) return text;
+      }
+    }
     return "";
   }
 
@@ -611,7 +664,16 @@
         // Extra info for specific elements
         if (tag === "a" && el.href) line += ` href="${el.href}"`;
         if (tag === "img" && el.src) line += ` src="${el.src.substring(0, 100)}"`;
-        if (["input", "textarea"].includes(tag) && el.value) line += ` value="${el.value.substring(0, 100)}"`;
+        if (["input", "textarea"].includes(tag) && el.value) {
+          // A masked control's live value must not reach the tree: masking
+          // promises "reads return the masked form", and an input's value is
+          // not a text node the mask could have replaced (see the mask
+          // module below). The dot placeholder keeps the field's shape (a
+          // value exists, withheld) without its content.
+          line += el.getAttribute("data-browzy-masked") !== null
+            ? ` value="••••••"`
+            : ` value="${el.value.substring(0, 100)}"`;
+        }
         if (tag === "input") line += ` type="${el.type || "text"}"`;
         if (el.getAttribute("aria-expanded")) line += ` expanded=${el.getAttribute("aria-expanded")}`;
         if (el.getAttribute("aria-checked")) line += ` checked=${el.getAttribute("aria-checked")}`;
@@ -671,32 +733,116 @@
       ".content",
       "#content",
     ];
-    // Clean text: remove script/style content, collapse whitespace.
+    // Clean text: the LIVE tree's rendered text, whitespace-collapsed.
+    // (fix-snapshot-text-and-jev-guards design 1.) A clone's textContent
+    // counts every hidden menu and collapsed block as text — the change's
+    // live measurement on the page it fixes: 111,724 cleaned characters with
+    // "Chủ đầu tư" at index 7,075, past the then-6,000 bound — and a detached
+    // clone has no rendering to ask about, so the walk must happen on the
+    // live tree and skip subtrees that are not rendered.
+    // Cost, recorded per design risk 1: one walk, one computed-style read and
+    // one checkVisibility call per visited element, and a non-rendered
+    // element's WHOLE subtree is skipped. The same page re-measured live
+    // against this walk (2026-09-18): ~13.5k rendered characters where the
+    // old clone-and-textContent read produced ~112k.
     // The SAME cleaning is applied to both the matched container and
     // document.body so the coverage ratio (design section 9a) compares
     // like-for-like text density.
-    function cleanText(el) {
-      const c = el.cloneNode(true);
-      // design.md D4 (repair-overlay-mount-and-visibility): the overlay
-      // host (extension/overlay/pointer-overlay.js) already lives outside
-      // document.body, which keeps it out of most extraction here — this is
-      // belt-and-suspenders for the fallback case where it does not
-      // (createOverlayHost()'s own `doc.documentElement || doc.body`) and
-      // for any future light-DOM sibling it grows.
-      c.querySelectorAll("script, style, noscript, template, svg, [data-browzy-overlay], [data-browzy-annotation]").forEach((e) => e.remove());
-      return c.textContent.replace(/\s+/g, " ").trim();
+    //
+    // Tags/hosts that never contribute text, whatever their rendering. The
+    // overlay exclusion (design.md D4 of repair-overlay-mount-and-visibility)
+    // is belt-and-suspenders: the overlay host already lives outside
+    // document.body, but createOverlayHost()'s own
+    // `doc.documentElement || doc.body` fallback and any future light-DOM
+    // sibling it grows must not become page text either.
+    function isTextExcluded(el) {
+      const tag = el.tagName.toLowerCase();
+      if (tag === "script" || tag === "style" || tag === "noscript" ||
+          tag === "template" || tag === "svg") return true;
+      return el.hasAttribute("data-browzy-overlay") || el.hasAttribute("data-browzy-annotation");
     }
 
-    /** Cheap length estimate for ranking — no clone, no DOM work. */
+    // The browser's own rendering answer when it has one:
+    // Element.checkVisibility({ checkVisibilityCSS: true }) is false for an
+    // element with no rendered box — display:none, visibility:hidden/collapse,
+    // a closed `<details>` body, a detached node — and ALSO for `display:
+    // contents`, which is the one false that must not prune: that element has
+    // no box of its own while its children and text nodes still render in the
+    // parent's formatting. So a false prunes the subtree unless the element's
+    // own computed display is `contents`.
+    // `content-visibility: hidden` is the invisible state checkVisibility does
+    // NOT report (Chromium answers true: the element keeps its box while its
+    // contents are skipped), so the computed property excludes it explicitly.
+    // `content-visibility: auto` subtrees are deliberately left in — the text
+    // stays a whole-page extract, never a viewport-scoped one. Without the
+    // method, the explicitly hiding states decide.
+    function isRendered(el) {
+      const style = typeof getComputedStyle === "function" ? getComputedStyle(el) : null;
+      if (style && style.contentVisibility === "hidden") return false;
+      if (typeof el.checkVisibility === "function") {
+        if (el.checkVisibility({ checkVisibilityCSS: true })) return true;
+        return !!style && style.display === "contents";
+      }
+      if (el.hidden === true || el.hasAttribute("hidden")) return false;
+      if (el.style && el.style.display === "none") return false;
+      if (!style) return true;
+      return !(style.display === "none" ||
+        style.visibility === "hidden" || style.visibility === "collapse");
+    }
+
+    function cleanText(el) {
+      // A root that is not rendered contributes nothing: a hidden container
+      // must never rank on invisible text (and must never be returned as the
+      // page's content).
+      if (!isRendered(el)) return "";
+      const parts = [];
+      const walk = (node) => {
+        for (const child of node.childNodes) {
+          if (child.nodeType === 3) { parts.push(child.nodeValue); continue; }
+          if (child.nodeType !== 1) continue;
+          if (isTextExcluded(child)) continue;
+          if (!isRendered(child)) continue;
+          // Masked controls: a textarea's value IS its text content, and
+          // masking hides it visually (dots) rather than by replacing text
+          // nodes — the walk contributes the placeholder and never reads the
+          // value. (Spelled out rather than MASK_ATTR: getPageText() is
+          // compiled standalone in
+          // test/registry-borrowed-tab-live-extraction.test.mjs.) Masked
+          // non-controls already carry the placeholder in their nodes.
+          if (child.tagName.toLowerCase() === "textarea" &&
+              child.hasAttribute("data-browzy-masked")) {
+            parts.push("••••••");
+            continue;
+          }
+          walk(child);
+        }
+      };
+      walk(el);
+      return parts.join("").replace(/\s+/g, " ").trim();
+    }
+
+    // One cleanText() per element: container ranking, the body baseline, and
+    // the final extraction all measure the same rendered text.
+    const measuredText = new Map();
+    function measure(el) {
+      let text = measuredText.get(el);
+      if (text === undefined) {
+        text = cleanText(el);
+        measuredText.set(el, text);
+      }
+      return text;
+    }
+
+    /** Length for ranking — rendered text, so hidden chrome cannot win. */
     function textLength(el) {
-      return (el.textContent || "").replace(/\s+/g, " ").trim().length;
+      return measure(el).length;
     }
 
     // A container holding a share this small is not the page's content, whatever
     // its class name says.
     const MIN_CONTAINER_SHARE = 0.1;
 
-    const bodyCleanedText = cleanText(document.body);
+    const bodyCleanedText = measure(document.body);
 
     // Take the RICHEST match, not the first one. The old rule stopped at
     // `document.querySelector(sel)`, so on a site whose footer carries a
@@ -729,7 +875,7 @@
     const url = location.href;
     const tag = source.tagName.toLowerCase();
 
-    const fullText = cleanText(source);
+    const fullText = measure(source);
     // Was 100000, which no tool result can carry: one real read of a listing
     // page came back at 100,639 characters, was rejected for exceeding the
     // caller's token ceiling, and got dumped to a file — costing a whole
@@ -776,6 +922,731 @@
       coverageRatio,
       usedBodyFallback
     });
+  }
+
+  // --- Sensitive-info masking (openspec/changes/add-sensitive-info-masking) --
+  //
+  // A page-level protective transform the agent runs BEFORE a screenshot or a
+  // read of a page that may carry credentials, card numbers, or other
+  // personal data. Matched form controls render as dots (text-security);
+  // matched non-control elements have their text nodes replaced with a
+  // placeholder, so the read paths above cannot leak them through
+  // textContent either. Layout is preserved, no input's value property is
+  // ever written, and every change is reversed by the unmask half.
+  //
+  // Detection follows the pattern discipline of the Orca reference's grab
+  // pipeline (its shared/browser-grab-types.ts GRAB_SECRET_PATTERNS): precise
+  // tokens, never broad words — "state", "code", "auth", and "token" alone
+  // match ordinary page attributes and are deliberately absent below.
+  //
+  // Not a security boundary against page scripts or javascript_tool (both
+  // read the real DOM), and per-document: a navigation starts unmasked.
+  const MASK_ATTR = "data-browzy-masked";
+  const MASK_STYLE_ID = "browzy-sensitive-mask-style";
+  const MASK_PLACEHOLDER = "••••••";
+  const MASK_MAX_ELEMENTS = 300;
+  const MASK_MAX_TEXT_NODES = 200;
+  const MASK_MAX_INNER_CONTROLS = 50;
+
+  /** Mask records for this document: the element plus each text node whose
+   * value was replaced, so unmask restores exactly. */
+  let maskedRecords = [];
+
+  /** Category for one candidate field, from its own descriptors. Pure and
+   * self-contained (tables are literals here, not module state) so the test
+   * suite extracts it on its own — same discipline as
+   * shortcutStepProducesContent in background.js. */
+  function maskCategoryForDescriptor(desc) {
+    if (!desc || typeof desc !== "object") return null;
+    const type = String(desc.type || "").toLowerCase();
+    // A capability/protocol hint needs no name evidence: the field itself
+    // says what it holds.
+    if (type === "password") return "password";
+    const ac = String(desc.autocomplete || "").toLowerCase().trim();
+    if (ac === "current-password" || ac === "new-password") return "password";
+    if (ac === "cc-number" || ac === "cc-csc" || ac === "cc-exp" ||
+        ac === "cc-exp-month" || ac === "cc-exp-year") return "payment";
+    if (ac === "one-time-code") return "otp";
+
+    // Two matching tiers. SHORT tokens must match a whole split token
+    // ("ssn" must not fire inside "classname"; "pin" must not fire inside
+    // "spinner"). PHRASE tokens match a field's compacted alphanumerics, so
+    // separators and camelCase both normalize ("card_number" and
+    // "cardNumber" both reach "cardnumber"; "api_key" reaches "apikey").
+    const fields = [desc.name, desc.id, desc.placeholder, desc.ariaLabel, desc.labelText]
+      .filter((v) => typeof v === "string" && v.trim());
+    const tokens = new Set();
+    const compacts = new Set();
+    for (const f of fields) {
+      const spaced = f.replace(/([a-z0-9])([A-Z])/g, "$1 $2").toLowerCase();
+      for (const t of spaced.split(/[^a-z0-9]+/)) if (t) tokens.add(t);
+      const compact = f.toLowerCase().replace(/[^a-z0-9]/g, "");
+      if (compact.length >= 5) compacts.add(compact);
+    }
+
+    const EXACT = {
+      password: "password", passwd: "password", pwd: "password",
+      secret: "token",
+      cvv: "payment", cvc: "payment", ccv: "payment",
+      ssn: "identity", pin: "identity", passport: "identity",
+      otp: "otp", totp: "otp",
+      iban: "bank", routing: "bank", sortcode: "bank"
+    };
+    const PHRASE = {
+      cardnumber: "payment", creditcard: "payment", ccnum: "payment",
+      ccnumber: "payment", cccsc: "payment", ccexp: "payment",
+      ccexpmonth: "payment", ccexpyear: "payment", cardexpiry: "payment",
+      securitycode: "payment",
+      accountnumber: "bank", bankaccount: "bank",
+      socialsecurity: "identity", socialsecuritynumber: "identity",
+      onetime: "otp", onetimecode: "otp", onetimepassword: "otp",
+      accesstoken: "token", authtoken: "token", apikey: "token",
+      clientsecret: "token", oauthstate: "token", sessionid: "token",
+      sessiontoken: "token", csrf: "token", secretkey: "token"
+    };
+
+    for (const t of tokens) {
+      if (EXACT[t]) return EXACT[t];
+    }
+    for (const c of compacts) {
+      for (const phrase of Object.keys(PHRASE)) {
+        if (c.includes(phrase)) return PHRASE[phrase];
+      }
+    }
+    return null;
+  }
+
+  function maskEnsureStyle() {
+    let style = document.getElementById(MASK_STYLE_ID);
+    if (!style) {
+      style = document.createElement("style");
+      style.id = MASK_STYLE_ID;
+      (document.head || document.documentElement).appendChild(style);
+    }
+    // Form controls show dots (their values are never rewritten — the dots
+    // are presentation). Every masked element gets a dashed outline so a
+    // human reading the screenshot can tell "masked" from "empty". Caret
+    // is suppressed so typing into a masked field shows nothing.
+    style.textContent =
+      `[${MASK_ATTR}]{caret-color:transparent!important;` +
+      `outline:1px dashed rgba(139,92,246,.65)!important;outline-offset:1px!important;}` +
+      `input[${MASK_ATTR}],textarea[${MASK_ATTR}]{-webkit-text-security:disc!important;}`;
+  }
+
+  /** Replace the text nodes under `el` with the placeholder, bounded, and
+   * return the originals. Nodes owned by an already-masked DESCENDANT are
+   * left alone (they belong to that record and must not be restored twice);
+   * a textarea's text is its value and is left to the visual mask. */
+  function maskReplaceTextNodes(el) {
+    const replaced = [];
+    try {
+      const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+      let node;
+      while ((node = walker.nextNode())) {
+        if (replaced.length >= MASK_MAX_TEXT_NODES) break;
+        const parent = node.parentElement;
+        if (!parent) continue;
+        const owner = parent.closest(`[${MASK_ATTR}]`);
+        if (owner && owner !== el) continue;
+        if (parent.tagName === "SCRIPT" || parent.tagName === "STYLE" ||
+            parent.tagName === "NOSCRIPT" || parent.tagName === "TEXTAREA") continue;
+        if (!node.nodeValue || !node.nodeValue.trim()) continue;
+        replaced.push({ node, before: node.nodeValue });
+        node.nodeValue = MASK_PLACEHOLDER;
+      }
+    } catch {
+      // A mutating DOM can break the walker mid-walk; the nodes collected so
+      // far are still valid and still restorable.
+    }
+    return replaced;
+  }
+
+  function maskApplyToElement(el, kind) {
+    if (!el || el.nodeType !== 1) return false;
+    if (el.hasAttribute(MASK_ATTR)) return false;
+    el.setAttribute(MASK_ATTR, kind);
+    const tag = el.tagName.toLowerCase();
+    const textReplaced =
+      tag !== "input" && tag !== "textarea" && el.isContentEditable !== true
+        ? maskReplaceTextNodes(el)
+        : [];
+    maskedRecords.push({ el, nodes: textReplaced, kind });
+    return true;
+  }
+
+  /** Mask sensitive information on this document. `options.selectors` adds
+   * caller-provided CSS selectors on top of the built-in heuristics; a
+   * masked container also attributes descendant form controls (bounded). */
+  function maskSensitiveInfo(options = {}) {
+    const explicitSelectors = Array.isArray(options.selectors)
+      ? options.selectors.filter((s) => typeof s === "string" && s.trim()).slice(0, 50)
+      : [];
+    const categories = {};
+    const invalidSelectors = [];
+    let masked = 0;
+    let already = 0;
+    let capped = false;
+
+    const applyCandidate = (el, kind) => {
+      if (!el || el.nodeType !== 1) return;
+      if (el.hasAttribute(MASK_ATTR)) { already++; return; }
+      if (masked >= MASK_MAX_ELEMENTS) { capped = true; return; }
+      if (maskApplyToElement(el, kind)) {
+        masked++;
+        categories[kind] = (categories[kind] || 0) + 1;
+      }
+    };
+
+    // Phase 1: form controls, by their own descriptors.
+    let controls = [];
+    try { controls = Array.from(document.querySelectorAll("input, textarea")); } catch { controls = []; }
+    for (const el of controls) {
+      if (masked >= MASK_MAX_ELEMENTS) { capped = true; break; }
+      let labelText = "";
+      try {
+        if (el.labels && el.labels.length) {
+          labelText = Array.from(el.labels).map((l) => l.textContent || "").join(" ");
+        } else if (el.getAttribute("aria-labelledby")) {
+          labelText = el.getAttribute("aria-labelledby")
+            .split(/\s+/)
+            .map((id) => { const t = document.getElementById(id); return t ? (t.textContent || "") : ""; })
+            .join(" ");
+        }
+        labelText = labelText.slice(0, 200);
+      } catch {}
+      const kind = maskCategoryForDescriptor({
+        type: el.type,
+        autocomplete: el.getAttribute("autocomplete"),
+        name: el.getAttribute("name"),
+        id: el.id,
+        placeholder: el.getAttribute("placeholder"),
+        ariaLabel: el.getAttribute("aria-label"),
+        labelText
+      });
+      if (kind) applyCandidate(el, kind);
+    }
+
+    // Phase 2: caller-provided selectors — the escape hatch for content the
+    // heuristics cannot know about.
+    for (const sel of explicitSelectors) {
+      let matches = [];
+      try { matches = Array.from(document.querySelectorAll(sel)); }
+      catch { invalidSelectors.push(sel); continue; }
+      for (const el of matches) {
+        if (masked >= MASK_MAX_ELEMENTS) { capped = true; break; }
+        applyCandidate(el, "explicit");
+        try {
+          for (const inner of Array.from(el.querySelectorAll("input, textarea")).slice(0, MASK_MAX_INNER_CONTROLS)) {
+            if (masked >= MASK_MAX_ELEMENTS) { capped = true; break; }
+            applyCandidate(inner, "explicit");
+          }
+        } catch {}
+      }
+    }
+
+    if (masked > 0 || already > 0) maskEnsureStyle();
+    return { ok: true, masked, already, categories, invalidSelectors, capped };
+  }
+
+  /** Restore everything this document's mask records touched: replaced text
+   * back to its originals, every mask attribute gone, the style element
+   * removed. Also sweeps stray attributes (a partial run whose record was
+   * lost, or a re-injected script copy's leftovers) so no element stays
+   * marked with no way to unmark it. Originals live only in this script
+   * instance's memory, so text replaced by a DEAD copy cannot be restored —
+   * its marks are still cleared. */
+  function unmaskSensitiveInfo() {
+    let restored = 0;
+    for (const rec of maskedRecords) {
+      for (const t of rec.nodes) {
+        try { t.node.nodeValue = t.before; } catch {}
+      }
+      try { rec.el.removeAttribute(MASK_ATTR); } catch {}
+      restored++;
+    }
+    maskedRecords = [];
+    try {
+      document.querySelectorAll(`[${MASK_ATTR}]`).forEach((e) => e.removeAttribute(MASK_ATTR));
+    } catch {}
+    const style = document.getElementById(MASK_STYLE_ID);
+    if (style) style.remove();
+    return { ok: true, restored };
+  }
+
+  // --- Structured page snapshot (openspec/changes/add-typesafe-jev-provider,
+  // design.md section 2 / specs/agent-browser-runtime.md "Page snapshot
+  // operation") --------------------------------------------------------------
+  //
+  // ONE bounded, machine-readable observation of this document: the controls
+  // a caller can actually act on — currently visible, enabled, interactive —
+  // with their live state, plus a bounded extract of the page's text. The
+  // structured-choice ("Jev") runtime decides from this table instead of from
+  // prose, and the table exists so BOTH decision engines read a page the same
+  // way rather than each growing its own reading of it.
+  //
+  // READ-ONLY, structurally and not merely as a promise: the walk reads
+  // properties and mints refs, and nothing here focuses, scrolls, clicks,
+  // types, or dispatches an event. The refs are the SAME `ref_N` handles
+  // read_page/find hand out (getOrAssignRef, one per-document counter), so
+  // `computer`, `form_input` and `scroll_to` resolve a snapshot's ref through
+  // the path they already use — no second identity system is introduced.
+  //
+  // The text is the shipped getPageText() result, parsed: there is exactly
+  // ONE definition in this file of what "the page's text" is, including its
+  // masked-textarea rule, and therefore no second copy to drift from it.
+  //
+  // Every bound (design.md section 2) is DISCLOSED rather than hidden, so a
+  // bounded table is never presented as the whole page.
+  const SNAPSHOT_MAX_ELEMENTS = 250;
+  // Sized for content, not chrome (fix-snapshot-text-and-jev-guards design 2):
+  // on the tender page this fixes the goods list began ~6,268 characters into
+  // the RENDERED text — just past the old 6,000 — so 10,000 reaches it. This
+  // number moves together with the host's MAX_PAGE_TEXT_CHARS and the
+  // text-helper field context; truncation stays disclosed either way.
+  const SNAPSHOT_MAX_TEXT_CHARS = 10000;
+  const SNAPSHOT_MAX_LABEL_CHARS = 100;
+  const SNAPSHOT_MAX_VALUE_CHARS = 100;
+  const SNAPSHOT_MAX_URL_CHARS = 8192;
+  const SNAPSHOT_MAX_LINK_CHARS = 32768;
+  const SNAPSHOT_MAX_SUBMIT_CHARS = 12000;
+  // A native select's options ARE its candidates for the host's SELECT
+  // operation, so a cut option is a target nobody can ever choose — counted
+  // into `truncated.omitted` and flagged like an omitted element, never
+  // silently dropped. Bounded at all because a Vietnamese address select
+  // routinely carries hundreds to thousands of options.
+  const SNAPSHOT_MAX_OPTIONS = 100;
+  // How many controls the walk will examine before it stops recording new
+  // ones. Above MAX_ELEMENTS because the table's fill order is viewport-first
+  // (see buildPageSnapshot): an on-screen control must be findable even when
+  // a page's DOM offers hundreds of earlier off-screen links — the live
+  // failure this exists for is a homepage whose advanced-search form sat
+  // behind ~448 nav/footer links, so a DOM-ordered 250-element table never
+  // contained the field it was asked to act on.
+  const SNAPSHOT_SCAN_LIMIT = 800;
+  // Input types that are NOT text fields. A checkbox and a file picker are
+  // both <input> and neither accepts typed text, so `editable` is decided by
+  // type rather than by tag.
+  const SNAPSHOT_NON_TEXT_INPUT_TYPES = {
+    checkbox: 1, radio: 1, button: 1, submit: 1, reset: 1,
+    file: 1, range: 1, color: 1, hidden: 1, image: 1
+  };
+
+  // --- Pointer-affordance pass (improve-jev-step-reasoning design.md
+  // section 1 / spec "Page snapshot operation") ---
+  //
+  // isInteractive() only admits a native tag, a declared ARIA role, a
+  // non-negative tabIndex, an inline handler, or contenteditable — so a
+  // framework-rendered row with a DELEGATED listener (an autocomplete
+  // suggestion, a custom option, a card that acts as a link) declares none
+  // of those and never reaches the table, even though a person can see and
+  // click it. The one signal such a control still gives is rendering with a
+  // pointer cursor, so this second, narrower pass looks for exactly that.
+  //
+  // Deliberately smaller than the native-interactive scan, because `cursor`
+  // is an INHERITED CSS property: a single `cursor: pointer` declaration on
+  // one wrapper makes every plain descendant compute the same value, and a
+  // loose pass would list the whole subtree instead of the one control it
+  // wraps. Its own scan limit and its own output cap keep that inheritance
+  // fan-out from ever growing the table's cost past a page whose native
+  // scan already dominates it; both are counted into the same `cut.omitted`
+  // disclosure the native scan already reports through.
+  const SNAPSHOT_POINTER_SCAN_LIMIT = 400;
+  const SNAPSHOT_MAX_POINTER_ELEMENTS = 40;
+  // A candidate that itself contains a real control is never listed by this
+  // pass in its place: that control is either already in the table on its
+  // own terms, or excluded from it on its own terms (disabled, hidden) —
+  // either way, the wrapper around it is not a substitute target. Same
+  // selector list contextLabelOf uses to recognise "this child IS a
+  // control, not a label" (line ~334), reused here for the same reason: a
+  // nested control, present or not, disqualifies the wrapper.
+  const SNAPSHOT_POINTER_NESTED_CONTROL_SELECTOR =
+    "input, select, textarea, button, [role='combobox'], [role='textbox']";
+
+  /** Whether `el` visibly affords a pointer interaction — the one signal a
+   * delegated-listener control still gives even though it declares no
+   * native tag, ARIA role, tabIndex or handler. Same cost class as
+   * isVisible's getComputedStyle read. */
+  function hasPointerAffordance(el) {
+    try {
+      return getComputedStyle(el).cursor === "pointer";
+    } catch {
+      return false;
+    }
+  }
+
+  /** The first `max` characters of a string field, and "" for anything that
+   * is not a string at all. 100 is the existing convention for a read's
+   * name/value (generateAccessibilityTree clips both the same way). */
+  function snapshotClipField(value, max) {
+    if (typeof value !== "string") return "";
+    return value.length > max ? value.slice(0, max) : value;
+  }
+
+  /** Whether a boolean ARIA state attribute is present and "true". */
+  function snapshotAriaState(el, name) {
+    return el.getAttribute(name) === "true";
+  }
+
+  /** An "actually disabled" control. The element's own `disabled` property
+   * covers the attribute; `:disabled` covers the state the property does not
+   * reflect (a control inside a disabled <fieldset>). Guarded because a
+   * minimal DOM has no matches(). */
+  function snapshotIsEnabled(el) {
+    if (el.disabled === true) return false;
+    try {
+      if (typeof el.matches === "function" && el.matches(":disabled")) return false;
+    } catch {}
+    return true;
+  }
+
+  /** Whether the control can receive typed text — the host's TYPE_TEXT
+   * availability signal. */
+  function snapshotIsEditable(el, tag, type) {
+    if (el.readOnly === true) return false;
+    if (tag === "textarea") return true;
+    if (el.isContentEditable === true || el.contentEditable === "true") return true;
+    if (tag !== "input") return false;
+    return !SNAPSHOT_NON_TEXT_INPUT_TYPES[type];
+  }
+
+  /** The value a read is allowed to report. A masked control reports the
+   * placeholder — its own attribute, or a masked ancestor's, since masking a
+   * container attributes the controls inside it too. An input's value is not
+   * a text node the mask could have replaced, so this is the only place the
+   * "reads return the masked form" promise can be kept for one. */
+  function snapshotValueOf(el, tag, options) {
+    if (el.hasAttribute(MASK_ATTR) || el.closest(`[${MASK_ATTR}]`)) return MASK_PLACEHOLDER;
+    if (tag === "select") {
+      for (const o of options) if (o.selected) return o.value;
+      return "";
+    }
+    if (tag === "input" || tag === "textarea") {
+      return typeof el.value === "string" ? el.value : "";
+    }
+    return "";
+  }
+
+  /** One element's row of the table. `cut` accumulates what a bound dropped,
+   * so the caller discloses it once for the whole snapshot. `watermarkAtStart`
+   * is the per-document watermark find()/generateAccessibilityTree() already
+   * mark "new since the previous read" against (readWatermark, ~line 65) —
+   * passed in rather than read fresh here so every row of one snapshot is
+   * judged against the SAME watermark, the same reasoning
+   * generateAccessibilityTree's watermarkAtStart comment gives (~line 596). */
+  function snapshotElementRecord(el, cut, watermarkAtStart) {
+    const tag = el.tagName.toLowerCase();
+    // typeof guard, same reason as getAccessibleName's: a form control named
+    // `type` shadows the built-in property with the element itself.
+    const type = typeof el.type === "string" ? el.type.toLowerCase() : "";
+
+    const options = [];
+    let selected = false;
+    if (tag === "select" && el.options) {
+      const all = Array.from(el.options);
+      for (const o of all) if (o.selected === true) selected = true;
+      for (const o of all) {
+        if (options.length >= SNAPSHOT_MAX_OPTIONS) {
+          cut.options = true;
+          cut.omitted += all.length - SNAPSHOT_MAX_OPTIONS;
+          break;
+        }
+        options.push({
+          label: snapshotClipField(o.textContent ? o.textContent.trim() : "", SNAPSHOT_MAX_LABEL_CHARS),
+          value: snapshotClipField(o.value, SNAPSHOT_MAX_VALUE_CHARS),
+          selected: o.selected === true
+        });
+      }
+    }
+
+    const ref = getOrAssignRef(el);
+    const record = {
+      ref,
+      // A control always gets a role: the ARIA mapping first, its tag
+      // otherwise — the same fallback findElements reports.
+      role: getRole(el) || tag,
+      label: snapshotClipField(getAccessibleName(el), SNAPSHOT_MAX_LABEL_CHARS),
+      tag,
+      type,
+      value: snapshotClipField(snapshotValueOf(el, tag, options), SNAPSHOT_MAX_VALUE_CHARS),
+      editable: snapshotIsEditable(el, tag, type),
+      readonly: el.readOnly === true,
+      contenteditable: el.isContentEditable === true || el.contentEditable === "true",
+      // Only enabled controls reach this table (buildPageSnapshot filters
+      // them), so this is the observed state of everything listed. Kept as
+      // its own field so a reader never has to know the filter to read it.
+      disabled: false,
+      checked: el.checked === true || snapshotAriaState(el, "aria-checked"),
+      selected: tag === "select" ? selected : snapshotAriaState(el, "aria-selected"),
+      expanded: snapshotAriaState(el, "aria-expanded"),
+      // Same "first seen since the previous read of this document" signal
+      // find()'s isNew (~line 1719) and generateAccessibilityTree's "*"
+      // prefix (~line 661) already carry — computed from the SAME shared
+      // watermark, never a second notion of "new" kept for the snapshot
+      // alone (design.md section 1 / tasks.md 1.4).
+      isNew: watermarkAtStart !== null && refNumber(ref) > watermarkAtStart
+    };
+    // Options are reported for native selects only: a custom widget answers
+    // through its own ARIA state, and inventing a list for it here would
+    // offer targets the host cannot select by value.
+    if (tag === "select") record.options = options;
+    // Preserve a real destination, never a guessed route or a clipped prefix.
+    // Reading .href resolves relative anchors against the browser document base.
+    if (tag === "a" && typeof el.href === "string" && /^https?:\/\//i.test(el.href)) {
+      if (el.href.length <= SNAPSHOT_MAX_URL_CHARS) record.href = el.href;
+      else cut.links++;
+    }
+    return record;
+  }
+
+  // A cross-document hint to CHECK completion before repeating a native
+  // submission, never proof that a submission is identical or may be denied.
+  // Only already-observed values participate. Hidden/masked form values are
+  // neither read nor hashed; JS-only buttons are not guessed to be submitters.
+  function snapshotSubmitContext(el, record, rows, nodes) {
+    const tag = record.tag;
+    const type = record.type || (tag === "button" ? "submit" : "");
+    if (!((tag === "button" && type === "submit") || (tag === "input" && type === "submit"))) return null;
+    const form = el.form;
+    if (!form || String(form.tagName).toLowerCase() !== "form") return null;
+    const action = el.hasAttribute("formaction") ? el.formAction : form.action;
+    const method = String(el.hasAttribute("formmethod") ? el.formMethod : form.method || "get").toLowerCase();
+    if (typeof action !== "string" || action.length > 2000 || !/^https?:\/\//i.test(action) || !["get", "post"].includes(method)) return null;
+    if (el.hasAttribute(MASK_ATTR) || el.closest(`[${MASK_ATTR}]`)) return null;
+    const fields = [];
+    for (const row of rows) {
+      const node = nodes.get(row.ref);
+      if (!node || node.form !== form || !["input", "textarea", "select"].includes(row.tag)) continue;
+      if (["hidden", "password", "file", "submit", "button", "reset", "image"].includes(row.type)) continue;
+      if (node.hasAttribute(MASK_ATTR) || node.closest(`[${MASK_ATTR}]`)) continue;
+      if (fields.length >= 40) return null;
+      fields.push({ name: snapshotClipField(node.getAttribute("name") || "", 100), label: row.label, type: row.type || row.tag,
+        value: row.value, checked: row.checked, selected: row.selected,
+        ...(row.options ? { selectedValues: row.options.filter((option) => option.selected).map((option) => option.value) } : {}) });
+    }
+    if (!fields.length) return null;
+    // Viewport-first snapshot ordering can change after a scroll/reload.
+    // The semantic form state must not depend on that presentation order.
+    fields.sort((left, right) => {
+      const a = JSON.stringify(left);
+      const b = JSON.stringify(right);
+      return a < b ? -1 : a > b ? 1 : 0;
+    });
+    const context = { scope: "observed_form_state", incomplete: true, action, method,
+      submitter: { name: snapshotClipField(el.getAttribute("name") || "", 100),
+        type, value: record.value, label: record.label }, fields };
+    return JSON.stringify(context).length <= 6000 ? context : null;
+  }
+
+  /** Depth-first, document-order walk of `root` and every open shadow root
+   * under it, with this extension's own annotation nodes skipped — the same
+   * traversal findElements performs, kept local for the same reason its
+   * collectAll is: the walk belongs to the caller that needs it. */
+  function snapshotWalk(root, visit) {
+    for (const el of root.querySelectorAll("*")) {
+      if (isAnnotationNode(el)) continue;
+      visit(el);
+      if (el.shadowRoot) snapshotWalk(el.shadowRoot, visit);
+    }
+  }
+
+  /** Build the bounded structured observation as a plain object; the
+   * background page serializes it as the operation's text. */
+  function buildPageSnapshot() {
+    const cut = { omitted: 0, options: false, pointer: false, links: 0 };
+    const inViewport = [];
+    const offscreen = [];
+    let scanned = 0;
+    const viewportW = Math.round(Number(window.innerWidth) || 0);
+    const viewportH = Math.round(Number(window.innerHeight) || 0);
+    // Snapshot once, before this call mints any ref of its own — the same
+    // "compare against a fixed point, not a moving one" reasoning
+    // generateAccessibilityTree's watermarkAtStart carries (~line 596): a
+    // ref minted mid-walk must never look new only because it happened to
+    // be recorded before the read that mints it finished.
+    const watermarkAtStart = readWatermark;
+    // Raw elements already headed for the table, kept alongside their
+    // records so the pointer pass below can ask "does this candidate merely
+    // wrap a control already listed?" without re-deriving isInteractive.
+    const listedNativeElements = [];
+    const snapshotNodes = new Map();
+    // Raw candidates for the pointer-affordance pass (task 1.1), collected
+    // during this same walk and resolved into rows AFTER the walk finishes —
+    // resolving them inline would decide "does this wrapper contain an
+    // already-listed control" before the control inside it had even been
+    // visited, since querySelectorAll("*") visits a parent before its
+    // children.
+    const pointerCandidates = [];
+    let pointerScanned = 0;
+
+    snapshotWalk(document, (el) => {
+      const tag = el.tagName.toLowerCase();
+      if (tag === "script" || tag === "style" || tag === "noscript" || tag === "template") return;
+
+      if (isInteractive(el)) {
+        if (!isVisible(el)) return;
+        // A control with no layout box cannot be clicked at its own centre,
+        // so it is not something a caller can act on — findElements applies
+        // the same 2px rule for the same reason.
+        const box = el.getBoundingClientRect();
+        if (box.width < 2 || box.height < 2) return;
+        // Hidden from assistive technology is hidden from this table too:
+        // the real <select> a select2-style widget keeps clipped and
+        // aria-hidden is not the control a user sees or a caller should act
+        // on.
+        if (el.closest('[aria-hidden="true"]')) return;
+        // The overlay host is this extension's own UI, never page content
+        // (see the same exclusion in findElements).
+        if (el.closest("[data-browzy-overlay]")) return;
+        if (!snapshotIsEnabled(el)) return;
+        if (scanned >= SNAPSHOT_SCAN_LIMIT) { cut.omitted++; return; }
+        scanned++;
+        const record = snapshotElementRecord(el, cut, watermarkAtStart);
+        snapshotNodes.set(record.ref, el);
+        listedNativeElements.push(el);
+        // Viewport-FIRST ordering, not a viewport filter: what is on screen
+        // is offered before everything else, and the off-screen remainder
+        // still rides along while the bound lasts. A control the operator
+        // can literally see must never be crowded out by a page's earlier
+        // DOM — the live failure this exists for is a homepage whose
+        // advanced-search form sat behind ~448 nav/footer links, so a
+        // DOM-ordered 250-element table never contained the field it was
+        // asked to act on, and scrolling could not help because scrolling
+        // does not change DOM order. With this order it does change the
+        // table — which is also what lets the runtime's scroll brake tell
+        // "scrolling reveals new controls" from "scrolling reveals nothing".
+        const intersects = box.y + box.height > 0 && box.y < viewportH && box.x + box.width > 0 && box.x < viewportW;
+        (intersects ? inViewport : offscreen).push(record);
+        return;
+      }
+
+      // --- Pointer-affordance pass (task 1.1): rendered, intersecting the
+      // viewport, computed cursor:pointer, no nested native control. Never
+      // off-screen — that tier belongs to controls a page already declares
+      // as interactive; a delegated-listener candidate is only trustworthy
+      // once it is actually rendered where the operator can see it.
+      if (!isVisible(el)) return;
+      const box = el.getBoundingClientRect();
+      if (box.width < 2 || box.height < 2) return;
+      const intersects = box.y + box.height > 0 && box.y < viewportH && box.x + box.width > 0 && box.x < viewportW;
+      if (!intersects) return;
+      if (el.closest('[aria-hidden="true"]')) return;
+      if (el.closest("[data-browzy-overlay]")) return;
+      if (!snapshotIsEnabled(el)) return;
+      if (pointerScanned >= SNAPSHOT_POINTER_SCAN_LIMIT) { cut.omitted++; cut.pointer = true; return; }
+      if (!hasPointerAffordance(el)) return;
+      // A wrapper around a real control is never a substitute for it —
+      // whether or not that control ends up listed on its own terms.
+      if (el.querySelector(SNAPSHOT_POINTER_NESTED_CONTROL_SELECTOR)) return;
+      pointerScanned++;
+      pointerCandidates.push(el);
+    });
+
+    // Innermost-only: drop a candidate that merely wraps a control already
+    // headed for the table, or wraps another surviving candidate — the
+    // ancestor carries no information a page with several nested
+    // pointer-cursor wrappers around one target does not already carry
+    // through its innermost element. Both checks are bounded by the two
+    // scan limits above, so this stays well short of a full-page walk.
+    const pointerElements = pointerCandidates.filter((candidate) => {
+      for (const listed of listedNativeElements) {
+        if (listed !== candidate && candidate.contains(listed)) return false;
+      }
+      for (const other of pointerCandidates) {
+        if (other !== candidate && candidate.contains(other)) return false;
+      }
+      return true;
+    });
+    let pointerAdded = 0;
+    for (const el of pointerElements) {
+      if (pointerAdded >= SNAPSHOT_MAX_POINTER_ELEMENTS) {
+        cut.omitted++;
+        cut.pointer = true;
+        continue;
+      }
+      pointerAdded++;
+      // Every surviving candidate intersects the viewport by construction
+      // above, so it joins the same tier native on-screen controls do —
+      // after them, so the existing viewport-first ordering is unchanged
+      // for a page that needed no pointer-affordance row at all.
+      inViewport.push(snapshotElementRecord(el, cut, watermarkAtStart));
+    }
+
+    // Fill viewport-first, then the off-screen remainder, all under the one
+    // element bound; what neither tier fits stays counted in the disclosure.
+    const elements = [];
+    let tableCut = false;
+    let linkChars = 0;
+    for (const tier of [inViewport, offscreen]) {
+      for (const record of tier) {
+        if (elements.length >= SNAPSHOT_MAX_ELEMENTS) {
+          tableCut = true;
+          cut.omitted++;
+          continue;
+        }
+        if (record.href && linkChars + record.href.length > SNAPSHOT_MAX_LINK_CHARS) {
+          const { href, ...withoutLink } = record;
+          elements.push(withoutLink);
+          cut.links++;
+        } else {
+          elements.push(record);
+          linkChars += record.href?.length ?? 0;
+        }
+      }
+    }
+
+    let submitChars = 0;
+    for (const record of elements) {
+      const node = snapshotNodes.get(record.ref);
+      if (!node) continue;
+      const submit = snapshotSubmitContext(node, record, elements, snapshotNodes);
+      if (!submit) continue;
+      const size = JSON.stringify(submit).length;
+      if (submitChars + size > SNAPSHOT_MAX_SUBMIT_CHARS) continue;
+      record.submit = submit;
+      submitChars += size;
+    }
+
+    // The page's text from the shipped extraction. Parsed rather than
+    // re-implemented: one definition of "page text" for every read path,
+    // masked textareas included. A parse failure here is a real failure of
+    // this observation and must surface as one, never as an empty page.
+    const pageText = JSON.parse(getPageText());
+    const fullText = typeof pageText.text === "string" ? pageText.text : "";
+    const textCut = pageText.truncated === true || fullText.length > SNAPSHOT_MAX_TEXT_CHARS;
+
+    const result = {
+      v: 1,
+      url: location.href,
+      docNonce: documentNonce,
+      title: document.title || "",
+      viewport: {
+        w: Math.round(Number(window.innerWidth) || 0),
+        h: Math.round(Number(window.innerHeight) || 0)
+      },
+      scroll: {
+        y: Math.round(Number(window.scrollY !== undefined ? window.scrollY : window.pageYOffset) || 0),
+        height: Number(document.documentElement && document.documentElement.scrollHeight) || 0
+      },
+      text: fullText.slice(0, SNAPSHOT_MAX_TEXT_CHARS),
+      truncated: {
+        // The table is not the whole page when the element bound cut it, OR
+        // a select's option list was cut (SNAPSHOT_MAX_OPTIONS), OR the
+        // pointer-affordance pass's own scan/output bound cut it.
+        elements: tableCut || cut.options || cut.pointer,
+        text: textCut,
+        omitted: cut.omitted,
+        ...(cut.links > 0 ? { links: cut.links } : {})
+      },
+      elements
+    };
+    // Recorded after every ref in this call has been assigned, not before —
+    // the same ordering generateAccessibilityTree (~line 720) and
+    // findElements (~line 1726) already use their own snapshotting of this
+    // watermark for. page_snapshot deliberately shares readWatermark with
+    // both of them rather than keeping a second copy: "new" means the same
+    // thing no matter which read the caller used last.
+    readWatermark = refCounter;
+    return result;
   }
 
   // --- Element finding ---
@@ -1066,6 +1937,79 @@
     return { results, total };
   }
 
+  function stableTargetElementVisible(el) {
+    if (!el || !el.isConnected || !isVisible(el)) return false;
+    if (typeof el.checkVisibility === "function" && !el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) return false;
+    // closest() stops at a shadow root. Walk through its host as well so an
+    // overlay/hidden host cannot expose an otherwise visible shadow child.
+    for (let node = el; node; node = node.parentElement || node.getRootNode()?.host) {
+      if (isAnnotationNode(node) || node.matches('[hidden], [inert], [aria-hidden="true"], [data-browzy-overlay]')) return false;
+      const style = getComputedStyle(node);
+      if (style.display === "none" || style.visibility === "hidden" || style.visibility === "collapse" ||
+          style.contentVisibility === "hidden" || style.opacity === "0") return false;
+    }
+    const box = el.getBoundingClientRect();
+    return box.width >= 2 && box.height >= 2;
+  }
+
+  /** Find a replay target by its exact frozen identity without going through
+   * findElements' presentation budget. `findElements` is intentionally
+   * capped at twenty ranked rows for model-facing output; a valid workflow
+   * target must not disappear just because other matches happen to
+   * rank ahead of it. This walk keeps the replay contract strict while still
+   * covering open shadow roots and the same visibility/overlay exclusions as
+   * the normal finder. */
+  function findStableTargetElement(target, wanted, norm) {
+    const wantedRole = target && typeof target.role === "string" && target.role
+      ? norm(target.role)
+      : "";
+    const matches = [];
+
+    function collect(root) {
+      if (!root || typeof root.querySelectorAll !== "function") return;
+      for (const el of root.querySelectorAll("*")) {
+        if (isAnnotationNode(el)) continue;
+
+        const tag = el.tagName.toLowerCase();
+        if (["script", "style", "noscript", "template"].includes(tag)) {
+          if (el.shadowRoot) collect(el.shadowRoot);
+          continue;
+        }
+        if (stableTargetElementVisible(el)) {
+          let actualName = getAccessibleName(el) || "";
+          let fieldLabel = "";
+          try {
+            if (el.matches(FIELD_CONTROL_SELECTOR)) fieldLabel = fieldLabelText(el);
+          } catch {}
+          if (fieldLabel && !actualName.toLowerCase().includes(fieldLabel.toLowerCase())) {
+            actualName = actualName ? `${fieldLabel}: ${actualName}` : fieldLabel;
+          }
+          if (!actualName) actualName = el.textContent?.trim()?.substring(0, 80) || "";
+
+          const actualRole = getRole(el) || tag;
+          if (norm(actualName) === wanted) {
+            matches.push({
+              el,
+              role: actualRole,
+              name: actualName,
+              roleMatch: !wantedRole || norm(actualRole) === wantedRole,
+              interactive: isInteractive(el),
+            });
+          }
+        }
+
+        if (el.shadowRoot) collect(el.shadowRoot);
+      }
+    }
+
+    collect(document);
+    matches.sort((a, b) =>
+      Number(b.roleMatch) - Number(a.roleMatch) ||
+      Number(b.interactive) - Number(a.interactive)
+    );
+    return matches[0] || null;
+  }
+
   /** Resolve a STABLE target identity — `{role, name}`, the shape a workflow
    *  step freezes at recording time — to the live element's coordinates.
    *
@@ -1079,17 +2023,81 @@
   function getTargetCoordinates(target, opts = {}) {
     const name = target && typeof target.name === "string" ? target.name : "";
     if (!name.trim()) return null;
-    const role = target && typeof target.role === "string" && target.role ? target.role : null;
     const norm = (s) => String(s == null ? "" : s).replace(/\s+/g, " ").trim().toLowerCase();
     const wanted = norm(name);
-    const { results } = findElements(name);
-    const hit =
-      results.find((r) => norm(r.name) === wanted && (!role || r.role === role)) ||
-      results.find((r) => norm(r.name) === wanted);
-    if (!hit) return null;
-    const coords = getRefCoordinates(hit.ref, { scrollIntoView: opts.scrollIntoView !== false });
+    const exact = findStableTargetElement(target, wanted, norm);
+    if (!exact) return null;
+    const ref = getOrAssignRef(exact.el);
+    const coords = getRefCoordinates(ref, { scrollIntoView: opts.scrollIntoView !== false });
     if (!coords) return null;
-    return { ref: hit.ref, role: hit.role, name: hit.name, ...coords };
+    return { ref, role: exact.role, name: exact.name, ...coords };
+  }
+
+  // A workflow can ask whether a recorded expansion is already satisfied.
+  // This is deliberately separate from coordinate resolution: it reads state
+  // without scrolling, assigning refs, changing the DOM, or clicking anything.
+  function workflowReplayElementVisible(el, requireHitTest) {
+    if (!stableTargetElementVisible(el)) return false;
+    if (el.closest('[disabled], [aria-disabled="true"]')) return false;
+    if (el.matches(":disabled")) return false;
+    for (let node = el; node; node = node.parentElement) {
+      const style = getComputedStyle(node);
+      if (style.pointerEvents === "none") return false;
+    }
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return false;
+    for (let node = el.parentElement; node; node = node.parentElement) {
+      const style = getComputedStyle(node);
+      const box = node.getBoundingClientRect();
+      const clipX = /^(hidden|clip)$/.test(style.overflowX || style.overflow);
+      const clipY = /^(hidden|clip)$/.test(style.overflowY || style.overflow);
+      if ((clipX && (box.width <= 0 || rect.right <= box.left || rect.left >= box.right)) ||
+          (clipY && (box.height <= 0 || rect.bottom <= box.top || rect.top >= box.bottom))) return false;
+    }
+    // A combo's popup can cover part of its own expanded panel without
+    // collapsing it. The heading remains hit-tested, the panel is state only.
+    if (requireHitTest === false) return true;
+    const left = Math.max(0, rect.left);
+    const top = Math.max(0, rect.top);
+    const right = Math.min(window.innerWidth, rect.right);
+    const bottom = Math.min(window.innerHeight, rect.bottom);
+    // Scrolling away does not collapse a rendered panel. This query must not
+    // scroll to inspect it; hit-test only the portion currently on screen.
+    if (right <= left || bottom <= top) return true;
+    const at = document.elementFromPoint((left + right) / 2, (top + bottom) / 2);
+    return !!at && (at === el || el.contains(at));
+  }
+
+  function getWorkflowReplayTargetState(target) {
+    const norm = (value) => String(value == null ? "" : value).replace(/\s+/g, " ").trim();
+    const wanted = target && typeof target.name === "string" ? norm(target.name) : "";
+    if (!wanted || (target.role && target.role !== "link")) return null;
+
+    // Supported widget contract: a search-mode heading publishes its exact
+    // expand/collapse labels, and its form owns one advanced-search panel.
+    // Neither page text, a hostname, nor a near-match establishes intent.
+    const candidates = Array.from(document.querySelectorAll("a.panel-heading.btn-search[data-search-advance][data-search-simple]"))
+      .filter((el) => norm(el.getAttribute("data-search-advance")) === wanted);
+    if (candidates.length !== 1) return null;
+    const control = candidates[0];
+    const simple = norm(control.getAttribute("data-search-simple"));
+    if (!simple || simple === wanted || getRole(control) !== "link" ||
+        norm(control.textContent) !== simple || norm(getAccessibleName(control)) !== simple ||
+        !workflowReplayElementVisible(control)) return null;
+
+    // If the recorded label still names a live control, leave its exact click
+    // to the ordinary resolver. An opposite-state candidate cannot override it.
+    for (const el of document.querySelectorAll('a, [role="link"]')) {
+      if (getRole(el) === "link" && norm(getAccessibleName(el)) === wanted && workflowReplayElementVisible(el)) return null;
+    }
+    const form = control.closest("form");
+    if (!form) return null;
+    const controls = Array.from(form.querySelectorAll("a.panel-heading.btn-search[data-search-advance][data-search-simple]"))
+      .filter((el) => el.closest("form") === form);
+    const panels = Array.from(form.querySelectorAll(".panel-body.advance-search"))
+      .filter((el) => el.closest("form") === form);
+    if (controls.length !== 1 || panels.length !== 1 || !workflowReplayElementVisible(panels[0], false)) return null;
+    return { alreadySatisfied: true, state: "expanded", evidence: "paired_search_labels_visible_panel" };
   }
 
   // --- Form input ---
@@ -1525,6 +2533,28 @@
       return true;
     }
 
+    // Structured, bounded, read-only observation (openspec/changes/
+    // add-typesafe-jev-provider, design.md section 2): this document's
+    // visible+enabled interactive controls plus bounded page text. Read-only
+    // by construction — see buildPageSnapshot's own comment.
+    if (msg.type === "pageSnapshot") {
+      const result = buildPageSnapshot();
+      sendResponse({ result });
+      return true;
+    }
+
+    if (msg.type === "maskSensitiveInfo") {
+      const result = maskSensitiveInfo({ selectors: msg.selectors });
+      sendResponse({ result });
+      return true;
+    }
+
+    if (msg.type === "unmaskSensitiveInfo") {
+      const result = unmaskSensitiveInfo();
+      sendResponse({ result });
+      return true;
+    }
+
     // Lightweight document-identity probe — url/title/epoch/nonce only, no
     // DOM text extraction — for callers that need to know whether the
     // document has changed since a prior capture without re-reading its
@@ -1617,6 +2647,12 @@
       return true;
     }
 
+    if (msg.type === "getWorkflowReplayTargetState") {
+      const result = getWorkflowReplayTargetState({ role: msg.role, name: msg.name });
+      sendResponse({ result });
+      return true;
+    }
+
     // Screenshot annotation, driven from takeScreenshot()'s capture lease. The
     // draw is wrapped so no page-level failure can ever fail the capture the
     // caller actually asked for; takeScreenshot() teardown is unconditional.
@@ -1687,6 +2723,9 @@
     describePoint,
     generateAccessibilityTree,
     getPageText,
+    buildPageSnapshot,
+    maskSensitiveInfo,
+    unmaskSensitiveInfo,
     findElements,
     setFormValue,
     getRefCoordinates,

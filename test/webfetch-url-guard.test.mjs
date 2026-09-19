@@ -185,13 +185,15 @@ function fakeSkills() {
 }
 
 {
-  // 26 preserved-baseline + 5 post-baseline additions (the 2 WebMCP page-tool
+  // 26 preserved-baseline + 7 post-baseline additions (the 2 WebMCP page-tool
   // operations from openspec/changes/consume-webmcp-page-tools,
-  // browser_batch from openspec/changes/add-browser-batch-tool, and
+  // browser_batch from openspec/changes/add-browser-batch-tool,
   // list_connected_browsers plus select_browser from
-  // openspec/changes/implement-stubbed-browser-tools) - 1 removal
-  // (switch_browser, replaced by select_browser) = 30.
-  ok(TOOLS.length === 30, `sanity: expected the known 30-entry registry (26 preserved + 5 post-baseline - 1 removed), got ${TOOLS.length}`);
+  // openspec/changes/implement-stubbed-browser-tools, mask_sensitive_info
+  // from openspec/changes/add-sensitive-info-masking, and page_snapshot from
+  // openspec/changes/add-typesafe-jev-provider) - 1 removal
+  // (switch_browser, replaced by select_browser) = 32.
+  ok(TOOLS.length === 32, `sanity: expected the known 32-entry registry (26 preserved + 7 post-baseline - 1 removed), got ${TOOLS.length}`);
   const { run, toolBridge } = await makeOptionsRun();
   const mcpServer = createBrowserMcpServer({ toolBridge, coerceArgs: (a) => a, run });
   const options = buildIsolatedOptions({ mcpServer, serverName: SDK_MCP_SERVER_NAME, snapshot: fakeSnapshot(), skills: fakeSkills() });

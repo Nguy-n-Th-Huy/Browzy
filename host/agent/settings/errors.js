@@ -29,7 +29,13 @@ export const PROVIDER_ERROR_CODES = /** @type {const} */ ([
   "SECRET_TOO_LARGE", // the credential does not fit the OS secret store's size limit and was NOT truncated
   "USAGE_LIMIT_REACHED", // upstream reported the signed-in ChatGPT account's usage limit
   "UPSTREAM_REJECTED_CLIENT", // upstream 403/400 whose message names the client/originator/instructions
-  "USAGE_UNAVAILABLE" // a 200 usage body that is not the expected shape — distinct from PROTOCOL_ERROR, which the settings page reads as "update the companion"
+  "USAGE_UNAVAILABLE", // a 200 usage body that is not the expected shape — distinct from PROTOCOL_ERROR, which the settings page reads as "update the companion"
+
+  // TypeSafe/Jev provider (add-typesafe-jev-provider): a 200 body that is not
+  // the shape the provider's protocol requires (a structured-choice answer
+  // that fails validation, or a text-model reply that is not exactly
+  // `{"text": ...}`) — never a transport failure.
+  "INVALID_RESPONSE"
 ]);
 
 export class ProviderError extends Error {

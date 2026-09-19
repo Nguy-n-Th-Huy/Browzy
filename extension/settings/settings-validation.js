@@ -23,10 +23,16 @@ function isLoopbackHost(hostname) {
 }
 
 /**
+ * The checks every Base URL on this page shares: absolute URL, no userinfo,
+ * no query, no fragment, HTTPS (or plain HTTP to an explicit loopback host).
+ * Extracted (add-typesafe-jev-provider task 5.5) only so the text-model Base
+ * URL below can reuse them verbatim; `validateBaseUrl`'s own results are
+ * unchanged by the split.
+ *
  * @param {string} raw
- * @returns {{ ok: true, normalized: string, isLoopbackHttp: boolean } | { ok: false, error: string }}
+ * @returns {{ ok: true, url: URL, isLoopbackHttp: boolean } | { ok: false, error: string }}
  */
-export function validateBaseUrl(raw) {
+function parseBaseUrl(raw) {
   if (typeof raw !== "string" || !raw.trim()) {
     return { ok: false, error: "Base URL is required" };
   }
@@ -60,16 +66,55 @@ export function validateBaseUrl(raw) {
     };
   }
 
-  let pathname = url.pathname.replace(/\/+$/, "");
+  return { ok: true, url, isLoopbackHttp };
+}
+
+/**
+ * @param {string} raw
+ * @returns {{ ok: true, normalized: string, isLoopbackHttp: boolean } | { ok: false, error: string }}
+ */
+export function validateBaseUrl(raw) {
+  const parsed = parseBaseUrl(raw);
+  if (!parsed.ok) return parsed;
+
+  let pathname = parsed.url.pathname.replace(/\/+$/, "");
   if (pathname === "/v1") {
     pathname = "";
   } else if (pathname.endsWith("/v1")) {
     pathname = pathname.slice(0, -"/v1".length);
   }
-  const port = url.port ? `:${url.port}` : "";
-  const normalized = `${url.protocol}//${url.hostname}${port}${pathname}`;
+  const port = parsed.url.port ? `:${parsed.url.port}` : "";
+  const normalized = `${parsed.url.protocol}//${parsed.url.hostname}${port}${pathname}`;
 
-  return { ok: true, normalized, isLoopbackHttp };
+  return { ok: true, normalized, isLoopbackHttp: parsed.isLoopbackHttp };
+}
+
+/**
+ * The text-model Base URL of a `typesafe` profile (add-typesafe-jev-provider
+ * task 5.5; specs/agent-settings "Editable provider profile"). Same rules as
+ * validateBaseUrl above, but the path is PRESERVED — including a terminal
+ * `/v1` — because this URL is not the Anthropic SDK's env prefix: the
+ * companion's text helper (host/agent/jev/text-helper.js, design.md decision
+ * 5) POSTs to `{textModelBaseUrl}/chat/completions`, and OpenAI-compatible
+ * services serve that under `/v1`. Stripping the segment here — the one thing
+ * validateBaseUrl deliberately does — would send every saved OpenAI text
+ * model to a 404. Mirrors host/agent/settings/profile.js's
+ * normalizeTextModelBaseUrl; only trailing slashes are normalized away, so
+ * "https://api.openai.com/v1/" and "https://api.openai.com/v1" store the same
+ * string.
+ *
+ * @param {string} raw
+ * @returns {{ ok: true, normalized: string, isLoopbackHttp: boolean } | { ok: false, error: string }}
+ */
+export function validateTextModelBaseUrl(raw) {
+  const parsed = parseBaseUrl(raw);
+  if (!parsed.ok) return parsed;
+
+  const pathname = parsed.url.pathname.replace(/\/+$/, "");
+  const port = parsed.url.port ? `:${parsed.url.port}` : "";
+  const normalized = `${parsed.url.protocol}//${parsed.url.hostname}${port}${pathname}`;
+
+  return { ok: true, normalized, isLoopbackHttp: parsed.isLoopbackHttp };
 }
 
 export const DEFAULT_BASE_URL = "https://api.anthropic.com";

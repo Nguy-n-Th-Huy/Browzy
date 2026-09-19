@@ -28,7 +28,8 @@
     "!agent/spike/**"
   ],
   "scripts": {
-    "test": "node test/endpoint.test.mjs && node test/parent-watch.test.mjs && node test/ownership.test.mjs"
+    "test": "node test/endpoint.test.mjs && node test/parent-watch.test.mjs && node test/ownership.test.mjs",
+    "recover-prompts": "node agent/recover-submitted-prompts.mjs"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.3.263",

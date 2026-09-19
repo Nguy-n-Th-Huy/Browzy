@@ -55,6 +55,7 @@
 
 import { ConversationModel, STREAM_PARTIAL_EVENT_TYPE } from "./conversation-model.js";
 import { DocumentsClient } from "./documents-client.js";
+import { ArtifactClient } from "./artifact-client.js";
 import { buildConversationArtifact, normalizeExportFormat } from "./history-export.js";
 import { RUN_PHASE } from "./run-states.js";
 import { buildContextMetadata } from "./context-binding.js";
@@ -268,10 +269,12 @@ export class PanelController {
       send: ({ conversationId, documentId, requestId }) =>
         this.protocol.documentRequest({ conversationId, documentId, requestId })
     });
+    this.artifacts = new ArtifactClient({ send: args => this.protocol.actionArtifactRequest(args) });
 
     this.protocol.onEnvelope((env) => this._onEnvelope(env));
     this.protocol.onHandshakeChange(() => this._notify());
     this.protocol.onDisconnect(() => {
+      this.artifacts.disconnect();
       // A Send still awaiting its answer whose connection just died was never
       // accepted — no ack can arrive any more. Settle it now so the caller
       // restores the draft and the message is marked as not sent, rather than
@@ -1651,6 +1654,9 @@ export class PanelController {
   }
 
   _onEnvelope(env) {
+    // Byte replies are view-local retrieval, not transcript updates. Consume
+    // before _notify so an image fetch cannot destroy its own target DOM.
+    if (this.artifacts.handleEnvelope(env)) return;
     // Document transfers are consumed before the switch below: their reply is
     // a chunk_begin/chunk_part*/chunk_end sequence plus an occasional
     // `document` not-found envelope, none of which any conversation model has
@@ -1658,6 +1664,10 @@ export class PanelController {
     // belong to a fetch this panel actually asked for, so an unrelated chunk
     // sequence (a screenshot artifact reply) still falls through untouched.
     if (this.documents.handleEnvelope(env)) return;
+    // A timed-out, rejected or disconnected transfer can still have bytes in
+    // flight. Once both correlated consumers decline them, these transport
+    // envelopes have no transcript meaning and must not trigger rendering.
+    if (["chunk_begin", "chunk_part", "chunk_end", "action_artifact"].includes(env.type)) return;
 
     // A refusal is an ANSWER. An `error` envelope carrying one of OUR
     // requestIds (the companion's history handlers echo the id on their
@@ -1742,6 +1752,23 @@ export class PanelController {
         // `_pendingResumes` field comment).
         this._resolvePendingResume(env.conversationId);
         this._persistHistoryEntry(model, { immediate: true });
+        // The replay just handed this panel the operator's own messages, out
+        // of the DURABLE transcript (`message_submitted`) rather than out of
+        // its own Send history. Adopt them into the local prompt cache — that
+        // cache is what titles the conversation (`_derivedTitleFor()`), what
+        // history search matches on, and what seeds a later rebuild — so a
+        // conversation opened on a fresh panel document keeps its questions
+        // instead of becoming an untitled row whose first bubble is a
+        // placeholder. Ordered AFTER `_persistHistoryEntry()` because
+        // `recordPrompt()` records into that entry and no-ops for a
+        // conversation the local index does not hold yet; the store's own
+        // rules still apply (first write per run wins, and the privacy toggle
+        // is enforced inside `recordPrompt`).
+        const submitted = model.submittedPrompts();
+        for (const prompt of submitted) {
+          if (prompt.runId) this.historyStore.recordPrompt(env.conversationId, prompt.runId, prompt.text).catch(() => {});
+        }
+        this._rememberFirstPrompt(env.conversationId, submitted.length ? submitted[0].text : null);
         this._notify();
         break;
       }
