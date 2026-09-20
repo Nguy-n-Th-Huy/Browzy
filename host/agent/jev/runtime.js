@@ -682,7 +682,7 @@ export async function runTypesafeRun({
     return { data, mimeType, artifactId: screenshotArtifact(content) };
   }
 
-  async function captureStepEvidence(snap, target) {
+  async function captureStepEvidence(snap, target, operation) {
     const evidence = observationEvidence(snap, target, now(), { status: "disabled" });
     if (!screenshotsEnabled) return { evidence, fresh: true };
     if (!snap) { evidence.screenshot = { status: "unavailable", reason: "page_unavailable" }; return { evidence, fresh: true }; }
@@ -691,17 +691,39 @@ export async function runTypesafeRun({
       ? { status: "available", artifactId: image.artifactId, mimeType: image.mimeType }
       : { status: "unavailable", reason: image ? "artifact_reference_missing" : captureFailure };
     if (!isRunning()) return { evidence, fresh: false };
-    // The picture can only claim this observation when the page survived the
-    // capture unchanged. The same re-read prevents stale pre-action captures
-    // from authorizing a mutation; failed pictures alone never block an action.
     const current = await observe();
     const targetState = (page) => {
       const row = target?.docNonce && target.docNonce === page?.docNonce && page?.elements?.find((entry) => entry.ref === target.ref);
       return row ? JSON.stringify({ ...row, isNew: undefined }) : null;
     };
-    const fresh = current.ok && current.snapshot.docNonce === snap?.docNonce &&
+    // Two separate invariants, not one. What the picture may claim: whether
+    // the whole observation it depicts still matches the live page. A page
+    // that rotates an ad, lazy-loads a widget or refreshes a counter during
+    // the roughly two seconds this capture takes fails this check on almost
+    // any real site, so it governs the screenshot's own status only.
+    const depictsObservation = current.ok && current.snapshot.docNonce === snap?.docNonce &&
       observationSignature(current.snapshot) === observationSignature(snap) && targetState(current.snapshot) === targetState(snap);
-    if (!fresh) evidence.screenshot = { status: "unavailable", reason: "stale_capture" };
+    if (!depictsObservation) evidence.screenshot = { status: "unavailable", reason: "stale_capture" };
+    // What authorizes the mutation: the re-read succeeded, the document is
+    // the same, and the selected target's own identity and state are
+    // unchanged. Movement elsewhere on the page no longer vetoes a targeted
+    // dispatch, because the target's own row is what a targeted action
+    // depends on. A targetless operation (WAIT, SCROLL_*) has no target row
+    // at all — target state is null on both sides regardless — so without
+    // the whole-page term this authorization would be a same-document check
+    // and nothing else. It keeps the observationSignature comparison here,
+    // exactly as this re-read always enforced, so a page that changes during
+    // the capture still refuses a targetless dispatch.
+    const targetless = operation === OPERATIONS.WAIT || operation === OPERATIONS.SCROLL_UP || operation === OPERATIONS.SCROLL_DOWN;
+    const fresh = current.ok && current.snapshot.docNonce === snap?.docNonce &&
+      (!targetless || observationSignature(current.snapshot) === observationSignature(snap)) &&
+      targetState(current.snapshot) === targetState(snap);
+    // A navigation's destination never depended on the picture: a capture
+    // that no longer matches the observation is a worse picture, not a
+    // reason to abandon a dispatch whose correctness the page cannot
+    // affect. Every other operation still treats an unfresh capture as a
+    // refusal.
+    if (!fresh && operation === OPERATIONS.NAVIGATE) return { evidence, fresh: true };
     return { evidence, fresh };
   }
 
@@ -715,16 +737,18 @@ export async function runTypesafeRun({
     try {
       verdict = await canUseTool(legacyToolName, coerced);
     } catch (err) {
-      return { ok: false, denied: true, message: `the approval gate failed: ${err?.message ?? String(err)}` };
+      // The message may echo whatever the gate itself threw; deniedReason
+      // never does — it is a fixed classification of WHICH refusal this was.
+      return { ok: false, denied: true, deniedReason: "approval_gate_error", message: `the approval gate failed: ${err?.message ?? String(err)}` };
     }
     if (!verdict || verdict.behavior !== "allow") {
-      return { ok: false, denied: true, message: verdict?.message || `the approval gate refused ${legacyToolName}` };
+      return { ok: false, denied: true, deniedReason: "approval_gate_refused", message: verdict?.message || `the approval gate refused ${legacyToolName}` };
     }
     if (!isRunning()) return { ok: false, stopped: true };
     if (before) {
       const current = await observe();
       if (!isRunning()) return { ok: false, stopped: true };
-      if (!current.ok) return { ok: false, stale: true, message: current.message };
+      if (!current.ok) return { ok: false, stale: true, staleReason: "reread_failed", message: current.message };
       snapshot = current.snapshot;
       recordObservation(snapshot);
       eligiblePreparation();
@@ -740,18 +764,48 @@ export async function runTypesafeRun({
       }));
       const validPrepared = !candidate.preparedId || [...prepared.textValues, ...prepared.navigation]
         .some((record) => record.id === candidate.preparedId && !record.consumed);
-      if ((oldTarget && (typeof before.docNonce !== "string" || !before.docNonce || typeof snapshot.docNonce !== "string" || !snapshot.docNonce)) ||
-          before.docNonce !== snapshot.docNonce || before.url !== snapshot.url || !sameTarget || !validPrepared ||
-          (!oldTarget && observationSignature(before) !== observationSignature(snapshot))) {
-        return { ok: false, stale: true };
+      // A prepared navigation carries no observed target: its destination is
+      // bound to the plan revision that prepared it, not to anything on the
+      // page, so document identity, URL and observation-signature equality —
+      // the guarantees a targeted operation's honesty depends on — protect a
+      // target that does not exist here. The complete precondition for a
+      // page-independent action is the single-use guarantee every prepared
+      // record already gets (validPrepared) and that the destination still
+      // differs from the page being dispatched against, the same "already
+      // there" case the candidate builder excludes when offering the action.
+      // Each branch below is the same OR'd precondition as before, split so
+      // the return can name which single condition tripped; the union of
+      // conditions, and therefore what counts as stale, is unchanged.
+      if (candidate.operation === OPERATIONS.NAVIGATE) {
+        if (!validPrepared) return { ok: false, stale: true, staleReason: "prepared_record_invalid" };
+        // Same comparison the candidate builder itself used to offer this
+        // action (questions.js's `buildDecisionRequest`): the destination's
+        // normalized form against the page actually being dispatched against.
+        if (new URL(candidate.url).href === snapshot.url) return { ok: false, stale: true, staleReason: "url_changed" };
+      } else if (oldTarget) {
+        if (typeof before.docNonce !== "string" || !before.docNonce || typeof snapshot.docNonce !== "string" || !snapshot.docNonce ||
+            before.docNonce !== snapshot.docNonce) return { ok: false, stale: true, staleReason: "document_changed" };
+        if (before.url !== snapshot.url) return { ok: false, stale: true, staleReason: "url_changed" };
+        // Checked before target identity: a binding an eligibility sweep just
+        // invalidated (the field's value now matches what was prepared, or
+        // the field stopped qualifying) always changes the same identity
+        // fields target-change detects, so the more specific cause is
+        // reported first.
+        if (!validPrepared) return { ok: false, stale: true, staleReason: "prepared_record_invalid" };
+        if (!sameTarget) return { ok: false, stale: true, staleReason: "target_changed" };
+      } else {
+        if (before.docNonce !== snapshot.docNonce) return { ok: false, stale: true, staleReason: "document_changed" };
+        if (before.url !== snapshot.url) return { ok: false, stale: true, staleReason: "url_changed" };
+        if (!validPrepared) return { ok: false, stale: true, staleReason: "prepared_record_invalid" };
+        if (observationSignature(before) !== observationSignature(snapshot)) return { ok: false, stale: true, staleReason: "signature_changed" };
       }
       signature = observationSignature(snapshot);
     }
-    const beforeEvidence = await captureStepEvidence(snapshot, candidate.target);
-    if (!beforeEvidence.fresh) return { ok: false, stale: true };
+    const beforeEvidence = await captureStepEvidence(snapshot, candidate.target, candidate.operation);
+    if (!beforeEvidence.fresh) return { ok: false, stale: true, staleReason: "stale_capture" };
     if (!isRunning()) return { ok: false, stopped: true };
     const finalCheck = runHostSideChecks({ run, legacyToolName, args: coerced, sendClassTool: legacyToolName === "computer" });
-    if (!finalCheck.ok) return { ok: false, denied: true, message: firstTextOf(finalCheck.result) || "the host-side checks refused dispatch after capture" };
+    if (!finalCheck.ok) return { ok: false, denied: true, deniedReason: "host_side_checks_refused", message: firstTextOf(finalCheck.result) || "the host-side checks refused dispatch after capture" };
     // Consume before crossing the bridge: an unknown result cannot be retried.
     if (candidate.preparedId) {
       const record = [...prepared.textValues, ...prepared.navigation].find((item) => item.id === candidate.preparedId);
@@ -883,6 +937,12 @@ export async function runTypesafeRun({
   let planRevision = 0;
   let replansWithoutProgress = 0;
   let planAttempted = false;
+  // A positive stuck judgment buys exactly one revised plan: once that plan
+  // exists and nothing has run under it yet, the run owes its next selected
+  // action an attempt rather than another identical consultation. True while
+  // the current revision came from a stuck-triggered consultation and no
+  // action has dispatched since; false once either stops being the case.
+  let stuckRevisionPending = false;
 
   // Bind only host-observed identities; display labels in the LLM table are
   // shortened and must never become the identity of a persistent value.
@@ -911,6 +971,11 @@ export async function runTypesafeRun({
       observation: snapshot ? observationSignature(snapshot) : null };
     memory = planned.memory;
     planRevision = revision;
+    // Every revision starts unspent for the stuck bound except the one this
+    // consultation was itself diverted for; any other trigger (start, an
+    // explicit REPLAN, stall recovery, verification) means the monitor's
+    // complaint about the prior plan no longer applies.
+    stuckRevisionPending = trigger === "stuck";
     planAttempted = true;
     memoryUrl = snapshot?.url ?? null;
     memoryAtAction = executed;
@@ -1198,6 +1263,9 @@ export async function runTypesafeRun({
       if (check.memory && memoryUpdates < maxMemoryUpdates) {
         memory = check.memory;
         planRevision += 1;
+        // This revision was produced by a verification rejection, not a
+        // stuck-triggered consultation, so the stuck bound owes it nothing.
+        stuckRevisionPending = false;
         prepared = { textValues: [], navigation: [] };
         memoryUrl = snapshot?.url ?? null;
         memoryAtAction = executed;
@@ -1225,11 +1293,20 @@ export async function runTypesafeRun({
       if (pageAvailability && intent) emitResult(intent, decidedStep.latencyMs);
       return finish({ outcome: "blocked", reason: blockedReason });
     }
-    if (operation === OPERATIONS.REPLAN || decision.stuck) {
+    // An explicitly selected REPLAN is the action head's own request for new
+    // content, not a monitor's veto, and always consults planning bounded by
+    // the replan budget alone. A positive stuck judgment is different: it may
+    // withhold the selected action at most once per plan revision. Once a
+    // stuck-triggered consultation has produced a revision and nothing has
+    // dispatched under it yet, the run owes the selected action an attempt —
+    // a further positive stuck judgment falls through to dispatch instead of
+    // requesting an identical plan a monitor has already been granted.
+    if (operation === OPERATIONS.REPLAN || (decision.stuck && !stuckRevisionPending)) {
       step.skippedReason = "replan";
       emitStep(step);
       history.push({ operation, action: operation, outcome: "skipped", skipped_reason: "replan", page_changed: false });
-      const ended = await replan(decision.stuck ? "stuck" : "replan");
+      const stuckTriggered = operation !== OPERATIONS.REPLAN && decision.stuck;
+      const ended = await replan(stuckTriggered ? "stuck" : "replan");
       if (ended) return ended;
       continue;
     }
@@ -1335,6 +1412,7 @@ export async function runTypesafeRun({
       }
       if (dispatched.stale) {
         step.skippedReason = "stale_observation";
+        if (dispatched.staleReason) step.staleReason = dispatched.staleReason;
         emitStep(step);
         history.push({ operation, action: operation, outcome: "skipped", skipped_reason: "stale_observation", page_changed: false });
         noProgress += 1;
@@ -1356,11 +1434,16 @@ export async function runTypesafeRun({
         return finish({ outcome: "error", reason: "navigation_failed", error: { code: "NAVIGATION_ERROR", message: dispatched.message } });
       }
       step.skippedReason = "action_denied";
+      if (dispatched.deniedReason) step.deniedReason = dispatched.deniedReason;
       emitStep(step);
       return finish({ outcome: "blocked", reason: "action_denied" });
     }
 
     executed += 1;
+    // An action has now run under the current plan revision: the stuck bound
+    // owes it nothing further until another stuck-triggered consultation
+    // spends it again.
+    stuckRevisionPending = false;
     if (![OPERATIONS.WAIT, OPERATIONS.SCROLL_UP, OPERATIONS.SCROLL_DOWN, OPERATIONS.HOVER].includes(operation)) {
       lastSubmissionKey = selectedSubmissionKey;
     }

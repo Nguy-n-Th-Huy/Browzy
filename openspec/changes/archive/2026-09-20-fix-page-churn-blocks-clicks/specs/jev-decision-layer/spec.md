@@ -1,10 +1,4 @@
-# jev-decision-layer Specification
-
-## Purpose
-
-Define the Jev action decision layer and its guarded integration with language-model planning.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Jev selects complete fresh actions
 
@@ -44,54 +38,6 @@ The TypeSafe runtime SHALL build complete host-owned action candidates from each
 
 - **WHEN** an enabled screenshot is captured before a targeted dispatch and the target's own observed state changes during that capture
 - **THEN** no action is dispatched and a fresh cycle rebuilds candidates
-
-### Requirement: Prepared content has exact bounded ownership
-
-The language model SHALL prepare bounded content from the user's goal and observed context. Host-owned TYPE_TEXT bindings SHALL identify the observed document and exact editable field, remain limited to the current plan revision and one dispatch, and SHALL NOT be rebound to another field by semantic similarity. NAVIGATE values SHALL be bounded absolute http(s) URLs. Missing content SHALL cause bounded replanning rather than guessed data.
-
-#### Scenario: New field needs content
-
-- **WHEN** a new editable field lacks a valid prepared value
-- **THEN** no text candidate is invented for it and REPLAN can prepare its value
-
-#### Scenario: Navigation or changed field invalidates text
-
-- **WHEN** the document changes, the binding cannot be established, or the ref/role/label differs
-- **THEN** the prior value is not offered for that field
-
-#### Scenario: Value was dispatched
-
-- **WHEN** a prepared text action executes
-- **THEN** its content record is consumed and another dispatch requires new preparation
-
-### Requirement: Monitors advise guarded control flow
-
-The Jev request SHALL include independently answered action, goal_done and stuck Choice heads over the same bounded state. A positive completion judgment or DONE choice SHALL trigger LLM verification rather than successful termination. REPLAN and stuck SHALL use bounded planning consultation. A positive stuck judgment SHALL withhold an executable selected action at most once per plan revision: once a stuck judgment has produced a revised plan and no action has been dispatched under that revision, a further positive stuck judgment SHALL NOT withhold the action the same decision selected. An explicitly selected REPLAN operation SHALL always consult planning, unaffected by that bound. ASK SHALL surface the existing blocked/operator-needed state. Every control choice SHALL remain subject to run bounds.
-
-#### Scenario: Monitor thinks the goal is done
-
-- **WHEN** goal_done is positive even though the action head selects a mutation
-- **THEN** completion is checked before mutation and success requires verification
-
-#### Scenario: Replans never progress
-
-- **WHEN** repeated REPLAN or stuck judgments produce no executed progress
-- **THEN** the bounded run ends blocked with a named reason rather than resetting its budgets
-
-#### Scenario: Operator help is required
-
-- **WHEN** Jev selects ASK
-- **THEN** the run records blocked and needsOperator and presents the need for user input without claiming an implemented pause/resume channel
-
-#### Scenario: Stuck repeats after the plan was already revised
-
-- **WHEN** a positive stuck judgment has already produced a revised plan, no action has been dispatched under that revision, and the next decision again reports stuck while selecting an executable action
-- **THEN** the selected action is dispatched rather than withheld for another identical planning consultation
-
-#### Scenario: The wrong page is the reason for being stuck
-
-- **WHEN** the observed page cannot advance the goal and every cycle selects a prepared navigation to the site the goal names while reporting stuck
-- **THEN** the run navigates to that site instead of ending on a spent planning budget without having left the page
 
 ### Requirement: Decision attribution is observable
 

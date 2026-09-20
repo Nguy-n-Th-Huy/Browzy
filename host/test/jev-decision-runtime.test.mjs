@@ -5,6 +5,7 @@ import { Run } from "../agent/session/run.js";
 import { BrowserLease } from "../agent/broker/browser-lease.js";
 import { ApprovalRegistry } from "../agent/policy/approvals.js";
 import { createCanUseTool } from "../agent/policy/can-use-tool.js";
+import { authorizeBorrowedTabMutation } from "../agent/tools/mapping.js";
 import { runTypesafeRun } from "../agent/jev/runtime.js";
 import { ACTION_PLAN, NEXT_STEP, COMPLETION_CHECK, FINAL_REPORT } from "../agent/jev/text-helper.js";
 
@@ -30,6 +31,11 @@ async function drive({ initial = page(), plan = () => prepare(), choose = () => 
     if (e.type === "approval_request") queueMicrotask(() => tracker.take(e.requestId)?.({ decision: "approve" }));
   } });
   await run.begin();
+  // Production authorizes the operator's bound (borrowed) tab for mutation
+  // at launch (companion.js's `_launchRun`); this suite exercises the
+  // decision loop, not the separate borrowed-tab gate, so its fixed tab is
+  // granted the same way here.
+  authorizeBorrowedTabMutation(run, 7);
   const actualGate = createCanUseTool({ run, approvals, requestIdTracker: tracker });
   const state = { run, events, actions, bodies, get page() { return current; }, set page(v) { current = v; } };
   const server = http.createServer(async (req, res) => {
@@ -161,6 +167,61 @@ test("a document replacement during pre-action capture cannot authorize a stale 
     bridgeHook: (name, args, s) => { if (args.action === "screenshot" && ++captures === 2) s.page.docNonce = "replacement"; }
   });
   assert.equal(h.actions.length, 0); assert(h.events.some((event) => event.skippedReason === "stale_observation"));
+  assert(h.events.some((event) => event.staleReason === "stale_capture"));
+});
+
+test("a click dispatches when the page churns elsewhere during evidence capture", async () => {
+  let captures = 0;
+  const h = await drive({ screenshots: true,
+    choose: ({ index }) => ({ operation: index ? "DONE" : "CLICK", ...(!index ? { ref: "go" } : {}) }),
+    bridgeHook: (name, args, s) => {
+      // Only the target's own row must survive unchanged: a rotating ad, a
+      // lazy-loaded widget, or a refreshed counter elsewhere on the page
+      // (the incident's measured 661-to-660 element drift) must not veto a
+      // click on a target the capture never touched.
+      if (args.action === "screenshot" && ++captures === 2) {
+        s.page.elements = [...s.page.elements, { ref: "ad", label: "Sponsored", role: "generic", tag: "div" }];
+      }
+    }
+  });
+  assert.equal(h.actions.length, 1);
+  assert(!h.events.some((event) => event.skippedReason === "stale_observation"));
+  const step = h.events.find((event) => event.type === "jev_step" && event.dispatched);
+  assert.equal(step.evidence.before.screenshot.status, "unavailable");
+  assert.equal(step.evidence.before.screenshot.reason, "stale_capture");
+});
+
+test("a click is still skipped stale when the target's own state changes during evidence capture", async () => {
+  let captures = 0;
+  const h = await drive({ screenshots: true,
+    choose: ({ index }) => ({ operation: index ? "ASK" : "CLICK", ...(!index ? { ref: "go" } : {}) }),
+    bridgeHook: (name, args, s) => {
+      if (args.action === "screenshot" && ++captures === 2) {
+        s.page.elements = s.page.elements.map((el) => (el.ref === "go" ? { ...el, label: "Continue now" } : el));
+      }
+    }
+  });
+  assert.equal(h.actions.length, 0);
+  assert(h.events.some((event) => event.skippedReason === "stale_observation" && event.staleReason === "stale_capture"));
+});
+
+test("a targetless action is still skipped stale when the page churns elsewhere during evidence capture", async () => {
+  let captures = 0;
+  const h = await drive({ screenshots: true,
+    choose: ({ index }) => ({ operation: index ? "ASK" : "WAIT" }),
+    bridgeHook: (name, args, s) => {
+      // Unlike a click or a hover, a WAIT has no target row of its own to
+      // anchor on: its surroundings are the only thing the post-capture
+      // re-read can judge, so a page that gains an element here — the same
+      // kind of unrelated churn a targeted dispatch now tolerates — must
+      // still refuse this dispatch.
+      if (args.action === "screenshot" && ++captures === 2) {
+        s.page.elements = [...s.page.elements, { ref: "ad", label: "Sponsored", role: "generic", tag: "div" }];
+      }
+    }
+  });
+  assert.equal(h.actions.length, 0);
+  assert(h.events.some((event) => event.skippedReason === "stale_observation" && event.staleReason === "stale_capture"));
 });
 
 test("unknown mutation outcome keeps before evidence and does not read or retry after uncertainty", async () => {
@@ -325,6 +386,15 @@ test("approval refresh rejects a changed submission even when the submit button 
     gate: (name, args, s) => { s.page.elements[1].submit = submitState("changed query"); return { behavior: "allow" }; }
   });
   assert.equal(h.actions.length, 0); assert(h.events.some((event) => event.skippedReason === "stale_observation"));
+});
+
+test("a target whose own label changes before dispatch is recorded as target_changed", async () => {
+  const h = await drive({
+    choose: ({ index }) => ({ operation: index ? "ASK" : "CLICK", ...(!index ? { ref: "go" } : {}) }),
+    gate: (name, args, s) => { s.page.elements[1].label = "Submit now"; return { behavior: "allow" }; }
+  });
+  assert.equal(h.actions.length, 0);
+  assert(h.events.some((event) => event.staleReason === "target_changed"));
 });
 
 test("replanning cannot erase unchanged-click evidence", async () => {
@@ -492,9 +562,74 @@ test("an uncertain action with positive completion monitor requires a successful
   assert(h.bodies.some((b) => b.messages?.[0]?.content === COMPLETION_CHECK));
 });
 
-for (const monitor of [false, true]) test(`replans without progress are bounded (stuck=${monitor})`, async () => {
-  const h = await drive({ choose: () => ({ operation: monitor ? "CLICK" : "REPLAN", stuck: monitor }), limits: { maxReplansWithoutProgress: 2 } });
+test("an explicitly selected REPLAN without progress is bounded by the replan budget", async () => {
+  const h = await drive({ choose: () => ({ operation: "REPLAN" }), limits: { maxReplansWithoutProgress: 2 } });
   assert.equal(h.result.reason, "replan_limit"); assert.equal(h.plans, 3); assert.equal(h.actions.length, 0);
+});
+
+test("a stuck monitor that never stops firing still ends blocked once its one permitted action changes nothing", async () => {
+  const h = await drive({ choose: () => ({ operation: "CLICK", ref: "go", stuck: true }), limits: { maxReplansWithoutProgress: 2 } });
+  // The first stuck judgment buys one revised plan; the second lets the same
+  // CLICK it keeps selecting actually run once. That attempt changes nothing,
+  // so the existing repeated-no-change and no-progress guards — not another
+  // identical planning consultation — are what end the run.
+  assert.equal(h.result.outcome, "blocked"); assert.equal(h.result.reason, "no_progress");
+  assert.equal(h.plans, 3); assert.equal(h.actions.length, 1);
+});
+
+test("a wrong-page run whose every decision is stuck reaches the site the goal names instead of spending its replan budget", async () => {
+  const target = "https://example.com/target-site";
+  const h = await drive({
+    plan: () => ({ memory, textValues: [], navigation: [{ url: target, purpose: "Reach the site the goal names" }] }),
+    choose: ({ state }) => (state.page.url === target ? { operation: "DONE" } : { operation: "NAVIGATE", stuck: true }),
+    mutate: (name, args, s) => { if (name === "navigate") { s.page.url = args.url; s.page.docNonce = "target-doc"; s.page.text = "Target site"; } },
+    check: (s) => ({ achieved: s.page.url === target, report: "Reached the target site" }),
+    limits: { maxReplansWithoutProgress: 2 }
+  });
+  assert.equal(h.result.outcome, "done"); assert.equal(h.result.doneVerified, true);
+  const navigations = h.actions.filter((a) => a.name === "navigate");
+  assert.equal(navigations.length, 1); assert.equal(navigations[0].args.url, target);
+  const step = h.events.find((e) => e.type === "jev_step" && e.tool === "navigate");
+  assert.equal(step.pageChanged, true); assert.equal(step.evidence.after.url, target);
+});
+
+test("a prepared navigation dispatches even though the page moved before dispatch", async () => {
+  const target = "https://example.com/target-site";
+  const h = await drive({
+    plan: () => ({ memory, textValues: [], navigation: [{ url: target, purpose: "Reach the required site" }] }),
+    choose: ({ index }) => (index ? { operation: "DONE" } : { operation: "NAVIGATE" }),
+    gate: (name, args, s) => { if (name === "navigate") s.page.url = "https://example.com/redirected"; return { behavior: "allow" }; },
+    mutate: (name, args, s) => { if (name === "navigate") { s.page.url = args.url; s.page.docNonce = "target-doc"; } }
+  });
+  assert.equal(h.actions.length, 1); assert.equal(h.actions[0].name, "navigate");
+  assert(!h.events.some((e) => e.skippedReason === "stale_observation"));
+});
+
+test("a targeted CLICK in the same page-moved situation still skips as a stale observation", async () => {
+  const h = await drive({
+    choose: ({ index }) => ({ operation: index ? "ASK" : "CLICK", ...(!index ? { ref: "go" } : {}) }),
+    gate: (name, args, s) => { s.page.url = "https://example.com/redirected"; return { behavior: "allow" }; }
+  });
+  assert.equal(h.actions.length, 0);
+  assert(h.events.some((e) => e.skippedReason === "stale_observation"));
+  assert(h.events.some((e) => e.staleReason === "url_changed"));
+});
+
+// Companion of "a document replacement during pre-action capture cannot
+// authorize a stale click" above: the same mid-capture page movement that
+// still cancels a CLICK only degrades a NAVIGATE's recorded evidence.
+test("a page that moves during the pre-dispatch capture degrades the navigation's evidence instead of cancelling it", async () => {
+  const target = "https://example.com/target-site";
+  let captures = 0;
+  const h = await drive({ screenshots: true,
+    plan: () => ({ memory, textValues: [], navigation: [{ url: target, purpose: "Reach the required site" }] }),
+    choose: ({ index }) => (index ? { operation: "DONE" } : { operation: "NAVIGATE" }),
+    bridgeHook: (name, args, s) => { if (args.action === "screenshot" && ++captures === 2) s.page.docNonce = "replacement"; },
+    mutate: (name, args, s) => { if (name === "navigate") { s.page.url = args.url; s.page.docNonce = "target-doc"; } }
+  });
+  assert.equal(h.actions.filter((a) => a.name === "navigate").length, 1);
+  const step = h.events.find((e) => e.type === "jev_step" && e.tool === "navigate");
+  assert.equal(step.evidence.before.screenshot.reason, "stale_capture");
 });
 
 test("WAIT remains bounded by the no-progress guard", async () => {
@@ -523,6 +658,7 @@ test("model latency cannot authorize a target from a replaced document", async (
     decisionHook: (s, body, index) => { if (!index) s.page.docNonce = "doc2"; } });
   assert.equal(h.result.reason, "needs_operator"); assert.equal(h.actions.length, 0);
   assert(h.events.some((e) => e.skippedReason === "stale_observation"));
+  assert(h.events.some((e) => e.staleReason === "document_changed"));
 });
 
 test("consumed text is not reused when the site clears the field again", async () => {
@@ -623,4 +759,50 @@ for (const replacement of [false, true]) test(`fresh decision clears obsolete in
   });
   assert.equal(h.result.outcome, "done"); assert.equal(h.actions.length, 2);
   assert(!h.events.some((e) => e.skippedReason === "repeated_no_change"));
+});
+
+test("a targetless action underneath the page is recorded as signature_changed", async () => {
+  const h = await drive({
+    choose: ({ index }) => ({ operation: index ? "ASK" : "WAIT" }),
+    gate: (name, args, s) => { s.page.elements.push({ ref: "extra", label: "New", role: "generic", tag: "div" }); return { behavior: "allow" }; }
+  });
+  assert(h.events.some((event) => event.staleReason === "signature_changed"));
+});
+
+test("a prepared text value already present on the field is recorded as prepared_record_invalid", async () => {
+  const h = await drive({
+    plan: () => prepare([{ element: "1", value: "Alice" }]),
+    choose: ({ index }) => ({ operation: index ? "ASK" : "TYPE_TEXT" }),
+    // The eligibility sweep inside dispatch() invalidates a text binding once
+    // the field already carries the prepared value — here simulating an
+    // external change landing between the decision and its dispatch, the same
+    // window every other reason code in this file exercises.
+    gate: (name, args, s) => { s.page.elements[0].value = "Alice"; return { behavior: "allow" }; }
+  });
+  assert(h.events.some((event) => event.staleReason === "prepared_record_invalid"));
+});
+
+test("a re-read failure immediately before dispatch is recorded as reread_failed", async () => {
+  let decided = false;
+  const h = await drive({
+    choose: ({ index }) => ({ operation: index ? "ASK" : "CLICK", ...(!index ? { ref: "go" } : {}) }),
+    decisionHook: () => { decided = true; },
+    // The next page_snapshot after a decision is dispatch()'s own preflight
+    // re-read; answering it with a shape lacking `url`/`elements` fails
+    // observe() itself, distinct from any document, URL or target change.
+    bridgeHook: (name) => {
+      if (name === "page_snapshot" && decided) { decided = false; return { result: { content: [{ type: "text", text: "{}" }] } }; }
+    }
+  });
+  assert(h.events.some((event) => event.staleReason === "reread_failed"));
+});
+
+test("a denied dispatch records its host-authored refusal reason", async () => {
+  const h = await drive({
+    choose: () => ({ operation: "CLICK", ref: "go" }),
+    gate: () => ({ behavior: "deny", message: "operator refused" })
+  });
+  assert.equal(h.result.outcome, "blocked"); assert.equal(h.result.reason, "action_denied");
+  const step = h.events.find((event) => event.type === "jev_step" && event.skippedReason === "action_denied");
+  assert.equal(step.deniedReason, "approval_gate_refused");
 });
