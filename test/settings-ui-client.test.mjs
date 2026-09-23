@@ -40,11 +40,19 @@ console.log("== outgoing message shape ==");
   await client.testCapability("default", "claude-sonnet-5");
   ok(calls[4].op === "test_capability" && calls[4].modelId === "claude-sonnet-5", "testCapability forwards modelId");
 
+  // jev-tools-connection-test-and-preference tasks.md 2.2/4.3: the SAME
+  // `test_capability` op, distinguished by `target: "jev-tools"` — never a
+  // `modelId` (the Jev-tools config is resolved from the profile itself).
+  await client.testJevToolsCapability("default");
+  ok(calls[5].op === "test_capability" && calls[5].target === "jev-tools" && calls[5].profileId === "default",
+    `testJevToolsCapability sends { op: "test_capability", target: "jev-tools", profileId } — got ${JSON.stringify(calls[5])}`);
+  ok(!("modelId" in calls[5]), "testJevToolsCapability never sends a modelId");
+
   await client.discoverModels("default");
-  ok(calls[5].op === "discover_models", "discoverModels op");
+  ok(calls[6].op === "discover_models", "discoverModels op");
 
   await client.exportProfile("default");
-  ok(calls[6].op === "export_profile", "exportProfile op");
+  ok(calls[7].op === "export_profile", "exportProfile op");
 }
 
 console.log("== outgoing message shape: the ChatGPT subscription ops ==");
@@ -140,99 +148,71 @@ console.log("== outgoing message shape: the ChatGPT account-usage read ==");
     "USAGE_UNAVAILABLE arrives as a typed ProviderErrorLike with its code intact");
 }
 
-console.log("== outgoing message shape: the TypeSafe provider ops ==");
+console.log("== outgoing message shape: the Jev browser-tools transport ops ==");
 {
-  // add-typesafe-jev-provider task 5.5. Two ops, two very different shapes:
+  // jev-tools-settings-on-llm-profiles. Two ops, two very different shapes:
   // the config op carries non-secret fields (and never a key), the credential
-  // op carries the raw keys OUTBOUND only and receives booleans back. Both are
+  // op carries the raw key OUTBOUND only and receives a boolean back. Both are
   // pinned here because the settings page's gating and the companion's
   // dispatch are written against exactly these names/fields.
   const calls = [];
   const configReply = {
     profileId: "default",
-    baseUrl: "https://api.typesafe.ai",
-    models: [{ id: "jev-latest", label: "Jev (ultrafast)" }],
-    defaultModelId: "jev-latest",
-    providerType: "typesafe",
-    textModelBaseUrl: "https://api.openai.com/v1",
-    textModelId: "gpt-5-mini",
+    baseUrl: "https://api.anthropic.com",
+    models: [{ id: "claude-sonnet-5", label: "Sonnet" }],
+    defaultModelId: "claude-sonnet-5",
+    providerType: "anthropic",
+    typesafeSource: "vercel",
+    jevToolsSendScreenshots: true,
     hasTypesafeKey: true,
-    hasTextModelKey: false,
-    hasCredential: false,
+    hasCredential: true,
     memoryOnlyCredential: false,
-    secretBackend: null,
+    secretBackend: "windows-credential-manager",
     revision: 3
   };
   const client = createSettingsClient({
     sendMessage: async (msg) => {
       calls.push(msg);
       if (msg.op === "set_typesafe_config") return { ok: true, result: configReply };
-      return { ok: true, result: { backend: "windows-credential-manager", hasTypesafeKey: true, hasTextModelKey: true } };
+      return { ok: true, result: { backend: "windows-credential-manager", hasTypesafeKey: true } };
     }
   });
 
-  const configResult = await client.setTypesafeConfig("default", { textModelBaseUrl: "https://api.openai.com/v1", textModelId: "gpt-5-mini" });
+  const configResult = await client.setTypesafeConfig("default", { typesafeSource: "vercel", jevToolsSendScreenshots: true });
   ok(calls[0].type === "agent_settings" && calls[0].op === "set_typesafe_config" && calls[0].profileId === "default",
     `setTypesafeConfig sends { type: "agent_settings", op: "set_typesafe_config", profileId } — got ${JSON.stringify(calls[0])}`);
-  ok(calls[0].textModelBaseUrl === "https://api.openai.com/v1" && calls[0].textModelId === "gpt-5-mini",
-    "and forwards the two non-secret text-model fields verbatim");
-  ok(!("baseUrl" in calls[0]), "an omitted TypeSafe endpoint is NOT sent — the companion keeps the one it seeded");
+  ok(calls[0].typesafeSource === "vercel" && calls[0].jevToolsSendScreenshots === true,
+    "and forwards the transport source and screenshot toggle verbatim");
+  ok(!("baseUrl" in calls[0]), "an omitted Jev endpoint is NOT sent — the host derives it from the source");
   ok(!/key|secret|token/i.test(Object.keys(calls[0]).join(",")), `no key-shaped field rides on the config op — got ${JSON.stringify(Object.keys(calls[0]))}`);
-  ok(configResult.textModelBaseUrl === "https://api.openai.com/v1" && configResult.hasTextModelKey === false,
+  ok(configResult.typesafeSource === "vercel" && configResult.hasTypesafeKey === true,
     "the updated secret-free profile passes through, booleans included");
 
-  const credentialsResult = await client.setTypesafeCredentials("default", { typesafeApiKey: "ts-secret-value", textModelApiKey: "" });
+  const credentialsResult = await client.setTypesafeCredentials("default", { typesafeApiKey: "ts-secret-value" });
   ok(calls[1].op === "set_typesafe_credentials" && calls[1].profileId === "default",
     "setTypesafeCredentials sends its own op for the profile");
   ok(calls[1].typesafeApiKey === "ts-secret-value",
-    "the raw TypeSafe key travels OUTBOUND on this one call (the same documented transient hold set_credential has)");
-  ok(calls[1].textModelApiKey === "", "an explicit empty string is forwarded as the removal signal, never dropped");
+    "the raw transport key travels OUTBOUND on this one call (the same documented transient hold set_credential has)");
   ok(!("memoryOnly" in calls[1]), "an ordinary save never asks for memory-only (only the confirmed retry does)");
-  ok(JSON.stringify(credentialsResult) === JSON.stringify({ backend: "windows-credential-manager", hasTypesafeKey: true, hasTextModelKey: true }),
-    `the reply is booleans plus the backend label — never a key — got ${JSON.stringify(credentialsResult)}`);
+  ok(JSON.stringify(credentialsResult) === JSON.stringify({ backend: "windows-credential-manager", hasTypesafeKey: true }),
+    `the reply is a boolean plus the backend label — never a key — got ${JSON.stringify(credentialsResult)}`);
 
-  await client.setTypesafeCredentials("default", { textModelApiKey: "tm-secret-value" }, { memoryOnly: true });
-  ok(calls[2].textModelApiKey === "tm-secret-value" && !("typesafeApiKey" in calls[2]),
-    "an omitted half is not sent at all, so the stored key for it is left alone");
+  await client.setTypesafeCredentials("default", { typesafeApiKey: "" }, { memoryOnly: true });
+  ok(calls[2].typesafeApiKey === "", "an explicit empty string is forwarded as the removal signal, never dropped");
   ok(calls[2].memoryOnly === true, "the user-confirmed memory-only retry is the one call that carries memoryOnly:true");
 
-  await client.setTypesafeConfig("default", { baseUrl: "https://api.typesafe.ai", textModelBaseUrl: "https://api.openai.com/v1", textModelId: "gpt-5-mini" });
-  ok(calls[3].baseUrl === "https://api.typesafe.ai", "a caller-supplied TypeSafe endpoint is forwarded when present (the page has no field for it yet)");
+  await client.setTypesafeConfig("default", { baseUrl: "https://api.typesafe.ai", typesafeSource: "typesafe" });
+  ok(calls[3].baseUrl === "https://api.typesafe.ai", "a caller-supplied endpoint is forwarded when present (the page has no field for it yet)");
 
-  // The screenshot toggle (add-jev-run-screenshots task 3.2): a non-secret
-  // boolean on the same config op. `false` must survive the spread — a client
-  // that dropped falsey values would silently leave screenshots ON for every
-  // operator who turned them off.
-  await client.setTypesafeConfig("default", { textModelBaseUrl: "https://api.openai.com/v1", textModelId: "gpt-5-mini", sendScreenshots: false });
-  ok(calls[4].sendScreenshots === false, `the toggle travels verbatim on set_typesafe_config — got ${JSON.stringify(calls[4])}`);
+  // The Jev-tools screenshot toggle (jev-subgoal-screenshots-default-off task
+  // 3.2): a non-secret boolean on the same config op. `false` must survive
+  // the spread — a client that dropped falsey values would silently leave
+  // screenshots ON for every operator who turned them off.
+  await client.setTypesafeConfig("default", { typesafeSource: "typesafe", jevToolsSendScreenshots: false });
+  ok(calls[4].jevToolsSendScreenshots === false, `the toggle travels verbatim on set_typesafe_config — got ${JSON.stringify(calls[4])}`);
   ok(!/key|secret|token/i.test(Object.keys(calls[4]).join(",")), "and no key-shaped field was added alongside it");
-  await client.setTypesafeConfig("default", { textModelBaseUrl: "https://api.openai.com/v1", textModelId: "gpt-5-mini" });
-  ok(!("sendScreenshots" in calls[5]), "an omitted toggle is not sent — the companion keeps the stored value, the same rule the two keys follow");
-
-  // The consult-sources toggle (jev-runs-consult-sources-beyond-the-page task
-  // 5.2): a non-secret boolean on the same config op, same rule as
-  // sendScreenshots above — `false` must survive the spread.
-  await client.setTypesafeConfig("default", { textModelBaseUrl: "https://api.openai.com/v1", textModelId: "gpt-5-mini", consultSources: false });
-  ok(calls[6].consultSources === false, `the toggle travels verbatim on set_typesafe_config — got ${JSON.stringify(calls[6])}`);
-  ok(!/key|secret|token/i.test(Object.keys(calls[6]).join(",")), "and no key-shaped field was added alongside it");
-  await client.setTypesafeConfig("default", { textModelBaseUrl: "https://api.openai.com/v1", textModelId: "gpt-5-mini" });
-  ok(!("consultSources" in calls[7]), "an omitted toggle is not sent — the companion keeps the stored value, the same rule the two keys follow");
-
-  // Decision-model source (task 3.6): the same generic passthrough this
-  // client already gives every field — decisionSource/decisionBaseUrl/
-  // decisionModelId ride verbatim when the controller sends them, and are
-  // simply absent from the call when it does not (the controller's own job,
-  // proven in test/settings-ui-controller.test.mjs — this only proves the
-  // wire itself adds/loses nothing).
-  await client.setTypesafeConfig("default", { decisionSource: "anthropic", decisionBaseUrl: "https://api.anthropic.com", decisionModelId: "claude-sonnet-5" });
-  ok(calls[8].decisionSource === "anthropic" && calls[8].decisionBaseUrl === "https://api.anthropic.com" && calls[8].decisionModelId === "claude-sonnet-5",
-    `the decision-model source's own fields travel verbatim — got ${JSON.stringify(calls[8])}`);
-  ok(!("textModelBaseUrl" in calls[8]) && !("textModelId" in calls[8]),
-    "and the openai source's text-model fields are not silently added alongside them");
-
-  await client.setTypesafeConfig("default", { decisionSource: "chatgpt", decisionModelId: "gpt-5.5" });
-  ok(calls[9].decisionSource === "chatgpt" && calls[9].decisionModelId === "gpt-5.5" && !("decisionBaseUrl" in calls[9]),
-    `the chatgpt source sends only its own model ID, no base URL — got ${JSON.stringify(calls[9])}`);
+  await client.setTypesafeConfig("default", { typesafeSource: "typesafe" });
+  ok(!("jevToolsSendScreenshots" in calls[5]), "an omitted toggle is not sent — the companion keeps the stored value, the same rule the key follows");
 }
 
 console.log("== success response translation ==");

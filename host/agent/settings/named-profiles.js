@@ -59,6 +59,7 @@ import {
   DEFAULT_PROFILE_ID,
   createEmptyProfile,
   isPlausibleProfile,
+  migrateStoredTypesafeProfile,
   capabilityTestKey
 } from "./profile-schema.js";
 import { normalizeBaseUrl } from "./url.js";
@@ -198,7 +199,14 @@ export function migrateLegacyProfile() {
   let legacy = null;
   try {
     const raw = readJsonAtomic(profileFilePath());
-    if (raw !== null && isPlausibleProfile(raw)) legacy = raw;
+    // A legacy `typesafe` profile is migrated to `anthropic` (the removed
+    // standalone Jev provider) through the same pure transform
+    // profile-store.js's readProfileFromDisk() applies on every ordinary
+    // read — but WITHOUT writing it back here: this function's contract is
+    // "never modifies or deletes the legacy file" (see the module header),
+    // so the transformed values are copied into the new collection record
+    // below while the legacy file itself is left exactly as it was found.
+    if (raw !== null && isPlausibleProfile(raw)) legacy = migrateStoredTypesafeProfile(raw);
   } catch {
     legacy = null; // corrupt legacy file: start empty, never crash migration
   }

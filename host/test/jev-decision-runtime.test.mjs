@@ -19,7 +19,7 @@ const content = (body) => { const v = body.messages[1].content; return JSON.pars
 async function drive({ initial = page(), plan = () => prepare(), choose = () => ({ operation: "DONE" }), mutate,
   gate = async () => ({ behavior: "allow" }), check = () => ({ achieved: true, report: "Confirmed" }),
   decisionHook, limits = {}, screenshots = false, bridgeHook, sleepHook,
-  report = () => ({ report: "Stopped honestly" }), fetchSourceImpl } = {}) {
+  report = () => ({ report: "Stopped honestly" }), fetchSourceImpl, goal = "Fill the form" } = {}) {
   let current = structuredClone(initial);
   const events = [], bodies = [], actions = [], snapshots = [];
   let plans = 0, decisions = 0;
@@ -69,7 +69,7 @@ async function drive({ initial = page(), plan = () => prepare(), choose = () => 
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const url = `http://127.0.0.1:${server.address().port}`;
   try {
-    const result = await runTypesafeRun({ run, fetchSourceImpl, provider: { tabId: 7, endpoint: url, apiKey: "test", model: "jev", goal: "Fill the form", sendScreenshots: screenshots,
+    const result = await runTypesafeRun({ run, fetchSourceImpl, provider: { tabId: 7, endpoint: url, apiKey: "test", model: "jev", goal, sendScreenshots: screenshots,
       textModel: { baseUrl: url, model: "planner", apiKey: "test" } },
       toolBridge: { async call(name, args) {
         const hooked = await bridgeHook?.(name, args, state);
@@ -805,4 +805,291 @@ test("a denied dispatch records its host-authored refusal reason", async () => {
   assert.equal(h.result.outcome, "blocked"); assert.equal(h.result.reason, "action_denied");
   const step = h.events.find((event) => event.type === "jev_step" && event.skippedReason === "action_denied");
   assert.equal(step.deniedReason, "approval_gate_refused");
+});
+
+// --- Operator literal field values (openspec/changes/jev-literal-field-values) --
+//
+// `field()`'s default label is "Name", so `'set Name to "..."'` matches it.
+// These tests drive `choose()` directly (no plan-supplied textValues) so a
+// literal candidate reaching `choices` proves the binding is entirely
+// host-side — no extra ACTION_PLAN consultation.
+
+test("an operator literal binds on the first cycle without an extra preparation call", async () => {
+  const h = await drive({
+    goal: 'set Name to "Alice"',
+    choose: ({ index, choices }) => {
+      if (!index) assert(choices.some((c) => c.operation === "TYPE_TEXT" && c.ref === "field"), "the literal is offered on the very first decision");
+      return index ? { operation: "DONE" } : { operation: "TYPE_TEXT", ref: "field" };
+    },
+    mutate: (name, args, s) => { if (name === "form_input") s.page.elements[0].value = args.value; }
+  });
+  assert.equal(h.result.outcome, "done");
+  assert.equal(h.plans, 1, "no extra planning consultation was needed for the literal");
+  assert.equal(h.actions.length, 1); assert.equal(h.actions[0].args.value, "Alice");
+  const step = h.events.find((event) => event.type === "jev_step" && event.operation === "TYPE_TEXT");
+  assert.equal(step.valueSource, "literal");
+  assert(!JSON.stringify(h.events).includes("Alice"), "the literal value itself is never recorded in a durable event");
+});
+
+test("a field revealed only after a click still gets the literal, without a replan", async () => {
+  const initial = page(); initial.elements = [button()];
+  const h = await drive({
+    initial,
+    goal: 'set Name to "Alice"',
+    choose: ({ index, choices }) => {
+      if (index === 1) assert(choices.some((c) => c.operation === "TYPE_TEXT" && c.ref === "field"), "the literal is offered as soon as the field appears");
+      return [{ operation: "CLICK", ref: "go" }, { operation: "TYPE_TEXT", ref: "field" }, { operation: "DONE" }][index];
+    },
+    mutate: (name, args, s) => {
+      if (args.ref === "go") s.page.elements.push(field());
+      else if (name === "form_input") s.page.elements.find((el) => el.ref === "field").value = args.value;
+    }
+  });
+  assert.equal(h.result.outcome, "done");
+  assert.equal(h.plans, 1, "the revealed field needed no REPLAN consultation");
+  assert.deepEqual(h.actions.map((a) => a.args.ref), ["go", "field"]);
+  assert.equal(h.actions[1].args.value, "Alice");
+});
+
+test("an operator literal supersedes a differing model-prepared value for the same field", async () => {
+  const h = await drive({
+    goal: 'set Name to "Alice"',
+    plan: () => prepare([{ element: "1", value: "Bob" }]),
+    choose: ({ index }) => (index ? { operation: "DONE" } : { operation: "TYPE_TEXT", ref: "field" }),
+    mutate: (name, args, s) => { if (name === "form_input") s.page.elements[0].value = args.value; }
+  });
+  assert.equal(h.actions[0].args.value, "Alice");
+  const step = h.events.find((event) => event.type === "jev_step" && event.operation === "TYPE_TEXT");
+  assert.equal(step.valueSource, "literal");
+});
+
+test("a dispatched literal is not offered again for the rest of the run, even once its field reappears empty", async () => {
+  const h = await drive({
+    goal: 'set Name to "Alice"',
+    choose: ({ index, choices }) => {
+      if (index === 1) assert(!choices.some((c) => c.operation === "TYPE_TEXT" && c.ref === "field"), "the spent literal is not re-offered");
+      return [{ operation: "TYPE_TEXT", ref: "field" }, { operation: "DONE" }][index];
+    },
+    mutate: (name, args, s) => {
+      if (name === "form_input") s.page.elements[0].value = ""; // the field clears itself again after submit
+    }
+  });
+  assert.equal(h.result.outcome, "done");
+  assert.equal(h.actions.length, 1, "the literal dispatches exactly once for the whole run");
+});
+
+test("a document nonce change drops the old literal binding and a fresh eligible observation rebinds", async () => {
+  const h = await drive({
+    goal: 'set Name to "Alice"',
+    choose: ({ index }) => [{ operation: "HOVER" }, { operation: "TYPE_TEXT", ref: "field" }, { operation: "DONE" }][index],
+    mutate: (name, args, s) => {
+      if (args.action === "hover") s.page.docNonce = "doc2";
+      else if (name === "form_input") s.page.elements[0].value = args.value;
+    }
+  });
+  assert.equal(h.result.outcome, "done");
+  assert.deepEqual(h.actions.map((a) => a.name), ["computer", "form_input"]);
+  assert.equal(h.actions[1].args.value, "Alice");
+});
+
+test("a search literal binds to the single observed search field", async () => {
+  const initial = page();
+  initial.elements = [{ ref: "q", role: "searchbox", tag: "input", type: "search", label: "Search", editable: true, value: "" }, button()];
+  const h = await drive({
+    initial,
+    goal: 'search for "red shoes"',
+    choose: ({ index }) => (index ? { operation: "DONE" } : { operation: "TYPE_TEXT", ref: "q" }),
+    mutate: (name, args, s) => { if (name === "form_input") s.page.elements[0].value = args.value; }
+  });
+  assert.equal(h.actions[0].args.value, "red shoes");
+  const step = h.events.find((event) => event.type === "jev_step" && event.operation === "TYPE_TEXT");
+  assert.equal(step.valueSource, "literal");
+});
+
+test("a sensitive field never receives an operator literal", async () => {
+  const initial = page();
+  initial.elements[0].sensitive = "password";
+  const h = await drive({
+    initial,
+    goal: 'set Name to "Alice"',
+    choose: ({ index, choices }) => {
+      if (!index) assert(!choices.some((c) => c.operation === "TYPE_TEXT"), "no literal is offered for a sensitive field");
+      return { operation: "DONE" };
+    }
+  });
+  assert.equal(h.result.outcome, "done");
+});
+
+test("a field already holding the literal value offers no binding, and the literal is not spent — it binds once the field later differs", async () => {
+  const initial = page(); initial.elements[0].value = "Alice";
+  const h = await drive({
+    initial,
+    goal: 'set Name to "Alice"',
+    choose: ({ index, choices }) => {
+      if (!index) assert(!choices.some((c) => c.operation === "TYPE_TEXT" && c.ref === "field"), "no literal binding is offered while the field already holds the literal value");
+      if (index === 1) assert(choices.some((c) => c.operation === "TYPE_TEXT" && c.ref === "field"), "the literal binds once the field's value differs, in the same document");
+      return [{ operation: "HOVER" }, { operation: "TYPE_TEXT", ref: "field" }, { operation: "DONE" }][index];
+    },
+    mutate: (name, args, s) => {
+      if (args.action === "hover") s.page.elements[0].value = "Bob"; // same document; field now differs from the literal
+      else if (name === "form_input") s.page.elements[0].value = args.value;
+    }
+  });
+  assert.equal(h.result.outcome, "done");
+  assert.equal(h.plans, 1, "no extra planning consultation was needed for the literal");
+  assert.deepEqual(h.actions.map((a) => a.name), ["computer", "form_input"]);
+  assert.equal(h.actions[1].args.value, "Alice");
+  const step = h.events.find((event) => event.type === "jev_step" && event.operation === "TYPE_TEXT");
+  assert.equal(step.valueSource, "literal");
+});
+
+test("a prompt outside the literal grammar offers no host-derived literal", async () => {
+  const h = await drive({
+    goal: "Fill the form using the applicant's real name",
+    choose: ({ index, choices }) => {
+      if (!index) assert(!choices.some((c) => c.operation === "TYPE_TEXT"), "no literal or unprepared content is offered without a plan");
+      return { operation: "DONE" };
+    }
+  });
+  assert.equal(h.result.outcome, "done");
+});
+
+test("a denied literal dispatch is refused like any other TYPE_TEXT candidate — every existing guard still runs", async () => {
+  const h = await drive({
+    goal: 'set Name to "Alice"',
+    choose: () => ({ operation: "TYPE_TEXT", ref: "field" }),
+    gate: () => ({ behavior: "deny", message: "operator refused" })
+  });
+  assert.equal(h.result.outcome, "blocked"); assert.equal(h.result.reason, "action_denied");
+  assert.equal(h.actions.length, 0);
+});
+
+test("a stale re-validation still applies to a literal dispatch (approval refresh refuses a changed field)", async () => {
+  const h = await drive({
+    goal: 'set Name to "Alice"',
+    choose: ({ index }) => ({ operation: index ? "ASK" : "TYPE_TEXT", ref: "field" }),
+    gate: (name, args, s) => { s.page.elements[0].label = "Renamed"; return { behavior: "allow" }; }
+  });
+  assert.equal(h.actions.length, 0);
+  assert(h.events.some((event) => event.skippedReason === "stale_observation"));
+});
+
+// --- jev-browser-subgoal-tool: subgoal mode ---------------------------------
+//
+// design.md decision 3 / tasks.md 1.1-1.4: subgoal mode is the standalone
+// loop above MINUS task-level completion verification/report — content
+// preparation, every dispatch guard, gate and bound stay exactly as proven
+// by every test above. `limits: { mode: "subgoal" }` is the only new input.
+
+test("subgoal mode prepares content once, ends a DONE as an unverified checkpoint, and never consults completion check or report", async () => {
+  const h = await drive({
+    limits: { mode: "subgoal" },
+    choose: () => ({ operation: "DONE" })
+  });
+  assert.equal(h.result.outcome, "done");
+  assert.equal(h.result.doneVerified, false, "subgoal mode never claims a verified completion");
+  assert(h.result.checkpoint, "a subgoal result carries a checkpoint");
+  assert.equal(h.plans, 1, "content preparation (prepare(\"start\")) still runs exactly once");
+  assert(!h.bodies.some((b) => b.messages?.[0]?.content === COMPLETION_CHECK), "no completion check is ever requested");
+  assert(!h.bodies.some((b) => b.messages?.[0]?.content === FINAL_REPORT), "no final report is ever requested");
+  assert.equal(h.result.hasResult, false, "a subgoal never fabricates an operator-facing jev_result");
+});
+
+test("subgoal mode ends on a positive goal_done monitor exactly like an explicit DONE — unverified, no completion check or report", async () => {
+  const h = await drive({
+    limits: { mode: "subgoal" },
+    choose: () => ({ operation: "CLICK", ref: "go", goalDone: true })
+  });
+  assert.equal(h.result.outcome, "done");
+  assert.equal(h.result.doneVerified, false, "subgoal mode never claims a verified completion");
+  assert(h.result.checkpoint, "a subgoal result carries a checkpoint");
+  assert.equal(h.actions.length, 0, "the monitored CLICK itself is never dispatched — goal_done short-circuits it, same as standalone");
+  assert(!h.bodies.some((b) => b.messages?.[0]?.content === COMPLETION_CHECK), "no completion check is ever requested");
+  assert(!h.bodies.some((b) => b.messages?.[0]?.content === FINAL_REPORT), "no final report is ever requested");
+  assert.equal(h.result.hasResult, false, "a subgoal never fabricates an operator-facing jev_result");
+});
+
+test("subgoal mode's checkpoint action summary carries operation/target/outcome and never a typed value", async () => {
+  const h = await drive({
+    limits: { mode: "subgoal" },
+    goal: "type the name",
+    plan: () => prepare([{ element: "1", value: "Alice" }]),
+    choose: ({ index }) => (index ? { operation: "DONE" } : { operation: "TYPE_TEXT", ref: "field" })
+  });
+  assert.equal(h.result.outcome, "done");
+  const actions = h.result.checkpoint.actions;
+  assert.equal(actions.length, 1);
+  assert.equal(actions[0].operation, "TYPE_TEXT");
+  assert.equal(actions[0].targetLabel, "Name");
+  assert.equal(actions[0].targetRole, "textbox");
+  assert.equal(actions[0].outcome, "succeeded");
+  assert.deepEqual(Object.keys(actions[0]).sort(), ["operation", "outcome", "targetLabel", "targetRole"]);
+  assert(!JSON.stringify(h.result).includes("Alice"), "the typed value must never reach the returned result");
+});
+
+test("subgoal mode: a send-class action still suspends on the shared approval card, and a denial ends blocked", async () => {
+  const h = await drive({
+    limits: { mode: "subgoal" },
+    choose: () => ({ operation: "CLICK", ref: "go" }),
+    gate: () => ({ behavior: "deny", message: "operator refused" })
+  });
+  assert.equal(h.result.outcome, "blocked");
+  assert.equal(h.result.reason, "action_denied");
+  assert.equal(h.actions.length, 0);
+  assert(h.result.checkpoint, "a blocked subgoal still carries a checkpoint");
+});
+
+test("subgoal mode's ASK ends blocked with needsOperator surfaced, and fabricates no operator-facing text", async () => {
+  const h = await drive({
+    limits: { mode: "subgoal" },
+    choose: () => ({ operation: "ASK" })
+  });
+  assert.equal(h.result.outcome, "blocked");
+  assert.equal(h.result.reason, "needs_operator");
+  assert.equal(h.result.needsOperator, true);
+  assert.equal(h.result.hasResult, false);
+});
+
+test("subgoal mode's default action bound is smaller than standalone's and ends blocked as step_budget", async () => {
+  const h = await drive({
+    limits: { mode: "subgoal", maxActions: 1 },
+    choose: () => ({ operation: "CLICK", ref: "go" }),
+    mutate: () => {}
+  });
+  assert.equal(h.result.outcome, "blocked");
+  assert.equal(h.result.reason, "step_budget");
+  assert(h.result.checkpoint);
+});
+
+test("subgoal mode's default memory-update bound (2) ends the run blocked as replan_limit once exhausted", async () => {
+  let n = 0;
+  const h = await drive({
+    limits: { mode: "subgoal", memoryUpdateEveryActions: 1, maxActions: 20, maxDecisions: 40 },
+    choose: () => ({ operation: "CLICK", ref: "go" }),
+    mutate: (name, args, s) => { n++; s.page.text = `Result ${n}`; }
+  });
+  assert.equal(h.result.outcome, "blocked");
+  assert.equal(h.result.reason, "replan_limit");
+});
+
+test("subgoal mode tags jev_step/jev_end events distinctly, and never touches the standalone event shape", async () => {
+  const subgoal = await drive({ limits: { mode: "subgoal" }, choose: () => ({ operation: "DONE" }) });
+  const subgoalStep = subgoal.events.find((event) => event.type === "jev_step");
+  const subgoalEnd = subgoal.events.find((event) => event.type === "jev_end");
+  assert.equal(subgoalStep.subgoal, true);
+  assert.equal(typeof subgoalStep.subgoalId, "string");
+  assert.equal(subgoalEnd.subgoal, true);
+  assert.equal(subgoalEnd.subgoalId, subgoalStep.subgoalId);
+  // The outer tool-call result (the checkpoint) references the SAME id
+  // tagging these jev_step/jev_end records (design.md decision 6) — never a
+  // second, independently-minted one.
+  assert.equal(subgoal.result.checkpoint.subgoalId, subgoalStep.subgoalId);
+
+  const standalone = await drive({ choose: () => ({ operation: "DONE" }) });
+  const standaloneStep = standalone.events.find((event) => event.type === "jev_step");
+  const standaloneEnd = standalone.events.find((event) => event.type === "jev_end");
+  assert.equal(standaloneStep.subgoal, undefined);
+  assert.equal(standaloneStep.subgoalId, undefined);
+  assert.equal(standaloneEnd.subgoal, undefined);
+  assert.equal(standaloneEnd.subgoalId, undefined);
 });

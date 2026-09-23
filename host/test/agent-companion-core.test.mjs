@@ -557,6 +557,70 @@ await test("deleting a conversation with an active run is handled explicitly, no
   assert(another.conversationId && another.conversationId !== conversationId, "creating another conversation afterward must work normally");
 });
 
+// jev-tools-reuse-primary-provider design.md decision 1 / tasks.md 4.3: the
+// run's own primary provider/model — derived once from the resolved
+// snapshot by `primaryTextModelFromSnapshot` — must reach BOTH Jev-tool
+// resolvers unchanged, and each resolver must be consulted exactly once per
+// run. The double below returns `null` from both resolvers (the gate is
+// unmet — no transport key configured), which is enough to prove the wiring
+// without needing the real SDK tool machinery this file's other tests avoid;
+// the resolvers' OWN gating behavior (a saved transport key, a missing
+// textModel) is proven directly against the real profile.js in
+// host/test/jev-browser-subgoal.test.mjs and host/test/jev-extract-page.test.mjs.
+// Companion.js mints no gateway token of its own for this wiring —
+// `primaryTextModelFromSnapshot` only ever reads the token/key the snapshot
+// already carries — so there is no separate "chatgpt run mints no extra
+// token" assertion to make here; that invariant holds by the code simply
+// never calling `issueGatewayToken` on this path.
+await test("an anthropic run derives the Jev text model from its own snapshot and passes the SAME object to both resolvers", async () => {
+  const captured = [];
+  const snapshotTextModel = { kind: "anthropic", baseUrl: "https://example.invalid", model: "claude-fake-model", apiKey: "fake-key" };
+  const profileProvider = {
+    async snapshotForRun(profileId, modelId) {
+      return {
+        model: modelId || "claude-fake-model",
+        env: { ANTHROPIC_BASE_URL: "https://example.invalid", ANTHROPIC_API_KEY: "fake-key" },
+        revision: 1,
+        profileId: profileId || "default"
+      };
+    },
+    primaryTextModelFromSnapshot(snapshot) {
+      if (!snapshot) return null;
+      const env = snapshot.env || {};
+      if (!env.ANTHROPIC_BASE_URL || !env.ANTHROPIC_API_KEY || !snapshot.model) return null;
+      return { kind: "anthropic", baseUrl: env.ANTHROPIC_BASE_URL, model: snapshot.model, apiKey: env.ANTHROPIC_API_KEY };
+    },
+    async resolveJevBrowserSubgoalConfig(profileId, opts) {
+      captured.push({ tool: "browser_subgoal", textModel: opts && opts.textModel });
+      return null; // the gate (a saved transport key) is unmet — proves absence raises no error
+    },
+    async resolveJevExtractPageConfig(profileId, opts) {
+      captured.push({ tool: "extract_page", textModel: opts && opts.textModel });
+      return null;
+    }
+  };
+  const core = buildCore({ profileProvider, sdk: fakeSdk({ messages: [{ type: "assistant", text: "hi" }] }) });
+  await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.HELLO, {}));
+  const { conversationId } = await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.NEW, {}));
+  const startReply = await core.handleEnvelope(
+    makeEnvelope(AGENT_MESSAGE_TYPES.START, { conversationId, profileId: "p1", modelId: "claude-fake-model", prompt: "hello" })
+  );
+  assert(startReply.accepted, "start should be accepted");
+
+  await new Promise((r) => setTimeout(r, 50));
+
+  assert(captured.length === 2, `expected both resolvers to be consulted exactly once, got ${captured.length}`);
+  for (const entry of captured) {
+    assert(entry.textModel, `${entry.tool}'s resolver must receive a non-null textModel`);
+    assert(
+      JSON.stringify(entry.textModel) === JSON.stringify(snapshotTextModel),
+      `${entry.tool}'s resolver must receive the exact snapshot-derived text model, got ${JSON.stringify(entry.textModel)}`
+    );
+  }
+  const snap = await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.SNAPSHOT_REQUEST, { conversationId, afterSeq: 0 }));
+  assert(snap.events.some((e) => e.type === "run_done"), "the run must still complete normally with neither Jev tool configured");
+});
+
 const failed = results.filter((r) => !r.ok);
 console.log(
   `\n${results.length - failed.length}/${results.length} passed` +

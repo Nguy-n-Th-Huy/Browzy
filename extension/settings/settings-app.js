@@ -9,8 +9,8 @@
 import { iconMarkup } from "../ui/icons.js";
 import { setThemeOverride } from "../ui/theme.js";
 import { createSettingsClient } from "./settings-client.js";
-import { SettingsController, typesafeSourceCopy, typesafeDisclosureText, typesafeTestDisclosureText } from "./settings-controller.js";
-import { describeErrorCode } from "./errors-ui.js";
+import { SettingsController, typesafeSourceCopy } from "./settings-controller.js";
+import { describeErrorCode, typesafeStageLabel } from "./errors-ui.js";
 import { connectionGate, connectionBlockedTitle } from "./connection-gate.js";
 
 const $ = (id) => document.getElementById(id);
@@ -24,35 +24,6 @@ const controller = new SettingsController(client, { onChange: render });
 // Carries no secret: getState() never includes a raw key (see
 // settings-controller.js file header).
 window.__settingsDebug = { controller, client };
-
-// The Anthropic endpoint field's own copy, read from settings.html before any
-// render can replace it (add-typesafe-endpoint-field): the same field doubles
-// as a `typesafe` profile's Jev endpoint, so every render that is not showing
-// that provider type restores these. Read off the shipped markup rather than
-// typed again here, so the page's first paint and every later render agree.
-const ANTHROPIC_BASE_URL_LABEL = $("base-url-label").textContent;
-const ANTHROPIC_BASE_URL_HINT = $("base-url-hint").textContent;
-
-// The Anthropic API-key field's own default label (task 3.6): the same
-// #key-input/#anthropic-key-item block is reused, unchanged, as a `typesafe`
-// profile's `anthropic` decision-model source's key — only the label changes
-// to say which key it now is (renderProvider() below).
-const KEY_INPUT_LABEL_DEFAULT = $("key-input-label").textContent;
-
-// The decision-model-id field's own label/hint, per source (task 3.6): both
-// `anthropic` and `chatgpt` need it (host/agent/settings/profile.js's
-// setTypesafeConfig() requires a nonempty typesafeDecisionModelId for
-// either); only the example model and which account it belongs to differ.
-const DECISION_MODEL_ID_COPY = {
-  anthropic: {
-    label: "Model ID mô hình quyết định (Anthropic)",
-    hint: "Model Anthropic dùng riêng cho mô hình quyết định — ví dụ claude-sonnet-5."
-  },
-  chatgpt: {
-    label: "Model ID mô hình quyết định (ChatGPT/Codex)",
-    hint: "Model Codex dùng cho mô hình quyết định trên gói ChatGPT đã đăng nhập — ví dụ gpt-5.5."
-  }
-};
 
 // Static icon injection for markup that never re-renders (moved out of
 // settings.html's former inline <script type="module"> block — MV3's
@@ -390,22 +361,11 @@ function renderBanner(state) {
     const box = document.createElement("div");
     box.className = "card settings-banner settings-banner-info";
     box.setAttribute("role", "status");
-    // A `typesafe` profile's onboarding is the same requirement with two
-    // endpoints instead of one (add-typesafe-jev-provider task 5.5): naming
-    // only the Anthropic Base URL would leave the operator looking for a field
-    // this provider type does not show.
-    if (state.providerType === "typesafe") {
-      box.innerHTML =
-        '<p class="card-title">Kết nối nhà cung cấp Jev (TypeSafe)</p>' +
-        '<p class="card-body">Nhập API key TypeSafe, Base URL và model ID của mô hình văn bản, rồi thêm ít nhất một mô hình để bắt đầu. ' +
-        "Không cần tài khoản Claude hay đăng nhập. Chi phí sử dụng tính riêng theo TypeSafe và dịch vụ mô hình văn bản bạn cấu hình.</p>";
-    } else {
-      box.innerHTML =
-        '<p class="card-title">Kết nối một nhà cung cấp tương thích Anthropic</p>' +
-        '<p class="card-body">Nhập Base URL, API key và ít nhất một mô hình để bắt đầu. ' +
-        "Không cần tài khoản Claude hay đăng nhập. Chi phí sử dụng phụ thuộc vào nhà cung cấp bạn cấu hình " +
-        "— không có suy luận miễn phí và không phải mọi gateway đều tương thích.</p>";
-    }
+    box.innerHTML =
+      '<p class="card-title">Kết nối một nhà cung cấp tương thích Anthropic</p>' +
+      '<p class="card-body">Nhập Base URL, API key và ít nhất một mô hình để bắt đầu. ' +
+      "Không cần tài khoản Claude hay đăng nhập. Chi phí sử dụng phụ thuộc vào nhà cung cấp bạn cấu hình " +
+      "— không có suy luận miễn phí và không phải mọi gateway đều tương thích.</p>";
     area.appendChild(box);
   }
   if (!state.banner) return;
@@ -615,45 +575,24 @@ function wireChipNav() {
 function renderProvider(state, gate) {
   $("provider-type-anthropic").checked = state.providerType === "anthropic";
   $("provider-type-chatgpt").checked = state.providerType === "chatgpt";
-  $("provider-type-typesafe").checked = state.providerType === "typesafe";
   $("provider-type-anthropic").disabled = state.switchingProviderType;
   $("provider-type-chatgpt").disabled = state.switchingProviderType;
-  $("provider-type-typesafe").disabled = state.switchingProviderType;
 
   const isChatgpt = state.providerType === "chatgpt";
-  // TypeSafe / Jev provider (add-typesafe-jev-provider task 5.5): the third
-  // provider type has no Anthropic API key at all, so the key field group the
-  // ChatGPT type hides is hidden here too, and its own block takes its place.
-  // The endpoint field is NOT hidden for it (add-typesafe-endpoint-field):
-  // that provider's endpoint is the same `profile.baseUrl` value, so the one
-  // field is shown under the provider type's own name and copy — see the
-  // endpoint block below.
-  const isTypesafe = state.providerType === "typesafe";
   const sourceCopy = typesafeSourceCopy(state.typesafeSource);
-  // The decision-model source (task 3.6): a `typesafe` profile's own choice
-  // of who plans/decides/judges the run. `showChatgpt` and `showAnthropicKey`
-  // are the two surfaces that reuse EXISTING blocks for that source rather
-  // than building new ones — the ChatGPT sign-in/account/usage/sign-out
-  // block, and the Anthropic API-key field, respectively.
-  const decisionSource = isTypesafe ? state.typesafeDecisionSource : null;
-  const showChatgpt = isChatgpt || (isTypesafe && decisionSource === "chatgpt");
-  const showAnthropicKey = !isChatgpt && (!isTypesafe || decisionSource === "anthropic");
+  const showChatgpt = isChatgpt;
+  const showAnthropicKey = !isChatgpt;
   $("provider-baseurl-item").hidden = isChatgpt;
   $("anthropic-key-item").hidden = !showAnthropicKey;
   $("chatgpt-fields").hidden = !showChatgpt;
-  $("typesafe-fields").hidden = !isTypesafe;
-  $("test-disclosure-anthropic").hidden = isChatgpt || isTypesafe;
+  $("test-disclosure-anthropic").hidden = isChatgpt;
   $("test-disclosure-chatgpt").hidden = !isChatgpt;
-  $("test-disclosure-typesafe").hidden = !isTypesafe;
   // The saved-credential status line/remove-key button only mean something
   // for the API-key half of the page; the ChatGPT half has its own signed-
   // in/signed-out affordances below (see the final `$("key-status-text")`/
   // `$("btn-remove-key")` block further down, which also checks
-  // `showAnthropicKey`), and the TypeSafe half carries a status line and a
-  // remove action per key.
+  // `showAnthropicKey`).
   $("key-status-text").hidden = !showAnthropicKey;
-  $("key-input-label").textContent =
-    isTypesafe && decisionSource === "anthropic" ? "API key Anthropic (mô hình quyết định)" : KEY_INPUT_LABEL_DEFAULT;
 
   if (showChatgpt) {
     renderChatgptFields(state);
@@ -667,127 +606,53 @@ function renderProvider(state, gate) {
     renderChatgptUsage(state, false);
   }
 
-  if (isTypesafe) {
-    // The Jev source select and the source-named copy (add-typesafe-endpoint-
-    // field; design.md decision 3): the key field's label, its stored/not-
-    // stored line and its remove action all name the selected source's key.
-    // One table — settings-controller.js's typesafeSourceCopy — feeds them,
-    // together with the endpoint field's own label below, so no surface of
-    // this block can drift from the source the others name. Like the
-    // text-model inputs, the select is state-controlled; nothing here is a
-    // secret.
-    $("typesafe-source-select").value = state.typesafeSource;
-    $("typesafe-key-label").textContent = sourceCopy.keyLabel;
-
-    // Both text-model inputs are state-controlled (unlike the two password
-    // inputs beside them): they are ordinary configuration, not secrets, and
-    // the same "don't fight the focused input" rule the Base URL field uses
-    // applies to them.
-    const textModelUrlInput = $("text-model-base-url");
-    if (document.activeElement !== textModelUrlInput) textModelUrlInput.value = state.textModelBaseUrlDraft;
-    textModelUrlInput.setAttribute("aria-invalid", state.fieldErrors.textModelBaseUrl ? "true" : "false");
-    $("text-model-base-url-error").textContent = state.fieldErrors.textModelBaseUrl || "";
-    $("text-model-base-url-error").hidden = !state.fieldErrors.textModelBaseUrl;
-
-    const textModelIdInput = $("text-model-id");
-    if (document.activeElement !== textModelIdInput) textModelIdInput.value = state.textModelIdDraft;
-    textModelIdInput.setAttribute("aria-invalid", state.fieldErrors.textModelId ? "true" : "false");
-    $("text-model-id-error").textContent = state.fieldErrors.textModelId || "";
-    $("text-model-id-error").hidden = !state.fieldErrors.textModelId;
-
-    // Each key's own presence line and remove action; the memory-only suffix
-    // matches the Anthropic key line's, since both stores can fall back to the
-    // companion's memory after SECURE_STORAGE_UNAVAILABLE. Both name the
-    // selected source's key through the same copy table as the field label
-    // above, so the three read as one field.
-    const memorySuffix = state.memoryOnlyCredential ? " (chỉ trong bộ nhớ)" : "";
-    $("typesafe-key-status-text").textContent = state.hasTypesafeKey
-      ? `Đã lưu ${sourceCopy.keyLabel}${memorySuffix}`
+  // Jev browser tools on this anthropic/chatgpt profile
+  // (jev-tools-reuse-primary-provider), shown for every profile. There is no
+  // text-model state to paint here at all: the tools' text/decision model is
+  // the profile's OWN primary provider, resolved host-side from the run
+  // snapshot.
+  {
+    // The transport source select and its key's label/status/remove action
+    // all name the selected source through the typesafeSourceCopy table. The
+    // endpoint is display-only — it is never sent (settings-controller.js's
+    // saveJevTools() doc comment: the host always derives it from the
+    // source, never from a stored value) — so it is a hint, not an editable
+    // field.
+    $("jevtools-transport-source-select").value = state.typesafeSource;
+    $("jevtools-transport-endpoint-text").textContent =
+      `Điểm cuối (theo nguồn đã chọn, không thể chỉnh riêng): ${sourceCopy.endpointDefault}`;
+    $("jevtools-transport-key-label").textContent = sourceCopy.keyLabel;
+    $("jevtools-transport-key-status-text").textContent = state.hasTypesafeKey
+      ? `Đã lưu ${sourceCopy.keyLabel}`
       : `Chưa lưu ${sourceCopy.keyLabel}`;
-    $("btn-remove-typesafe-key").hidden = !state.hasTypesafeKey;
-    $("btn-remove-typesafe-key").textContent = sourceCopy.keyRemoveLabel;
-    $("btn-remove-typesafe-key").disabled = state.removingCredential;
-    $("text-model-key-status-text").textContent = state.hasTextModelKey
-      ? `Đã lưu API key mô hình văn bản${memorySuffix}`
-      : "Chưa lưu API key mô hình văn bản";
-    $("btn-remove-text-model-key").hidden = !state.hasTextModelKey;
-    $("btn-remove-text-model-key").disabled = state.removingCredential;
+    $("btn-remove-jevtools-transport-key").hidden = !state.hasTypesafeKey;
+    $("btn-remove-jevtools-transport-key").textContent = sourceCopy.keyRemoveLabel;
+    $("btn-remove-jevtools-transport-key").disabled = state.removingCredential;
 
-    // The screenshot toggle (add-jev-run-screenshots task 3.2): a controlled
-    // checkbox like the two text-model inputs above, never a secret. The
-    // controller's state is the only writer, and Save is the only op that
-    // persists it — flipping it here changes nothing on the wire until then.
-    $("send-screenshots").checked = state.sendScreenshots;
-
-    // The consult-sources toggle (jev-runs-consult-sources-beyond-the-page
-    // task 5.2): a controlled checkbox beside the screenshot one above, same
-    // rule — the controller's state is the only writer, Save is the only op
+    // The Jev-tools screenshot toggle (jev-subgoal-screenshots-default-off
+    // task 3.2): a controlled checkbox — the controller's state is the only
+    // writer, and this section's own Save (btn-save-jevtools) is the only op
     // that persists it.
-    $("consult-sources").checked = state.consultSources;
+    $("jevtools-send-screenshots").checked = state.jevToolsSendScreenshots;
 
-    // Decision-model source (task 3.6): only the selected source's own block
-    // shows. `decision-openai-fields` wraps the pre-existing text-model
-    // fields above (now conditional on this source instead of always shown);
-    // `decision-anthropic-fields`/`decision-model-id-item` are the two new
-    // ones; the `chatgpt` source's own fields are the reused #chatgpt-fields
-    // block, already rendered above via `showChatgpt`.
-    $("decision-source-select").value = decisionSource;
-    $("decision-openai-fields").hidden = decisionSource !== "openai";
-    $("decision-anthropic-fields").hidden = decisionSource !== "anthropic";
-    $("decision-model-id-item").hidden = decisionSource === "openai";
+    $("btn-save-jevtools").disabled = state.savingJevTools;
+    $("btn-save-jevtools").textContent = state.savingJevTools ? "Đang lưu…" : "Lưu Jev browser tools";
 
-    const decisionModelIdCopy = DECISION_MODEL_ID_COPY[decisionSource];
-    if (decisionModelIdCopy) {
-      $("decision-model-id-label").textContent = decisionModelIdCopy.label;
-      $("decision-model-id-hint").textContent = decisionModelIdCopy.hint;
-    }
-
-    const decisionBaseUrlInput = $("decision-base-url");
-    if (document.activeElement !== decisionBaseUrlInput) decisionBaseUrlInput.value = state.decisionBaseUrlDraft;
-    decisionBaseUrlInput.setAttribute("aria-invalid", state.fieldErrors.decisionBaseUrl ? "true" : "false");
-    $("decision-base-url-error").textContent = state.fieldErrors.decisionBaseUrl || "";
-    $("decision-base-url-error").hidden = !state.fieldErrors.decisionBaseUrl;
-
-    const decisionModelIdInput = $("decision-model-id");
-    if (document.activeElement !== decisionModelIdInput) decisionModelIdInput.value = state.decisionModelIdDraft;
-    decisionModelIdInput.setAttribute("aria-invalid", state.fieldErrors.decisionModelId ? "true" : "false");
-    $("decision-model-id-error").textContent = state.fieldErrors.decisionModelId || "";
-    $("decision-model-id-error").hidden = !state.fieldErrors.decisionModelId;
-
-    // The disclosure (task 3.6 item 4; specs/agent-settings "TypeSafe
-    // disclosure names what is sent where") names TypeSafe and, separately,
-    // wherever the selected decision-model source actually sends its
-    // requests — the operator's Anthropic endpoint, their ChatGPT
-    // subscription through the local gateway, or the configured text-model
-    // endpoint.
-    $("typesafe-disclosure").textContent = typesafeDisclosureText(decisionSource);
-    $("test-disclosure-typesafe").textContent = typesafeTestDisclosureText(decisionSource);
+    // The Jev-tools connection test (jev-tools-connection-test-and-preference
+    // tasks.md 2.2): its own status line + pills, entirely separate from
+    // #connection-state/#capability-detail below (the PRIMARY provider's own
+    // test) — never read or written by renderConnection's own block.
+    $("btn-test-jevtools").disabled = state.testingJevTools;
+    $("btn-test-jevtools").textContent = state.testingJevTools ? "Đang kiểm tra…" : "Kiểm tra kết nối Jev";
+    renderJevToolsTestResult(state);
   }
 
-  // NOTE: the two TypeSafe key <inputs> are deliberately left UNCONTROLLED,
-  // exactly like #key-input above — their values are never read from or
-  // written back to controller state, and only the Save handler reads (once,
-  // at submit time) and clears them.
+  // NOTE: the Jev-tools transport key <input> is deliberately left
+  // UNCONTROLLED, exactly like #key-input above — its value is never read
+  // from or written back to controller state, and only the Save handler
+  // reads (once, at submit time) and clears it.
 
-  // The provider's own endpoint (add-typesafe-endpoint-field; design.md
-  // decision 1): one `profile.baseUrl` value, shown for `anthropic` and
-  // `typesafe` alike and hidden only for `chatgpt` (which has no endpoint at
-  // all). For a `typesafe` profile its label, placeholder and hint all name
-  // the selected Jev source — the placeholder is that source's documented
-  // default and the hint states the rule the controller mirrors in the draft
-  // (setTypesafeSource): a source change moves a still-default endpoint and
-  // keeps any other one. Every other provider type gets the field's shipped
-  // Anthropic copy back.
   const urlInput = $("base-url");
-  if (isTypesafe) {
-    $("base-url-label").textContent = sourceCopy.endpointLabel;
-    urlInput.placeholder = sourceCopy.endpointDefault;
-    $("base-url-hint").textContent = sourceCopy.endpointHint;
-  } else {
-    $("base-url-label").textContent = ANTHROPIC_BASE_URL_LABEL;
-    urlInput.placeholder = "";
-    $("base-url-hint").textContent = ANTHROPIC_BASE_URL_HINT;
-  }
   if (document.activeElement !== urlInput) urlInput.value = state.baseUrlDraft;
   urlInput.setAttribute("aria-invalid", state.fieldErrors.baseUrl ? "true" : "false");
   $("base-url-error").textContent = state.fieldErrors.baseUrl || "";
@@ -826,27 +691,10 @@ function renderProvider(state, gate) {
   const capsBox = $("capability-detail");
   capsBox.innerHTML = "";
   if (state.connectionStatus && state.connectionStatus.capabilities) {
-    // A `typesafe` test reports its own stages instead of the Anthropic
-    // capabilities (design.md decision 9) — named in Vietnamese so the pills
-    // read as capabilities, not as opaque keys. The third one is the image
-    // stage (add-jev-run-screenshots design.md decision 5): it is reported
-    // SEPARATELY from the text-model stage and never gates runnability, so a
-    // result stored before the stage existed (or a run that skipped it) shows
-    // it as not yet tested instead of silently omitting the question.
-    const capabilityKeys = isTypesafe
-      ? [["systemone", "TypeSafe"], ["textModel", "mô hình văn bản"], ["image", "hình ảnh"]]
-      : [["text", "text"], ["tool", "tool"], ["vision", "vision"]];
+    const capabilityKeys = [["text", "text"], ["tool", "tool"], ["vision", "vision"]];
     for (const [key, label] of capabilityKeys) {
       const value = state.connectionStatus.capabilities[key];
-      if (!value || value === "not_run") {
-        if (isTypesafe && key === "image") {
-          const pending = document.createElement("span");
-          pending.className = "status-pill is-cancelled";
-          pending.textContent = `${label}: chưa kiểm tra`;
-          capsBox.appendChild(pending);
-        }
-        continue;
-      }
+      if (!value || value === "not_run") continue;
       const pill = document.createElement("span");
       pill.className = `status-pill ${value === "pass" ? "is-succeeded" : "is-failed"}`;
       pill.textContent = `${label}: ${value}`;
@@ -862,6 +710,80 @@ function renderProvider(state, gate) {
   $("btn-test-connection").disabled = !gate.canTest;
   $("btn-test-connection").textContent = state.testing ? "Đang kiểm tra…" : "Kiểm tra kết nối";
   renderTestGateFeedback(gate);
+}
+
+/**
+ * The Jev-tools connection test's own result (jev-tools-connection-test-and-
+ * preference tasks.md 2.2): a status line plus pills naming which tool(s) the
+ * current config enables and, when a stage ran, its own pass/fail — reusing
+ * the `typesafeStageLabel`/`describeErrorCode` copy (host/agent/settings/
+ * profile.js's `testCapabilityForJevTools` deliberately keys its result
+ * `systemone`/`textModel` for exactly this reuse). Renders from
+ * `state.jevToolsTest` ONLY — never `state.connectionStatus`, which is the
+ * primary provider's own test and stays untouched by this section. Never
+ * renders anything under a `secret`/`apiKey`/`credential`-shaped key: the
+ * host result never carries one (host/agent/jev/capability.js's own
+ * "never a credential" contract), and this function reads only `status`,
+ * `tools`, `capabilities`, and `errors[...].code`/`.message`.
+ */
+function renderJevToolsTestResult(state) {
+  const statusEl = $("jevtools-test-status");
+  const resultBox = $("jevtools-test-result");
+  resultBox.innerHTML = "";
+  const test = state.jevToolsTest;
+  if (!test) {
+    statusEl.textContent = "";
+    return;
+  }
+  if (test.status === "testing") {
+    statusEl.textContent = "Đang kiểm tra kết nối Jev…";
+    return;
+  }
+  if (test.status === "not_configured") {
+    statusEl.textContent =
+      "Chưa cấu hình Jev browser tools cho hồ sơ này — lưu khóa API ở mục Vận chuyển Jev bên trên trước khi kiểm tra.";
+    return;
+  }
+  // A transport-level failure before any stage could even run (companion
+  // unreachable, protocol mismatch) — the same shape testConnection()'s own
+  // catch branch reports under an errors.connection key.
+  if (test.errors && test.errors.connection) {
+    const copy = describeErrorCode(test.errors.connection.code);
+    statusEl.textContent = `${copy.title}: ${copy.message}`;
+    return;
+  }
+
+  statusEl.textContent = test.status === "pass" ? "Đã kiểm tra kết nối Jev." : "Kiểm tra kết nối Jev thất bại.";
+
+  const toolPills = [
+    ["extract_page", "extract_page"],
+    ["browser_subgoal", "browser_subgoal"]
+  ];
+  for (const [key, label] of toolPills) {
+    const enabled = Boolean(test.tools && test.tools[key]);
+    const pill = document.createElement("span");
+    pill.className = `status-pill ${enabled ? "is-succeeded" : "is-cancelled"}`;
+    pill.textContent = `${label}: ${enabled ? "bật" : "chưa bật"}`;
+    resultBox.appendChild(pill);
+  }
+
+  for (const stage of ["systemone", "textModel"]) {
+    const value = test.capabilities ? test.capabilities[stage] : null;
+    if (!value || value === "not_run") continue;
+    const pill = document.createElement("span");
+    pill.className = `status-pill ${value === "pass" ? "is-succeeded" : "is-failed"}`;
+    pill.textContent = `${typesafeStageLabel(stage) || stage}: ${value}`;
+    resultBox.appendChild(pill);
+  }
+
+  if (test.status === "fail" && test.errors) {
+    const firstStage = Object.keys(test.errors)[0];
+    const firstErr = firstStage ? test.errors[firstStage] : null;
+    if (firstErr) {
+      const copy = describeErrorCode(firstErr.code, { stage: firstStage });
+      statusEl.textContent = `${copy.title}: ${copy.message}`;
+    }
+  }
 }
 
 function renderModels(state) {
@@ -951,14 +873,7 @@ function renderModels(state) {
   $("model-list-error").textContent = state.fieldErrors.models || "";
   $("model-list-error").hidden = !state.fieldErrors.models;
   // Discovery needs a usable credential — the companion resolves it host-side.
-  // For a `typesafe` profile that is the TypeSafe/Jev key alone: model
-  // discovery is about Jev's own model list, not the decision model (which,
-  // since task 3.6, may have no text-model key at all — its source can be
-  // `anthropic` or `chatgpt`), so the decision-model source is never part of
-  // this gate.
-  const discoveryReady = state.providerType === "typesafe"
-    ? Boolean(state.hasTypesafeKey)
-    : Boolean(state.hasCredential);
+  const discoveryReady = Boolean(state.hasCredential);
   $("btn-discover-models").disabled = state.discovering || !discoveryReady;
   $("btn-discover-models").textContent = state.discovering ? "Đang tìm…" : "Tìm mô hình";
 }
@@ -992,49 +907,52 @@ function wireEvents() {
   $("provider-type-chatgpt").addEventListener("change", () => {
     if ($("provider-type-chatgpt").checked) controller.setProviderType("chatgpt");
   });
-  $("provider-type-typesafe").addEventListener("change", () => {
-    if ($("provider-type-typesafe").checked) controller.setProviderType("typesafe");
-  });
 
-  // TypeSafe / Jev provider (add-typesafe-jev-provider task 5.5). The two
-  // text-model fields are ordinary controlled configuration, so they follow
-  // #base-url's own pattern (draft on input, validate on blur); the two key
-  // inputs are deliberately NOT wired to any controller call — no per-keystroke
-  // path exists for a secret (settings-controller.js's file header).
-  $("typesafe-source-select").addEventListener("change", (e) => controller.setTypesafeSource(e.target.value));
-  // Decision-model source picker (task 3.6): same draft-on-input/validate-
-  // on-blur pattern as every other field here.
-  $("decision-source-select").addEventListener("change", (e) => controller.setTypesafeDecisionSource(e.target.value));
-  $("decision-base-url").addEventListener("input", (e) => controller.setDecisionBaseUrlDraft(e.target.value));
-  $("decision-base-url").addEventListener("blur", () => controller.validateDecisionBaseUrlField());
-  $("decision-model-id").addEventListener("input", (e) => controller.setDecisionModelIdDraft(e.target.value));
-  // The screenshot toggle (add-jev-run-screenshots task 3.2): ordinary
-  // non-secret configuration, so it follows the same pattern as the two
-  // text-model inputs — the change lands in controller state and Save is the
+  // Jev browser tools on this anthropic/chatgpt profile
+  // (jev-tools-reuse-primary-provider). No text-model input exists here at
+  // all — the tools' text/decision model is the profile's OWN primary
+  // provider, resolved host-side. The transport source uses its OWN setter
+  // (setJevToolsTransportSource) so choosing it can never move the profile's
+  // primary Anthropic/ChatGPT Base URL draft — see that setter's doc
+  // comment. The key input is deliberately NOT wired to any per-keystroke
+  // controller call, exactly like every other secret input on this page.
+  $("jevtools-transport-source-select").addEventListener("change", (e) => controller.setJevToolsTransportSource(e.target.value));
+  // The Jev-tools screenshot toggle (jev-subgoal-screenshots-default-off
+  // task 3.2): ordinary non-secret configuration — the change lands in
+  // controller state and this section's own Save (btn-save-jevtools) is the
   // only op that persists it.
-  $("send-screenshots").addEventListener("change", (e) => controller.setSendScreenshots(e.target.checked));
-  // The consult-sources toggle (jev-runs-consult-sources-beyond-the-page task
-  // 5.2): ordinary non-secret configuration, same pattern as the screenshot
-  // toggle above — the change lands in controller state and Save is the only
-  // op that persists it.
-  $("consult-sources").addEventListener("change", (e) => controller.setConsultSources(e.target.checked));
-  $("text-model-base-url").addEventListener("input", (e) => controller.setTextModelBaseUrlDraft(e.target.value));
-  $("text-model-base-url").addEventListener("blur", () => controller.validateTextModelBaseUrlField());
-  $("text-model-id").addEventListener("input", (e) => controller.setTextModelIdDraft(e.target.value));
+  $("jevtools-send-screenshots").addEventListener("change", (e) => controller.setJevToolsSendScreenshots(e.target.checked));
 
-  $("btn-remove-typesafe-key").addEventListener("click", async () => {
-    // The confirmation names the same source's key the button does (add-
-    // typesafe-endpoint-field; design.md decision 3), read at click time like
-    // the button's own label is — never a second, hardcoded name that could
-    // point at the wrong key than the one about to be removed.
+  $("btn-remove-jevtools-transport-key").addEventListener("click", async () => {
     const { keyLabel } = typesafeSourceCopy(controller.getState().typesafeSource);
-    if (!confirm(`Xóa ${keyLabel} đã lưu? Các phiên đang chạy dùng key này sẽ bị hủy.`)) return;
-    await controller.removeTypesafeKey("typesafe");
+    if (!confirm(`Xóa ${keyLabel} đã lưu? extract_page và browser_subgoal sẽ ngừng khả dụng cho tới khi nhập lại.`)) return;
+    await controller.removeTypesafeKey();
   });
-  $("btn-remove-text-model-key").addEventListener("click", async () => {
-    if (!confirm("Xóa API key của mô hình văn bản đã lưu? Các phiên đang chạy dùng key này sẽ bị hủy.")) return;
-    await controller.removeTypesafeKey("textModel");
+
+  $("btn-save-jevtools").addEventListener("click", async () => {
+    // This section's OWN save — distinct from the page's main #btn-save
+    // above, which now also persists a key typed into this input
+    // (jev-tools-reuse-primary-provider's original gap: the section had no
+    // key-saving path other than this button). This handler stays for the
+    // Jev config fields (transport source, screenshot toggle) that only IT
+    // persists, and remains a perfectly valid way to save a typed key on its
+    // own without touching the rest of the page. Read once, trimmed, cleared
+    // before the call — the same uncontrolled-secret-input rule every key
+    // field on this page follows (file header of settings-controller.js).
+    // Named distinctly from the main Save handler's own
+    // `jevToolsTransportKeyInputMain` local so a source scan for "how many
+    // times is each key input read/cleared" can tell the two handlers apart.
+    const jevToolsTransportKeyInput = $("jevtools-transport-key-input");
+    const jevToolsSecrets = { typesafeApiKey: jevToolsTransportKeyInput.value.trim() };
+    jevToolsTransportKeyInput.value = "";
+
+    await controller.saveJevTools(jevToolsSecrets);
   });
+
+  // jev-tools-connection-test-and-preference tasks.md 2.2: a separate button
+  // from the primary "Kiểm tra kết nối" above — never sends `modelId`, and
+  // never touches `connectionStatus`/the primary test's own banner.
+  $("btn-test-jevtools").addEventListener("click", () => controller.testJevToolsConnection());
 
   $("btn-chatgpt-signin-browser").addEventListener("click", async () => {
     const result = await controller.startBrowserSignIn();
@@ -1119,22 +1037,21 @@ function wireEvents() {
     // whether the save ultimately succeeds or fails.
     keyInput.value = "";
 
-    // The two TypeSafe key inputs get exactly the same treatment, in the same
-    // click, for the same reason (add-typesafe-jev-provider task 5.5): read
-    // once, trimmed, cleared before the call. They are cleared even when the
-    // displayed provider is not `typesafe` — the controller ignores them for
-    // every other provider type, and a value left sitting in a hidden password
-    // field is the one thing this page must never keep.
-    const typesafeKeyInput = $("typesafe-key-input");
-    const textModelKeyInput = $("text-model-key-input");
-    const typesafeSecrets = {
-      typesafeApiKey: typesafeKeyInput.value.trim(),
-      textModelApiKey: textModelKeyInput.value.trim()
-    };
-    typesafeKeyInput.value = "";
-    textModelKeyInput.value = "";
+    // The Jev browser-tools section's own key input (jev-tools-reuse-primary-
+    // provider) gets the SAME treatment, in this SAME click, so this page's
+    // one bottom Save button actually persists a key typed there — the
+    // section's own #btn-save-jevtools below is a separate, narrower save
+    // that most users never notice. Read once, trimmed, cleared before the
+    // call — a value left sitting in a hidden password field is the one
+    // thing this page must never keep. Named distinctly from the section's
+    // own handler's `jevToolsTransportKeyInput` local so a source scan for
+    // "how many times is each key input read/cleared" can tell the two
+    // handlers apart.
+    const jevToolsTransportKeyInputMain = $("jevtools-transport-key-input");
+    const jevToolsSecrets = { typesafeApiKey: jevToolsTransportKeyInputMain.value.trim() };
+    jevToolsTransportKeyInputMain.value = "";
 
-    await controller.save(secretInput, typesafeSecrets);
+    await controller.save(secretInput, jevToolsSecrets);
   });
   $("btn-discover-models").addEventListener("click", () => controller.discoverModels());
 

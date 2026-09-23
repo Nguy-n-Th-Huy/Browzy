@@ -29,37 +29,33 @@ const CHATGPT_OPS = new Set([
   "chatgpt_usage"
 ]);
 
-// The agent_settings ops this change adds (add-typesafe-jev-provider task
-// 5.5, design.md decision 9) — same reason CHATGPT_OPS exists above: a
-// companion built before the TypeSafe provider answers one of these with its
-// own unknown-op PROTOCOL_ERROR, which means "your companion is older than
-// this page", not "this endpoint is not Anthropic-compatible". `test_capability`
-// is deliberately NOT here: it predates the change and its PROTOCOL_ERROR
-// still means what it always did (the endpoint itself did not answer the
-// Anthropic Messages protocol).
+// The agent_settings ops the Jev browser tools' own transport section uses
+// (jev-tools-settings-on-llm-profiles) — same reason CHATGPT_OPS exists
+// above: a companion built before Jev browser tools answers one of these with
+// its own unknown-op PROTOCOL_ERROR, which means "your companion is older
+// than this page", not "this endpoint is not Anthropic-compatible".
+// `test_capability` is deliberately NOT here: it predates Jev browser tools
+// and its PROTOCOL_ERROR still means what it always did (the endpoint itself
+// did not answer the Anthropic Messages protocol).
 const TYPESAFE_OPS = new Set(["set_typesafe_config", "set_typesafe_credentials"]);
 
-// The three stages of a `typesafe` profile's capability test (design.md
-// decisions 4/5; specs/agent-settings "Explicit compatibility and connection
-// testing" — "settings identify the failed stage by name"). A TypeSafe run
-// talks to two independent services, so a bare "the connection failed" would
-// leave the operator with no idea which credential or endpoint to fix; the
-// third stage (`image`, add-jev-run-screenshots decision 5) asks the SAME
-// text-model endpoint to accept image content, so it must read as its own
-// condition — the model can be perfectly reachable for text and still reject
-// the page capture a run would send.
+// The two stages of the Jev browser-tools capability test (jev-tools-
+// connection-test-and-preference; specs/agent-settings "Explicit
+// compatibility and connection testing" — "settings identify the failed
+// stage by name"). The test talks to two independent services — the Jev
+// transport and the profile's own primary text/decision model — so a bare
+// "the connection failed" would leave the operator with no idea which
+// credential or endpoint to fix.
 const TYPESAFE_STAGE_VI = {
   systemone: "TypeSafe (câu hỏi có cấu trúc)",
-  textModel: "mô hình văn bản",
-  image: "hình ảnh",
-  search: "tìm kiếm web"
+  textModel: "mô hình văn bản"
 };
 
 /**
- * The Vietnamese name of one `typesafe` capability-test stage, or null for
- * anything else — the one place the stage keys of
+ * The Vietnamese name of one Jev browser-tools capability-test stage, or null
+ * for anything else — the one place the stage keys of
  * host/agent/jev/capability.js's result are turned into user-facing words.
- * @param {string} [stage] "systemone" | "textModel" | "image"
+ * @param {string} [stage] "systemone" | "textModel"
  * @returns {string|null}
  */
 export function typesafeStageLabel(stage) {
@@ -75,9 +71,8 @@ export function typesafeStageLabel(stage) {
  *   TYPESAFE_OPS above) and for SECURE_STORAGE_UNAVAILABLE, which promises a
  *   memory-only option: on a ChatGPT op that option is the sign-in's
  *   memory-only mode, not an API key. Every existing call site with no second
- *   argument is unaffected. `stage` (add-typesafe-jev-provider task 5.5) is
- *   one of host/agent/jev/capability.js's three result keys — "systemone",
- *   "textModel", or "image" (add-jev-run-screenshots) — and names which
+ *   argument is unaffected. `stage` is one of host/agent/jev/capability.js's
+ *   result keys — "systemone" or "textModel" — and names which Jev-tools
  *   capability failed; absent, the copy is returned exactly as it always was.
  * @returns {{ title: string, message: string, action: string }}
  */
@@ -146,8 +141,8 @@ function describeCode(code, { isChatgptOp, isTypesafeOp, stageKey }) {
       if (isTypesafeOp) {
         return {
           title: "Cần cập nhật companion",
-          message: "Companion đang kết nối chưa hỗ trợ nhà cung cấp TypeSafe, nên thao tác này không được xử lý.",
-          action: "Cập nhật Browzy companion lên phiên bản mới nhất rồi lưu lại cấu hình TypeSafe."
+          message: "Companion đang kết nối chưa hỗ trợ Jev browser tools, nên thao tác này không được xử lý.",
+          action: "Cập nhật Browzy companion lên phiên bản mới nhất rồi lưu lại cấu hình Jev browser tools."
         };
       }
       return {
@@ -162,24 +157,11 @@ function describeCode(code, { isChatgptOp, isTypesafeOp, stageKey }) {
         action: "Chọn mô hình khác hỗ trợ tool-use có cấu trúc."
       };
     case "VISION_ERROR":
-      // The `image` stage of a `typesafe` capability test lands here when the
-      // text-model endpoint rejects the embedded test image (or accepts it and
-      // never sees it): the model is reachable, it just cannot take the page
-      // capture a run would send. Runnability does not depend on this stage
-      // (design.md decision 5), so the copy points at the two ways out — a
-      // vision-capable model, or the screenshot toggle. The stage-less case is
-      // the pre-existing Anthropic vision capability, byte-identical to before.
-      return stageKey === "image"
-        ? {
-            title: "Mô hình không nhận nội dung hình ảnh",
-            message: "Mô hình văn bản từ chối hoặc không xử lý được ảnh thử nghiệm, nên ảnh chụp màn hình của lượt chạy sẽ không gửi được.",
-            action: "Chọn một mô hình văn bản nhận được nội dung hình ảnh, hoặc tắt “Gửi ảnh chụp màn hình cho mô hình quyết định” để mọi yêu cầu chỉ còn văn bản. Hồ sơ vẫn chạy được."
-          }
-        : {
-            title: "Không hỗ trợ nhận diện hình ảnh",
-            message: "Mô hình từ chối hoặc không xử lý được ảnh thử nghiệm.",
-            action: "Chọn mô hình khác hỗ trợ đầu vào hình ảnh, hoặc tiếp tục dùng ở chế độ chỉ văn bản."
-          };
+      return {
+        title: "Không hỗ trợ nhận diện hình ảnh",
+        message: "Mô hình từ chối hoặc không xử lý được ảnh thử nghiệm.",
+        action: "Chọn mô hình khác hỗ trợ đầu vào hình ảnh, hoặc tiếp tục dùng ở chế độ chỉ văn bản."
+      };
     case "REDIRECT_REJECTED":
       return {
         title: "Chặn chuyển hướng khác nguồn",
@@ -295,41 +277,27 @@ function describeCode(code, { isChatgptOp, isTypesafeOp, stageKey }) {
         action: "Bấm \"Làm mới\" để thử lại. Nếu vẫn lỗi, backend không chính thức này có thể đã thay đổi — phần còn lại của trang vẫn dùng bình thường."
       };
 
-    // TypeSafe / Jev provider (add-typesafe-jev-provider, host/agent/settings/
-    // errors.js's PROVIDER_ERROR_CODES): a 200 whose body is not the structure
-    // the caller validates, or a structured-choice answer whose probabilities
-    // do not pass the strict checks. Its own code — rather than
-    // PROTOCOL_ERROR, which reads as "update the companion", or
-    // MODEL_UNAVAILABLE_ERROR, which blames the model id — is what makes the
-    // message actionable: the service answered, it just did not answer in the
-    // shape this application may act on. Nothing is executed on an invalid
-    // answer; the run or the test stops instead.
+    // Jev browser tools' own capability test (jev-tools-connection-test-and-
+    // preference, host/agent/settings/errors.js's PROVIDER_ERROR_CODES): a
+    // 200 whose body is not the structure the caller validates, or a
+    // structured-choice answer whose probabilities do not pass the strict
+    // checks. Its own code — rather than PROTOCOL_ERROR, which reads as
+    // "update the companion", or MODEL_UNAVAILABLE_ERROR, which blames the
+    // model id — is what makes the message actionable: the service answered,
+    // it just did not answer in the shape this application may act on.
+    // Nothing is executed on an invalid answer; the test stops instead.
     case "INVALID_RESPONSE": {
       const stage = typesafeStageLabel(stageKey);
       return {
         title: stage ? `Phản hồi không hợp lệ từ ${stage}` : "Phản hồi không hợp lệ",
         message: "Dịch vụ trả về HTTP 200 nhưng nội dung không đúng cấu trúc mà ứng dụng đọc được, nên yêu cầu bị dừng thay vì được đoán.",
         action: stageKey === "textModel"
-          ? "Kiểm tra model ID và Base URL của mô hình văn bản (điểm cuối phải tương thích OpenAI Chat Completions), rồi thử lại."
+          ? "Kiểm tra cấu hình nhà cung cấp chính của hồ sơ này ở phần phía trên (Base URL và model ID nếu là hồ sơ Anthropic-compatible; đăng nhập lại hoặc chọn mô hình khác nếu là hồ sơ ChatGPT), rồi thử lại."
           : stageKey === "systemone"
             ? "Kiểm tra model ID TypeSafe và điểm cuối TypeSafe của hồ sơ này, rồi thử lại."
-            : stageKey === "image"
-              ? "Chọn một mô hình văn bản nhận được nội dung hình ảnh, hoặc tắt “Gửi ảnh chụp màn hình cho mô hình quyết định”, rồi thử lại."
-              : "Kiểm tra model ID và điểm cuối của nhà cung cấp (TypeSafe hoặc mô hình văn bản), rồi thử lại."
+            : "Kiểm tra cấu hình nhà cung cấp chính (Anthropic-compatible hoặc ChatGPT) hoặc điểm cuối TypeSafe của hồ sơ này, rồi thử lại."
       };
     }
-    // The search stage of a `typesafe` capability test: the decision-model
-    // source cannot run a provider-side web search. Deliberately NOT phrased
-    // as a broken configuration — nothing is blocked by it. The run still
-    // reads the URLs it can name from the page or the goal, which is the
-    // capability the consultation toggle governs; only the model's own search
-    // is absent.
-    case "SEARCH_UNAVAILABLE":
-      return {
-        title: "Mô hình quyết định không tự tìm kiếm web được",
-        message: "Nguồn mô hình quyết định của hồ sơ này không chạy được tìm kiếm web phía nhà cung cấp, nên câu trả lời sẽ không có kết quả tìm kiếm.",
-        action: "Không cần sửa gì: lượt chạy vẫn đọc được các URL thấy trên trang hoặc nêu trong mục tiêu. Muốn có tìm kiếm, chọn nguồn mô hình quyết định chuẩn Anthropic với model hỗ trợ công cụ tìm kiếm."
-      };
     // Skills catalog codes (host/agent/skills/errors.js — task 7.3).
     case "INVALID_METADATA":
       return {

@@ -1,5 +1,5 @@
-// The 32 browzy-in-chrome tool definitions (25 preserved-baseline operations
-// plus 7 post-baseline operations — the 2 WebMCP page tools added by
+// The 33 browzy-in-chrome tool definitions (25 preserved-baseline operations
+// plus 8 post-baseline operations — the 2 WebMCP page tools added by
 // openspec/changes/consume-webmcp-page-tools, browser_batch added by
 // openspec/changes/add-browser-batch-tool, list_connected_browsers plus
 // select_browser added by openspec/changes/implement-stubbed-browser-tools
@@ -439,6 +439,21 @@ export const TOOLS = [
         .describe(
           "If true, clear the network requests after reading to avoid duplicates on subsequent calls. Default is false."
         )
+    }
+  },
+  {
+    name: "page_monitor",
+    description:
+      "Monitor any web page using its rendered DOM/text snapshot, with optional observed JSON as a fallback. After navigating to the requested detail page, call this tool directly with action=save; do not look for a page_monitor UI, browser extension menu, input field, or on-page log. Browzy stores the snapshot in extension-global storage and extracts stable identifiers from the supplied identifier, current page URL, and page text. A successful result has ok=true, action=save, and status=saved; ok=false is the authoritative capture failure to report. Save a baseline by identifier or page URL, check it after the configured interval, and return field-level added/removed/changed values. Use action=list to see saved monitors or action=delete with monitorId to remove one.",
+    paramShape: {
+      tabId: z.number().describe("Tab ID containing the loaded page to monitor."),
+      action: z.enum(["save", "check", "list", "delete"]).optional().describe("Operation to perform. Defaults to list."),
+      identifier: z.string().optional().describe("Identifier for the page record to monitor, when the response contains one."),
+      url: z.string().optional().describe("The page or API URL for the record."),
+      kind: z.string().optional().describe("Optional label for the monitored record. Defaults to auto."),
+      intervalDays: z.number().positive().max(365).optional().describe("Days between checks. Defaults to 7."),
+      monitorId: z.string().optional().describe("Saved monitor ID for check or delete."),
+      force: z.boolean().optional().describe("For check, bypass the interval gate and capture immediately.")
     }
   },
   {

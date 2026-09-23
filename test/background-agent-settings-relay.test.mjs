@@ -168,11 +168,11 @@ async function main() {
     ok(res.ok === true && res.result && res.result.planType === "plus", "the display-shaped reply resolves back to its caller");
   }
 
-  console.log("== both TypeSafe provider ops are allowlisted ==");
+  console.log("== both Jev browser-tools transport ops are allowlisted ==");
   {
-    // add-typesafe-jev-provider task 5.5. Omitted here, the settings page's
-    // third provider type would answer every save of its text-model config or
-    // its two keys with the local unknown-op PROTOCOL_ERROR above — the form
+    // jev-tools-settings-on-llm-profiles. Omitted here, the settings page's
+    // Jev-tools section would answer every save of its transport config or
+    // its key with the local unknown-op PROTOCOL_ERROR above — the form
     // would look saved while nothing reached the companion, which is exactly
     // the class of silent failure the permission-mode ops' comment describes.
     const typesafeOps = ["set_typesafe_config", "set_typesafe_credentials"];
@@ -183,13 +183,13 @@ async function main() {
         op,
         profileId: "default",
         ...(op === "set_typesafe_config"
-          ? { textModelBaseUrl: "https://api.openai.com/v1", textModelId: "gpt-5-mini" }
+          ? { typesafeSource: "vercel", jevToolsSendScreenshots: true }
           : { typesafeApiKey: `key-${i}` })
       })
     );
-    ok(posted.length === typesafeOps.length, `both TypeSafe ops were forwarded (${posted.length}/${typesafeOps.length})`);
+    ok(posted.length === typesafeOps.length, `both Jev-tools transport ops were forwarded (${posted.length}/${typesafeOps.length})`);
     ok(posted.every((env, i) => env.op === typesafeOps[i]), "each forwarded envelope carries its own op name unchanged");
-    ok(posted[0].textModelBaseUrl === "https://api.openai.com/v1" && posted[0].textModelId === "gpt-5-mini",
+    ok(posted[0].typesafeSource === "vercel" && posted[0].jevToolsSendScreenshots === true,
       "set_typesafe_config's non-secret payload rides along unchanged");
     ok(posted[1].typesafeApiKey === "key-1",
       "set_typesafe_credentials' key field rides along (the relay is a pass-through, never a filter that drops it)");

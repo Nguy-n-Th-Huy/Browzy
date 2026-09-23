@@ -166,6 +166,8 @@ import { sdkQualifiedToolNames, legacyToolNameFromSdkName, SDK_MCP_SERVER_NAME }
 import { createWebFetchPreToolUseHook } from "../policy/webfetch-url-guard.js";
 import { createPermissionModeGateHook } from "../policy/can-use-tool.js";
 import { _mutationClassificationCoverage } from "./mapping.js";
+import { BROWSER_SUBGOAL_TOOL_NAME } from "./browser-subgoal.js";
+import { EXTRACT_PAGE_TOOL_NAME } from "./extract-page.js";
 
 // Filesystem writes and arbitrary command execution stay disabled by
 // default — that is this project's own non-negotiable, unchanged by the
@@ -360,6 +362,8 @@ export function renderBrowserAutomationSystemPrompt(serverName = SDK_MCP_SERVER_
     "",
     `Use ${t("get_page_text")} when you need to READ the page's text: an article, a list of results, the content the user is asking about. That is reading, not navigating — it is not how you locate a button.`,
     "",
+    `For API/page change tracking, after you navigate to the requested detail page call ${t("page_monitor")} directly with action "save" using the record identifier or page/API URL. Do this even when there is no visible page_monitor panel, webpage input, or on-page log: the structured tool result is the evidence. Treat ok=true with action "save" and status "saved" as success; treat ok=false as the capture failure to report. It automatically captures matching JSON from the target tab and may reload that tab once to obtain a completed response body. Never ask the user to copy JSON from DevTools or paste a response manually.`,
+    "",
     `**Do not fetch a page you already have open.** \`WebFetch\` runs server-side and carries none of this browser's session, so for a page the user is signed in to it sees the signed-out version — or a login wall — and returns it with nothing to say the content differs from what is on screen. An answer built from that is about a different page than the one the user is looking at. The tab in front of you is read with ${t("get_page_text")}, ${t("read_page")} or ${t("find")}, which see it exactly as the user's own session renders it. Reach for \`WebFetch\` only for a URL that is NOT open in the browser, and prefer opening it in a tab when the task is about that page at all.`,
     "",
     `Do not dump the page's accessibility tree to decide where to click. ${t("read_page")} is a last resort for a page you cannot get at any other way; it is large, slow, and turns visible work into an invisible DOM operation. Searching for a label with ${t("find")} is not that — it is the normal first move.`,
@@ -389,6 +393,8 @@ export function renderBrowserAutomationSystemPrompt(serverName = SDK_MCP_SERVER_
     `Some actions are never allowed inside a batch because they need the user's own decision: a click on a submit/send/pay/confirm control, a page-declared tool call, or an Enter/Space press that may activate a submit control. A batch containing one is refused before anything runs, naming the item — issue that action as its own call so the user sees exactly what they are approving.`,
     "",
     "Coordinates in a batch are read against the screenshot from BEFORE the batch started, because no screenshot taken inside the batch reaches you. If an earlier item scrolls, expands or navigates, use a ref for the later steps instead of a coordinate you have not verified.",
+    "",
+    `A result that already states the outcome — a navigation succeeded, a field was filled, a click landed — does not need its own confirmation screenshot. Screenshot when you are about to act on what you see, when the outcome is ambiguous, or when the user asked to see it: every turn spent re-checking text the result already stated is seconds the user waits.`,
     "",
     "## Running script against a page",
     "",
@@ -486,6 +492,56 @@ export function renderUploadGrantsSystemPrompt(uploadGrants) {
     ...paths.map((p) => `- ${p}`),
     "Any other local path is refused before dispatch — do not guess at one."
   ].join("\n");
+}
+
+/**
+ * The Jev-tools preference nudge (jev-tools-connection-test-and-preference
+ * design.md decision 4 / tasks.md 3.1). `browser_subgoal` and `extract_page`
+ * are each configured, gated Jev SDK tools (jev-browser-subgoal-tool /
+ * jev-extract-page-tool) that may or may not be registered for THIS run —
+ * `extraToolNames` is the same list `buildIsolatedOptions` uses to compute
+ * `qualifiedBrowserToolNames` below, so this reads the identical source of
+ * truth about what the model can actually call.
+ *
+ * Strictly additive guidance, never a constraint: the native tools
+ * (`computer`, `find`, `form_input`, etc.) stay available and this never
+ * says otherwise. A tool absent from `extraToolNames` is NEVER named here —
+ * the spec's own scenario ("Only the registered tool is referenced") is the
+ * reason this checks membership per tool rather than emitting one shared
+ * paragraph. Returns `null` (not `""`) when neither tool is present, so the
+ * `.filter(Boolean).join(...)` below adds nothing and the assembled
+ * `systemPromptText` is byte-for-byte the text a run without either tool
+ * received before this capability existed.
+ *
+ * @param {string} serverName
+ * @param {string[]} extraToolNames
+ * @returns {string|null}
+ */
+export function renderJevToolsPreferenceSystemPrompt(serverName, extraToolNames) {
+  const names = Array.isArray(extraToolNames) ? extraToolNames : [];
+  const hasBrowserSubgoal = names.includes(BROWSER_SUBGOAL_TOOL_NAME);
+  const hasExtractPage = names.includes(EXTRACT_PAGE_TOOL_NAME);
+  if (!hasBrowserSubgoal && !hasExtractPage) return null;
+
+  const t = (name) => `mcp__${serverName}__${name}`;
+  const lines = ["## Default to the Jev browser tools when available"];
+  if (hasBrowserSubgoal) {
+    lines.push(
+      `${t(BROWSER_SUBGOAL_TOOL_NAME)} is the primary, default way to perform every page interaction — click, type, select, submit, or navigate within the page — by describing the goal in natural language and letting it observe, find, and act in one step. Do not fall back to the read_page-then-find-then-${t("computer")}-click pattern for interactions. Use ${t("computer")}/${t("form_input")} only as a fallback: when a ${t(BROWSER_SUBGOAL_TOOL_NAME)} attempt fails, returns blocked, or the step is something it cannot express.`
+    );
+    lines.push(
+      `Group a coherent sequence of related interactions into ONE ${t(BROWSER_SUBGOAL_TOOL_NAME)} call — fill and submit a form in one goal, not one subgoal per field or click. Return to your own reasoning only at a real decision point or when a subgoal reports blocked.`
+    );
+    lines.push(
+      `One subgoal can carry a whole user-visible flow — navigate, search, filter, open the right result — while its steps serve one end state; splitting it into many small subgoals, or interleaving your own clicks, finds and screenshots between subgoals, is the slow path the user waits on. The checkpoint's own observed page (URL, title, what changed, the actions taken) is your fresh view of that work: decide the next step from what it reports, and take your own screenshot or read only when the checkpoint leaves the next step genuinely undecided or the user asked to see it.`
+    );
+  }
+  if (hasExtractPage) {
+    lines.push(
+      `${t(EXTRACT_PAGE_TOOL_NAME)} is the primary, default way to read structured or field-level data from a page. Keep ${t("read_page")}/${t("get_page_text")} for free-text reading and inspection only, falling back to them when ${t(EXTRACT_PAGE_TOOL_NAME)} cannot express what you need.`
+    );
+  }
+  return lines.join("\n");
 }
 
 /**
@@ -740,7 +796,13 @@ export function buildIsolatedOptions({
   const systemPromptText = [
     renderBrowserAutomationSystemPrompt(serverName),
     renderPageContextSystemPrompt(pageContext),
-    renderUploadGrantsSystemPrompt(uploadGrants)
+    renderUploadGrantsSystemPrompt(uploadGrants),
+    // jev-tools-connection-test-and-preference tasks.md 3.1: strictly
+    // conditional on `extraToolNames` (computed below into
+    // `qualifiedBrowserToolNames`, but read from the SAME source here) — see
+    // `renderJevToolsPreferenceSystemPrompt`'s own doc comment for why an
+    // absent tool is never named and why neither present adds nothing at all.
+    renderJevToolsPreferenceSystemPrompt(serverName, extraToolNames)
   ]
     .filter(Boolean)
     .join("\n\n");

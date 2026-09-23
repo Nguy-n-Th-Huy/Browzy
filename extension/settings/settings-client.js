@@ -13,6 +13,13 @@
 //   op: "set_credential"       payload: { profileId, secret, memoryOnly? }
 //   op: "remove_credential"    payload: { profileId }
 //   op: "test_capability"      payload: { profileId, modelId }
+//                              payload: { profileId, target: "jev-tools" }
+//                                 (jev-tools-connection-test-and-preference
+//                                 tasks.md 1.2/2.2: tests the Jev browser-
+//                                 tools config attached to an
+//                                 anthropic/chatgpt profile instead of the
+//                                 primary provider; absent `target` is the
+//                                 pre-existing behavior above, unchanged)
 //   op: "discover_models"      payload: { profileId }
 //   op: "export_profile"       payload: { profileId }
 //
@@ -65,93 +72,44 @@
 // id, no user id, and no email — the page already shows the profile's own
 // email and plan, so every extra identity field would be a leak surface.
 //
-// TypeSafe / Jev provider ops (add-typesafe-jev-provider design.md decisions
-// 1/5/9 — the host side is host/agent/settings/profile.js's
-// setTypesafeConfig()/setTypesafeCredentials(), which persist
-// `textModelBaseUrl`/`textModelId` on the profile and the two keys in ONE
-// merged JSON secret at `browzy-in-chrome/typesafe/<profileId>`):
-//   op: "set_typesafe_config"      payload: { profileId, baseUrl?, typesafeSource?, textModelBaseUrl?, textModelId?, sendScreenshots?, consultSources?, decisionSource?, decisionBaseUrl?, decisionModelId? }
+// Jev browser tools' own transport ops (jev-tools-settings-on-llm-profiles —
+// the host side is host/agent/settings/profile.js's
+// setTypesafeConfig()/setTypesafeCredentials(), which persist the transport
+// source on the profile and the transport key in the JSON secret at
+// `browzy-in-chrome/typesafe/<profileId>`). These configure ONLY the Jev
+// transport (element selection) that `extract_page`/`browser_subgoal` use —
+// the tools' text/decision model is always the profile's own primary
+// Anthropic/ChatGPT provider, resolved host-side, and is never configured
+// through these ops:
+//   op: "set_typesafe_config"      payload: { profileId, typesafeSource?, jevToolsSendScreenshots? }
 //                                 -> result: the updated secret-free profile
 //                                 (same result shape as "get_profile":
-//                                 `textModelBaseUrl`, `textModelId`,
-//                                 `hasTypesafeKey`, `hasTextModelKey`
-//                                 booleans, alongside the pre-existing
-//                                 fields). `baseUrl` is the TypeSafe endpoint
-//                                 (design.md decision 1 reuses the profile's
-//                                 own Base URL for it, defaulting to
-//                                 https://api.typesafe.ai host-side) and is
-//                                 OPTIONAL: the settings page DOES have a
-//                                 TypeSafe endpoint field now
-//                                 (add-typesafe-endpoint-field) and the
-//                                 endpoint is persisted through `save_profile`
-//                                 from the same draft, so this client forwards
-//                                 a caller-supplied `baseUrl` only when one is
-//                                 passed — `set_typesafe_config` is not the
-//                                 endpoint writer in the shipped flow; an
-//                                 omitted `baseUrl` never clears what is
-//                                 stored.
-//                                 `sendScreenshots` (add-jev-run-screenshots
-//                                 design.md decision 4) is this profile's
-//                                 screenshot toggle: a non-secret boolean,
-//                                 persisted with the rest of the config and
-//                                 resolved to the documented default (enabled)
-//                                 on load, so `get_profile` always answers a
-//                                 boolean — absent on an older companion, which
-//                                 the settings page reads as enabled. An
-//                                 OMITTED value keeps the stored one.
-//                                 `consultSources`
-//                                 (jev-runs-consult-sources-beyond-the-page
-//                                 task 5.1/5.2) is this profile's source-
-//                                 consultation toggle: a non-secret boolean,
-//                                 same rules as `sendScreenshots` above —
-//                                 persisted with the rest of the config,
-//                                 resolved to the documented default (enabled)
-//                                 on load, and an OMITTED value keeps the
-//                                 stored one. When on, a run may fetch, read-
-//                                 only and without credentials, at most 3 URLs
-//                                 it saw on the driven page or that the goal
-//                                 named.
-//                                 `textModelBaseUrl` is the OpenAI-compatible
-//                                 root the text helper appends
-//                                 "/chat/completions" to, so a terminal "/v1"
-//                                 is SIGNIFICANT and preserved (unlike the
-//                                 Anthropic Base URL above, whose /v1 the SDK
-//                                 appends itself).
-//                                 `decisionSource` (task 3.6) is the
-//                                 `typesafe` profile's decision-model source —
-//                                 `openai` (the documented default; the pair
-//                                 above), `anthropic` (the profile's EXISTING
-//                                 Anthropic credential, set/removed through
-//                                 the pre-existing set_credential/
-//                                 remove_credential ops, never this one — plus
-//                                 `decisionBaseUrl`, an Anthropic-standard
-//                                 endpoint), or `chatgpt` (the existing
-//                                 ChatGPT sign-in/gateway, reused verbatim —
-//                                 no key rides this op for it either).
-//                                 `decisionModelId` is required by BOTH
-//                                 `anthropic` and `chatgpt`. The settings page
-//                                 sends only the ACTIVE source's own subset of
-//                                 these keys (settings-controller.js's
-//                                 validateDecisionSourceFields()) — an omitted
-//                                 key, exactly like `baseUrl` above, keeps
-//                                 whatever the companion already has stored
-//                                 for a deselected source, so switching away
-//                                 and back never re-asks for it.
-//   op: "set_typesafe_credentials" payload: { profileId, typesafeApiKey?, textModelApiKey?, memoryOnly? }
-//                                 -> result: { backend, hasTypesafeKey, hasTextModelKey }
+//                                 `hasTypesafeKey` boolean, alongside the
+//                                 pre-existing fields).
+//                                 `jevToolsSendScreenshots`
+//                                 (jev-subgoal-screenshots-default-off
+//                                 design.md decision 1) is whether a
+//                                 `browser_subgoal` sub-run captures a
+//                                 screenshot for its optional planning/content
+//                                 model — Jev's own action selection never
+//                                 receives the image either way. A non-secret
+//                                 boolean, resolved to the documented default
+//                                 (DISABLED) on load. An OMITTED value keeps
+//                                 the stored one.
+//   op: "set_typesafe_credentials" payload: { profileId, typesafeApiKey?, memoryOnly? }
+//                                 -> result: { backend, hasTypesafeKey }
 //                                 WRITE-ONLY, in this direction only: the raw
 //                                 key value travels out exactly like
 //                                 `set_credential`'s, is never echoed back,
-//                                 and the reply is booleans plus the
+//                                 and the reply is a boolean plus the
 //                                 non-secret storage-backend label. An
-//                                 OMITTED key keeps the key already stored for
-//                                 that half; an explicit "" removes it, and
-//                                 removal is what the two "Xóa key" actions
-//                                 below send (never a delete of the other
-//                                 half). `memoryOnly: true` means exactly what
-//                                 it means for `set_credential`: hold the keys
-//                                 in the companion's memory only, never in the
-//                                 OS credential store (specs/agent-settings
+//                                 OMITTED key keeps the key already stored;
+//                                 an explicit "" removes it, and removal is
+//                                 what the "Xóa key" action sends. `memoryOnly:
+//                                 true` means exactly what it means for
+//                                 `set_credential`: hold the key in the
+//                                 companion's memory only, never in the OS
+//                                 credential store (specs/agent-settings
 //                                 "Secret isolation"), and is sent only for an
 //                                 explicit, user-confirmed retry after
 //                                 SECURE_STORAGE_UNAVAILABLE.
@@ -232,6 +190,12 @@ export function createSettingsClient(opts = {}) {
     setCredential: (profileId, secret, options) => call("set_credential", { profileId, secret, ...(options || {}) }),
     removeCredential: (profileId) => call("remove_credential", { profileId }),
     testCapability: (profileId, modelId) => call("test_capability", { profileId, modelId }),
+    // jev-tools-connection-test-and-preference tasks.md 1.2/2.2: the SAME
+    // `test_capability` op, routed by the companion to the separate
+    // Jev-tools test via `target: "jev-tools"` — never `modelId` (the
+    // Jev-tools config is resolved from the profile itself, not a chosen
+    // conversation model).
+    testJevToolsCapability: (profileId) => call("test_capability", { profileId, target: "jev-tools" }),
     discoverModels: (profileId) => call("discover_models", { profileId }),
     exportProfile: (profileId) => call("export_profile", { profileId }),
     // Named-profile collection ops (P2, task 9.2): same `agent_settings`
@@ -263,13 +227,10 @@ export function createSettingsClient(opts = {}) {
     // block above for the exact reply shape).
     chatgptUsage: (profileId) => call("chatgpt_usage", { profileId }),
 
-    // TypeSafe / Jev provider (add-typesafe-jev-provider): the non-secret
-    // text-model configuration, and the two write-only keys. Both are
-    // documented in the wire-contract block above; `setTypesafeConfig` only
-    // forwards the keys its caller actually set, so an omitted `baseUrl`
-    // never overwrites what is stored — the TypeSafe endpoint is written by
-    // `save_profile` from the page's draft (add-typesafe-endpoint-field),
-    // and `setTypesafeCredentials`'s explicit "" is the removal signal (an
+    // Jev browser tools' own transport config, and its write-only key. Both
+    // are documented in the wire-contract block above; `setTypesafeConfig`
+    // only forwards the keys its caller actually set, and
+    // `setTypesafeCredentials`'s explicit "" is the removal signal (an
     // omitted key keeps what is stored). Neither method ever reads a key
     // back out of a reply — the reply is booleans only.
     setTypesafeConfig: (profileId, config) => call("set_typesafe_config", { profileId, ...(config || {}) }),

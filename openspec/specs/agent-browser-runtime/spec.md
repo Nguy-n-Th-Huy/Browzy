@@ -256,7 +256,7 @@ Marking SHALL be relative to the current document. When the document identity ch
 
 ### Requirement: Page snapshot operation
 
-The runtime SHALL provide a `page_snapshot` operation that returns, for one tab, a bounded and structured observation: the page URL and title; viewport size and scroll position; an ordered table of the tab's currently visible, enabled interactive controls, each carrying a code-owned element reference that existing actions (`computer` clicks, `form_input`, `scroll_to`) resolve exactly as they resolve `read_page`/`find` references, together with the control's role, accessible name, and current state (value, checked/selected/expanded state, disabled state, and options for native selects); a bounded extract of the page's rendered text — elements that are not rendered (`display: none`, `visibility: hidden`, the `hidden` attribute) SHALL contribute nothing, so hidden navigation, collapsed menus, or other invisible chrome cannot crowd the extract ahead of the page's content; and explicit disclosure, including an omission count, whenever the element table or the text was truncated by a bound. The text bound SHALL be sized so that a long content page's main content is reached rather than consumed by chrome, and a truncation SHALL always be disclosed. The operation SHALL NOT mutate the page or browser state, SHALL be classified read-only for tab-scope purposes (usable on the bound page tab on the same terms as the existing read tools), and SHALL never be classified send/submit-class. Values of masked controls SHALL be returned in their masked form, never their live values.
+The runtime SHALL provide a `page_snapshot` operation that returns, for one tab, a bounded and structured observation: the page URL and title; viewport size and scroll position; an ordered table of the tab's currently visible, enabled interactive controls, each carrying a code-owned element reference that existing actions (`computer` clicks, `form_input`, `scroll_to`) resolve exactly as they resolve `read_page`/`find` references, together with the control's role, accessible name, and current state (value, checked/selected/expanded state, disabled state, and options for native selects); a bounded extract of the page's rendered text — elements that are not rendered (`display: none`, `visibility: hidden`, the `hidden` attribute) SHALL contribute nothing, so hidden navigation, collapsed menus, or other invisible chrome cannot crowd the extract ahead of the page's content; and explicit disclosure, including an omission count, whenever the element table or the text was truncated by a bound. The text bound SHALL be sized so that a long content page's main content is reached rather than consumed by chrome, and a truncation SHALL always be disclosed. A listed control whose markup provides no accessible name SHALL still be identified: the visible caption presented beside it in its field group SHALL name it when the page provides one, and otherwise its own visible text SHALL stand in, bounded as every other name is. A control's own text SHALL NOT displace a caption that names it, because for a combobox that text is the value it currently displays rather than its name. A control that already has an accessible name SHALL be unaffected. The operation SHALL NOT mutate the page or browser state, SHALL be classified read-only for tab-scope purposes (usable on the bound page tab on the same terms as the existing read tools), and SHALL never be classified send/submit-class. Values of masked controls SHALL be returned in their masked form, never their live values.
 
 #### Scenario: Structured observation with resolvable references
 
@@ -278,6 +278,26 @@ The runtime SHALL provide a `page_snapshot` operation that returns, for one tab,
 - **WHEN** `page_snapshot` targets a tab outside the session's owned group that the user has bound, without mutating authorization
 - **THEN** the observation is allowed on the same basis as the existing read tools, and no page or browser state is changed and no dispatch outside the read path occurs
 
+#### Scenario: A widget control carries no accessible name
+
+- **WHEN** a listed control is a generic container with no accessible name from any markup source, and the page shows its state as text inside a descendant the table does not list
+- **THEN** the control is listed with a name that identifies it rather than an empty one, so two such controls nested in one another can be told apart
+
+#### Scenario: A caption names the control instead of its value
+
+- **WHEN** an unnamed combobox displays its current value as its own text and a visible caption precedes it in the same field group
+- **THEN** the caption names the control and the displayed value does not displace it
+
+#### Scenario: An existing accessible name is untouched
+
+- **WHEN** a control already carries an accessible name from its markup, including one a page authored poorly
+- **THEN** that name is reported unchanged and no fallback replaces it
+
+#### Scenario: Surrounding prose does not become a name
+
+- **WHEN** an unnamed interactive container holds or sits beside long or unrelated text rather than a short caption
+- **THEN** no name is invented from that text and the bounds that keep names short still hold
+
 ### Requirement: Decision-engine independence of execution guarantees
 
 A run's execution guarantees SHALL NOT depend on which decision engine drives it. Whether a step's tool call originates from the LLM tool-use loop or from the structured-choice runtime, an equivalent classified call SHALL pass the same run-state, lease, and tab-scope checks; the same protected-action backstop; the same send/submit approval gate and bound single-use approval artifacts; the same borrowed-tab rules; and the same result-unknown handling. Stop SHALL prevent further dispatch identically in both, and a dispatched effect SHALL never be represented as undone in either.
@@ -291,3 +311,41 @@ A run's execution guarantees SHALL NOT depend on which decision engine drives it
 
 - **WHEN** a dispatch's response is lost under either engine
 - **THEN** both report the action as result unknown, neither retries it automatically, and both pause further mutation until page state is observed again
+
+### Requirement: Run guidance prefers the Jev browser tools when they are available
+
+When a run has the `browser_subgoal` and/or `extract_page` tools registered, the run's system guidance SHALL instruct the model to treat the registered Jev tool as the primary path for its purpose and to treat the native tools as a fallback used only when the Jev tool fails, returns blocked, or cannot express the step. Specifically, when `browser_subgoal` is registered the guidance SHALL instruct defaulting to `browser_subgoal` for every page interaction (clicking, typing, selecting, submitting, in-page navigation) by describing the goal in natural language, and using `computer`/`form_input` only as that fallback rather than as the default. When `extract_page` is registered the guidance SHALL instruct defaulting to `extract_page` for structured data reads rather than reading and parsing the page manually. This guidance SHALL be emitted only for the tools actually registered for that run, SHALL NOT reference a tool that is absent, and SHALL leave the existing browser-automation guidance and the native tools available and unchanged — it is guidance, not enforcement, and the native tools remain callable. A run without either Jev tool SHALL receive exactly the guidance it received before this capability existed.
+
+#### Scenario: Guidance appears when the tool is present
+
+- **WHEN** a run is configured with `browser_subgoal` (and/or `extract_page`) registered
+- **THEN** the system guidance instructs using that tool as the primary path for its purpose, and the native tools remain available
+
+#### Scenario: Native tools are named as fallback only
+
+- **WHEN** `browser_subgoal` is registered
+- **THEN** the guidance directs the model to reach for `computer`/`form_input` only when a `browser_subgoal` attempt fails, is blocked, or cannot express the step — not as the default for interactions
+
+#### Scenario: No guidance when the tool is absent
+
+- **WHEN** a run has neither `browser_subgoal` nor `extract_page` registered
+- **THEN** the system guidance does not mention them and is byte-for-byte the guidance given before this capability existed
+
+#### Scenario: Only the registered tool is referenced
+
+- **WHEN** only `extract_page` is registered (text model configured but not the decision model/transport)
+- **THEN** the guidance references `extract_page` only and does not instruct using `browser_subgoal`
+
+### Requirement: Run guidance batches related interactions into one Jev subgoal
+
+When `browser_subgoal` is registered for a run, the run's system guidance SHALL instruct the model to batch a coherent sequence of related page interactions into a single `browser_subgoal` goal (for example, filling all fields of a form and submitting it) rather than issuing one subgoal per click, and to return to its own reasoning only at a real decision point or when a subgoal reports blocked. This guidance SHALL be emitted only when `browser_subgoal` is registered for that run, SHALL NOT be emitted when it is absent, and SHALL not weaken any dispatch guard or approval — a send/submit-class step inside a batched subgoal still suspends on its own approval card.
+
+#### Scenario: Guidance encourages batching when the tool is present
+
+- **WHEN** a run has `browser_subgoal` registered
+- **THEN** the system guidance instructs grouping a coherent sequence of related interactions into one `browser_subgoal` rather than one per click
+
+#### Scenario: No batching guidance when the tool is absent
+
+- **WHEN** a run does not have `browser_subgoal` registered
+- **THEN** the system guidance does not mention batching subgoals

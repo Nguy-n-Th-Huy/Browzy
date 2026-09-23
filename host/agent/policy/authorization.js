@@ -43,6 +43,7 @@ const TAB_ARG_KEYS = {
   page_snapshot: ["tabId"],
   read_console_messages: ["tabId"],
   read_network_requests: ["tabId"],
+  page_monitor: ["tabId"],
   read_page: ["tabId"],
   set_tab_focus: ["tabId"],
   upload_image: ["tabId"],

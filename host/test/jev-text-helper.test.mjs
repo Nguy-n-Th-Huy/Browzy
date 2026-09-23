@@ -74,7 +74,8 @@ import {
   requestStallRecovery,
   searchWasPerformed,
   webSearchTool,
-  WEB_SEARCH_TOOL_TYPE
+  WEB_SEARCH_TOOL_TYPE,
+  decisionMessages
 } from "../agent/jev/text-helper.js";
 import { OPERATIONS, TARGET_BEARING_OPERATIONS, MAX_PAGE_TEXT_CHARS } from "../agent/jev/questions.js";
 import { JevError, DEFAULT_TIMEOUT_MS } from "../agent/jev/client.js";
@@ -1851,6 +1852,32 @@ for (const kind of ["openai", "anthropic"]) {
     } finally { await stub.close(); }
   });
 }
+
+await test("ACTION_PLAN names JSON, satisfying the json_object wire's own precondition", () => {
+  assert(/json/i.test(ACTION_PLAN), "ACTION_PLAN must literally name JSON for the Chat Completions json_object mode");
+});
+
+await test("the json_object wire appends a JSON mention when the instruction lacks one, and leaves one that already has it alone", () => {
+  const userTurn = { role: "user", content: "{}" };
+  const bare = "Decide the field's value.";
+  const withHint = decisionMessages("openai", bare, userTurn);
+  assert(withHint.length === 2 && withHint[1] === userTurn, "the user turn rides unchanged");
+  assert(withHint[0].role === "system" && /json/i.test(withHint[0].content), "the system message now names JSON");
+  assert(withHint[0].content.startsWith(bare), "the original instruction is preserved, not replaced");
+
+  const already = "Decide the field's value and return JSON.";
+  const unchanged = decisionMessages("openai", already, userTurn);
+  const mentions = (already.match(/json/gi) || []).length;
+  assert(unchanged[0].content === already, "an instruction that already names JSON is not modified");
+  assert((unchanged[0].content.match(/json/gi) || []).length === mentions, "no double-appending");
+});
+
+await test("the anthropic wire never receives the JSON hint: it carries no system message at all", () => {
+  const userTurn = { role: "user", content: "{}" };
+  const bare = "Decide the field's value.";
+  const messages = decisionMessages("anthropic", bare, userTurn);
+  assert(messages.length === 1 && messages[0] === userTurn, "anthropic gets only the user turn; the instruction rides the caller's own `system` field, untouched");
+});
 
 await test("required preparation fails honestly and blank startup has no invented page", async () => {
   const stub = await startStub((req, res) => sendJson(res, 200, completion(JSON.stringify(preparedAnswer()))));

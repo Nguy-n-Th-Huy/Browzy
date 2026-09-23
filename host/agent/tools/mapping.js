@@ -133,6 +133,13 @@ const JAVASCRIPT_TOOL_STEERING_NOTE =
 
 const LIVE_EXTRACTION_TOOLS = new Set(["get_page_text", "read_page"]);
 
+const PAGE_MONITOR_STEERING_NOTE =
+  " After navigating to a requested detail page, call page_monitor directly with action=save (using the record identifier or page URL); " +
+  "do this even when no page_monitor panel, webpage input, or on-page log is visible. The structured tool result is the evidence: " +
+  "ok=true with action=save and status=saved confirms the baseline, while ok=false is the capture failure to report. Browzy captures " +
+  "matching API JSON automatically from the target tab and may reload it once to obtain a completed response body. Do not ask the user " +
+  "to open DevTools, copy JSON, or paste a response manually.";
+
 // Tools that get the listing-page steering note (read_page and find both
 // cover enumeration of links/items, per design 9b/9c).
 const LISTING_STEERING_READ_TOOLS = new Set(["read_page", "find"]);
@@ -149,6 +156,7 @@ export function sdkFacingDescription(legacyTool) {
   if (legacyTool.name === "get_page_text") text += LISTING_STEERING_NOTE_GET_PAGE_TEXT;
   if (LISTING_STEERING_READ_TOOLS.has(legacyTool.name)) text += LISTING_STEERING_NOTE_READ_PAGE_FIND;
   if (legacyTool.name === "javascript_tool") text += JAVASCRIPT_TOOL_STEERING_NOTE;
+  if (legacyTool.name === "page_monitor") text += PAGE_MONITOR_STEERING_NOTE;
   return text;
 }
 
@@ -900,8 +908,8 @@ export function fingerprintNormalizedArgs(normalized) {
 
 // --- Mutating vs. read-only classification, by legacy tool name -----------
 //
-// A closed, exhaustive classification of all 32 registry tools — the 25
-// preserved-baseline entries plus the 7 post-baseline additions (the 2 WebMCP
+// A closed, exhaustive classification of all 33 registry tools — the 25
+// preserved-baseline entries plus the 8 post-baseline additions (the 2 WebMCP
 // page-tool operations from openspec/changes/consume-webmcp-page-tools,
 // browser_batch from openspec/changes/add-browser-batch-tool,
 // list_connected_browsers plus select_browser from
@@ -921,6 +929,7 @@ const READ_ONLY_LEGACY_TOOLS = new Set([
   "find",
   "read_console_messages",
   "read_network_requests",
+  "page_monitor",
   "debug",
   "debug_timings",
   "get_config",
@@ -1023,6 +1032,7 @@ const TAB_TARGET_ARG_KEYS = {
   page_snapshot: ["tabId"],
   read_console_messages: ["tabId"],
   read_network_requests: ["tabId"],
+  page_monitor: ["tabId"],
   read_page: ["tabId"],
   resize_window: ["tabId"],
   set_tab_focus: ["tabId"],

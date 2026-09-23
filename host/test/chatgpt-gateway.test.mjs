@@ -751,6 +751,54 @@ await check("non-stream returns one Anthropic message with the upstream text", a
   }
 });
 
+await check("non-stream survives a real-shaped upstream sequence whose response.completed output is empty", async () => {
+  // Mirrors a captured real Codex upstream sequence for a non-tool reply:
+  // response.created, response.in_progress, response.output_item.added,
+  // response.content_part.added, response.output_text.delta (x N),
+  // response.output_text.done, response.content_part.done,
+  // response.output_item.done, response.completed — with response.completed's
+  // response.output an EMPTY array. The gateway must still return non-empty
+  // Anthropic content sourced from the output_item.done item.
+  const upstream = await startMockUpstream(async (_req, res) => {
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    res.end(
+      sseFrame("response.created", { type: "response.created", response: { id: "r14", model: "gpt-5.6-terra" } }) +
+        sseFrame("response.in_progress", { type: "response.in_progress", response: { id: "r14" } }) +
+        sseFrame("response.output_item.added", { type: "response.output_item.added", output_index: 0, item: { type: "message", content: [] } }) +
+        sseFrame("response.content_part.added", { type: "response.content_part.added", output_index: 0 }) +
+        sseFrame("response.output_text.delta", { type: "response.output_text.delta", output_index: 0, delta: "hello " }) +
+        sseFrame("response.output_text.delta", { type: "response.output_text.delta", output_index: 0, delta: "world" }) +
+        sseFrame("response.output_text.done", { type: "response.output_text.done", output_index: 0 }) +
+        sseFrame("response.content_part.done", { type: "response.content_part.done", output_index: 0 }) +
+        sseFrame("response.output_item.done", {
+          type: "response.output_item.done",
+          output_index: 0,
+          item: { type: "message", content: [{ type: "output_text", text: "hello world" }] }
+        }) +
+        sseFrame("response.completed", {
+          type: "response.completed",
+          response: { id: "r14", model: "gpt-5.6-terra", output: [], usage: { input_tokens: 5, output_tokens: 2 } }
+        })
+    );
+  });
+  const { gw } = buildGateway({ upstreamUrl: upstream.url });
+  try {
+    await gw.ensureStarted();
+    const { token } = gw.issueToken({ profileId: "p1", model: "gpt-5.6-terra", credentialRevision: 1, purpose: "run" });
+    const res = await gatewayFetch(gw, "/v1/messages", { token, body: { ...anthropicMessagesBody(), stream: false } });
+    assertEqual(res.status, 200, "status");
+    const body = await readJson(res);
+    assertEqual(body.type, "message", "must be a message");
+    assert(Array.isArray(body.content) && body.content.length > 0, "content must not be empty despite response.completed's empty output");
+    assertEqual(body.content[0].type, "text", "the recovered content block is a text block");
+    assertEqual(body.content[0].text, "hello world", "the recovered text matches what output_item.done delivered");
+    assertEqual(body.stop_reason, "end_turn", "stop_reason is end_turn, not a fabricated value");
+  } finally {
+    await gw.close();
+    await upstream.close();
+  }
+});
+
 await check("stream returns text/event-stream with content_block_delta / message_stop", async () => {
   const upstream = await startMockUpstream(async (_req, res) => {
     res.writeHead(200, { "Content-Type": "text/event-stream" });

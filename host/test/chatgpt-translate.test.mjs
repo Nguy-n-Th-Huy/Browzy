@@ -744,6 +744,94 @@ console.log("\n== non-stream accumulator: reasoning with signature ==");
   ok(block.type === "thinking" && block.thinking === "because" && block.signature === "brzcx1.blob", "the non-stream thinking block carries the same brzcx1.-prefixed signature the stream path would emit");
 }
 
+console.log("\n== non-stream accumulator: empty completed output falls back to output_item.done items ==");
+{
+  // Real upstream shape: response.completed's response.output is an empty
+  // array even though the turn delivered one message item via
+  // response.output_item.done.
+  const frames = [
+    { data: { type: "response.created", response: { id: "r10", model: "m" } } },
+    { data: { type: "response.output_text.delta", delta: "hi" } },
+    { data: { type: "response.output_item.done", output_index: 0, item: { type: "message", content: [{ type: "output_text", text: "hi" }] } } },
+    {
+      data: {
+        type: "response.completed",
+        response: { id: "r10", model: "m", output: [], usage: { input_tokens: 3, output_tokens: 1 } }
+      }
+    }
+  ];
+  const result = accumulateNonStreamMessage(frames);
+  ok("message" in result, "a completed turn with an empty terminal output still returns { message }");
+  ok(result.message.content.length === 1 && result.message.content[0].type === "text" && result.message.content[0].text === "hi", "the message item delivered via output_item.done becomes the text block, even though response.output was empty");
+  ok(result.message.stop_reason === "end_turn", "stop_reason is still computed correctly from the (empty-output) terminal response");
+}
+
+console.log("\n== non-stream accumulator: reasoning + message via output_item.done, empty completed output ==");
+{
+  const frames = [
+    { data: { type: "response.output_item.done", output_index: 0, item: { type: "reasoning", summary: [{ text: "because" }], encrypted_content: "blob" } } },
+    { data: { type: "response.output_item.done", output_index: 1, item: { type: "message", content: [{ type: "output_text", text: "answer" }] } } },
+    {
+      data: {
+        type: "response.completed",
+        response: { id: "r11", model: "m", output: [], usage: {} }
+      }
+    }
+  ];
+  const result = accumulateNonStreamMessage(frames);
+  ok(result.message.content.length === 2, "both the reasoning and message items surface as content blocks");
+  ok(result.message.content[0].type === "thinking" && result.message.content[0].thinking === "because" && result.message.content[0].signature === "brzcx1.blob", "the reasoning item becomes a thinking block with its signature, sourced from output_item.done");
+  ok(result.message.content[1].type === "text" && result.message.content[1].text === "answer", "the message item becomes a text block, in arrival order after the reasoning block");
+}
+
+console.log("\n== non-stream accumulator: function_call via output_item.done, empty completed output ==");
+{
+  const longName = "v".repeat(70);
+  const { toolNameMap } = translateAnthropicRequestToCodex(
+    { tools: [{ name: longName, input_schema: { type: "object" } }], messages: [] },
+    { model: "m" }
+  );
+  const shortName = toolNameMap.get(longName);
+  const frames = [
+    { data: { type: "response.output_item.done", output_index: 0, item: { type: "function_call", call_id: "c9", name: shortName, arguments: '{"q":"weather"}' } } },
+    {
+      data: {
+        type: "response.completed",
+        response: { id: "r12", model: "m", output: [], usage: {} }
+      }
+    }
+  ];
+  const result = accumulateNonStreamMessage(frames, { toolNameMap });
+  const block = result.message.content[0];
+  ok(block.type === "tool_use" && block.name === longName && block.id === "c9", "a function_call delivered only via output_item.done (empty terminal output) still becomes a tool_use block with the restored name");
+  ok(block.input.q === "weather", "its arguments are parsed the same way as the non-empty-output path");
+  ok(result.message.stop_reason === "tool_use", "stop_reason is tool_use even though the terminal response.output was empty");
+}
+
+console.log("\n== non-stream accumulator: non-empty completed output still wins over output_item.done ==");
+{
+  // If the terminal event ever DOES carry a non-empty output (current/other
+  // upstream behavior), it must still be used as-is rather than the
+  // output_item.done collection — output_item.done here deliberately
+  // disagrees with the terminal output to prove precedence.
+  const frames = [
+    { data: { type: "response.output_item.done", output_index: 0, item: { type: "message", content: [{ type: "output_text", text: "stale" }] } } },
+    {
+      data: {
+        type: "response.completed",
+        response: {
+          id: "r13",
+          model: "m",
+          output: [{ type: "message", content: [{ type: "output_text", text: "authoritative" }] }],
+          usage: {}
+        }
+      }
+    }
+  ];
+  const result = accumulateNonStreamMessage(frames);
+  ok(result.message.content.length === 1 && result.message.content[0].text === "authoritative", "a non-empty terminal response.output is used verbatim, ignoring the (disagreeing) output_item.done collection");
+}
+
 console.log("\n== non-stream accumulator: failed/error terminal ==");
 {
   const frames = [{ data: { type: "error", error: { type: "authentication_error", message: "no" } } }];

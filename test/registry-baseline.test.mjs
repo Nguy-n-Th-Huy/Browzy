@@ -162,7 +162,8 @@ const POST_BASELINE_ADDITIONS = [
   "list_connected_browsers",
   "select_browser",
   "mask_sensitive_info",
-  "page_snapshot"
+  "page_snapshot",
+  "page_monitor"
 ];
 
 // Operations removed from the baseline, each naming its replacement, so a

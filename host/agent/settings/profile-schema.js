@@ -10,138 +10,76 @@
 // Provider type (add-chatgpt-subscription-provider design.md decision 5):
 // a profile also carries `providerType`, either `anthropic` (the only type
 // that ever existed before, and the default a profile with no such field
-// loads as), `chatgpt`, or `typesafe`. `chatgptAccount` is the ChatGPT
-// profile's non-secret companion field — signed-in email and plan type, read
-// once from the ID token by host/agent/chatgpt/auth.js — never the
-// credential itself.
+// loads as) or `chatgpt`. `chatgptAccount` is the ChatGPT profile's
+// non-secret companion field — signed-in email and plan type, read once from
+// the ID token by host/agent/chatgpt/auth.js — never the credential itself.
 //
-// `typesafe` (add-typesafe-jev-provider design.md decision 1) is the
-// TypeSafe/Jev provider; the profile additionally carries the non-secret
-// text-model fields (`textModelBaseUrl`, `textModelId`) and the per-key
-// stored-ness bookkeeping flags (`hasTypesafeKey`, `hasTextModelKey`) the
-// settings UI reads instead of ever seeing a key. Both keys live in ONE
-// secret record under the dedicated target
+// The Jev engine is reached only through the `extract_page`/`browser_subgoal`
+// tools on an `anthropic`/`chatgpt` profile, never as a provider type of its
+// own. Those tools reuse the profile's own primary text model, and need only
+// ONE piece of profile state of their own: a saved Jev transport key. That
+// key (plus a now-inert legacy text-model key kept only so nothing already
+// stored is discarded) lives in ONE secret record under the dedicated target
 // `browzy-in-chrome/typesafe/<profileId>` (host/agent/settings/profile.js) —
-// never in this object, never in `baseUrl`'s place.
+// never in this object, never in `baseUrl`'s place. A profile stored with the
+// removed `typesafe` provider type migrates to `anthropic` the first time it
+// is read (migrateStoredTypesafeProfile below) — that secret record is never
+// touched by the migration, so a saved Jev transport key keeps enabling the
+// Jev browser tools exactly as before.
 
 import { DEFAULT_BASE_URL } from "./url.js";
 
 export const PROFILE_SCHEMA_VERSION = 1;
 export const DEFAULT_PROFILE_ID = "default";
 
-export const PROVIDER_TYPES = /** @type {const} */ (["anthropic", "chatgpt", "typesafe"]);
+export const PROVIDER_TYPES = /** @type {const} */ (["anthropic", "chatgpt"]);
 export const DEFAULT_PROVIDER_TYPE = "anthropic";
 
-// The TypeSafe/Jev provider's documented endpoint default
-// (add-typesafe-jev-provider design.md decision 1: "The TypeSafe endpoint
-// reuses profile.baseUrl (default https://api.typesafe.ai, existing URL
-// validation)"). Exported for the settings surface that offers it as the
-// initial value; nothing on the run path guesses an endpoint of its own.
+// The Jev transport's documented endpoint default for its own System One
+// source. Exported so the Jev browser tools' resolvers (host/agent/settings/
+// profile.js's `typesafeDefaultForSource`) never guess an endpoint of their
+// own — the endpoint always follows the profile's persisted `typesafeSource`.
 export const DEFAULT_TYPESAFE_BASE_URL = "https://api.typesafe.ai";
 
-// The Vercel AI Gateway endpoint a `typesafe` profile uses when its source is
+// The Vercel AI Gateway endpoint the Jev transport uses when its source is
 // `vercel` (see TYPESAFE_SOURCES below). Exported for the same reason as the
-// direct default: the settings surface offers it and the host maps a
-// default-endpoint switch to it; nothing invents an endpoint.
+// direct default above.
 export const DEFAULT_TYPESAFE_GATEWAY_BASE_URL = "https://ai-gateway.vercel.sh";
 
-// The OpenRouter endpoint a `typesafe` profile uses when its source is
-// `openrouter`. Offered for the same reason as the other two defaults: the
-// settings surface fills it in and the host maps a default-endpoint switch to
-// it. OpenRouter publishes the decision route under `/api/alpha/`, so this
-// source is the one whose protocol is expected to move; the settings surface
-// labels it alpha and client.js keeps its constants in one block.
+// The OpenRouter endpoint the Jev transport uses when its source is
+// `openrouter`. Exported for the same reason as the other two defaults.
+// OpenRouter publishes the decision route under `/api/alpha/`, so this source
+// is the one whose protocol is expected to move.
 export const DEFAULT_TYPESAFE_OPENROUTER_BASE_URL = "https://openrouter.ai";
 
-// The ways a `typesafe` profile reaches the Jev model. `typesafe` is the
-// provider's own System One endpoint (`POST /v1/systemone`, a TypeSafe API
-// key); `vercel` is the Vercel AI Gateway's evaluation endpoint
-// (`POST /v4/ai/evaluation-model`, a Vercel AI Gateway key); `openrouter` is
-// OpenRouter's decision route (`POST /api/alpha/decisions`, an OpenRouter
-// key) — the same typed questions and answers over different wire protocols
-// (see host/agent/jev/client.js's source paths). Jev is never reachable
-// through any of these providers' chat-completion or Messages ports: it is an
-// evaluation model, and those ports refuse it. The profile persists the
-// choice; every consumer branches on it, and nothing sniffs the endpoint URL
-// to guess.
+// The ways the Jev browser tools (`extract_page`, `browser_subgoal`) reach
+// the Jev transport. `typesafe` is the provider's own System One endpoint
+// (`POST /v1/systemone`, a TypeSafe API key); `vercel` is the Vercel AI
+// Gateway's evaluation endpoint (`POST /v4/ai/evaluation-model`, a Vercel AI
+// Gateway key); `openrouter` is OpenRouter's decision route
+// (`POST /api/alpha/decisions`, an OpenRouter key) — the same typed questions
+// and answers over different wire protocols (see host/agent/jev/client.js's
+// source paths). Jev is never reachable through any of these providers'
+// chat-completion or Messages ports: it is an evaluation model, and those
+// ports refuse it. The profile persists the choice; every consumer branches
+// on it, and nothing sniffs the endpoint URL to guess.
 export const TYPESAFE_SOURCES = /** @type {const} */ (["typesafe", "vercel", "openrouter"]);
 export const DEFAULT_TYPESAFE_SOURCE = "typesafe";
 
-// Where a `typesafe` profile's DECISION model comes from — the model that
-// decides every step, holds the run's memory, and judges completion. Jev is
-// not that model: it answers one typed question per step on its own decision
-// route (TYPESAFE_SOURCES above), and none of these sources can reach it.
-//
-//   - `openai`:    an OpenAI-compatible Chat Completions host (base URL, model
-//                  id, key) — the wire this loop was ported onto, kept so a
-//                  local model, OpenRouter, or any other such host stays
-//                  usable;
-//   - `anthropic`: the operator's own Anthropic endpoint and key;
-//   - `chatgpt`:   their ChatGPT subscription, through the companion's local
-//                  gateway, which speaks the Anthropic Messages wire.
-//
-// The last two are the language this project already speaks everywhere else,
-// so a `typesafe` profile can run its decisions on a provider the operator has
-// already configured instead of demanding a third-party key of its own.
-// `openai` is the default, so a profile stored before this choice existed
-// keeps its behaviour exactly.
-export const TYPESAFE_DECISION_SOURCES = /** @type {const} */ (["openai", "anthropic", "chatgpt"]);
-export const DEFAULT_TYPESAFE_DECISION_SOURCE = "openai";
+// The Jev-tools screenshot toggle: controls ONLY whether a `browser_subgoal`
+// sub-run (on an `anthropic`/`chatgpt` profile) captures a screenshot for its
+// optional planning/content model — Jev's own action selection never
+// receives it either way. Opt-IN: only an explicit `true` enables it, so a
+// profile stored before this field existed (or one that never touched it)
+// loads DISABLED, and a `browser_subgoal` sub-run is text-only by default.
+export const DEFAULT_JEV_TOOLS_SEND_SCREENSHOTS = false;
 
 /**
- * @param {unknown} source
- * @returns {boolean} true only for one of the exact known decision sources.
+ * @param {{ jevToolsSendScreenshots?: unknown }} profile
+ * @returns {boolean} the resolved toggle: disabled unless explicitly on.
  */
-export function isKnownTypesafeDecisionSource(source) {
-  return TYPESAFE_DECISION_SOURCES.includes(source);
-}
-
-/**
- * A profile's decision-model source, defaulted for a profile saved before the
- * field existed. Same rule as the Jev source above: a configuration choice
- * with a documented default, validated by the writers.
- */
-export function resolveTypesafeDecisionSource(profile) {
-  const stored = profile && profile.typesafeDecisionSource;
-  return isKnownTypesafeDecisionSource(stored) ? stored : DEFAULT_TYPESAFE_DECISION_SOURCE;
-}
-
-// The `typesafe` profile's screenshot toggle (openspec/changes/
-// add-jev-run-screenshots design.md decision 4): the configured model receives
-// ONE page capture per run cycle — attached to the step decision and, when the
-// decision claims DONE, to the completion check — unless the operator turns
-// this off. Only an explicit `false` disables it, so a profile stored before
-// the field existed loads ENABLED, which is the documented default; the
-// settings surface is what turns it off, and the toggle is the cost and
-// privacy control for the image part of those requests.
-export const DEFAULT_SEND_SCREENSHOTS = true;
-
-// Whether a run may read documents beyond the page it drives (spec
-// `typesafe-jev-provider`, "A run may consult sources beyond the page it
-// drives"). On by default: the guards around the fetch are what bound the
-// risk, and a capability that ships off is a capability nobody who does not
-// read release notes ever has. The operator who disagrees turns it off here,
-// and the settings disclosure states what leaves the machine so the choice is
-// an informed one rather than a silent default.
-//
-// Only an explicit `false` disables it, so a profile stored before the field
-// existed loads ENABLED — the same rule the screenshot toggle uses.
-export const DEFAULT_CONSULT_SOURCES = true;
-
-/**
- * @param {{ consultSources?: unknown }} profile
- * @returns {boolean} the resolved toggle: enabled unless explicitly off.
- */
-export function resolveConsultSources(profile) {
-  return profile && profile.consultSources === false ? false : DEFAULT_CONSULT_SOURCES;
-}
-
-/**
- * @param {{ sendScreenshots?: unknown }} profile
- * @returns {boolean} the resolved toggle: enabled unless explicitly off.
- */
-export function resolveSendScreenshots(profile) {
-  return profile && profile.sendScreenshots === false ? false : DEFAULT_SEND_SCREENSHOTS;
+export function resolveJevToolsSendScreenshots(profile) {
+  return Boolean(profile && profile.jevToolsSendScreenshots === true);
 }
 
 /**
@@ -189,8 +127,8 @@ export function resolveProviderType(profile) {
  * @param {string} [profileId]
  * @returns the initial, empty profile: default Base URL, no models, no
  *   credential revision yet, never a guessed model, `anthropic` provider
- *   type, no ChatGPT account, no TypeSafe text-model configuration or
- *   stored keys, and the TypeSafe screenshot toggle at its enabled default.
+ *   type, no ChatGPT account, no Jev transport key, and the Jev-tools
+ *   screenshot toggle at its disabled default.
  */
 export function createEmptyProfile(profileId = DEFAULT_PROFILE_ID) {
   return {
@@ -205,30 +143,97 @@ export function createEmptyProfile(profileId = DEFAULT_PROFILE_ID) {
     memoryOnlyCredential: false,
     lastCapabilityTest: {},
     chatgptAccount: null,
-    // add-typesafe-jev-provider design.md decision 1: the non-secret
-    // text-model fields, plus the per-key stored-ness flags the settings
-    // surface reads instead of a key. A profile saved before these existed
-    // simply has them absent, which every reader treats the same as these
-    // defaults.
+    // The now-inert legacy text-model fields, kept only so a profile that
+    // stored one before the standalone Jev provider was removed does not
+    // lose it. Nothing reads these to build a request any more.
     textModelBaseUrl: null,
     textModelId: null,
+    // The Jev transport key's own stored-ness (settings surface reads this
+    // instead of ever seeing the key). `hasTextModelKey` is the same
+    // now-inert bookkeeping as `textModelBaseUrl`/`textModelId` above.
     hasTypesafeKey: false,
     hasTextModelKey: false,
-    // The persisted Jev source choice (TYPESAFE_SOURCES above); absent on a
-    // profile saved before it existed, which every reader treats as this
-    // default.
+    // The persisted Jev source choice (TYPESAFE_SOURCES above), read by the
+    // Jev browser tools' resolvers; absent on a profile saved before it
+    // existed, which every reader treats as this default.
     typesafeSource: DEFAULT_TYPESAFE_SOURCE,
-    // The decision-model source and the two non-secret fields the
-    // `anthropic`/`chatgpt` sources need (the `openai` source keeps using the
-    // text-model fields below). A deselected source's values are KEPT, so
-    // switching back does not ask the operator to type them again.
-    typesafeDecisionSource: DEFAULT_TYPESAFE_DECISION_SOURCE,
-    typesafeDecisionBaseUrl: "",
-    typesafeDecisionModelId: "",
-    // The screenshot toggle (DEFAULT_SEND_SCREENSHOTS above): stored as a
-    // plain boolean and resolved through resolveSendScreenshots() on every
-    // read, so "absent" and "explicitly enabled" are the same state.
-    sendScreenshots: DEFAULT_SEND_SCREENSHOTS
+    // The Jev-tools screenshot toggle (DEFAULT_JEV_TOOLS_SEND_SCREENSHOTS
+    // below) — stored as a plain boolean and resolved through
+    // resolveJevToolsSendScreenshots() on every read, so "absent" and
+    // "explicitly disabled" are the same state.
+    jevToolsSendScreenshots: DEFAULT_JEV_TOOLS_SEND_SCREENSHOTS
+  };
+}
+
+// The Jev transport's documented model entry per source — seeded ONCE into
+// an `anthropic`/`chatgpt` run's Jev-tools resolvers (host/agent/settings/
+// profile.js's `typesafeModelSeeds`/`typesafeDefaultForSource`) as the fixed
+// model id every decision request on that source carries. Also the shape a
+// stored model list is compared against by `migrateStoredTypesafeProfile`
+// below, to tell an untouched seed apart from a list the operator edited.
+export const TYPESAFE_MODEL_SEEDS = Object.freeze({
+  typesafe: [{ id: "jev-latest", label: "Jev (ultrafast)" }],
+  vercel: [{ id: "typesafe-ai/jev", label: "Jev (Vercel AI Gateway)" }],
+  openrouter: [{ id: "typesafe/jev-1.13", label: "Jev (OpenRouter, alpha)" }]
+});
+
+/**
+ * True when `models` is exactly one Jev source's untouched seed list — the
+ * test `migrateStoredTypesafeProfile` uses to tell an operator-edited model
+ * list apart from a list nobody ever touched after the switch that seeded it.
+ * @param {unknown} models
+ * @returns {boolean}
+ */
+function isTypesafeSeedModelList(models) {
+  if (!Array.isArray(models)) return false;
+  return Object.values(TYPESAFE_MODEL_SEEDS).some(
+    (seed) => models.length === seed.length && models.every((m, i) => m && m.id === seed[i].id && m.label === seed[i].label)
+  );
+}
+
+/**
+ * One-time migration of a stored `typesafe` profile (the removed standalone
+ * Jev provider) to `anthropic`. A profile whose `providerType` is anything
+ * else is returned BY REFERENCE, unchanged, so a caller can cheaply detect
+ * "nothing to migrate" with `result === stored` and skip a write-back.
+ *
+ * The rules:
+ *   - `providerType` becomes `anthropic`;
+ *   - `baseUrl` becomes the default Anthropic base URL — the TypeSafe
+ *     endpoint (direct, Vercel, or OpenRouter) meant nothing to an Anthropic
+ *     run;
+ *   - `models`/`defaultModelId` are cleared ONLY when the list is exactly a
+ *     Jev seed the operator never edited; any other list (including one the
+ *     operator added to or edited) is kept exactly as stored;
+ *   - `lastCapabilityTest` is cleared — a result recorded against the Jev
+ *     transport means nothing for an Anthropic endpoint;
+ *   - the standalone-only fields (`typesafeDecisionSource`,
+ *     `typesafeDecisionBaseUrl`, `typesafeDecisionModelId`, `sendScreenshots`,
+ *     `consultSources`) are dropped — nothing reads them once the standalone
+ *     run path is gone;
+ *   - `revision` is bumped, since this is a real, once-only edit.
+ *
+ * The Jev transport secret record (`browzy-in-chrome/typesafe/<profileId>`)
+ * is never touched here — the caller (profile-store.js) only rewrites the
+ * non-secret profile file — so `hasTypesafeKey`/`typesafeSource`/
+ * `jevToolsSendScreenshots` and a saved Jev transport key all keep working
+ * exactly as before for the migrated profile's Jev browser tools.
+ *
+ * @param {Record<string, unknown> | null} stored
+ * @returns {Record<string, unknown> | null}
+ */
+export function migrateStoredTypesafeProfile(stored) {
+  if (!stored || stored.providerType !== "typesafe") return stored;
+  const seedList = isTypesafeSeedModelList(stored.models);
+  const { typesafeDecisionSource, typesafeDecisionBaseUrl, typesafeDecisionModelId, sendScreenshots, consultSources, ...rest } = stored;
+  return {
+    ...rest,
+    providerType: DEFAULT_PROVIDER_TYPE,
+    baseUrl: DEFAULT_BASE_URL,
+    models: seedList ? [] : stored.models,
+    defaultModelId: seedList ? null : stored.defaultModelId,
+    lastCapabilityTest: {},
+    revision: (typeof stored.revision === "number" ? stored.revision : 0) + 1
   };
 }
 

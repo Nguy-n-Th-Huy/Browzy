@@ -5,79 +5,19 @@ Adds a TypeSafe (Jev) provider that drives browser tasks through structured choi
 
 ## Requirements
 
-### Requirement: Provider type and configuration surface
-
-A provider profile SHALL support a third provider type, `typesafe`, alongside `anthropic` and `chatgpt`. Selecting it in Settings SHALL expose the TypeSafe credential (for the selected Jev source), the text-model configuration (base URL, model ID, credential), the profile's editable model list with exactly one default model, a screenshot toggle that is enabled by default, and an editable endpoint field for the provider's own requests — prefilled with the profile's current endpoint and labeled with the selected Jev source; it SHALL NOT expose Base URL or API-key fields for an Anthropic endpoint. The provider-type choice and the provider's own settings section SHALL label the Jev integration as beta, stating that its behavior, quality, and results may change between releases. Switching a profile's provider type SHALL remain nondestructive to the other fields, and SHALL reject any value that is not a known provider type.
-
-When a `typesafe` profile's model list is empty at the moment the provider type is selected, settings SHALL seed it with the provider's documented `jev-latest` entry; an existing or user-edited list SHALL never be overwritten. The text-model base URL and text-model ID SHALL be required, nonempty settings before a run or a capability test is attempted, and SHALL be validated as a well-formed HTTPS URL (loopback HTTP permitted under the existing URL rules). The screenshot toggle SHALL persist with the profile as a non-secret setting, and a profile stored before the toggle existed SHALL load with it enabled. The endpoint SHALL be validated under the same URL rules, persisted with the profile, and used by every request the provider makes; a change of Jev source SHALL move it to the new source's documented default (`https://api.typesafe.ai` for TypeSafe API, `https://ai-gateway.vercel.sh` for Vercel AI Gateway) only while it is still a known default, and SHALL leave any other endpoint untouched — reachable for editing under its own label rather than hidden.
-
-#### Scenario: Switching to the TypeSafe provider
-
-- **WHEN** the user selects the `typesafe` provider type in Settings
-- **THEN** the Anthropic Base URL and API-key fields are hidden, the TypeSafe credential, text-model fields, the enabled screenshot toggle, and the endpoint field carrying the profile's current endpoint are shown, and an empty model list is seeded with `jev-latest` exactly once
-
-#### Scenario: The beta status is disclosed
-
-- **WHEN** the operator views the provider-type choice, or the `typesafe` provider's own section in Settings
-- **THEN** the Jev — ultrafast integration is labeled as beta there, stating that its behavior and results may change between releases
-
-#### Scenario: Existing profiles are unaffected
-
-- **WHEN** a profile of type `anthropic` or `chatgpt` is loaded or used after this change
-- **THEN** its provider type, fields, credentials, capability results, and run behavior are unchanged
-
-#### Scenario: Invalid provider type value
-
-- **WHEN** a caller attempts to persist a provider type that is not `anthropic`, `chatgpt`, or `typesafe`
-- **THEN** the change is rejected and no profile is written
-
-#### Scenario: The screenshot toggle defaults on for existing profiles
-
-- **WHEN** a `typesafe` profile stored before the toggle existed is loaded
-- **THEN** the toggle shows enabled and its runs capture the bound tab as if it had been set
-
-#### Scenario: The endpoint is editable
-
-- **WHEN** the operator edits the endpoint field on a `typesafe` profile — including an endpoint carried over as a custom URL from another provider type — to a valid URL and saves
-- **THEN** the profile persists it, subsequent capability tests and runs issue their provider requests against exactly that endpoint, and a source change no longer strands it
-
 ### Requirement: Credential and configuration storage for the TypeSafe provider
 
-The TypeSafe API key and the text-model API key SHALL be stored by the native companion in the OS credential store as one secret record under a per-profile target (`browzy-in-chrome/typesafe/<profileId>`), separate from the `anthropic` credential target and the `chatgpt` refresh-token target. Neither key SHALL ever appear in extension storage, page scripts, profile files, logs, exported settings, or the SDK environment. The settings UI SHALL accept each key write-only, SHALL clear submitted raw values, and SHALL report only whether each key is saved. A secret that does not fit the OS credential store's size limit SHALL fail with the existing `SECRET_TOO_LARGE` outcome and SHALL NOT be truncated. Removing the credential SHALL bump the credential revision, cancel active runs using it, and require re-entry before another TypeSafe request.
+The Jev transport API key used by the Jev browser tools (`browser_subgoal`, `extract_page`) on `anthropic` and `chatgpt` profiles SHALL be stored by the native companion in the OS credential store as one secret record under a per-profile target (`browzy-in-chrome/typesafe/<profileId>`), separate from the `anthropic` credential target and the `chatgpt` refresh-token target. The key SHALL never appear in extension storage, page scripts, profile files, logs, exported settings, or the SDK environment. The settings UI SHALL accept the key write-only, SHALL clear submitted raw values, and SHALL report only whether the key is saved. A secret that does not fit the OS credential store's size limit SHALL fail with the existing `SECRET_TOO_LARGE` outcome and SHALL NOT be truncated. Removing the credential SHALL bump the credential revision, cancel active runs using it, and require re-entry before another Jev transport request. A legacy text-model API key stored in the same record by an earlier version MAY remain stored, SHALL be kept when the record is migrated or rewritten, and SHALL never be read or sent anywhere.
 
 #### Scenario: Keys never leave the companion
 
 - **WHEN** settings are exported, diagnostics are viewed, or a run's environment is constructed
-- **THEN** neither the TypeSafe API key nor the text-model API key appears in the output
+- **THEN** neither the Jev transport key nor any legacy text-model API key appears in the output
 
 #### Scenario: Credential removal during a run
 
-- **WHEN** the stored TypeSafe credential is removed while a TypeSafe run is active
-- **THEN** the run is stopped through the existing revocation path and a later run requires the credential again
-
-### Requirement: TypeSafe capability test
-
-The capability test for a `typesafe` profile SHALL issue one decision request through its configured supported Jev transport with the same `action`, `goal_done`, and `stuck` Choice heads and strict response validation used by the runtime. It SHALL separately test the configured text model with a minimal single-`text` JSON completion and an embedded-image completion. Results SHALL be recorded for the exact endpoint/model/credential revision tested; changes invalidate the result. Each stage SHALL report separately. Image failure SHALL NOT decide runnability when the other stages pass, allowing screenshots to be disabled. Existing actionable error codes and `INVALID_RESPONSE` for malformed successful responses SHALL remain, and neither credential SHALL be exposed.
-
-#### Scenario: Successful test
-
-- **WHEN** the decision, text and image probes pass
-- **THEN** all three stages report success for the tested configuration and the profile is runnable
-
-#### Scenario: Invalid structured response
-
-- **WHEN** any of the three Jev heads is missing, extra or fails strict choice validation
-- **THEN** the test reports `INVALID_RESPONSE` and does not mark the profile verified
-
-#### Scenario: Text-model failure is distinguishable
-
-- **WHEN** Jev succeeds but the text completion fails or lacks valid single-key text JSON
-- **THEN** the failed stage is identifiable and the profile is not marked verified
-
-#### Scenario: Image stage is reported separately
-
-- **WHEN** only the image probe fails
-- **THEN** its own failure is reported while the profile remains runnable with screenshots disabled
+- **WHEN** the stored Jev transport key is removed while an `anthropic`/`chatgpt` run using the Jev browser tools is active
+- **THEN** the run is stopped through the existing revocation path, and a later run offers the Jev browser tools only after the key is saved again
 
 ### Requirement: Structured observation through `page_snapshot`
 
@@ -155,7 +95,6 @@ Request fitting SHALL preserve control/prepared choices, deterministically bound
 - **THEN** it remains data and cannot change host permissions or configuration
 
 ### Requirement: Text values from the configured small model
-
 
 The configured model SHALL prepare bounded text values, including an explicit empty string to clear a field, bound host-side to an exact observed editable field and current plan revision. The runtime SHALL offer only still-valid bindings and consume each after one dispatch. It SHALL never cross-product values with unrelated fields or invent missing content; new content requires bounded replanning. Invalid preparation SHALL be refused before dispatch.
 
@@ -312,20 +251,6 @@ Every attempted, executed or skipped decision SHALL produce a durable `jev_step`
 - **WHEN** a successful preparation or revision emits memory
 - **THEN** it appears in the current turn immediately
 
-### Requirement: Coexistence with the existing runtimes
-
-The TypeSafe provider SHALL be additive: `anthropic` and `chatgpt` runs, the external MCP entry points, skills, recordings, and the share of the browser lease SHALL behave exactly as before, and a TypeSafe run SHALL obey the same lease and queueing arbitration as any other run. Switching a conversation's provider identity SHALL follow the existing bound-identity rules: a conversation bound to a different provider or model requires a new conversation unless the operator explicitly starts a new context.
-
-#### Scenario: Side-by-side providers
-
-- **WHEN** a `typesafe` conversation and an `anthropic` or `chatgpt` conversation both exist
-- **THEN** each runs under its own provider path, lease contention is arbitrated exactly as between two LLM conversations, and neither path's behavior is altered by the other's existence
-
-#### Scenario: Identity mismatch is refused
-
-- **WHEN** a conversation bound to an `anthropic` profile/model is asked to run a `typesafe` turn without a new context
-- **THEN** the existing incompatible-identity outcome applies unchanged
-
 ### Requirement: Run plan and context held by the configured model
 
 The configured language model SHALL prepare bounded plan, observable completion criteria and notes after the first usable observation, with required content preparation as specified by the decision layer. The latest memory SHALL accompany subsequent Jev decisions and configured-model consultations, including replanning and completion. Revisions triggered by page changes, cadence, explicit REPLAN or bounded recovery SHALL prepare a replacement plan and content against current context rather than preserving advisory-only content. All outputs SHALL be strictly validated. Parser refusal SHALL retain the existing single feedback retry, and a second refusal or failed required preparation SHALL end with named `preparation_failed` error unless stopped. A failed preparation SHALL not emit a successful revision event or continue under a silent fallback architecture. Global update/recovery budgets SHALL remain bounded. Goal, memory, page content and captures SHALL remain data and never grant approvals or alter configuration.
@@ -437,3 +362,17 @@ When enabled, screenshots SHALL be obtained through the existing guarded read-on
 
 - **WHEN** screenshots are disabled
 - **THEN** no capture is requested and consultations use text only
+
+### Requirement: Sensitive-field category on observed controls
+
+Each `page_snapshot` control row SHALL carry a `sensitive` field holding the category that the extension's existing sensitive-field classifier assigns to that control (for example `password`, `payment` or `otp`), or `null` when the classifier assigns none. The classifier SHALL be the same one that sensitive-info masking uses, never a second copy. The field SHALL be additive: existing row fields and their meanings SHALL NOT change, and consumers that ignore it SHALL behave as before. Host-side literal eligibility SHALL read the category from the observed control row directly; the category SHALL NOT be sent to Jev in decision rows.
+
+#### Scenario: A password input is classified
+
+- **WHEN** an observed input has type `password` or autocomplete `current-password`
+- **THEN** its snapshot row carries `sensitive: "password"`
+
+#### Scenario: An ordinary field is unclassified
+
+- **WHEN** an observed text input has no sensitive descriptor
+- **THEN** its snapshot row carries `sensitive: null`

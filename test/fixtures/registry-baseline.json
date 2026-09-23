@@ -552,6 +552,64 @@
     }
   },
   {
+    "name": "page_monitor",
+    "description": "Monitor any web page using its rendered DOM/text snapshot, with optional observed JSON as a fallback. After navigating to the requested detail page, call this tool directly with action=save; do not look for a page_monitor UI, browser extension menu, input field, or on-page log. Browzy stores the snapshot in extension-global storage and extracts stable identifiers from the supplied identifier, current page URL, and page text. A successful result has ok=true, action=save, and status=saved; ok=false is the authoritative capture failure to report. Save a baseline by identifier or page URL, check it after the configured interval, and return field-level added/removed/changed values. Use action=list to see saved monitors or action=delete with monitorId to remove one.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "tabId": {
+          "type": "number",
+          "description": "Tab ID containing the loaded page to monitor."
+        },
+        "action": {
+          "type": "string",
+          "enum": [
+            "save",
+            "check",
+            "list",
+            "delete"
+          ],
+          "description": "Operation to perform. Defaults to list."
+        },
+        "identifier": {
+          "type": "string",
+          "description": "Identifier for the page record to monitor, when the response contains one."
+        },
+        "url": {
+          "type": "string",
+          "description": "The page or API URL for the record."
+        },
+        "kind": {
+          "type": "string",
+          "description": "Optional label for the monitored record. Defaults to auto."
+        },
+        "intervalDays": {
+          "type": "number",
+          "exclusiveMinimum": true,
+          "minimum": 0,
+          "maximum": 365,
+          "description": "Days between checks. Defaults to 7."
+        },
+        "monitorId": {
+          "type": "string",
+          "description": "Saved monitor ID for check or delete."
+        },
+        "force": {
+          "type": "boolean",
+          "description": "For check, bypass the interval gate and capture immediately."
+        }
+      },
+      "required": [
+        "tabId"
+      ],
+      "additionalProperties": false
+    },
+    "resultShape": {
+      "producesImage": false,
+      "currentlyStub": false
+    }
+  },
+  {
     "name": "page_snapshot",
     "description": "Take one bounded, structured snapshot of a tab's current page state: the URL and title, viewport and scroll position, an ordered table of the currently visible, enabled interactive controls (each with the reference other tools accept, its role, accessible name, current value/state, and options for a native select), and a bounded extract of the visible text, with explicit disclosure when either the element table or the text was truncated. This is a READ-ONLY observation: it changes no page or browser state, dispatches no input, and is safe on a borrowed tab. References it returns are the SAME refs read_page/find return and are accepted by computer (clicks), form_input, and scroll_to on the same document. Prefer it when you need a structured, bounded view of what is actionable right now; use read_page/get_page_text when you need page prose.",
     "inputSchema": {

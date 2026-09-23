@@ -384,6 +384,13 @@ await test("the image stage is the text probe with one embedded PNG added", asyn
     const bytes = Buffer.from(CAPABILITY_IMAGE.data, "base64");
     assert(bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])), "the probe image must be a real PNG");
     assert(bytes.subarray(12, 16).toString("ascii") === "IHDR", "and carry a PNG header chunk");
+    // Providers impose their own minimum image dimensions (a live gateway once
+    // rejected an 8x8 probe as too small, which the stage misreported as the
+    // model rejecting image content). A 32px floor keeps the probe well above
+    // that and above patch-based vision models' own minimums.
+    const width = bytes.readUInt32BE(16);
+    const height = bytes.readUInt32BE(20);
+    assert(width >= 32 && height >= 32, `the probe image must clear provider minimum-dimension checks, got ${width}x${height}`);
     assert(imageRequest.max_tokens === 1024 && imageRequest.reasoning.effort === "low", JSON.stringify(imageRequest));
     // The text stage itself stayed text-only.
     const textRequest = completions.find((body) => typeof body.messages[1].content === "string" && body.messages[0].content === TEXT_PROBE);

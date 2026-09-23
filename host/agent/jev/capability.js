@@ -65,16 +65,22 @@ export const CAPABILITY_GOAL = "Confirm that this provider answers a structured 
 export const CAPABILITY_TEXT_GOAL = "Type the word OK into the selected field.";
 export const CAPABILITY_TEXT_FIELD = Object.freeze({ label: "Confirmation", role: "textbox", value: "" });
 
-// Stage 3's embedded probe image (design.md §5): a real, self-contained 8x8
+// Stage 3's embedded probe image (design.md §5): a real, self-contained 64x64
 // PNG held as a host-side constant — small enough to ride one request, valid
 // enough that a strict provider cannot reject it as a corrupt image, and
 // containing nothing about the user's page or machine. The stage's whole point
 // is the WIRE (does this endpoint accept an image part at all), so the probe
-// instruction and goal are the text stage's own.
+// instruction and goal are the text stage's own. Providers impose their own
+// minimum image dimensions independent of PNG validity — a live gateway once
+// rejected an 8x8 probe with "height:8 or width:8 must be larger than 10",
+// which the stage then misreported as the model rejecting image content
+// entirely. The probe is sized with headroom above known provider and
+// patch-based-vision-model minimums rather than as small as possible, so a
+// dimension failure is never mistaken for a capability failure.
 export const CAPABILITY_IMAGE = Object.freeze({
   mimeType: "image/png",
   data:
-    "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAGUlEQVR42mO4Y6Px69cvTJIBqyiQZBiUOgBZVIXBXrxGwgAAAABJRU5ErkJggg=="
+    "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAS0lEQVR42u3PMQ0AAAwDoEqv9ErYvQQckD4XAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAYHLAB8+AWnmfUycAAAAAElFTkSuQmCC"
 });
 
 // Exercise the actual runtime builder and all three heads over a tiny page.

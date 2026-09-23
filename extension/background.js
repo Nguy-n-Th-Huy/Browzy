@@ -5,6 +5,18 @@ import * as humanize from "./humanize/index.js";
 import * as audit from "./audit/index.js";
 import * as actionEvents from "./events/action-events.js";
 import * as documentIdentity from "./events/document-identity.js";
+import {
+  PageMonitorStore,
+  collectObservedResponses,
+  diffMonitorFields,
+  normalizeMonitorTarget,
+  normalizeDomText,
+  selectObservedResponse,
+  observedJsonSource,
+  DOM_TEXT_SOURCE,
+  getMonitorSource,
+  DEFAULT_INTERVAL_DAYS,
+} from "./page-monitor.js";
 
 // Prevent unhandled rejections from killing the service worker
 self.addEventListener("unhandledrejection", (event) => {
@@ -12,6 +24,7 @@ self.addEventListener("unhandledrejection", (event) => {
 });
 
 const NATIVE_HOST_NAME = "com.anthropic.browzy_in_chrome";
+const pageMonitorStore = new PageMonitorStore(chrome.storage.local);
 
 // --- State ---
 let nativePort = null;
@@ -688,11 +701,12 @@ function createAgentSettingsRelay(opts) {
     // profile-cache mirror would gain nothing from re-writing the profile a
     // usage read never touched.
     "chatgpt_usage",
-    // TypeSafe / Jev provider (add-typesafe-jev-provider task 5.5). The
-    // settings page's third provider type rides these two ops; omitted here,
-    // saving the text-model configuration or either key answers with the
-    // local unknown-op PROTOCOL_ERROR above, so the TypeSafe fields would
-    // look saved in the form while nothing reached the companion.
+    // Jev browser tools' own transport config (jev-tools-settings-on-llm-
+    // profiles). The settings page's Jev-tools section rides these two ops;
+    // omitted here, saving the transport source/screenshot toggle or the
+    // transport key answers with the local unknown-op PROTOCOL_ERROR above,
+    // so the Jev-tools fields would look saved in the form while nothing
+    // reached the companion.
     "set_typesafe_config",
     "set_typesafe_credentials",
     // Permission modes + remembered-site management
@@ -928,15 +942,15 @@ const chatgptSignInProfileById = new Map();
  * `chatgpt_device_start` never touch the mirror on their own — nothing about
  * the profile changes until the sign-in actually completes.
  *
- * TypeSafe ops (add-typesafe-jev-provider) split the same way, for the same
- * reason: `set_typesafe_config` replies the full updated profile (mirrored
- * directly), while `set_typesafe_credentials` replies only the two presence
- * booleans a write-only credential op is allowed to return — the profile's
- * `hasTypesafeKey`/`hasTextModelKey`/`credentialRevision`/`lastCapabilityTest`
- * all changed host-side, so that one re-fetches the authoritative profile
- * rather than hand-patching a guess from the narrow reply. Without this, the
- * settings page would show the saved TypeSafe state while the sidepanel's
- * cached copy kept reporting a missing key.
+ * The Jev browser-tools transport ops (jev-tools-settings-on-llm-profiles)
+ * split the same way, for the same reason: `set_typesafe_config` replies the
+ * full updated profile (mirrored directly), while `set_typesafe_credentials`
+ * replies only the presence boolean a write-only credential op is allowed to
+ * return — the profile's `hasTypesafeKey`/`credentialRevision`/
+ * `lastCapabilityTest` all changed host-side, so that one re-fetches the
+ * authoritative profile rather than hand-patching a guess from the narrow
+ * reply. Without this, the settings page would show the saved Jev-tools
+ * state while the sidepanel's cached copy kept reporting a missing key.
  * @param {{ op?: string, profileId?: string, signInId?: string }} request
  * @param {{ ok: boolean, result?: any }} response
  */
@@ -3034,6 +3048,18 @@ async function ensureAttached(tabId) {
   const attach = (async () => {
     await chrome.debugger.attach({ tabId }, "1.3");
     attachedTabs.set(tabId, { enabledDomains: new Set() });
+    // Network events must start at attach time. Enabling it only when a
+    // page_monitor call arrives misses responses from pages that were already
+    // loaded, which makes a body look unavailable even though the browser can
+    // retrieve it for requests observed from this point onward.
+    try {
+      await chrome.debugger.sendCommand({ tabId }, "Network.enable", {});
+      attachedTabs.get(tabId).enabledDomains.add("Network");
+    } catch {
+      // Keep the attach usable for non-network tools; page_monitor retries the
+      // domain enable through ensureDomain and reports a normal capture miss if
+      // the debugger cannot provide Network.
+    }
   // No device-metrics emulation here. Screenshots get CSS-pixel framing from an
   // explicit capture clip instead (see takeScreenshot), which is more direct and
   // touches nothing about the page — no re-layout, no resize handlers fired.
@@ -3210,6 +3236,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
   // record in place rather than appending a duplicate.
   if (method === "Network.responseReceived" && params.response) {
     recordNetworkEvent(tabId, params.requestId, (existing) => ({
+      requestId: params.requestId,
       status: params.response.status,
       statusText: params.response.statusText,
       mimeType: params.response.mimeType,
@@ -3224,11 +3251,30 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
 
   if (method === "Network.requestWillBeSent" && params.request) {
     recordNetworkEvent(tabId, params.requestId, (existing) => ({
+      requestId: params.requestId,
       url: params.request.url,
       method: params.request.method,
       type: params.type || (existing && existing.type) || "Other",
       status: (existing && existing.status) || 0,
+      responseBodyReady: false,
+      loadingFailed: false,
       timestamp: (existing && existing.timestamp) || Date.now(),
+    }));
+  }
+  if (method === "Network.loadingFinished" && params.requestId) {
+    recordNetworkEvent(tabId, params.requestId, (existing) => ({
+      ...(existing || { requestId: params.requestId }),
+      responseBodyReady: true,
+      loadingFailed: false,
+      finishedAt: Date.now()
+    }));
+  }
+  if (method === "Network.loadingFailed" && params.requestId) {
+    recordNetworkEvent(tabId, params.requestId, (existing) => ({
+      ...(existing || { requestId: params.requestId }),
+      responseBodyReady: false,
+      loadingFailed: true,
+      errorText: params.errorText || "network loading failed"
     }));
   }
   // GIF capture frames. Buffer the JPEG bytes with a receipt timestamp (the
@@ -5502,6 +5548,78 @@ async function gifStopScreencast(tabId) {
   } catch {}
 }
 
+async function readObservedJsonResponses(tabId, target) {
+  await ensureAttached(tabId);
+  await ensureDomain(tabId, "Network");
+  const source = getMonitorSource(target) || observedJsonSource;
+  const read = async () => {
+    const records = (networkRequests.get(tabId) || []).filter((record) =>
+      record && record.requestId && record.loadingFailed !== true && record.responseBodyReady !== false
+    );
+    return collectObservedResponses(records, async (record) => {
+      try {
+        return await cdp(tabId, "Network.getResponseBody", { requestId: record.requestId });
+      } catch {
+        return null;
+      }
+    }, target, source);
+  };
+  let responses = await read();
+  if (responses.length) return responses;
+
+  // A tab may have been loaded before the debugger attached, so there is no
+  // historical response event or requestId for getResponseBody to use. Reload
+  // the current tab once, automatically, and wait for a completed matching
+  // response. This is the capture path; users never need to copy from DevTools.
+  networkRequests.set(tabId, []);
+  networkByRequestId.set(tabId, new Map());
+  await ensureDomain(tabId, "Page");
+  await cdp(tabId, "Page.reload", { ignoreCache: false });
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline) {
+    await sleep(100);
+    responses = await read();
+    if (responses.length) return responses;
+  }
+  return responses;
+}
+
+// A monitor is a page/tender snapshot first. The page-read path is already
+// the extension's supported, session-aware DOM observation path, so a monitor
+// must not require Network events or response bodies to establish its
+// baseline. API JSON remains a useful optional fallback for pages whose
+// rendered content cannot be read.
+async function readPageMonitorSnapshot(tabId) {
+  const response = await sendContentMessage(tabId, { type: "getPageText" });
+  if (!response?.result) return null;
+
+  let page = response.result;
+  if (typeof page === "string") {
+    try {
+      page = JSON.parse(page);
+    } catch {
+      page = { text: page };
+    }
+  }
+  if (!page || typeof page !== "object" || typeof page.text !== "string" || !page.text.trim()) return null;
+
+  const normalized = normalizeDomText(page);
+  return {
+    url: typeof page.url === "string" && page.url ? page.url : null,
+    source: DOM_TEXT_SOURCE,
+    matchedPath: normalized.matchedPath,
+    fields: normalized.fields,
+  };
+}
+
+function pageMonitorReply(value) {
+  // Keep the JSON envelope for the model, but also use MCP's structured error
+  // bit so a failed automatic capture cannot be mistaken for a missing UI
+  // panel or an unconfirmed no-op. The tool result, not page chrome, is the
+  // evidence for this capability.
+  return { ...(value?.ok === false ? { isError: true } : {}), content: [{ type: "text", text: JSON.stringify(value) }] };
+}
+
 const toolHandlers = {
   async tabs_context_mcp(args) {
     if (currentToolMeta && currentToolMeta.runId) return sdkTabsContext(currentToolMeta);
@@ -6944,6 +7062,64 @@ const toolHandlers = {
       .join("\n");
 
     return { content: [{ type: "text", text: `Network requests (${reqs.length}):\n${text}` }] };
+  },
+
+  async page_monitor(args) {
+    const { tabId, action = "list", monitorId, identifier, url, kind, intervalDays, force } = args || {};
+    if (!(await isInGroup(tabId))) return pageMonitorReply({ ok: false, reason: "tab_not_in_group", tabId });
+    try {
+      if (action === "list") return pageMonitorReply({ ok: true, action, monitors: await pageMonitorStore.list() });
+      if (action === "delete") {
+        if (typeof monitorId !== "string" || !monitorId) throw new Error("delete requires monitorId");
+        return pageMonitorReply({ ok: true, action, monitorId, deleted: await pageMonitorStore.delete(monitorId) });
+      }
+      if (action !== "save" && action !== "check") throw new Error("action must be save, check, list, or delete");
+
+      let target;
+      let existing = null;
+      if (action === "check" && monitorId) {
+        existing = await pageMonitorStore.find({ id: monitorId });
+        if (existing) target = { ...existing.target, source: existing.source || existing.target.source };
+      }
+      if (!target) target = normalizeMonitorTarget({ identifier, url, kind });
+      if (action === "check" && !existing) {
+        existing = await pageMonitorStore.find({ target });
+        if (existing) target = { ...existing.target, source: existing.source || existing.target.source };
+      }
+      if (action === "check" && !existing) return pageMonitorReply({ ok: false, reason: "monitor_not_found", monitorId: monitorId || null, target });
+
+      const now = Date.now();
+      const dueAt = existing
+        ? Date.parse(existing.lastCheckedAt || existing.baseline.capturedAt) + existing.intervalDays * 86400000
+        : 0;
+      if (action === "check" && !force && dueAt > now) {
+        return pageMonitorReply({ ok: true, action, status: "not_due", monitorId: existing.id, dueAt: new Date(dueAt).toISOString(), intervalDays: existing.intervalDays });
+      }
+
+      let selected = null;
+      if (target.source !== observedJsonSource.id) {
+        selected = await readPageMonitorSnapshot(tabId);
+      }
+      if (!selected && target.source !== DOM_TEXT_SOURCE) {
+        const responses = await readObservedJsonResponses(tabId, target);
+        selected = selectObservedResponse(responses, target);
+      }
+      if (!selected) {
+        return pageMonitorReply({ ok: false, reason: "page_snapshot_not_found", detail: "Browzy could not read the current page text or an optional API observation. Ensure the detail page is loaded and try again; do not wait for or copy response data from DevTools." });
+      }
+
+      if (action === "save") {
+        const monitor = await pageMonitorStore.save({ target, response: selected, intervalDays: intervalDays === undefined ? DEFAULT_INTERVAL_DAYS : Number(intervalDays), now: new Date(now) });
+        return pageMonitorReply({ ok: true, action, status: "saved", monitor: { id: monitor.id, kind: monitor.kind, source: monitor.source, target: monitor.target, intervalDays: monitor.intervalDays, capturedAt: monitor.baseline.capturedAt, sourceUrl: monitor.baseline.sourceUrl } });
+      }
+
+      const diff = diffMonitorFields(existing.baseline.fields, selected.fields);
+      const result = { status: diff.summary.hasChanges ? "changed" : "unchanged", checkedAt: new Date(now).toISOString(), sourceUrl: selected.url, diff };
+      await pageMonitorStore.recordCheck(existing.id, result, new Date(now));
+      return pageMonitorReply({ ok: true, action, monitorId: existing.id, ...result });
+    } catch (error) {
+      return pageMonitorReply({ ok: false, reason: "invalid_request", detail: String(error?.message || error) });
+    }
   },
 
   async resize_window(args) {

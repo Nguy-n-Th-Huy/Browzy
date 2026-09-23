@@ -71,7 +71,7 @@ const BASELINE = JSON.parse(fs.readFileSync(SNAPSHOT_PATH, "utf8"));
 // counts are mirrored here instead — every bare "26" this suite asserted
 // before those changes is replaced with the arithmetic below.
 const LEGACY_BASELINE_COUNT = 26;
-const POST_BASELINE_ADDITIONS_COUNT = 7;
+const POST_BASELINE_ADDITIONS_COUNT = 8;
 const REMOVED_BASELINE_COUNT = 1;
 const TOTAL_REGISTRY_COUNT = LEGACY_BASELINE_COUNT + POST_BASELINE_ADDITIONS_COUNT - REMOVED_BASELINE_COUNT;
 

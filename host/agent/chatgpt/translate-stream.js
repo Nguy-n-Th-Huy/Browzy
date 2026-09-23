@@ -533,11 +533,22 @@ function toolUseInput(argumentsJSON) {
 /**
  * Accumulate a whole turn's worth of parsed Codex SSE frames into one
  * Anthropic message object (spec: "Non-streaming requests SHALL return the
- * same content as one Anthropic message object"). Reads only the terminal
- * `response.completed`/`response.incomplete` event's `response.output`,
- * which already carries the complete content for the turn — matching how
- * the streaming path's own terminal-event handling reconstructs anything a
- * delta might have missed.
+ * same content as one Anthropic message object").
+ *
+ * Invariant: the terminal `response.completed`/`response.incomplete` event's
+ * own `response.output` is NOT reliably populated — real upstream traffic
+ * has been observed to send an empty `output: []` on `response.completed`
+ * for both a plain text reply and a reasoning + web_search reply, with the
+ * turn's actual content having already arrived as a sequence of
+ * `response.output_item.done` events (one per item: message, reasoning,
+ * function_call, ...). This accumulator therefore collects every
+ * `output_item.done` frame's `item`, in arrival order and deduped by
+ * `output_index` when present, and uses that collection as the output list
+ * whenever the terminal event's own `output` is empty or missing. When the
+ * terminal `output` is non-empty it is used as-is (unchanged behavior) —
+ * matching how the streaming path's own terminal-event handling
+ * (`drainTerminalFunctionCalls`) treats a non-empty `response.output` as
+ * authoritative for anything a delta might have missed.
  *
  * @param {Array<{ event?: string, data: Record<string, any> }>} frames
  * @param {{ toolNameMap?: Map<string, string> }} [options]
@@ -550,9 +561,17 @@ export function accumulateNonStreamMessage(frames, { toolNameMap } = {}) {
   }
 
   let terminal = null;
+  const doneItemOrder = [];
+  const doneItemsByKey = new Map();
+  let doneItemSeq = 0;
   for (const frame of frames || []) {
     const data = frame && typeof frame === "object" && "data" in frame ? frame.data : frame;
     if (!data || typeof data !== "object") continue;
+    if (data.type === "response.output_item.done" && data.item) {
+      const key = data.output_index !== undefined ? `index:${data.output_index}` : `seq:${doneItemSeq++}`;
+      if (!doneItemsByKey.has(key)) doneItemOrder.push(key);
+      doneItemsByKey.set(key, data.item);
+    }
     if (
       data.type === "response.completed" ||
       data.type === "response.incomplete" ||
@@ -572,10 +591,12 @@ export function accumulateNonStreamMessage(frames, { toolNameMap } = {}) {
   }
 
   const response = terminal.response || {};
+  const terminalOutput = Array.isArray(response.output) ? response.output : [];
+  const output = terminalOutput.length > 0 ? terminalOutput : doneItemOrder.map((key) => doneItemsByKey.get(key));
   const content = [];
   let hasToolCall = false;
 
-  for (const item of Array.isArray(response.output) ? response.output : []) {
+  for (const item of output) {
     if (item.type === "reasoning") {
       const summaryText = reasoningSummaryText(item);
       const signature = signatureFor(item.encrypted_content);

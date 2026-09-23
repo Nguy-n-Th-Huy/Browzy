@@ -45,25 +45,34 @@ import { PHASE_LABELS, cleanEvidence } from "./run-feedback.js";
 //    conversation can still show what was asked. See the "Known gaps"
 //    section of reports/05-panel-evidence.md.
 //
-// 5. The TypeSafe Jev runtime (openspec/changes/add-typesafe-jev-provider,
-//    design.md §8) needs no new machinery here: one `jev_step` becomes one
-//    toolRows entry carrying the decision record (`row.jev`) and one
-//    `jev_end` becomes the turn's terminal outcome line. Both events are
-//    durable, so decision 3's full-rebuild rule covers them unchanged — a
-//    reconnect replays the same steps and outcome instead of merging a second
-//    copy of them — and neither fabricates assistant text, because a Jev run
-//    produces none. openspec/changes/add-jev-run-context extends the same
-//    treatment to one more durable event, `jev_memory` (the run's plan, each
-//    context revision, and each stall recovery: one row carrying
-//    `row.jevMemory`, keyed by the event's own 1-based index so a rebuild
-//    reproduces it exactly), and to two fields the runtime already records:
-//    the `DONE` step's `verification` (the completion check's verdict) and
-//    `jev_end`'s `doneVerified`, which the outcome copy discloses as a
-//    verified completion versus the decision model's judgment alone. Its
-//    labour-split rework (design.md §10) reshapes the step record this model
-//    copies verbatim: `operation`/`intent` are the configured model's step
-//    decision, `target`/`targetProbability`/`confidence`/`latencies.selectionMs`
-//    are the TypeSafe endpoint's element selection, and `operationProbability`
+// 5. Jev has no provider or turn of its own — it is reached only through the
+//    `browser_subgoal` tool call inside an ordinary anthropic/chatgpt turn.
+//    That call starts a short Jev sub-run on the turn's already-bound tab,
+//    and the sub-run's own durable events (`jev_phase`, `jev_step`,
+//    `jev_memory`, `jev_result`, `jev_end`) carry the SAME `runId` as the
+//    enclosing turn, so no new turn-lookup machinery is needed here: one
+//    `jev_step` becomes one toolRows entry on the enclosing turn carrying
+//    the decision record (`row.jev`), attributed to the sub-run the
+//    `browser_subgoal` call started, and `jev_end` ends only that sub-run —
+//    it records the outcome line (`turn.jevOutcome`) but never touches
+//    `turn.lifecycle`; the turn itself still only completes through the
+//    run_done/run_stopped/run_error events the companion emits independently
+//    for the whole run. Both events are durable, so decision 3's
+//    full-rebuild rule covers them unchanged — a reconnect replays the same
+//    steps and outcome instead of merging a second copy of them — and
+//    neither fabricates assistant text, because a Jev sub-run produces none.
+//    One more durable event, `jev_memory`, gets the same treatment (the
+//    sub-run's plan, each context revision, and each stall recovery: one row
+//    carrying `row.jevMemory`, keyed by the event's own 1-based index so a
+//    rebuild reproduces it exactly), along with two fields the runtime
+//    already records: the `DONE` step's `verification` (the completion
+//    check's verdict) and `jev_end`'s `doneVerified`, which the outcome copy
+//    discloses as a verified completion versus the decision model's judgment
+//    alone. The step record this model copies verbatim splits labour between
+//    two owners: `operation`/`intent` are the configured model's (the turn's
+//    own anthropic/chatgpt provider) step decision, while
+//    `target`/`targetProbability`/`confidence`/`latencies.selectionMs` are
+//    the TypeSafe endpoint's element selection, and `operationProbability`
 //    no longer exists in those historical records. Decision-layer records
 //    instead attribute actions to Jev and preserve explicit action scores and
 //    independent monitor metadata; absence retains the old attribution.

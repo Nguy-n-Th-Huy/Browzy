@@ -285,17 +285,39 @@
       if (labelText) return labelText;
     }
 
-    // Direct text content (only for leaf-ish elements)
+    // Direct text content: leaf-ish elements named by what is written on
+    // them, plus — new — any other interactive GENERIC container: a
+    // div/span-shaped widget carrying a role, a tabindex, an onclick or
+    // contenteditable, but none of the tags below, each of which already had
+    // its own dedicated chance to name itself above, or has native semantics
+    // of its own that its own textContent would misrepresent — a <select>'s
+    // textContent is every option glued together, not what is displayed; a
+    // <details>'s is its summary plus its whole body; an <iframe>'s is its
+    // fallback content, not the embedded document. `div` was excluded on
+    // purpose until muasamcong.mpi.gov.vn's advanced search proved the gap:
+    // its Ant Design "Tìm theo" select is a `div[tabindex=0]` wrapping a
+    // `div[role=combobox]`, neither carrying any of the sources above and
+    // neither with a caption beside it either, so both reached the model as
+    // "" and, nested inside one another, could not be told apart. A visible,
+    // enabled control's own text is a strictly better name than a blank
+    // line, whatever tag renders it — as long as that tag has no native
+    // naming convention of its own to be misrepresented by this fallback.
     const tag = el.tagName.toLowerCase();
-    if (["a", "button", "h1", "h2", "h3", "h4", "h5", "h6", "li", "summary", "label", "th", "td", "span"].includes(tag)) {
-      // A combobox widget (select2 and friends) carries its CURRENT VALUE as
-      // its own text — "Chưa phân loại", the selected chip — so that text is
-      // not the control's name. Verified live on DauThau.info's province
-      // filter: the control the operator calls "Nơi thực hiện" appeared in
-      // the observation as a combobox named by its placeholder value, and the
+    const leafTags = ["a", "button", "h1", "h2", "h3", "h4", "h5", "h6", "li", "summary", "label", "th", "td", "span"];
+    const nonGenericTags = ["input", "select", "textarea", "option", "optgroup", "details", "iframe"];
+    const isGenericInteractiveContainer = !leafTags.includes(tag) && !nonGenericTags.includes(tag) && isInteractive(el);
+    if (leafTags.includes(tag) || isGenericInteractiveContainer) {
+      // A combobox widget (select2 and friends, or a hand-rolled
+      // div[role=combobox]) carries its CURRENT VALUE as its own text —
+      // "Chưa phân loại", the selected chip — so that text is not the
+      // control's name. Verified live on DauThau.info's province filter: the
+      // control the operator calls "Nơi thực hiện" appeared in the
+      // observation as a combobox named by its placeholder value, and the
       // run hunted for a control by that name and never found it. The
-      // context label beside the control names it correctly; only when there
-      // is none does the text stand in.
+      // context label beside the control names it correctly; only when
+      // there is none does the text stand in — which is also why a
+      // combobox's own text is only ever a fallback, never a name that
+      // outranks a caption the page does offer.
       if (el.getAttribute("role") === "combobox") {
         const context = contextLabelOf(el);
         if (context) return context;
@@ -317,20 +339,37 @@
    * including the "Nơi thực hiện" province selector — resolved to "", and
    * with this fallback all twelve resolve to their visible labels.
    *
+   * A caption sibling is recognised on tag or class as before (label, legend,
+   * th, or a label-ish class) — accepted unconditionally, exactly as before
+   * this rule existed, so a page whose captions already use that markup
+   * keeps byte-identical names — OR, new, on its SHAPE: no interactive
+   * descendant (the existing exclusion below), no element children of its
+   * own (text through and through), within the same length bound, and
+   * positioned before the control among this scope's children. Shape-only
+   * recognition is what lets muasamcong.mpi.gov.vn's "Tìm theo" caption — a
+   * plain, unstyled <div>, no label tag, no label-ish class — name the Ant
+   * Design combobox beside it; the tag/class rule alone never matched it.
+   * The position check exists only to keep a shape match from picking up
+   * unrelated text that happens to sit after the control instead of
+   * captioning it.
+   *
    * Bounded on purpose: at most six ancestors — a select2-style widget inserts
    * two wrapper levels of its own, so the label sits deeper for the widget
    * than for the raw control (measured live: the province filter's widget is
    * five levels below its form-group label while the underlying select is
    * three) — and at each level, only DIRECT children are considered, a child
    * that itself holds a form control is skipped (it is a sibling control's
-   * own label), and the accepted text must be short. The label-ish test
-   * covers <label>/<legend>/<th> and the common label classes; anything
-   * longer is never invented as a name. */
+   * own label), and the accepted text must be short. Anything longer, or
+   * that sits after the control rather than before it, is never invented as
+   * a name. */
   function contextLabelOf(el) {
     let scope = el.parentElement;
     for (let depth = 0; depth < 6 && scope; depth++, scope = scope.parentElement) {
-      for (const child of scope.children) {
-        if (child === el || child.contains(el)) continue;
+      const siblings = Array.from(scope.children);
+      const controlIndex = siblings.findIndex((child) => child === el || child.contains(el));
+      for (let i = 0; i < siblings.length; i++) {
+        const child = siblings[i];
+        if (i === controlIndex) continue;
         if (child.querySelector("input, select, textarea, button, [role='combobox'], [role='textbox']")) continue;
         const childTag = child.tagName.toLowerCase();
         const childClass = typeof child.className === "string" ? child.className : "";
@@ -339,7 +378,12 @@
           childTag === "legend" ||
           childTag === "th" ||
           /(^|[\s_-])(control-label|field-label|form-label|label)([\s_-]|$)/i.test(childClass);
-        if (!labelish) continue;
+        // A shape match additionally requires text-only content (no element
+        // children of its own) and a position before the control in this
+        // scope — what makes it a caption rather than any short text that
+        // happens to sit nearby. A tag/class match needs neither.
+        const shapeMatch = !labelish && child.children.length === 0 && controlIndex !== -1 && i < controlIndex;
+        if (!labelish && !shapeMatch) continue;
         const text = child.textContent?.trim();
         if (text && text.length <= 80) return text;
       }
@@ -1016,6 +1060,36 @@
     return null;
   }
 
+  /** The descriptor `maskCategoryForDescriptor` classifies, built from an
+   * input/textarea's own attributes and associated label text. Shared by the
+   * masking scan (below) and the page_snapshot `sensitive` field
+   * (snapshotElementRecord) so the classifier is fed the SAME evidence in
+   * both places and is never duplicated (openspec/changes/
+   * jev-literal-field-values design.md decision 6). */
+  function maskDescriptorForControl(el) {
+    let labelText = "";
+    try {
+      if (el.labels && el.labels.length) {
+        labelText = Array.from(el.labels).map((l) => l.textContent || "").join(" ");
+      } else if (el.getAttribute("aria-labelledby")) {
+        labelText = el.getAttribute("aria-labelledby")
+          .split(/\s+/)
+          .map((id) => { const t = document.getElementById(id); return t ? (t.textContent || "") : ""; })
+          .join(" ");
+      }
+      labelText = labelText.slice(0, 200);
+    } catch {}
+    return {
+      type: el.type,
+      autocomplete: el.getAttribute("autocomplete"),
+      name: el.getAttribute("name"),
+      id: el.id,
+      placeholder: el.getAttribute("placeholder"),
+      ariaLabel: el.getAttribute("aria-label"),
+      labelText
+    };
+  }
+
   function maskEnsureStyle() {
     let style = document.getElementById(MASK_STYLE_ID);
     if (!style) {
@@ -1102,27 +1176,7 @@
     try { controls = Array.from(document.querySelectorAll("input, textarea")); } catch { controls = []; }
     for (const el of controls) {
       if (masked >= MASK_MAX_ELEMENTS) { capped = true; break; }
-      let labelText = "";
-      try {
-        if (el.labels && el.labels.length) {
-          labelText = Array.from(el.labels).map((l) => l.textContent || "").join(" ");
-        } else if (el.getAttribute("aria-labelledby")) {
-          labelText = el.getAttribute("aria-labelledby")
-            .split(/\s+/)
-            .map((id) => { const t = document.getElementById(id); return t ? (t.textContent || "") : ""; })
-            .join(" ");
-        }
-        labelText = labelText.slice(0, 200);
-      } catch {}
-      const kind = maskCategoryForDescriptor({
-        type: el.type,
-        autocomplete: el.getAttribute("autocomplete"),
-        name: el.getAttribute("name"),
-        id: el.id,
-        placeholder: el.getAttribute("placeholder"),
-        ariaLabel: el.getAttribute("aria-label"),
-        labelText
-      });
+      const kind = maskCategoryForDescriptor(maskDescriptorForControl(el));
       if (kind) applyCandidate(el, kind);
     }
 
@@ -1371,6 +1425,12 @@
       editable: snapshotIsEditable(el, tag, type),
       readonly: el.readOnly === true,
       contenteditable: el.isContentEditable === true || el.contentEditable === "true",
+      // The masking classifier's own category (or null), reusing the exact
+      // descriptor construction the masking scan itself builds — never a
+      // second copy of that classifier (openspec/changes/
+      // jev-literal-field-values design.md decision 6). Only input/textarea
+      // carry a descriptor at all; every other row is unclassified.
+      sensitive: (tag === "input" || tag === "textarea") ? maskCategoryForDescriptor(maskDescriptorForControl(el)) : null,
       // Only enabled controls reach this table (buildPageSnapshot filters
       // them), so this is the observed state of everything listed. Kept as
       // its own field so a reader never has to know the filter to read it.

@@ -129,6 +129,13 @@ function makeElement(tag, opts = {}) {
     tagName: String(tag).toUpperCase(),
     nodeType: 1,
     id: opts.id || "",
+    // Real elements reflect the `class` attribute onto `.className` — the
+    // one property contextLabelOf and the ref-hint helpers read a class
+    // pattern off (getAttribute("class") is a separate, already-covered
+    // path). A plain field, not an accessor: content.js's own annotation
+    // code does a bare `el.className = "..."` write, which this must accept
+    // exactly like a real element does.
+    className: (opts.attrs && opts.attrs.class) || "",
     _text: opts.text === undefined ? "" : String(opts.text),
     _attrs: Object.assign({}, opts.attrs),
     _track: opts.track || null,
@@ -494,6 +501,246 @@ console.log("== a control whose visible label sits beside it (no for=, no aria) 
     `a combobox takes the field name beside it, not its own value text (got ${record && JSON.stringify(record.label)})`);
 }
 
+// --- 2c. Naming a widget control that carries no accessible name of its own
+console.log("== an unnamed generic container is named by the value it displays, or by its caption when the page offers one ==");
+{
+  // muasamcong.mpi.gov.vn's Ant Design "Tìm theo" select, reproduced by
+  // shape: a div[role="combobox"] whose displayed value lives in an
+  // uncaptured descendant (div.ant-select-selection__rendered > div), with
+  // no aria-label, no title, no associated label, and no caption beside it.
+  const world = bootWorld({
+    elements: [
+      (track) => {
+        const group = makeElement("div", {});
+        const combo = makeElement("div", { track, attrs: { role: "combobox" } });
+        const rendered = makeElement("div", {});
+        attach(rendered, makeElement("div", { text: "Thông báo mời thầu" }));
+        attach(combo, rendered);
+        attach(group, combo);
+        return group;
+      }
+    ]
+  });
+  const record = world.send({ type: "pageSnapshot" }).reply.result.elements.find((e) => e.role === "combobox");
+  ok(record && record.label === "Thông báo mời thầu",
+    `an unnamed combobox with no caption is named by the value it displays (got ${record && JSON.stringify(record.label)})`);
+}
+{
+  // The same shape, now with a visible caption preceding it in the field
+  // group — a plain, unstyled <div>, no label tag, no label-ish class. The
+  // caption names the control and the displayed value does not displace it.
+  const world = bootWorld({
+    elements: [
+      (track) => {
+        const group = makeElement("div", {});
+        const caption = makeElement("div", { track, text: "Tìm theo" });
+        const combo = makeElement("div", { track, attrs: { role: "combobox" } });
+        const rendered = makeElement("div", {});
+        attach(rendered, makeElement("div", { text: "Thông báo mời thầu" }));
+        attach(combo, rendered);
+        attach(group, caption);
+        attach(group, combo);
+        return group;
+      }
+    ]
+  });
+  const record = world.send({ type: "pageSnapshot" }).reply.result.elements.find((e) => e.role === "combobox");
+  ok(record && record.label === "Tìm theo",
+    `a shape-recognised caption names the control instead of the value it displays (got ${record && JSON.stringify(record.label)})`);
+}
+{
+  // A control that already carries an accessible name — including one this
+  // portal authors poorly (the literal string "Default") — is reported
+  // unchanged: no fallback runs, and a caption beside it never overrides it.
+  const world = bootWorld({
+    elements: [
+      (track) => {
+        const group = makeElement("div", {});
+        const caption = makeElement("div", { track, text: "Tìm theo" });
+        const combo = makeElement("div", { track, attrs: { role: "combobox", "aria-label": "Default" } });
+        attach(combo, makeElement("div", { text: "Thông báo mời thầu" }));
+        attach(group, caption);
+        attach(group, combo);
+        return group;
+      }
+    ]
+  });
+  const record = world.send({ type: "pageSnapshot" }).reply.result.elements.find((e) => e.role === "combobox");
+  ok(record && record.label === "Default",
+    `an existing accessible name, however authored, is reported unchanged (got ${record && JSON.stringify(record.label)})`);
+}
+
+console.log("== every previously-accepted caption sibling form still resolves the same way ==");
+{
+  const legendWorld = bootWorld({
+    elements: [
+      (track) => {
+        const fieldset = makeElement("fieldset", {});
+        attach(fieldset, makeElement("legend", { track, text: "Loại thông báo" }));
+        const row = makeElement("div", { track });
+        attach(row, makeElement("select", { track, attrs: { id: "kind" } }));
+        attach(fieldset, row);
+        return fieldset;
+      }
+    ]
+  });
+  const legendRecord = legendWorld.send({ type: "pageSnapshot" }).reply.result.elements.find((e) => e.tag === "select");
+  ok(legendRecord && legendRecord.label === "Loại thông báo",
+    `a <legend> sibling still names the control (got ${legendRecord && JSON.stringify(legendRecord.label)})`);
+}
+{
+  const thWorld = bootWorld({
+    elements: [
+      (track) => {
+        const tr = makeElement("tr", {});
+        attach(tr, makeElement("th", { track, text: "Trạng thái" }));
+        const td = makeElement("td", { track });
+        attach(td, makeElement("select", { track, attrs: { id: "status" } }));
+        attach(tr, td);
+        return tr;
+      }
+    ]
+  });
+  const thRecord = thWorld.send({ type: "pageSnapshot" }).reply.result.elements.find((e) => e.tag === "select");
+  ok(thRecord && thRecord.label === "Trạng thái",
+    `a <th> sibling still names the control (got ${thRecord && JSON.stringify(thRecord.label)})`);
+}
+{
+  const classWorld = bootWorld({
+    elements: [
+      (track) => {
+        const group = makeElement("div", {});
+        attach(group, makeElement("div", { track, attrs: { class: "control-label" }, text: "Ngày đăng" }));
+        const row = makeElement("div", { track });
+        attach(row, makeElement("select", { track, attrs: { id: "date" } }));
+        attach(group, row);
+        return group;
+      }
+    ]
+  });
+  const classRecord = classWorld.send({ type: "pageSnapshot" }).reply.result.elements.find((e) => e.tag === "select");
+  ok(classRecord && classRecord.label === "Ngày đăng",
+    `a label-ish class sibling still names the control (got ${classRecord && JSON.stringify(classRecord.label)})`);
+}
+
+console.log("== surrounding prose does not become a name ==");
+{
+  // "Holding": the container's own displayed value is long, unrelated prose
+  // — the existing 200-char own-text bound still applies, so nothing is
+  // invented from it, and the name stays empty exactly as before.
+  const longValue = "Đoạn mô tả dài không phải tên điều khiển, chỉ là nội dung hiển thị bên trong widget này, viết đủ dài để vượt quá hai trăm ký tự của giới hạn văn bản trực tiếp hiện có trong getAccessibleName, để phép thử này chắc chắn không đặt tên từ nó, dù nó là nội dung duy nhất bên trong.";
+  ok(longValue.length >= 200, "sanity: the fixture text exceeds the own-text bound");
+  const world = bootWorld({
+    elements: [
+      (track) => {
+        const group = makeElement("div", {});
+        const combo = makeElement("div", { track, attrs: { role: "combobox" } });
+        attach(combo, makeElement("div", { text: longValue }));
+        attach(group, combo);
+        return group;
+      }
+    ]
+  });
+  const record = world.send({ type: "pageSnapshot" }).reply.result.elements.find((e) => e.role === "combobox");
+  ok(record && record.label === "", `a long displayed value is never invented as a name (got ${record && JSON.stringify(record.label)})`);
+}
+{
+  // "Sitting beside": a preceding sibling carrying long, unrelated prose is
+  // still rejected by the existing 80-char caption bound, even though it
+  // otherwise has the shape of a caption (no interactive descendant, no
+  // element children of its own, positioned before the control).
+  const longProse = "Đoạn văn bản dài không phải nhãn của ô nào cả, chỉ là nội dung trang bình thường viết dài hơn tám mươi ký tự để chắc chắn bị từ chối.";
+  ok(longProse.length > 80, "sanity: the fixture text exceeds the caption length bound");
+  const world = bootWorld({
+    elements: [
+      (track) => {
+        const group = makeElement("div", {});
+        attach(group, makeElement("div", { track, text: longProse }));
+        const combo = makeElement("div", { track, attrs: { role: "combobox" } });
+        attach(group, combo);
+        return group;
+      }
+    ]
+  });
+  const record = world.send({ type: "pageSnapshot" }).reply.result.elements.find((e) => e.role === "combobox");
+  ok(record && record.label === "",
+    `long unrelated text beside the control is never invented as a caption (got ${record && JSON.stringify(record.label)})`);
+}
+{
+  // The position half of the shape rule, isolated: a short, text-only,
+  // otherwise caption-shaped sibling that sits AFTER the control instead of
+  // before it must not be accepted — a caption describes what follows it,
+  // not what came before. The combobox's own displayed value is what should
+  // stand in instead, proving the sibling was genuinely rejected rather than
+  // never reached.
+  const world = bootWorld({
+    elements: [
+      (track) => {
+        const group = makeElement("div", {});
+        const combo = makeElement("div", { track, attrs: { role: "combobox" } });
+        attach(combo, makeElement("div", { text: "Thông báo mời thầu" }));
+        attach(group, combo);
+        attach(group, makeElement("div", { track, text: "Tìm theo" }));
+        return group;
+      }
+    ]
+  });
+  const record = world.send({ type: "pageSnapshot" }).reply.result.elements.find((e) => e.role === "combobox");
+  ok(record && record.label === "Thông báo mời thầu",
+    `a caption-shaped sibling AFTER the control is not accepted as its caption (got ${record && JSON.stringify(record.label)})`);
+}
+{
+  // The text-only half of the shape rule, isolated: a sibling before the
+  // control that is short and holds no interactive descendant, but is NOT
+  // text through and through — its text lives inside an element child of its
+  // own (a <span> wrapper) — must not be accepted either. Again the
+  // combobox's own displayed value is what should stand in, proving the
+  // wrapped sibling was rejected rather than accidentally matched by the
+  // pre-existing tag/class rule.
+  const world = bootWorld({
+    elements: [
+      (track) => {
+        const group = makeElement("div", {});
+        const wrapped = makeElement("div", { track });
+        attach(wrapped, makeElement("span", { track, text: "Tìm theo" }));
+        const combo = makeElement("div", { track, attrs: { role: "combobox" } });
+        attach(combo, makeElement("div", { text: "Thông báo mời thầu" }));
+        attach(group, wrapped);
+        attach(group, combo);
+        return group;
+      }
+    ]
+  });
+  const record = world.send({ type: "pageSnapshot" }).reply.result.elements.find((e) => e.role === "combobox");
+  ok(record && record.label === "Thông báo mời thầu",
+    `a caption-shaped sibling that is not text-only (its text sits inside a child element) is not accepted (got ${record && JSON.stringify(record.label)})`);
+}
+
+console.log("== the reported page's exact nested shape resolves ==");
+{
+  // The reported live shape: a div[tabindex=0] wrapping a div[role=combobox],
+  // both unnamed, both showing the same descendant text — the shape that
+  // reached the model as two indistinguishable "" rows and stalled the run
+  // (repeated_no_change x5, then blocked / no_progress).
+  const world = bootWorld({
+    elements: [
+      (track) => {
+        const outer = makeElement("div", { track, tabIndex: 0 });
+        const inner = makeElement("div", { track, attrs: { role: "combobox" } });
+        const rendered = makeElement("div", {});
+        attach(rendered, makeElement("div", { text: "Thông báo mời thầu" }));
+        attach(inner, rendered);
+        attach(outer, inner);
+        return outer;
+      }
+    ]
+  });
+  const snap = world.send({ type: "pageSnapshot" }).reply.result;
+  ok(snap.elements.length === 2, `both nested controls are listed (got ${snap.elements.length})`);
+  ok(snap.elements.every((e) => e.label === "Thông báo mời thầu"),
+    `both are named by the value they display, so they can be told apart from other unnamed rows (got ${JSON.stringify(snap.elements.map((e) => e.label))})`);
+}
+
 // --- 2d. Viewport-first ordering -------------------------------------------
 console.log("== an on-screen control outranks earlier off-screen links ==");
 {
@@ -536,7 +783,7 @@ console.log("== contract fields ==");
 
   const row = snap.elements[0];
   const EXPECTED = ["ref", "role", "label", "tag", "type", "value", "editable", "readonly",
-    "contenteditable", "disabled", "checked", "selected", "expanded"];
+    "contenteditable", "disabled", "checked", "selected", "expanded", "sensitive"];
   for (const field of EXPECTED) ok(field in row, `element carries ${field}`);
   ok(!("options" in row), "a non-select carries no options key");
   ok(/^ref_\d+$/.test(row.ref), `ref is a ref_N handle (${row.ref})`);
@@ -600,6 +847,43 @@ console.log("== values, masking, editable flags ==");
   ok(byLabel["CVV"].value === MASK_PLACEHOLDER, "a control inside a masked container is masked too");
   ok(!JSON.stringify(snap.elements).includes("737"), "the masked container's inner value never leaks");
   ok(world.mutations.length === 0, `reading values wrote nothing back (${JSON.stringify(world.mutations)})`);
+}
+
+// --- 5b. The sensitive-field category (openspec/changes/jev-literal-field-values) --
+console.log("== the sensitive-field category, reusing the masking classifier ==");
+{
+  // The category rides the SAME descriptor construction the masking scan
+  // itself uses (content.js's maskDescriptorForControl), never a second copy
+  // of maskCategoryForDescriptor's rules — a type/autocomplete match needs no
+  // name evidence at all.
+  const world = bootWorld({
+    elements: [
+      (track) => makeElement("input", { track, type: "password", attrs: { "aria-label": "Mật khẩu" } }),
+      (track) => makeElement("input", { track, type: "text", attrs: { "aria-label": "Mật khẩu hiện tại", autocomplete: "current-password" } }),
+      (track) => makeElement("input", { track, type: "text", attrs: { "aria-label": "Tên công ty" }, value: "Alice, Inc." })
+    ]
+  });
+  const snap = world.send({ type: "pageSnapshot" }).reply.result;
+  const byLabel = Object.fromEntries(snap.elements.map((r) => [r.label, r]));
+  ok(byLabel["Mật khẩu"].sensitive === "password", `a password-type input is classified (got ${JSON.stringify(byLabel["Mật khẩu"].sensitive)})`);
+  ok(byLabel["Mật khẩu hiện tại"].sensitive === "password", `autocomplete=current-password is classified (got ${JSON.stringify(byLabel["Mật khẩu hiện tại"].sensitive)})`);
+  ok(byLabel["Tên công ty"].sensitive === null, `an ordinary input carries no category (got ${JSON.stringify(byLabel["Tên công ty"].sensitive)})`);
+  // Every other row field stays exactly as section 5 already proves — this
+  // only checks that adding `sensitive` did not disturb them for the same rows.
+  ok(byLabel["Mật khẩu"].editable === true && byLabel["Mật khẩu"].tag === "input" && byLabel["Mật khẩu"].type === "password",
+    "existing row fields are unchanged alongside the new sensitive field");
+  ok(byLabel["Tên công ty"].value === "Alice, Inc.", "an unclassified field still reports its real value (never masked by this field alone)");
+  ok(world.mutations.length === 0, "classifying rows for the sensitive field changed nothing on the page");
+}
+{
+  // A non-input/textarea control (e.g. a native select) never runs the
+  // classifier at all — the descriptor is only meaningful for text entry
+  // controls, matching the masking scan's own "input, textarea" scope.
+  const world = bootWorld({
+    elements: [(track) => makeElement("select", { track, attrs: { "aria-label": "Quốc gia", id: "ssn" }, options: [{ textContent: "VN", value: "vn", selected: true }] })]
+  });
+  const row = world.send({ type: "pageSnapshot" }).reply.result.elements[0];
+  ok(row.sensitive === null, `a non-text control never carries a sensitive category (got ${JSON.stringify(row.sensitive)})`);
 }
 
 // --- 6. Native select options -------------------------------------------

@@ -259,6 +259,32 @@ await test("test_capability (real fixture HTTP server, real SDK wire protocol) r
   }
 });
 
+await test("test_capability with target: \"jev-tools\" routes through the REAL companion to the separate Jev-tools test, without touching the primary path", async () => {
+  // jev-tools-connection-test-and-preference tasks.md 1.2: proves the actual
+  // `if (envelope.target === "jev-tools")` branch inside companion.js's own
+  // "test_capability" case, through the real dispatcher — not the scripted
+  // fake test/settings-ui-scripted-companion.mjs uses, and not a direct call
+  // into profile.js. No fixture server is needed: an anthropic profile with
+  // no Jev-tools fields ever configured must report "not_configured" with
+  // zero network calls, which is provable without any live endpoint.
+  const jevProfileId = `${PROFILE_ID}-jevtools-routing`;
+  await core_save_and_credential(jevProfileId, "https://api.anthropic.com", [{ id: "claude-x", label: "Claude X" }], "claude-x");
+  const core = buildRealSettingsCore();
+  const reply = await core.handleEnvelope(agentSettingsEnvelope("test_capability", { profileId: jevProfileId, target: "jev-tools" }));
+  assert(reply.ok === true, `test_capability with target: "jev-tools" must succeed: ${JSON.stringify(reply.error)}`);
+  assert(reply.result.status === "not_configured", `an anthropic profile with no Jev-tools fields must report not_configured, got ${JSON.stringify(reply.result)}`);
+  assert(
+    reply.result.tools.extract_page === false && reply.result.tools.browser_subgoal === false,
+    `both tools must report disabled when nothing is configured, got ${JSON.stringify(reply.result.tools)}`
+  );
+  const wire = JSON.stringify(reply.result);
+  assert(!/secret|apiKey|api_key|credential/i.test(wire), `the jev-tools test result must never carry a secret-shaped field: ${wire}`);
+  // The absent-target path (the pre-existing "test_capability (real fixture
+  // HTTP server...)" test above) is untouched by this branch's existence —
+  // it is a separate `if`, and the default path below it is the exact same
+  // two lines that existed before this change.
+});
+
 await test("an unknown agent_settings op is a structured PROTOCOL_ERROR, not a crash or a fabricated success", async () => {
   const core = buildRealSettingsCore();
   const reply = await core.handleEnvelope(agentSettingsEnvelope("totally_made_up_op", { profileId: PROFILE_ID }));
@@ -342,6 +368,21 @@ await test("set_provider_type with an unknown providerType is INVALID_PROFILE, n
   const core = buildRealSettingsCore();
   const reply = await core.handleEnvelope(agentSettingsEnvelope("set_provider_type", { profileId: PROFILE_ID, providerType: "openai" }));
   assert(reply.ok === false && reply.error.code === "INVALID_PROFILE", `expected INVALID_PROFILE, got ${JSON.stringify(reply.error)}`);
+});
+
+await test("set_provider_type rejects the removed standalone typesafe provider as INVALID_PROFILE, never persisted", async () => {
+  const core = buildRealSettingsCore();
+  const profileId = `${PROFILE_ID}-reject-typesafe`;
+  await core.handleEnvelope(agentSettingsEnvelope("save_profile", { profileId, baseUrl: "https://api.anthropic.com", models: [], defaultModelId: null }));
+  // This suite's single profile slot may carry a providerType left over from
+  // an earlier test in this file (save_profile never resets it) — capture
+  // whatever it currently is rather than assuming "anthropic".
+  const before = await core.handleEnvelope(agentSettingsEnvelope("get_profile", { profileId }));
+  const reply = await core.handleEnvelope(agentSettingsEnvelope("set_provider_type", { profileId, providerType: "typesafe" }));
+  assert(reply.ok === false && reply.error.code === "INVALID_PROFILE", `expected INVALID_PROFILE, got ${JSON.stringify(reply.error)}`);
+  const after = await core.handleEnvelope(agentSettingsEnvelope("get_profile", { profileId }));
+  assert(after.ok === true && after.result.providerType === before.result.providerType, "a rejected switch must never persist");
+  assert(after.result.providerType !== "typesafe", "the rejected value must never end up stored");
 });
 
 await test("set_provider_type without a profileId is a PROTOCOL_ERROR", async () => {
@@ -596,59 +637,47 @@ await test("a start reply that DID carry a token field fails closed (secret-free
   assert(JSON.stringify(reply).indexOf("SECRET-REF-XYZ") === -1, "a refreshToken must never appear in the reply");
 });
 
-await test("set_typesafe_config persists the screenshot toggle and get_profile exposes it (default enabled)", async () => {
+await test("set_typesafe_config on an anthropic profile persists only typesafeSource/jevToolsSendScreenshots and get_profile exposes them (default disabled)", async () => {
   const core = buildRealSettingsCore();
-  const profileId = `${PROFILE_ID}-toggle`;
+  const profileId = `${PROFILE_ID}-jevtools-toggle`;
   const saved = await core.handleEnvelope(
     agentSettingsEnvelope("save_profile", { profileId, baseUrl: "https://api.anthropic.com", models: [], defaultModelId: null })
   );
   assert(saved.ok === true, `setup save_profile failed: ${JSON.stringify(saved.error)}`);
-  const typed = await core.handleEnvelope(agentSettingsEnvelope("set_provider_type", { profileId, providerType: "typesafe" }));
-  assert(typed.ok === true && typed.result.providerType === "typesafe", `setup set_provider_type failed: ${JSON.stringify(typed)}`);
 
-  // A profile this version just created carries the enabled default.
+  // A profile this version just created carries the disabled default, and no
+  // longer carries the removed standalone provider's own screenshot toggle.
   const initial = await core.handleEnvelope(agentSettingsEnvelope("get_profile", { profileId }));
-  assert(initial.ok === true && initial.result.sendScreenshots === true, `get_profile must expose the toggle: ${JSON.stringify(initial)}`);
+  assert(initial.ok === true && initial.result.jevToolsSendScreenshots === false, `get_profile must expose the Jev-tools toggle: ${JSON.stringify(initial)}`);
+  assert(!("sendScreenshots" in initial.result), "the removed primary/typesafe screenshot toggle must not exist on the profile");
 
-  // A profile STORED before the toggle existed (the field absent from disk)
-  // reads back as ENABLED — the documented default.
-  const profileFile = path.join(scratchConfigDir, "agent-profile.json");
-  const legacy = JSON.parse(fs.readFileSync(profileFile, "utf-8"));
-  delete legacy.sendScreenshots;
-  fs.writeFileSync(profileFile, JSON.stringify(legacy));
-  const legacyReply = await core.handleEnvelope(agentSettingsEnvelope("get_profile", { profileId }));
-  assert(legacyReply.ok === true && legacyReply.result.sendScreenshots === true, `an absent toggle must load enabled: ${JSON.stringify(legacyReply)}`);
-
-  // Off persists through the op, and the reply carries the stored value.
-  const off = await core.handleEnvelope(
+  // On persists through the op, and the reply carries the stored value. A
+  // pre-removal settings page's legacy fields (textModelBaseUrl/textModelId)
+  // are accepted (shape-checked) but silently ignored on this profile type.
+  const on = await core.handleEnvelope(
     agentSettingsEnvelope("set_typesafe_config", {
       profileId,
+      typesafeSource: "vercel",
       textModelBaseUrl: "https://text.example.invalid/v1",
       textModelId: "text-model",
-      sendScreenshots: false
+      jevToolsSendScreenshots: true
     })
   );
-  assert(off.ok === true && off.result.sendScreenshots === false, `set_typesafe_config must persist the toggle: ${JSON.stringify(off)}`);
+  assert(on.ok === true, `set_typesafe_config must succeed: ${JSON.stringify(on.error)}`);
+  assert(on.result.typesafeSource === "vercel", `expected the vercel source, got ${on.result.typesafeSource}`);
+  assert(on.result.jevToolsSendScreenshots === true, `set_typesafe_config must persist the toggle: ${JSON.stringify(on)}`);
   const reread = await core.handleEnvelope(agentSettingsEnvelope("get_profile", { profileId }));
-  assert(reread.ok === true && reread.result.sendScreenshots === false, `the toggle must survive the round trip: ${JSON.stringify(reread)}`);
+  assert(reread.ok === true && reread.result.jevToolsSendScreenshots === true, `the toggle must survive the round trip: ${JSON.stringify(reread)}`);
+  assert(reread.result.typesafeSource === "vercel", "the Jev source must survive the round trip");
 
   // An omitted field keeps the stored value; a non-boolean is refused before
   // anything is written.
-  const omitted = await core.handleEnvelope(
-    agentSettingsEnvelope("set_typesafe_config", { profileId, textModelBaseUrl: "https://text.example.invalid/v1", textModelId: "text-model" })
-  );
-  assert(omitted.ok === true && omitted.result.sendScreenshots === false, `an omitted toggle keeps the stored value: ${JSON.stringify(omitted)}`);
-  const bad = await core.handleEnvelope(
-    agentSettingsEnvelope("set_typesafe_config", {
-      profileId,
-      textModelBaseUrl: "https://text.example.invalid/v1",
-      textModelId: "text-model",
-      sendScreenshots: "off"
-    })
-  );
+  const omitted = await core.handleEnvelope(agentSettingsEnvelope("set_typesafe_config", { profileId }));
+  assert(omitted.ok === true && omitted.result.jevToolsSendScreenshots === true, `an omitted toggle keeps the stored value: ${JSON.stringify(omitted)}`);
+  const bad = await core.handleEnvelope(agentSettingsEnvelope("set_typesafe_config", { profileId, jevToolsSendScreenshots: "off" }));
   assert(bad.ok === false && bad.error.code === "PROTOCOL_ERROR", `a non-boolean toggle must be refused: ${JSON.stringify(bad)}`);
   const afterBad = await core.handleEnvelope(agentSettingsEnvelope("get_profile", { profileId }));
-  assert(afterBad.result.sendScreenshots === false, "a refused call must leave the stored toggle untouched");
+  assert(afterBad.result.jevToolsSendScreenshots === true, "a refused call must leave the stored toggle untouched");
 });
 
 // --- test helpers ----------------------------------------------------------

@@ -6,6 +6,7 @@
 import { RUN_STATES } from "../session/run.js";
 import { runHostSideChecks, firstTextOf } from "../tools/dispatch-checks.js";
 import { buildActionSpace, buildDecisionRequest, observationSignature, OPERATIONS } from "./questions.js";
+import { parseOperatorLiteral, literalFieldEligible } from "./literal-field-value.js";
 import { requestDecision, JevError } from "./client.js";
 import { fetchSource, SourceFetchError } from "./source-fetch.js";
 import { observationEvidence, screenshotArtifact } from "./evidence.js";
@@ -143,6 +144,18 @@ export const MAX_VERIFICATION_REJECTIONS = 3;
 export const MAX_RECOVERIES = 2;
 export const MAX_REPLANS_WITHOUT_PROGRESS = 3;
 
+// Subgoal mode's own bounds (jev-browser-subgoal-tool design.md decision 3 /
+// tasks.md 1.1): "smaller ... budgets" than the standalone run above, never
+// larger — a `browser_subgoal` sub-run is ONE bounded interaction the driving
+// LLM delegates, not a whole task. Every one of these is still overridable
+// through `runTypesafeRun`'s `limits` parameter (tests use that, exactly like
+// the standalone constants above); these are only the DEFAULTS applied when
+// `limits.mode === "subgoal"` and the caller passed no explicit override.
+export const SUBGOAL_MAX_ACTIONS = 10;
+export const SUBGOAL_MAX_DECISIONS = 20;
+export const SUBGOAL_NO_PROGRESS_LIMIT = 2;
+export const SUBGOAL_MAX_MEMORY_UPDATES = 2;
+
 export const WAIT_ACTION_SECONDS = 1;
 export const SCROLL_ACTION_TICKS = 3;
 
@@ -241,6 +254,30 @@ function summarizeArgs(tool, args, { omitValue = false } = {}) {
   return { ...args };
 }
 
+function explicitlyRequestsPageMonitor(goal) {
+  const text = String(goal ?? "").toLowerCase();
+  return text.includes("page_monitor") &&
+    /\b(?:save|monitor(?:ing)?)\b/.test(text) &&
+    /\bpage\b/.test(text);
+}
+
+function pageMonitorIdentifier(url) {
+  try {
+    const query = new URL(url).searchParams;
+    return query.get("notifyNo") || query.get("planNo") || null;
+  } catch {
+    return null;
+  }
+}
+
+function pageMonitorPayload(result) {
+  const text = firstTextOf(result);
+  if (text) {
+    try { return JSON.parse(text); } catch {}
+  }
+  return result?.structuredContent ?? result;
+}
+
 function observedPageUrl(value) {
   const url = typeof value === "string" ? value : "";
   const replayUrlTruncated = url.length > MAX_REPLAY_URL_CHARS;
@@ -337,20 +374,62 @@ export async function runTypesafeRun({
   if (typeof canUseTool !== "function") throw new TypeError("runTypesafeRun requires a canUseTool function");
   if (!provider || typeof provider !== "object") throw new TypeError("runTypesafeRun requires a provider");
 
+  // Subgoal mode (jev-browser-subgoal-tool design.md decision 3): the caller
+  // (the `browser_subgoal` tool handler) supplies a goal and shares this run,
+  // toolBridge and canUseTool; the ONE behavioral subtraction versus the
+  // standalone loop below is that Jev's own DONE/`goal_done` ends the sub-run
+  // as an unverified checkpoint instead of triggering task-level completion
+  // verification/report. Everything else — prepare()/replan(), every guard,
+  // gate and dispatch check — is byte-for-byte the standalone path.
+  const subgoalMode = limits.mode === "subgoal";
+  // Correlates this sub-run's `jev_step`/`jev_end` records with the outer
+  // tool call that started it (tasks.md 1.4 / design.md decision 6), so the
+  // panel can attribute them and the outer tool-call result can reference
+  // the same id. The caller may supply one (`provider.subgoalId`, e.g. the
+  // SDK's own tool-call id) for that correlation; a run that omits it still
+  // gets a distinct id rather than an untagged one.
+  const subgoalId = subgoalMode
+    ? (typeof provider.subgoalId === "string" && provider.subgoalId ? provider.subgoalId : `subgoal:${now()}:${Math.random().toString(36).slice(2, 8)}`)
+    : null;
   const maxReplansWithoutProgress = Number.isFinite(limits.maxReplansWithoutProgress) ? Math.max(1, limits.maxReplansWithoutProgress) : MAX_REPLANS_WITHOUT_PROGRESS;
-  const maxActions = Number.isFinite(limits.maxActions) ? Number(limits.maxActions) : MAX_ACTIONS;
-  const maxDecisions = Number.isFinite(limits.maxDecisions) ? Number(limits.maxDecisions) : MAX_DECISIONS;
+  const maxActions = Number.isFinite(limits.maxActions) ? Number(limits.maxActions) : (subgoalMode ? SUBGOAL_MAX_ACTIONS : MAX_ACTIONS);
+  const maxDecisions = Number.isFinite(limits.maxDecisions) ? Number(limits.maxDecisions) : (subgoalMode ? SUBGOAL_MAX_DECISIONS : MAX_DECISIONS);
   const memoryUpdateEveryActions = Number.isFinite(limits.memoryUpdateEveryActions) ? Number(limits.memoryUpdateEveryActions) : MEMORY_UPDATE_EVERY_ACTIONS;
-  const maxMemoryUpdates = Number.isFinite(limits.maxMemoryUpdates) ? Number(limits.maxMemoryUpdates) : MAX_MEMORY_UPDATES;
+  const maxMemoryUpdates = Number.isFinite(limits.maxMemoryUpdates) ? Number(limits.maxMemoryUpdates) : (subgoalMode ? SUBGOAL_MAX_MEMORY_UPDATES : MAX_MEMORY_UPDATES);
   const maxVerificationRejections = Number.isFinite(limits.maxVerificationRejections) ? Number(limits.maxVerificationRejections) : MAX_VERIFICATION_REJECTIONS;
   const maxRecoveries = Number.isFinite(limits.maxRecoveries) ? Number(limits.maxRecoveries) : MAX_RECOVERIES;
   const scrollOnlyStreakLimit = Number.isFinite(limits.scrollOnlyStreak) ? Number(limits.scrollOnlyStreak) : SCROLL_ONLY_STREAK_LIMIT;
+  // The no-progress bound (NO_PROGRESS_LIMIT below): the only guard whose
+  // production constant was not already parameterized through `limits`
+  // before this change. Subgoal mode gets its own smaller default; the
+  // standalone default and every existing test's behavior are unchanged.
+  const noProgressLimit = Number.isFinite(limits.noProgressLimit) ? Number(limits.noProgressLimit) : (subgoalMode ? SUBGOAL_NO_PROGRESS_LIMIT : NO_PROGRESS_LIMIT);
   const tabId = provider.tabId;
   // The screenshot toggle (design.md §4): the companion resolves the profile's
   // default and hands the runtime a boolean; ONLY an explicit `true` enables
   // captures, so an unresolved/absent flag makes every request text-only.
   const screenshotsEnabled = provider.sendScreenshots === true;
+  // Operator literal field values (openspec/changes/jev-literal-field-values):
+  // parsed ONCE, here, from `provider.goal` alone — the operator's own prompt
+  // for this turn, never plan memory, model output, conversation history or
+  // page text. `null` when the prompt is not one of the two whole-prompt
+  // literal forms, which is the common case and leaves every existing path
+  // unchanged. `literalSpent` is a per-run flag: once a literal-sourced
+  // TYPE_TEXT has been DISPATCHED (not merely invalidated by a stale
+  // observation), no further literal binding is created for the rest of the
+  // run, even if its field reappears. `literalBindingSeq` only keeps each
+  // binding's `id` distinct from every other prepared record's id.
+  const operatorLiteral = parseOperatorLiteral(provider.goal);
+  let literalSpent = false;
+  let literalBindingSeq = 0;
   const history = [];
+  // Subgoal mode's own action summary (design.md decision 4 / spec "The tool
+  // returns an unverified checkpoint"): built ONLY in subgoal mode, from the
+  // same evidence `history` rows carry, but shaped for the caller's contract
+  // — target role included (history's rows do not carry it) and NO typed
+  // value or navigated URL ever, for any operation. `history` itself is
+  // unchanged by this addition.
+  const subgoalActionLog = [];
   let executed = 0;
   let decisionsMade = 0;
   // Declared here, not at their first use further down, because `finish()`
@@ -424,13 +503,24 @@ export async function runTypesafeRun({
   // one when a DONE was confirmed, and the final report never duplicates it.
   let resultEmitted = false;
   const emitResult = (text, latencyMs) => {
+    // A subgoal sub-run never writes an operator-facing assistant message:
+    // the checkpoint object returned to the caller (the driving LLM) carries
+    // everything it needs, and the LLM — not this sub-run — owns what (if
+    // anything) the operator sees. Without this guard, the bootstrap-failure
+    // and ASK-branch text below would leak Vietnamese chat text into a
+    // conversation an LLM, not Jev, is driving.
+    if (subgoalMode) return;
     if (!text || resultEmitted) return;
     resultEmitted = true;
     run.emit({ type: "jev_result", text, latencyMs });
   };
 
   const isRunning = () => run.state === RUN_STATES.RUNNING;
-  const emitStep = (step) => run.emit({ type: "jev_step", dispatched: false, ...step });
+  // Standalone events are byte-for-byte unchanged (tasks.md 1.5): the
+  // subgoal tag is spread in ONLY when subgoalMode is true, and never
+  // otherwise touches the emitted shape.
+  const subgoalTag = subgoalMode ? { subgoal: true, subgoalId } : {};
+  const emitStep = (step) => run.emit({ type: "jev_step", dispatched: false, ...subgoalTag, ...step });
   let previousPhase = null;
   let phaseStep = 1;
   const emitPhase = (phase) => {
@@ -468,7 +558,11 @@ export async function runTypesafeRun({
     //     reached, because asking that same model again turns one provider
     //     failure into two.
     let reportError = null;
-    const canReport = !resultEmitted && snapshot !== null && !["text_model_error", "preparation_failed"].includes(reason);
+    // Subgoal mode's one behavioral subtraction (design.md decision 3): NO
+    // task-level completion verification or report, for ANY terminal
+    // outcome — not only `done`. The driving LLM owns verification; this
+    // sub-run's only job is the checkpoint `finish()` attaches below.
+    const canReport = !subgoalMode && !resultEmitted && snapshot !== null && !["text_model_error", "preparation_failed"].includes(reason);
     if (canReport) {
       try {
         emitPhase("reporting");
@@ -521,7 +615,8 @@ export async function runTypesafeRun({
       ...(disclosedError ? { summaryError: disclosedError } : {}),
       // Whether this run produced an answer at all, so a turn without one
       // shows a disclosed absence rather than reading as a blank reply.
-      hasResult: resultEmitted
+      hasResult: resultEmitted,
+      ...subgoalTag
     });
     const result = { outcome, reason: reason ?? null, steps: executed };
     if (reason === "needs_operator") result.needsOperator = true;
@@ -529,6 +624,23 @@ export async function runTypesafeRun({
     if (error) result.error = error;
     if (disclosedError) result.summaryError = disclosedError;
     result.hasResult = resultEmitted;
+    // The checkpoint the `browser_subgoal` tool handler maps into its
+    // returned contract (design.md decision 4): the observed page after the
+    // sub-run and the bounded ordered action summary built alongside
+    // `history` above. Present ONLY in subgoal mode — the standalone return
+    // shape is otherwise byte-identical (tasks.md 1.5).
+    if (subgoalMode) {
+      result.checkpoint = {
+        // The SAME id tagged on this sub-run's `jev_step`/`jev_end` records
+        // (`subgoalTag` above) — never a second, independently-minted one —
+        // so the outer tool-call result can reference the exact events the
+        // panel attributes to this sub-run (design.md decision 6).
+        subgoalId,
+        url: snapshot?.url ?? null,
+        title: snapshot?.title ?? null,
+        actions: subgoalActionLog.slice()
+      };
+    }
     return result;
   };
 
@@ -810,6 +922,11 @@ export async function runTypesafeRun({
     if (candidate.preparedId) {
       const record = [...prepared.textValues, ...prepared.navigation].find((item) => item.id === candidate.preparedId);
       if (record) record.consumed = true;
+      // A literal is spent after one DISPATCH for the whole run, even if its
+      // field reappears. A binding invalidated without ever reaching here
+      // (a stale nonce, a target change) never sets this flag, so a fresh
+      // eligible observation can still rebind (design.md decision 4).
+      if (record?.source === "literal") literalSpent = true;
     }
     const meta = run.describeRequestForWire();
     emitPhase(coerced.action === "wait" ? "waiting" : "executing");
@@ -937,6 +1054,7 @@ export async function runTypesafeRun({
   let planRevision = 0;
   let replansWithoutProgress = 0;
   let planAttempted = false;
+  let pageMonitorAttempted = false;
   // A positive stuck judgment buys exactly one revised plan: once that plan
   // exists and nothing has run under it yet, the run owes its next selected
   // action an attempt rather than another identical consultation. True while
@@ -963,7 +1081,11 @@ export async function runTypesafeRun({
       const raw = snapshot?.elements.find((el) => el.ref === target?.ref);
       if (!snapshot?.docNonce || !raw) throw new JevError("INVALID_RESPONSE", "prepared text requires an observed document identity and exact field");
       return { id: `${revision}:text:${index}`, ref: raw.ref, role: String(raw.role ?? ""),
-        label: String(raw.label ?? ""), docNonce: snapshot.docNonce, value: record.value, consumed: false };
+        label: String(raw.label ?? ""), docNonce: snapshot.docNonce, value: record.value, consumed: false,
+        // Distinguishes a model-prepared binding from an operator literal
+        // (jev-literal-field-values): a literal binding always supersedes a
+        // "prepared" one for the same field.
+        source: "prepared" };
     });
     prepared = { textValues, navigation: planned.navigation.map((record, index) => ({
       ...record, id: `${revision}:url:${index}`, consumed: false
@@ -994,6 +1116,45 @@ export async function runTypesafeRun({
           String(field.value ?? "") === record.value) record.consumed = true;
     }
     if (!snapshot?.docNonce || snapshot.docNonce !== prepared.docNonce || observationSignature(snapshot) !== prepared.observation) delete prepared.visualNotes;
+
+    // Operator literal field values (openspec/changes/jev-literal-field-values
+    // design.md decision 3): bind host-side, at observation time, without any
+    // language-model call — so a matching field revealed after the initial
+    // plan (a later cycle, a post-navigation observation) still gets the
+    // literal without a REPLAN. Runs AFTER the invalidation pass above, on
+    // every call — including the pre-dispatch re-validation inside
+    // dispatch() — so a stale binding is always cleared before a fresh one
+    // is considered.
+    if (operatorLiteral && !literalSpent && snapshot?.docNonce) {
+      const elements = Array.isArray(snapshot.elements) ? snapshot.elements : [];
+      const eligible = elements.find((el) => literalFieldEligible(operatorLiteral, el, elements));
+      if (eligible) {
+        // Already satisfied: the field already holds the literal, so nothing
+        // is bound and nothing is spent.
+        const alreadyEqual = String(eligible.value ?? "") === operatorLiteral.value;
+        const hasUnconsumedLiteral = prepared.textValues.some((record) =>
+          record.source === "literal" && record.ref === eligible.ref &&
+          record.docNonce === snapshot.docNonce && !record.consumed);
+        if (!alreadyEqual && !hasUnconsumedLiteral) {
+          // A literal supersedes a model-prepared value for the same field:
+          // any unconsumed "prepared" binding for this ref is dropped, never
+          // offered alongside the literal.
+          prepared.textValues = prepared.textValues.filter((record) =>
+            !(record.ref === eligible.ref && record.source !== "literal" && !record.consumed));
+          literalBindingSeq += 1;
+          prepared.textValues.push({
+            id: `literal:${literalBindingSeq}`,
+            ref: eligible.ref,
+            role: String(eligible.role ?? ""),
+            label: String(eligible.label ?? ""),
+            docNonce: snapshot.docNonce,
+            value: operatorLiteral.value,
+            consumed: false,
+            source: "literal"
+          });
+        }
+      }
+    }
     return prepared;
   }
 
@@ -1032,7 +1193,7 @@ export async function runTypesafeRun({
   // target-unresolved alike. Returns the terminal result when the guard ends
   // the run, or null to let the loop continue.
   async function noProgressGuard() {
-    if (noProgress < NO_PROGRESS_LIMIT) return null;
+    if (noProgress < noProgressLimit) return null;
     return recoverFromStall("no_progress");
   }
 
@@ -1040,6 +1201,54 @@ export async function runTypesafeRun({
   catch (err) {
     if (!isRunning()) return finish({ outcome: "stopped", reason: "stopped" });
     return finish({ outcome: "error", reason: "preparation_failed", error: { code: err?.code ?? "INVALID_RESPONSE", message: err.message } });
+  }
+
+  // `page_monitor` is an explicit browser capability, not one of Jev's
+  // complete-action choices. Honor a clear request deterministically once the
+  // first page snapshot exists, before the normal Jev decision loop can choose
+  // DONE or BLOCKED without ever dispatching the monitor.
+  if (explicitlyRequestsPageMonitor(provider.goal) && snapshot && !pageMonitorAttempted) {
+    pageMonitorAttempted = true;
+    const monitorArgs = {
+      tabId,
+      action: "save",
+      identifier: pageMonitorIdentifier(snapshot.url),
+      url: snapshot.url,
+      kind: "page"
+    };
+    const monitorStep = {
+      step: executed + 1,
+      operation: null,
+      decisionSource: "runtime",
+      target: null,
+      tool: "page_monitor",
+      argsSummary: summarizeArgs("page_monitor", monitorArgs),
+      latencies: { dispatchMs: 0 },
+      pageChanged: false,
+      observed: { ...observedPageUrl(snapshot.url) }
+    };
+    const dispatchStartedAt = now();
+    const dispatched = await dispatch("page_monitor", monitorArgs, { operation: null, target: null });
+    monitorStep.dispatched = dispatched.dispatched === true;
+    monitorStep.latencies.dispatchMs = now() - dispatchStartedAt;
+    const payload = dispatched.ok ? pageMonitorPayload(dispatched.result) : null;
+    const saved = dispatched.ok && payload?.ok === true && payload?.status === "saved";
+    if (saved) {
+      monitorStep.actionOutcome = "succeeded";
+      monitorStep.monitorStatus = "saved";
+      executed += 1;
+      emitStep(monitorStep);
+      return finish({ outcome: "done", reason: null, doneVerified: true });
+    }
+    monitorStep.actionOutcome = dispatched.unknown || dispatched.failed || dispatched.actionFailed ? "failed" : "blocked";
+    if (dispatched.actionError) monitorStep.actionError = dispatched.actionError;
+    emitStep(monitorStep);
+    if (!isRunning() || dispatched.stopped) return finish({ outcome: "stopped", reason: "stopped" });
+    if (dispatched.unknown) {
+      return finish({ outcome: "error", reason: "tool_result_unknown", error: { code: "RESULT_UNKNOWN", message: dispatched.message } });
+    }
+    if (dispatched.denied || dispatched.stale) return finish({ outcome: "blocked", reason: "action_denied" });
+    return finish({ outcome: "error", reason: null, error: { code: "PAGE_MONITOR_FAILED", message: "page_monitor did not confirm a saved baseline" } });
   }
 
   while (true) {
@@ -1181,6 +1390,17 @@ export async function runTypesafeRun({
       if (!current.ok) return finish({ outcome: "blocked", reason: "completion_unverified", summaryError: current.message });
       snapshot = current.snapshot;
       recordObservation(snapshot);
+      // Subgoal mode's one behavioral subtraction (design.md decision 3):
+      // Jev's own DONE/`goal_done` judgment — or a repeated submission,
+      // which standalone treats as needing verification before a second
+      // send — ends the sub-run HERE, as an unverified checkpoint. No
+      // completion-check call, no report; the driving LLM owns whether the
+      // goal was really reached and whether to submit again.
+      if (subgoalMode) {
+        step.skippedReason = "done";
+        emitStep(step);
+        return finish({ outcome: "done", reason: null, doneVerified: false });
+      }
       image = screenshotsEnabled ? await capturePage() : null;
       if (!isRunning()) return finish({ outcome: "stopped", reason: "stopped" });
       // A fresh completion consultation gets one optional screenshot. Jev
@@ -1357,6 +1577,13 @@ export async function runTypesafeRun({
       tool = "form_input";
       args = { ref: target.ref, value: decidedStep.text, tabId };
       generatedText = decidedStep.text;
+      // Which source prepared this dispatch's value (jev-literal-field-values,
+      // "Text value source is observable"). The typed value itself is never
+      // recorded — only which of the two mutually exclusive sources it came
+      // from — and a candidate offered by buildDecisionRequest always traces
+      // back to a still-present prepared.textValues record.
+      const preparedRecord = candidate.preparedId ? prepared.textValues.find((record) => record.id === candidate.preparedId) : null;
+      step.valueSource = preparedRecord?.source === "literal" ? "literal" : "prepared";
     } else if (operation === OPERATIONS.NAVIGATE) {
       // The prepared URL was validated as bounded absolute http(s) content
       // before becoming an offered complete navigation action.
@@ -1426,11 +1653,13 @@ export async function runTypesafeRun({
         // `tool_result_unknown`), never retried.
         step.skippedReason = "result_unknown";
         emitStep(step);
+        if (subgoalMode) subgoalActionLog.push({ operation, targetLabel: target?.label ?? null, targetRole: target?.role ?? null, outcome: "unknown" });
         return finish({ outcome: "error", reason: "tool_result_unknown", error: { code: "RESULT_UNKNOWN", message: dispatched.message } });
       }
       if (dispatched.failed) {
         step.skippedReason = "navigation_failed";
         emitStep(step);
+        if (subgoalMode) subgoalActionLog.push({ operation, targetLabel: target?.label ?? null, targetRole: target?.role ?? null, outcome: "failed" });
         return finish({ outcome: "error", reason: "navigation_failed", error: { code: "NAVIGATION_ERROR", message: dispatched.message } });
       }
       step.skippedReason = "action_denied";
@@ -1457,6 +1686,14 @@ export async function runTypesafeRun({
       text: generatedText,
       page_changed: false
     });
+    if (subgoalMode) {
+      subgoalActionLog.push({
+        operation,
+        targetLabel: target?.label ?? null,
+        targetRole: target?.role ?? null,
+        outcome: dispatched.actionFailed ? "failed" : "succeeded"
+      });
+    }
 
     // An action that was already in flight when the run stopped settles as-is
     // (its real result was received, so it is recorded), and the loop then

@@ -72,7 +72,13 @@ export async function createRealCompanionHarness(opts = {}) {
           result = await profileModule.removeCredential(msg.profileId);
           break;
         case "test_capability":
-          result = await profileModule.testCapability(msg.profileId, msg.modelId);
+          // jev-tools-connection-test-and-preference tasks.md 1.2: mirrors
+          // companion.js's own routing — an optional `target: "jev-tools"`,
+          // absent target unchanged.
+          result =
+            msg.target === "jev-tools"
+              ? await profileModule.testJevToolsCapability(msg.profileId)
+              : await profileModule.testCapability(msg.profileId, msg.modelId);
           break;
         case "discover_models":
           result = await profileModule.refreshDiscoveredModels(msg.profileId);
