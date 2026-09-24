@@ -1516,6 +1516,21 @@ export class ConversationModel {
       // Attached to the TURN rather than pushed as a top-level item so the
       // card sits with the answer that produced it, the way the transcript
       // already anchors mid-turn question answers.
+      case "memory_recalled": {
+        // openspec/changes/add-task-memory: the run was offered what earlier
+        // completed runs on this site did. A DISCLOSURE, not an action: it is
+        // kept on the turn apart from toolRows, so it can never be counted as
+        // a browser operation or rendered as a step that was performed.
+        // Replay-safe by construction: one field, overwritten, never appended.
+        const turn = this._turnFor(event.runId, { createIfMissing: true, ts: event.ts });
+        const confirmed = Array.isArray(event.confirmedAt) ? event.confirmedAt.filter((ms) => Number.isFinite(ms)) : [];
+        turn.memoryRecall = {
+          host: typeof event.host === "string" ? event.host : null,
+          count: Array.isArray(event.memoryIds) ? event.memoryIds.length : 0,
+          lastConfirmedAt: confirmed.length ? Math.max(...confirmed) : null
+        };
+        break;
+      }
       case "document_created": {
         const turn = this._turnFor(event.runId, { createIfMissing: true, ts: event.ts });
         if (!Array.isArray(turn.documents)) turn.documents = [];

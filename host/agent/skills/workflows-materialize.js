@@ -742,7 +742,7 @@ function recordedHosts(calls) {
  *  null when the window carries no such listing, or the URL is not an
  *  ordinary http(s) page — a replay is never pointed at an invented
  *  address. */
-function recordedStartUrl({ conversationEvents, runId, calls }) {
+export function recordedStartUrl({ conversationEvents, runId, calls }) {
   const listCallIds = new Set(
     calls.filter((call) => call.name === "tabs_context_mcp" && call.toolUseId).map((call) => call.toolUseId)
   );

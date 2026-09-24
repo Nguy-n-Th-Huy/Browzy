@@ -90,7 +90,7 @@ When a run delegates a step to the Jev decision layer, the same rendered advice,
 
 ### Requirement: Reinforcement, staleness and confirmation
 
-The host SHALL record which memory ids were offered to a run. When that run ends in `run_done`, each offered entry SHALL be reinforced (use count incremented, last used and last confirmed times updated). When that run ends in `run_error`, is stopped by the operator after a failed step, ends Jev `blocked`, or ends in a drift outcome on the same host, each offered entry SHALL be marked stale with the reason. A stale entry SHALL not be offered again until a later `run_done` on that host confirms it: a new derivation with the same intent tokens and a step tool sequence at least 80 % identical SHALL replace the stale entry as fresh.
+The host SHALL record which memory ids were offered to a run. When that run ends in `run_done`, each offered entry SHALL be reinforced (use count incremented, last used and last confirmed times updated). When that run ends in `run_error`, is stopped by the operator after a failed step, ends Jev `blocked`, or ends in a drift outcome on the same host, each offered entry SHALL be marked stale with the reason. A stale entry SHALL not be offered again until a later `run_done` on that host confirms it: a new derivation whose intent tokens and step tool sequence each match the stored entry at least 80 % SHALL replace it as fresh, keeping its usage history. The same rule applies to a fresh entry, so repeating a task refreshes its memory rather than accumulating copies.
 
 #### Scenario: Memory contradicted by a failure
 - **WHEN** a run that received a memory fails on that site
@@ -99,6 +99,10 @@ The host SHALL record which memory ids were offered to a run. When that run ends
 #### Scenario: Memory re-confirmed
 - **WHEN** a later run on that host completes with the same intent and a nearly identical step sequence
 - **THEN** the stale entry is replaced by the fresh derivation and becomes a candidate again
+
+#### Scenario: Repeating a task does not pile up copies
+- **WHEN** the same task is completed on the same host a second time with a nearly identical step sequence
+- **THEN** one entry remains for it, fresh, with its use history kept
 
 ### Requirement: Operator control, privacy and deletion
 

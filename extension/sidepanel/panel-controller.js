@@ -456,6 +456,18 @@ export class PanelController {
     return { ok: true, count: typeof reply.count === "number" ? reply.count : cleared, hadActiveRuns: reply.hadActiveRuns || 0 };
   }
 
+  /** The START `privacy` field (add-task-memory): `{ privacy: { rawPromptCaching } }`,
+   *  or nothing when the history store cannot answer. */
+  _privacyForStart() {
+    try {
+      const policy = this.historyStore && typeof this.historyStore.policy === "function" ? this.historyStore.policy() : null;
+      if (policy && typeof policy.rawPromptCaching === "boolean") return { privacy: { rawPromptCaching: policy.rawPromptCaching } };
+    } catch {
+      // No policy readable: say nothing rather than guess.
+    }
+    return {};
+  }
+
   _newIdempotencyKey(prefix, conversationId) {
     this._idempotencySeq = (this._idempotencySeq || 0) + 1;
     return `${prefix}_${conversationId}_${this._idempotencySeq}_${Date.now()}`;
@@ -1164,7 +1176,13 @@ export class PanelController {
           // choice. The key makes a duplicate delivery of THIS send resolve to
           // the entry it already created (design.md decision 7).
           mode,
-          idempotencyKey
+          idempotencyKey,
+          // openspec/changes/add-task-memory: the history privacy switch
+          // ("Không lưu nội dung câu hỏi") travels with the send, so the host
+          // writes no task memory for a turn whose request the operator chose
+          // not to keep. Read fresh per send; absent when the store is not
+          // available, which the host treats as "no policy stated".
+          ...this._privacyForStart()
         });
       } catch {
         // The send never left (ProtocolClient throws when its port is gone).

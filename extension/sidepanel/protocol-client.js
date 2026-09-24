@@ -308,7 +308,7 @@ export class ProtocolClient {
    * `attachments`, when present, is an additive optional field of artifact
    * references (never raw bytes) — ignored by older companions.
    */
-  start({ conversationId, profileId, modelId, tabScope, prompt, context, attachments, effort, elementRecord, mode, idempotencyKey }) {
+  start({ conversationId, profileId, modelId, tabScope, prompt, context, attachments, effort, elementRecord, mode, idempotencyKey, privacy }) {
     const payload = { conversationId, profileId, modelId, tabScope, prompt, context };
     if (attachments && attachments.length) payload.attachments = attachments;
     // Absent, not null: the companion reads an absent field as "send no effort
@@ -331,6 +331,10 @@ export class ProtocolClient {
     // duplicate delivery of the SAME send resolves to the entry it already
     // created instead of queueing the message twice.
     if (idempotencyKey) payload.idempotencyKey = idempotencyKey;
+    // openspec/changes/add-task-memory: the history privacy policy for this
+    // turn ({ rawPromptCaching }). Additive optional: an old companion
+    // ignores it, and absent means "no policy stated".
+    if (privacy && typeof privacy === "object") payload.privacy = privacy;
     this._send(envelope(MSG.START, payload));
   }
 

@@ -706,7 +706,12 @@ export function buildIsolatedOptions({
   maxTurns = null,
   maxBudgetUsd = null,
   resolveHint = null,
-  policySnapshot = null
+  policySnapshot = null,
+  // openspec/changes/add-task-memory (design.md decision 5): the rendered
+  // "What worked on this site before" section, or null. Guidance only —
+  // appended to the system prompt beside the other conditional sections and
+  // never to `prompt`; null leaves the system prompt byte-identical.
+  taskMemoryGuidance = null
 }) {
   if (!mcpServer) throw new Error("buildIsolatedOptions requires mcpServer");
   if (!serverName) throw new Error("buildIsolatedOptions requires serverName");
@@ -802,7 +807,11 @@ export function buildIsolatedOptions({
     // `qualifiedBrowserToolNames`, but read from the SAME source here) — see
     // `renderJevToolsPreferenceSystemPrompt`'s own doc comment for why an
     // absent tool is never named and why neither present adds nothing at all.
-    renderJevToolsPreferenceSystemPrompt(serverName, extraToolNames)
+    renderJevToolsPreferenceSystemPrompt(serverName, extraToolNames),
+    // add-task-memory: recalled memory as past evidence, rendered by
+    // host/agent/memory/guidance.js. A non-string is ignored rather than
+    // stringified, so a caller bug cannot inject "[object Object]".
+    typeof taskMemoryGuidance === "string" && taskMemoryGuidance.trim() ? taskMemoryGuidance : null
   ]
     .filter(Boolean)
     .join("\n\n");

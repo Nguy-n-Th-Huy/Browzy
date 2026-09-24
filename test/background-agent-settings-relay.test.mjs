@@ -259,7 +259,9 @@ async function main() {
       "../extension/settings/permissions-client.js",
       "../extension/sidepanel/permissions-client.js",
       "../extension/settings/skills-client.js",
-      "../extension/sidepanel/skills-client.js"
+      "../extension/sidepanel/skills-client.js",
+      // add-task-memory: Settings > Bộ nhớ cách làm việc.
+      "../extension/settings/memory-client.js"
     ];
     const sentOps = new Set();
     for (const rel of clientFiles) {

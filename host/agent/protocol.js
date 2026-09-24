@@ -923,6 +923,24 @@ export const START_MODES = Object.freeze({
  * Validate START's optional `mode` field.
  * @returns {{ok: true, mode: string} | {ok: false, reason: string}}
  */
+/**
+ * Validate START's optional `privacy` field (openspec/changes/add-task-memory
+ * design.md decision 8): the panel's own history privacy policy, which lives
+ * extension-side. Only `rawPromptCaching` is read — `false` means the
+ * operator chose "Không lưu nội dung câu hỏi", and the host then writes no
+ * new task memory for this turn. Absent is valid (no policy stated); a
+ * present value of the wrong shape is refused rather than guessed.
+ * @returns {{ok: true, privacy: {rawPromptCaching?: boolean} | null} | {ok: false, reason: string}}
+ */
+export function validateStartPrivacy(value) {
+  if (value === undefined || value === null) return { ok: true, privacy: null };
+  if (typeof value !== "object" || Array.isArray(value)) return { ok: false, reason: "malformed_privacy" };
+  if (value.rawPromptCaching !== undefined && typeof value.rawPromptCaching !== "boolean") {
+    return { ok: false, reason: "malformed_privacy" };
+  }
+  return { ok: true, privacy: typeof value.rawPromptCaching === "boolean" ? { rawPromptCaching: value.rawPromptCaching } : {} };
+}
+
 export function validateStartMode(value) {
   if (value === undefined || value === null) return { ok: true, mode: START_MODES.QUEUE };
   if (value === START_MODES.QUEUE || value === START_MODES.INTERRUPT) return { ok: true, mode: value };

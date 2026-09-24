@@ -73,6 +73,9 @@ const STATIC_LABELS_VI = {
   // page_monitor covers save/check/list/delete for a tracked page baseline —
   // one label spans all four actions, same pattern as page_snapshots above.
   page_monitor: "Đã lưu hoặc kiểm tra theo dõi trang",
+  // openspec/changes/add-task-memory: the read-only recall tool — reading
+  // what earlier runs on this site did, never an action on the page.
+  task_memory: "Đã xem lại cách làm lần trước",
   ask_user: "Đã hỏi người dùng"
 };
 

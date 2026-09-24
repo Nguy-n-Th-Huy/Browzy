@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Bộ nhớ cách làm việc — Browzy</title>
+<link rel="stylesheet" href="../ui/tokens.css" />
+<link rel="stylesheet" href="../ui/base.css" />
+<link rel="stylesheet" href="../ui/components.css" />
+<link rel="stylesheet" href="../ui/prose.css" />
+<script type="module" src="../ui/theme.js"></script>
+<script type="module" src="../ui/behaviors.js"></script>
+<style>
+  /* Page-local layout only — shared tokens/primitives in extension/ui/**
+     are reused, never edited here (same note permissions.html carries). */
+  .panel-shell {
+    max-width: 640px;
+    margin: 0 auto;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    background: var(--color-canvas);
+  }
+  .panel-scroll {
+    flex: 1;
+    overflow-y: auto;
+    padding: var(--space-4) var(--panel-gutter) var(--space-8);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+  .memory-note { font-size: var(--font-size-small); color: var(--color-text-secondary); line-height: 1.55; margin: 0; }
+  .toggle-row { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); }
+  .site-card { display: flex; flex-direction: column; gap: var(--space-2); padding: var(--space-3) 14px; border-radius: var(--radius-md); border: 1px solid var(--color-border-subtle); background: var(--color-surface); box-shadow: var(--shadow-sm); }
+  .site-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); flex-wrap: wrap; }
+  .site-host { font-weight: 700; font-family: var(--font-mono); font-size: var(--font-size-small); overflow-wrap: anywhere; }
+  .memory-row { display: flex; flex-direction: column; gap: 2px; padding-top: var(--space-2); border-top: 1px solid var(--color-border-subtle); }
+  .memory-intent { font-size: var(--font-size-ui); overflow-wrap: anywhere; }
+  .memory-meta { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: var(--font-size-small); color: var(--color-text-secondary); }
+  .memory-stale { color: var(--color-status-warning); }
+  .memory-empty {
+    display: flex; flex-direction: column; align-items: center; text-align: center; gap: var(--space-2);
+    padding: var(--space-8) var(--space-6); background: var(--color-surface); border: 1px dashed var(--color-border);
+    border-radius: var(--radius-md);
+  }
+  /* The class sets display, which would otherwise beat the UA's [hidden]. */
+  .memory-empty[hidden], .memory-note[hidden] { display: none; }
+</style>
+</head>
+<body>
+<div class="panel-shell">
+  <header class="panel-header">
+    <button class="btn-icon" aria-label="Quay lại" id="btn-back"></button>
+    <span class="panel-header-title" style="font-size:var(--font-size-h2)">Bộ nhớ cách làm việc</span>
+    <div class="panel-header-actions"></div>
+  </header>
+
+  <main class="panel-scroll">
+    <div id="banner-area"></div>
+
+    <p class="section-heading" id="toggle-heading">Ghi nhớ</p>
+    <div class="field-group">
+      <div class="field-group-item">
+        <div class="toggle-row">
+          <span>
+            <label class="field-label" for="memory-enabled">Ghi nhớ cách làm việc</label>
+            <p class="field-hint">Khi một lượt chạy hoàn tất, Browzy nhớ các bước đã làm trên trang đó. Lần sau bạn yêu cầu việc tương tự trên cùng trang, nó đi thẳng tới cách đã làm được thay vì mò lại.</p>
+          </span>
+          <label class="switch">
+            <input type="checkbox" id="memory-enabled" role="switch" />
+            <span class="switch-track"></span>
+            <span class="switch-thumb"></span>
+          </label>
+        </div>
+        <p class="field-hint" style="margin-top:var(--space-2)">Khi bật "Không lưu nội dung câu hỏi" trong Lịch sử, Browzy tạm dừng ghi nhớ mới; những cách làm đã nhớ vẫn được dùng. Tắt công tắc này không xóa gì — dùng các nút bên dưới để quên.</p>
+      </div>
+    </div>
+
+    <p class="section-heading" id="sites-heading">Đã ghi nhớ</p>
+    <p class="memory-note">Đây là ghi chép về những lần làm trước, chỉ để tham khảo. Nó không cấp quyền gì: mọi thao tác vẫn được hỏi quyền như bình thường. Không lưu mật khẩu, nội dung bạn gõ hay nội dung trang.</p>
+    <div class="field-row-actions" style="justify-content:flex-end">
+      <button class="btn btn-ghost btn-sm" type="button" id="btn-forget-all">Quên tất cả</button>
+    </div>
+    <div id="site-list" role="group" aria-labelledby="sites-heading" style="display:flex;flex-direction:column;gap:8px"></div>
+    <p class="memory-note" id="invalid-note" hidden></p>
+    <div class="memory-empty" id="memory-empty" hidden>
+      <span id="ic-empty"></span>
+      <p style="font-weight:700;margin:0">Chưa ghi nhớ cách làm nào</p>
+      <p style="font-size:var(--font-size-small);color:var(--color-text-secondary);margin:0;max-width:340px">Khi một lượt chạy trên một trang hoàn tất, cách làm sẽ xuất hiện ở đây.</p>
+    </div>
+  </main>
+</div>
+
+<script type="module" src="./memory-app.js"></script>
+</body>
+</html>

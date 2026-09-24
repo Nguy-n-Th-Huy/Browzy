@@ -1161,7 +1161,11 @@ function renderTurnHtml(turn, opts) {
   // expanded view -- their data is unchanged by the visual collapse, only
   // the row's visibility toggles (its DOM exists either way so the spec's
   // "expansion state does not alter the underlying record" held both ways).
-  const timelineHtml = turn.toolRows.length ? renderTimelineCollapsed(turn) : "";
+  const timelineHtml = turn.toolRows.length
+    ? renderTimelineCollapsed(turn)
+    : turn.memoryRecall
+      ? `<div class="tool-timeline-group">${renderMemoryRecallHtml(turn)}</div>`
+      : "";
   // Tasks 7.4/7.5: injection findings / probe failures / tab-risk updates
   // recorded for this turn's run — plain informational warnings, positioned
   // right after the tool timeline (roughly where the tool call that
@@ -1346,8 +1350,33 @@ function renderTimelineCollapsed(turn) {
         <span class="tool-timeline-glyph" aria-hidden="true">${iconMarkup(isExpanded ? "chevronDown" : "chevronRight", { size: 14 })}</span>
         <span class="tool-timeline-text">${escapeHtml(summaryLabel)}</span>
       </button>
+      ${renderMemoryRecallHtml(turn)}
       <div class="tool-timeline tool-timeline-list" id="${escapeHtml(`tl-${turn.runId}`)}" ${isExpanded ? "" : "hidden"}>${listHtml}</div>
     </div>`;
+}
+
+// openspec/changes/add-task-memory (browser-assistant-panel delta "Recalled
+// memory is disclosed truthfully in the run timeline"): one line saying the
+// run consulted what earlier runs on this site did. Deliberately NOT a tool
+// row — no state icon, no expand, outside timelineCounts() — so it can never
+// read as, or be counted as, an operation that was performed.
+function relativeDayLabel(ms) {
+  if (!Number.isFinite(ms)) return "";
+  const days = Math.floor((Date.now() - ms) / 86_400_000);
+  if (days <= 0) return "hôm nay";
+  if (days === 1) return "hôm qua";
+  if (days < 30) return `${days} ngày trước`;
+  return new Date(ms).toLocaleDateString("vi-VN");
+}
+
+function renderMemoryRecallHtml(turn) {
+  const recall = turn && turn.memoryRecall;
+  if (!recall) return "";
+  const parts = ["Đã tham khảo cách làm lần trước"];
+  if (recall.host) parts.push(recall.host);
+  const when = relativeDayLabel(recall.lastConfirmedAt);
+  if (when) parts.push(when);
+  return `<p class="memory-recall-note">${iconMarkup("history", { size: 14 })}<span>${escapeHtml(parts.join(" · "))}</span></p>`;
 }
 
 function renderUserItemHtml(item) {

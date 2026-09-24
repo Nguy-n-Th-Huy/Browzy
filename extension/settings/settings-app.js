@@ -43,6 +43,8 @@ $("ic-skills").innerHTML = iconMarkup("skills", { size: 18 });
 $("ic-chevr-skills").innerHTML = iconMarkup("chevronRight", { size: 16 });
 $("ic-permissions").innerHTML = iconMarkup("lock", { size: 18 });
 $("ic-chevr-permissions").innerHTML = iconMarkup("chevronRight", { size: 16 });
+$("ic-memory").innerHTML = iconMarkup("history", { size: 18 });
+$("ic-chevr-memory").innerHTML = iconMarkup("chevronRight", { size: 16 });
 
 // ChatGPT sign-in copy per phase (add-chatgpt-subscription-provider tasks.md
 // 5.3) — kept as one small lookup so the aria-live status paragraph and any
@@ -1116,6 +1118,9 @@ function wireEvents() {
   });
   $("nav-permissions").addEventListener("click", () => {
     window.location.href = "./permissions.html";
+  });
+  $("nav-memory").addEventListener("click", () => {
+    window.location.href = "./memory.html";
   });
   $("nav-skills").addEventListener("click", () => {
     window.location.href = "./skills.html";

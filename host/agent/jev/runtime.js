@@ -1072,6 +1072,10 @@ export async function runTypesafeRun({
     const planned = await requestActionPlan({
       textModel: provider.textModel, goal: provider.goal, memory, page: pageOf(snapshot),
       pageAvailability, conversation: provider.conversation, elements: space.elements,
+      // add-task-memory: bounded advice from earlier completed runs on this
+      // site, when the caller supplied any. Plan-request context only; no
+      // selection, verification or bound in this loop reads it.
+      ...(typeof provider.priorPathAdvice === "string" && provider.priorPathAdvice ? { priorPathAdvice: provider.priorPathAdvice } : {}),
       elementsOmitted: space.omitted, history, image, reason: trigger, now, sleep
     });
     if (!isRunning()) return false;

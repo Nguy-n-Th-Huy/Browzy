@@ -103,6 +103,6 @@ client.handleEnvelope(corrupt[0]);
 client.handleEnvelope({ ...corrupt[1], size: 4 });
 assert.equal((await pending).found, false);
 
-const renderTimeline = compile(extractFunction("renderTimelineCollapsed", "extension/sidepanel/sidepanel.js"), { timelineCounts, timelineExpandedRuns: new Set(), timelineDurationLabel: () => "38s", toolRowHtml: () => "", escapeHtml, iconMarkup: () => "" }, "renderTimelineCollapsed");
+const renderTimeline = compile(extractFunction("renderTimelineCollapsed", "extension/sidepanel/sidepanel.js"), { timelineCounts, timelineExpandedRuns: new Set(), timelineDurationLabel: () => "38s", toolRowHtml: () => "", escapeHtml, iconMarkup: () => "", renderMemoryRecallHtml: () => "" }, "renderTimelineCollapsed");
 assert.ok(renderTimeline(turn).includes("1 thao tác trình duyệt · 2 lập kế hoạch/kiểm tra"));
 console.log("PASS feedback: phase/permission/terminal priority, exact counts, bounded escaped evidence, replay, safe disclosure, historical artifact identity/MIME/chunks/unavailability");

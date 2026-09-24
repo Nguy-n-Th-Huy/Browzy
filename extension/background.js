@@ -736,7 +736,16 @@ function createAgentSettingsRelay(opts) {
     "skills_disable",
     "skills_remove",
     "skills_set_invocation_flags",
-    "get_advertised_commands"
+    "get_advertised_commands",
+    // Task memory (openspec/changes/add-task-memory): the settings page's
+    // "Bộ nhớ cách làm việc" switch and its list/forget surface. Same class
+    // of omission as the permission and skills ops above — left out here,
+    // every call answers with the local unknown-op PROTOCOL_ERROR and the
+    // page can neither show nor forget anything.
+    "task_memory_get_settings",
+    "task_memory_set_settings",
+    "task_memory_list",
+    "task_memory_forget"
   ]);
 
   function settle(requestId, response) {

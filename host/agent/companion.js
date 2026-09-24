@@ -41,6 +41,7 @@ import {
   validateStartEffort,
   validateStartSessionChoice,
   validateStartMode,
+  validateStartPrivacy,
   START_MODES,
   attachmentKind,
   makeEnvelope,
@@ -87,6 +88,13 @@ import { TabRiskRegistry } from "./threat/tab-risk.js";
 import { createAskUserTool, ASK_USER_TOOL_NAME } from "./tools/ask-the-user.js";
 import { createCreateDocumentTool, CREATE_DOCUMENT_TOOL_NAME } from "./tools/create-document.js";
 import { createPageSnapshotsTool, PAGE_SNAPSHOTS_TOOL_NAME } from "./tools/page-snapshots.js";
+import { createTaskMemoryTool, TASK_MEMORY_TOOL_NAME } from "./tools/task-memory.js";
+import { TaskMemoryStore } from "./memory/store.js";
+import { deriveTaskMemory, runSucceeded } from "./memory/derive.js";
+import { recallForRun } from "./memory/recall.js";
+import { renderTaskMemorySystemPrompt, renderPriorPathAdvice } from "./memory/guidance.js";
+import { loadTaskMemorySettings, saveTaskMemorySettings } from "./memory/settings.js";
+import { normalizeHost as normalizeMemoryHost, hostOfUrl as memoryHostOfUrl } from "./skills/workflows-match.js";
 import { DocumentStore } from "./documents/store.js";
 import { SnapshotStore } from "./snapshots/store.js";
 import { authorizeBorrowedTabMutation } from "./tools/mapping.js";
@@ -365,7 +373,7 @@ export class CompanionCore {
    *   network call. Additive: omitted, the op resolves the real module
    *   lazily.
    */
-  constructor({ toolBridge, sessionManager, lease, coerceArgs, sdk, profileProvider, settingsProvider, chatgptAuthProvider, chatgptUsageReader, artifactStore, attachmentStore, askUserToolFactory, documentStore, snapshotStore, healProposals }) {
+  constructor({ toolBridge, sessionManager, lease, coerceArgs, sdk, profileProvider, settingsProvider, chatgptAuthProvider, chatgptUsageReader, artifactStore, attachmentStore, askUserToolFactory, documentStore, snapshotStore, healProposals, taskMemoryStore, taskMemorySettings }) {
     this.toolBridge = toolBridge;
     this.sessionManager = sessionManager;
     this.lease = lease;
@@ -384,6 +392,12 @@ export class CompanionCore {
     // by page URL under the agent root, because the monitoring pattern spans
     // conversations (see host/agent/snapshots/store.js's own header).
     this.snapshotStore = snapshotStore || new SnapshotStore();
+    // Task memory (openspec/changes/add-task-memory): what completed runs on
+    // a site did, kept per site under the agent root — like snapshots, it
+    // outlives the conversation that produced it. The settings source is
+    // injectable so tests can flip the switch without touching disk.
+    this.taskMemoryStore = taskMemoryStore || new TaskMemoryStore();
+    this.taskMemorySettings = taskMemorySettings || { load: loadTaskMemorySettings, save: saveTaskMemorySettings };
     this.attachmentStore = attachmentStore || new UserAttachmentStore();
     this._settingsModulePromise = null;
     // ChatGPT auth provider: injected double (tests) or the real auth.js
@@ -1864,6 +1878,20 @@ export class CompanionCore {
       // unreachable — a refusal is an ANSWER, not silence.
       return makeEnvelope(AGENT_MESSAGE_TYPES.ERROR, { reason: "unknown_conversation", conversationId, requestId });
     }
+    // add-task-memory: memories this conversation produced go with it. Done
+    // BEFORE the conversation itself, so a failure here is reported as a
+    // failed delete with nothing removed — never a claimed success that left
+    // the conversation's memories behind.
+    try {
+      this.taskMemoryStore.forgetByConversation(conversationId);
+    } catch (err) {
+      return makeEnvelope(AGENT_MESSAGE_TYPES.ERROR, {
+        reason: "memory_forget_failed",
+        detail: err.message,
+        conversationId,
+        requestId
+      });
+    }
     const { hadActiveRun, onDiskRemoved } = this.sessionManager.deleteConversation(conversationId);
     // This conversation is gone — its TabRiskRegistry (see
     // _tabRiskRegistryFor()) would otherwise linger in memory forever in a
@@ -1899,6 +1927,16 @@ export class CompanionCore {
     const { removed, failed, hadActiveRuns } = this.sessionManager.deleteAllConversations();
     for (const conversationId of removed) this._tabRiskByConversation.delete(conversationId);
     for (const conversationId of removed) this._uploadGrantsByConversation.delete(conversationId);
+    // add-task-memory: every removed conversation's memories go with it; a
+    // memory that could not be forgotten makes the sweep a reported partial
+    // failure rather than a claimed success.
+    for (const conversationId of removed) {
+      try {
+        this.taskMemoryStore.forgetByConversation(conversationId);
+      } catch (err) {
+        failed.push({ conversationId, reason: "memory_forget_failed", detail: err.message });
+      }
+    }
     const reply = makeEnvelope(AGENT_MESSAGE_TYPES.DELETE_ALL_CONVERSATIONS, {
       idempotencyKey: key.key,
       deleted: failed.length === 0,
@@ -2446,6 +2484,63 @@ export class CompanionCore {
    * *whether* a credential is saved (`hasCredential`/`{backend}`/
    * `{removed:true}`), never the key itself.
    */
+  /**
+   * The task-memory ops on the settings relay (add-task-memory tasks.md 6.4):
+   *   task_memory_get_settings  -> { enabled }
+   *   task_memory_set_settings  { enabled: boolean } -> { enabled }
+   *   task_memory_list          -> { sites: [{ host, memories: [summary] }], invalid }
+   *   task_memory_forget        { host } | { all: true } -> { forgotten }
+   * Returns null for any other op. A summary never carries the recorded
+   * steps' arguments — the surface shows what is remembered, not how.
+   */
+  _handleTaskMemoryOp(envelope, { ok, fail }) {
+    const op = envelope.op;
+    if (typeof op !== "string" || !op.startsWith("task_memory_")) return null;
+    try {
+      switch (op) {
+        case "task_memory_get_settings":
+          return ok(this.taskMemorySettings.load());
+        case "task_memory_set_settings":
+          if (typeof envelope.enabled !== "boolean") return fail("VALIDATION_ERROR", "`enabled` must be a boolean");
+          return ok(this.taskMemorySettings.save({ enabled: envelope.enabled }));
+        case "task_memory_list": {
+          const entries = this.taskMemoryStore.listAll();
+          const sites = new Map();
+          let invalid = 0;
+          for (const entry of entries) {
+            if (!entry.ok) {
+              invalid += 1;
+              continue;
+            }
+            const memory = entry.memory;
+            if (!sites.has(memory.host)) sites.set(memory.host, []);
+            sites.get(memory.host).push({
+              id: memory.id,
+              intent: memory.intent.text,
+              stepCount: memory.steps.length,
+              actionCount: memory.outcome.actionCount,
+              lastConfirmedAt: memory.stats.lastConfirmedAt,
+              useCount: memory.stats.useCount,
+              state: memory.stats.state
+            });
+          }
+          return ok({ sites: [...sites.entries()].map(([host, memories]) => ({ host, memories })), invalid });
+        }
+        case "task_memory_forget": {
+          if (envelope.all === true) return ok({ forgotten: this.taskMemoryStore.forgetAll() });
+          if (typeof envelope.host === "string" && normalizeMemoryHost(envelope.host)) {
+            return ok({ forgotten: this.taskMemoryStore.forgetHost(envelope.host) });
+          }
+          return fail("VALIDATION_ERROR", "task_memory_forget needs a `host` or `all: true`");
+        }
+        default:
+          return fail("PROTOCOL_ERROR", `unknown task memory op: ${op}`);
+      }
+    } catch (err) {
+      return fail("STORAGE_ERROR", `task memory: ${err.message}`);
+    }
+  }
+
   async _handleAgentSettings(envelope) {
     const requestId = envelope.requestId;
     const fail = (code, message) =>
@@ -2455,6 +2550,13 @@ export class CompanionCore {
     if (typeof envelope.v !== "number" || !Number.isInteger(envelope.v) || !isSupportedVersion(envelope.v)) {
       return fail("PROTOCOL_ERROR", `unsupported protocol version: ${JSON.stringify(envelope.v)}`);
     }
+
+    // add-task-memory: the memory switch and management surface. Handled
+    // before the provider-settings module loads — none of them touches a
+    // profile or a credential, and none should fail because that module is
+    // unavailable.
+    const memoryReply = this._handleTaskMemoryOp(envelope, { ok, fail });
+    if (memoryReply) return memoryReply;
 
     let settings;
     try {
@@ -3140,9 +3242,16 @@ export class CompanionCore {
       newSdkSession,
       elementRecord,
       mode,
-      idempotencyKey
+      idempotencyKey,
+      privacy
     } = envelope;
     if (!conversationId) return makeEnvelope(AGENT_MESSAGE_TYPES.ERROR, { reason: "missing_conversation_id" });
+    // add-task-memory: the panel's history privacy policy for this turn,
+    // validated on the same footing as the other optional START fields.
+    const privacyResult = validateStartPrivacy(privacy);
+    if (!privacyResult.ok) {
+      return makeEnvelope(AGENT_MESSAGE_TYPES.ERROR, { reason: privacyResult.reason, conversationId });
+    }
     // Rejected here, before any run exists, for the same reason a malformed
     // attachment is: a turn must never run at a different reasoning depth
     // than the composer showed.
@@ -3230,7 +3339,8 @@ export class CompanionCore {
       profileId: profileId ?? null,
       modelId: modelId ?? null,
       newSdkSession: sessionChoiceResult.newSdkSession,
-      tabScope: tabScope || "any"
+      tabScope: tabScope || "any",
+      privacy: privacyResult.privacy
     };
     if (this.sessionManager.hasActiveRun(conversationId) || this.sessionManager.pendingQueueEntries(conversationId).length > 0) {
       return this._admitQueuedStart(conversationId, { mode: modeResult.mode, idempotencyKey: idemKey, submission });
@@ -3439,7 +3549,8 @@ export class CompanionCore {
       attachmentRefs: submission.attachmentRefs || [],
       elementRecord: submission.elementRecord ?? null,
       effort: submission.effort ?? null,
-      newSdkSession: submission.newSdkSession === true
+      newSdkSession: submission.newSdkSession === true,
+      privacy: submission.privacy ?? null
     }).catch((err) => {
       run.emit({ type: "run_error", error: String((err && err.message) || err) });
       this._releaseRunGatewayToken(run);
@@ -3617,7 +3728,7 @@ export class CompanionCore {
     return null;
   }
 
-  async _runAfterLeaseGranted(run, { profileId, modelId, prompt, context, attachmentRefs = [], elementRecord = null, effort = null, newSdkSession = false }) {
+  async _runAfterLeaseGranted(run, { profileId, modelId, prompt, context, attachmentRefs = [], elementRecord = null, effort = null, newSdkSession = false, privacy = null }) {
     const conversationId = run.conversationId;
     const granted = await run.begin();
     if (!granted) {
@@ -3899,6 +4010,12 @@ export class CompanionCore {
       jevExtractPageConfig = null;
     }
 
+    // add-task-memory: recall what earlier completed runs on this page's site
+    // did (design.md decisions 4-5). Best-effort and inert: a failure here
+    // means no memory, never a failed run, and nothing recalled here reaches
+    // any approval path — it becomes system-prompt text and planner advice.
+    const taskMemory = this._prepareTaskMemory(run, { prompt, context, privacy });
+
     // Task 9.5: build the application-owned ask-the-user tool bound to this
     // run + this companion's _pendingQuestions tracker. Registered alongside
     // the browser tools on the same SDK MCP server, so the SDK's tools/
@@ -3963,7 +4080,20 @@ export class CompanionCore {
           coerceArgs: this.coerceArgs,
           canUseTool: (name, toolArgs) => sharedCanUseTool(name, toolArgs),
           jevConfig: jevSubgoalConfig,
-          resolveTabId: () => this._typesafeTabId(run, context)
+          resolveTabId: () => this._typesafeTabId(run, context),
+          getPriorPathAdvice: () => taskMemory.advice
+        })
+      : null;
+    // add-task-memory: the READ-ONLY recall tool, pinned to this run's bound
+    // site. Registered whenever task memory is enabled, and named alongside
+    // the others in extraToolNames below — registered-but-invisible is the
+    // documented trap every host tool here guards against.
+    const taskMemoryTool = taskMemory.enabled
+      ? await createTaskMemoryTool({
+          run,
+          store: this.taskMemoryStore,
+          host: taskMemory.host,
+          getCandidates: () => taskMemory.candidates
         })
       : null;
     // jev-extract-page-tool: registered ONLY when `jevExtractPageConfig`
@@ -3989,7 +4119,8 @@ export class CompanionCore {
         pageSnapshotsTool,
         proposeHealTool,
         ...(browserSubgoalTool ? [browserSubgoalTool] : []),
-        ...(extractPageTool ? [extractPageTool] : [])
+        ...(extractPageTool ? [extractPageTool] : []),
+        ...(taskMemoryTool ? [taskMemoryTool] : [])
       ],
       // CRITICAL fix: this conversation's OWN TabRiskRegistry (see
       // _tabRiskRegistryFor()'s own comment), not the per-run default
@@ -4112,8 +4243,17 @@ export class CompanionCore {
           PAGE_SNAPSHOTS_TOOL_NAME,
           PROPOSE_WORKFLOW_HEAL_TOOL_NAME,
           ...(browserSubgoalTool ? [BROWSER_SUBGOAL_TOOL_NAME] : []),
-          ...(extractPageTool ? [EXTRACT_PAGE_TOOL_NAME] : [])
+          ...(extractPageTool ? [EXTRACT_PAGE_TOOL_NAME] : []),
+          ...(taskMemoryTool ? [TASK_MEMORY_TOOL_NAME] : [])
         ],
+        // add-task-memory: past evidence, never authority — see
+        // host/agent/memory/guidance.js. null when nothing was recalled; the
+        // recall tool is named in it only when this run registered it.
+        taskMemoryGuidance: renderTaskMemorySystemPrompt(
+          SDK_MCP_SERVER_NAME,
+          taskMemory.candidates,
+          taskMemoryTool ? [TASK_MEMORY_TOOL_NAME] : []
+        ),
         effort,
         resume: resumeSessionId || undefined
       });
@@ -4124,6 +4264,11 @@ export class CompanionCore {
       this.sessionManager.finishRun(conversationId, run);
       return;
     }
+    // add-task-memory: the options this run starts with carry the recalled
+    // memory, so record — durably, once — that it was offered. The panel's
+    // disclosure line is rendered from this event, and the run's outcome
+    // reinforces or stales exactly these ids (see _settleTaskMemory).
+    this._announceTaskMemory(run, taskMemory);
 
     // Tasks 2.1/2.2: bind this run's app-immutable identity (secret-free
     // profile identity, session-schema identity, permission-policy
@@ -4190,6 +4335,112 @@ export class CompanionCore {
       );
     }
     return resolved;
+  }
+
+  // --- Task memory (openspec/changes/add-task-memory) -----------------------
+  //
+  // Three moments, three methods:
+  //   _prepareTaskMemory  — run start: read the switch, recall for the bound
+  //                         site, render the planner advice.
+  //   _announceTaskMemory — once the run's options are built: one durable
+  //                         `memory_recalled` event naming what was offered.
+  //   _settleTaskMemory   — after the run's terminal event is stored: derive a
+  //                         memory from a clean success and reinforce what was
+  //                         offered, or stale what was offered on a failure.
+  // Every one of them is best-effort: memory is advice, and no failure in
+  // keeping it may fail, delay or alter a run.
+
+  /** @returns {{ enabled: boolean, host: string|null, candidates: Array, advice: string|null }} */
+  _prepareTaskMemory(run, { prompt, context, privacy }) {
+    const none = { enabled: false, host: null, candidates: [], advice: null };
+    let enabled = false;
+    try {
+      enabled = this.taskMemorySettings.load().enabled === true;
+    } catch {
+      enabled = false;
+    }
+    if (!enabled) {
+      run._taskMemory = none;
+      return none;
+    }
+    const host =
+      normalizeMemoryHost(typeof context?.hostname === "string" ? context.hostname : "") ||
+      (typeof context?.url === "string" ? memoryHostOfUrl(context.url) : null);
+    const request = typeof prompt === "string" ? prompt : "";
+    let candidates = [];
+    if (host) {
+      try {
+        candidates = recallForRun({ memories: this.taskMemoryStore.freshForHost(host), host, request }).candidates;
+      } catch {
+        candidates = [];
+      }
+    }
+    const plan = { enabled: true, host, candidates, advice: renderPriorPathAdvice(candidates) };
+    run._taskMemory = { ...plan, request, privacy: privacy || null, announced: false };
+    return plan;
+  }
+
+  _announceTaskMemory(run, taskMemory) {
+    if (!taskMemory?.candidates?.length || !run._taskMemory) return;
+    run._taskMemory.announced = true;
+    run.emit({
+      type: "memory_recalled",
+      host: taskMemory.host,
+      memoryIds: taskMemory.candidates.map((candidate) => candidate.memory.id),
+      confirmedAt: taskMemory.candidates.map((candidate) => candidate.memory.stats.lastConfirmedAt),
+      ts: Date.now()
+    });
+  }
+
+  /** Did a failed run fail on a STEP (not merely get stopped by the operator)? */
+  _runHadFailedStep(events, runId) {
+    for (const event of events) {
+      if (!event || event.runId !== runId) continue;
+      if (event.type === "tool_rejected" || event.type === "tool_result_unknown") return true;
+      if (event.type === "stream_message" && event.message?.type === "user") {
+        const content = Array.isArray(event.message.message?.content) ? event.message.message.content : [];
+        if (content.some((block) => block?.type === "tool_result" && block.is_error === true)) return true;
+      }
+    }
+    return false;
+  }
+
+  _settleTaskMemory(run) {
+    const memory = run?._taskMemory;
+    if (!memory || !memory.enabled) return;
+    const conversationId = run.conversationId;
+    try {
+      if (!this.sessionManager.hasConversation(conversationId)) return; // deleted meanwhile: nothing to keep
+      const events = this.sessionManager.store.allEvents(conversationId);
+      const offered = memory.announced ? memory.candidates.map((candidate) => candidate.memory.id) : [];
+      const outcome = runSucceeded({ conversationEvents: events, runId: run.runId });
+      if (outcome.ok) {
+        for (const id of offered) this.taskMemoryStore.reinforce(id, { confirmed: true });
+        const meta = this.sessionManager.store.loadMeta(conversationId);
+        const derived = deriveTaskMemory({
+          conversationEvents: events,
+          conversationId,
+          runId: run.runId,
+          request: memory.request,
+          boundHost: memory.host,
+          metaHostname: meta && typeof meta.hostname === "string" ? meta.hostname : null,
+          privacy: memory.privacy || {}
+        });
+        if (derived.ok) this.taskMemoryStore.write(derived.memory);
+        return;
+      }
+      if (!offered.length) return;
+      const contradicted =
+        outcome.reason === "run_error" ||
+        outcome.reason === "drift" ||
+        outcome.reason.startsWith("jev_") ||
+        (outcome.reason === "run_stopped" && this._runHadFailedStep(events, run.runId));
+      if (contradicted) {
+        for (const id of offered) this.taskMemoryStore.markStale(id, outcome.reason);
+      }
+    } catch {
+      // Best-effort — see the section note above.
+    }
   }
 
   /**
@@ -4320,6 +4571,10 @@ export class CompanionCore {
       // interrupted run's unwind can land after a successor already owns this
       // conversation's slot, and must not retire it.
       this.sessionManager.finishRun(run.conversationId, run);
+      // add-task-memory: finishRun() has just stored the terminal event, so
+      // the whole trail is on disk. Deferred so keeping a memory never delays
+      // the panel's view of the outcome.
+      if (run._taskMemory?.enabled) setImmediate(() => this._settleTaskMemory(run));
     }
   }
 }

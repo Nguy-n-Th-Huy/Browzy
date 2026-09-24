@@ -45,8 +45,7 @@
   steps: [ { index, tool, action?, args, target?: {role,name}, host, omitted?: true, reason? } ] ≤ 40,
   outcome: { status: "completed", actionCount, durationMs },
   provenance: { conversationId, runId, completedAt, deriveVersion },
-  stats: { useCount, lastUsedAt, lastConfirmedAt, state: "fresh" | "stale" },
-  size: bytes
+  stats: { useCount, lastUsedAt, lastConfirmedAt, state: "fresh" | "stale", staleReason? }
 }
 ```
 `intent.text` is the operator's request bounded to 200 characters **and is `null` when the privacy control disables raw prompt caching** (see decision 8). `intent.tokens` is a normalized, deduplicated bag of lowercase tokens (diacritics preserved — Vietnamese carries meaning in them; only case and punctuation folded). Readers tolerate unknown keys; a missing optional key is not corruption.
@@ -77,7 +76,7 @@ Nothing in the approval path reads memory: `can-use-tool.js`, the classifier, pe
 
 ### 7. Reinforcement and staleness
 
-`companion.js` records on the run which memory ids were offered (`memory_recalled` durable event, decision 9). At the next terminal event of that run: `run_done` → `reinforce(id, { confirmed: true })` for every offered id; `run_error`, `run_stopped` by the operator after a failed step, a Jev `blocked`, or a drift outcome on the same host → `markStale(id, reason)`. Stale entries are not offered until a later `run_done` on that host produces a new memory or re-confirms this one (a fresh derivation with the same intent tokens and ≥ 80 % identical step tool sequence replaces the stale entry). No decay clock in v1: a memory is either confirmed by evidence or contradicted by it.
+`companion.js` records on the run which memory ids were offered (`memory_recalled` durable event, decision 9). At the next terminal event of that run: `run_done` → `reinforce(id, { confirmed: true })` for every offered id; `run_error`, `run_stopped` by the operator after a failed step, a Jev `blocked`, or a drift outcome on the same host → `markStale(id, reason)`. Stale entries are not offered until a later `run_done` on that host produces a new memory or re-confirms this one (a fresh derivation whose intent tokens and step tool sequence each match ≥ 80 % replaces the entry, keeping its usage history — the same rule stops a repeated task from piling up copies of a fresh entry). No decay clock in v1: a memory is either confirmed by evidence or contradicted by it.
 
 ### 8. Privacy, opt-out, forgetting, deletion
 

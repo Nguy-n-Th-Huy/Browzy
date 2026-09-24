@@ -108,7 +108,10 @@ export async function createBrowserSubgoalTool({
   jevConfig,
   resolveTabId,
   toolFactory,
-  runTypesafeRunImpl
+  runTypesafeRunImpl,
+  // add-task-memory: returns this run's rendered prior-path advice (or null),
+  // read fresh at call time. Optional; absent means no advice.
+  getPriorPathAdvice = null
 }) {
   if (!run) throw new Error("createBrowserSubgoalTool requires a run");
   if (!toolBridge) throw new Error("createBrowserSubgoalTool requires a toolBridge");
@@ -193,6 +196,10 @@ export async function createBrowserSubgoalTool({
           // Self-contained by design (design.md decision 2): a subgoal
           // carries no prior-turn transcript.
           conversation: [],
+          // add-task-memory: what earlier completed runs on this site did,
+          // read at call time from the outer run's recalled memory. Advice
+          // for the planner only — see requestActionPlan's prior_path_advice.
+          ...(typeof getPriorPathAdvice === "function" && getPriorPathAdvice() ? { priorPathAdvice: getPriorPathAdvice() } : {}),
           tabId
         },
         limits: { mode: "subgoal" }
