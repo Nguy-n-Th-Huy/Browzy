@@ -35,7 +35,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { listCatalog } from "./manage.js";
 import { snapshotDir } from "./paths.js";
-import { SkillPathError } from "./errors.js";
+import { SkillPathError, SkillBindingAbortedError } from "./errors.js";
 import { toSkillOverrideValue } from "./capabilities.js";
 
 // Fixed, application-owned plugin name for every session's materialized
@@ -217,11 +217,36 @@ function materializeSkillsPlugin(sessionWorkspaceDir, skillEntries) {
  * by `(CLAUDE_CONFIG_DIR, encoded cwd)`, so this is a real, load-bearing
  * isolation property for any future SDK-`resume` use, not merely tidiness.
  *
+ * `isAborted`, when given, is consulted exactly once, right after the
+ * `await listCatalog()` above resolves and before any synchronous write
+ * (`materializeSkillsPlugin()`'s mkdir/copy, then this function's own
+ * `configDir` mkdir) — the one place in this async function where a caller
+ * whose conversation was deleted while this call was in flight (e.g.
+ * host/agent/companion.js's `_bindSkillsForRun()`, guarding against
+ * SessionManager.deleteConversation()'s tombstone) can still stop it before
+ * it recreates the very directory the delete just removed. JS's
+ * single-threaded execution model makes a check placed immediately before a
+ * synchronous block race-free: nothing can flip the predicate between the
+ * check and the writes that follow it. Throws `SkillBindingAbortedError`
+ * rather than returning a sentinel, so a caller that does not pass
+ * `isAborted` (every other caller — see this function's other call sites)
+ * keeps its exact prior behavior with zero risk of silently swallowing the
+ * abort.
+ *
  * @param {string} sessionWorkspaceDir
+ * @param {object} [opts]
+ * @param {() => boolean} [opts.isAborted] - checked once after `listCatalog()`
+ *   resolves; when it returns true, this function throws
+ *   `SkillBindingAbortedError` instead of materializing anything.
  * @returns {Promise<{ skillsDir: string, pluginDir: string, configDir: string, allowedSkillNames: string[], catalogSnapshot: object[], skillOverrides: Record<string, string> }>}
  */
-export async function buildSessionSkills(sessionWorkspaceDir) {
+export async function buildSessionSkills(sessionWorkspaceDir, { isAborted } = {}) {
   const catalog = await listCatalog();
+  if (typeof isAborted === "function" && isAborted()) {
+    throw new SkillBindingAbortedError(
+      `Skills binding aborted: "${sessionWorkspaceDir}" was deleted before catalog materialization began.`
+    );
+  }
   const approved = catalog.filter(
     (s) => s.enabled === true && (!s.unsupportedCapabilities || s.unsupportedCapabilities.length === 0)
   );

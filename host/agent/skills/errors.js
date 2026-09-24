@@ -65,3 +65,18 @@ export class SkillNotFoundError extends Error {
     this.code = "NOT_FOUND";
   }
 }
+
+// Raised when a conversation's skills binding is aborted mid-flight because
+// the conversation was deleted (SessionManager.deleteConversation()'s
+// tombstone) while an async gap (a live catalog read, or a resume-snapshot
+// check) was still pending. Callers must treat this as a clean, expected
+// shutdown — never a real binding failure — because the delete path already
+// stopped the run and told the panel it is gone; see
+// host/agent/companion.js's `_bindSkillsForRun()`/`_runAfterLeaseGranted()`.
+export class SkillBindingAbortedError extends Error {
+  constructor(message) {
+    super(message || "Skills binding aborted: the conversation was deleted before binding completed.");
+    this.name = "SkillBindingAbortedError";
+    this.code = "CONVERSATION_DELETED";
+  }
+}

@@ -24,5 +24,6 @@ export {
   SkillCapabilityError,
   SkillDispatchError,
   SkillSnapshotMismatchError,
-  SkillNotFoundError
+  SkillNotFoundError,
+  SkillBindingAbortedError
 } from "./errors.js";

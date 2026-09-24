@@ -102,6 +102,7 @@ import {
   SkillSnapshotMismatchError,
   SkillNotFoundError,
   SkillPathError,
+  SkillBindingAbortedError,
   listCatalog as listSkillsCatalog,
   getSkill,
   authorSkill,
@@ -3471,6 +3472,21 @@ export class CompanionCore {
     const existing = this.sessionManager.getSkillsBinding(conversationId);
     if (existing) {
       await assertResumeSnapshotAvailable(existing.catalogSnapshot);
+      // Race guard (mirrors the fresh-path `isAborted` check passed to
+      // buildSessionSkills() below): the conversation may have been deleted
+      // — SessionManager.deleteConversation()'s tombstone — while the await
+      // above was pending. Checked here, immediately before any backfill
+      // write (materializePluginFromCatalogSnapshot()'s mkdir/copy, or the
+      // configDir mkdir further down), and nowhere else in this branch, so
+      // nothing after this line can resurrect the just-removed conversation
+      // directory. JS's single-threaded execution makes this race-free: no
+      // further await separates this check from the synchronous writes it
+      // guards.
+      if (this.sessionManager.wasDeleted(conversationId)) {
+        throw new SkillBindingAbortedError(
+          `Skills binding aborted: conversation "${conversationId}" was deleted before its existing binding could be backfilled.`
+        );
+      }
       let migrated = existing;
       let changed = false;
 
@@ -3538,7 +3554,15 @@ export class CompanionCore {
       return existing;
     }
     const workspaceDir = conversationDir(conversationId);
-    const built = await buildSessionSkills(workspaceDir);
+    // `isAborted` closes the same race for a conversation's FIRST binding:
+    // buildSessionSkills() checks it right after its own `await
+    // listCatalog()` and right before its synchronous materialize/mkdir
+    // writes — see that function's own docstring. Re-reading
+    // `wasDeleted(conversationId)` here (rather than capturing a boolean
+    // now) is deliberate: the predicate must reflect whatever is true at the
+    // moment buildSessionSkills() actually checks it, not at the moment this
+    // call was made.
+    const built = await buildSessionSkills(workspaceDir, { isAborted: () => this.sessionManager.wasDeleted(conversationId) });
     const binding = { cwd: workspaceDir, ...built };
     this.sessionManager.setSkillsBinding(conversationId, binding);
     return binding;
@@ -3692,6 +3716,21 @@ export class CompanionCore {
     try {
       skills = await this._bindSkillsForRun(conversationId);
     } catch (err) {
+      if (err instanceof SkillBindingAbortedError) {
+        // The conversation was deleted (SessionManager.deleteConversation()'s
+        // tombstone) while skills were binding. That delete already stopped
+        // this run and told the panel the conversation is gone — see
+        // deleteConversation()'s own doc comment — so emitting a
+        // skills_binding_failed run_error here would misreport a clean,
+        // already-handled shutdown as a fresh failure for a conversation
+        // that no longer exists (and race back to resurrecting its
+        // directory, the exact bug this guard exists to close). End quietly:
+        // release whatever this run was holding and retire its slot, exactly
+        // like the failure branch below does, minus the misleading error.
+        this._releaseRunGatewayToken(run);
+        this.sessionManager.finishRun(conversationId, run);
+        return;
+      }
       const reason = err instanceof SkillSnapshotMismatchError ? "skills_snapshot_unavailable" : "skills_binding_failed";
       run.emit({ type: "run_error", reason, detail: err.message });
       run.stop(reason);
