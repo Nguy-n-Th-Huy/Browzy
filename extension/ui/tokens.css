@@ -7,55 +7,48 @@
  * settings screens resolves through this file, which is what makes a palette
  * change a one-file change.
  *
- * The palette is Aurora, the direction settled for the remote-control
- * overlay (extension/overlay/pointer-overlay.js) and carried through to the
- * rest of the UI so the page a run is driving and the panel driving it read
- * as one product. It replaces the earlier warm scheme (off-white #F7F5F2 /
- * charcoal #191918 / terracotta #C4785B) wholesale — hue, ground and text
- * tone all moved, not just the accent.
- *
- * Aurora is built from two hues at equal lightness and chroma, oklch(0.74
- * 0.19 215) cyan and oklch(0.74 0.19 300) violet. Only cyan becomes a token
- * here; see the accent block for why violet does not.
+ * The palette is Amber: a warm cream ground, brown-black text and a single
+ * burnt-orange accent. It replaces Aurora (cool grey ground, cyan accent)
+ * wholesale — hue, ground and text tone all moved, not just the accent. The
+ * remote-control overlay (extension/overlay/pointer-overlay.js) keeps its
+ * own Aurora colours; it paints over arbitrary pages and does not read this
+ * file.
  *
  * EVERY text/background and accent pairing below was measured against WCAG
- * 2.1 AA and carries its ratio inline. Three of them constrain the palette
- * rather than follow from it, and would be easy to break by "tidying" a
- * value:
+ * 2.1 AA and carries its ratio inline (test/design-tokens-contrast.test.mjs
+ * recomputes them). Three of them constrain the palette rather than follow
+ * from it, and would be easy to break by "tidying" a value:
  *
- *  1. Cyan at its authored lightness is 1.87:1 on the light canvas — far
- *     below AA for text. The light theme therefore carries THREE cyan steps,
- *     not one: --color-accent for fills and icons (3.63:1, non-text only),
- *     --color-accent-text one step darker for anything body-sized (4.63:1),
- *     and --color-accent-fg as the label colour on an accent fill (4.87:1
- *     against it). The dark theme needs no such split: there the authored
- *     cyan already clears 9.62:1 and is used as-is.
- *  2. --color-accent-fg is DARK, not white. White on the light theme's
- *     accent fill reaches only 3.89:1; the near-black reaches 4.87:1. This
- *     inverts the usual instinct and is deliberate.
+ *  1. The light theme carries TWO orange steps: --color-accent for fills
+ *     and icons (4.81:1 on canvas) and --color-accent-text one step darker
+ *     for accent-coloured body text and links (6.31:1). The dark theme uses
+ *     one lighter orange for both (8.99:1).
+ *  2. --color-accent-fg flips between themes: WHITE on the light theme's
+ *     deep orange fill (5.18:1), near-black on the dark theme's light
+ *     orange (8.45:1). Neither works in the other theme.
  *  3. A single border colour cannot be both quiet and pass 3:1 everywhere.
  *     Two tokens exist: --color-border-subtle (decorative dividers and card
  *     edges that are reinforced by a background change or shadow) and
  *     --color-border (>=3:1 against canvas, surface AND sunken in both
  *     themes, for functional boundaries — inputs, outlined buttons, and
  *     anything whose visibility is the only cue of an interactive edge).
- *     The sunken surface is the binding constraint in both themes; a border
- *     that passes on canvas can still fail there.
+ *     The sunken surface is the binding constraint in the light theme and
+ *     the raised surface in the dark one.
  */
 
 :root {
   color-scheme: light;
 
   /* ---- Color: surfaces ---- */
-  --color-canvas: #f6f7f9;
+  --color-canvas: #faf6ef;
   --color-surface: #ffffff; /* slightly raised: cards, composer, menus */
-  --color-surface-sunken: #eceef2; /* inputs, code blocks */
+  --color-surface-sunken: #f2ebdf; /* inputs, code blocks */
   /* Paper. Deliberately the same in both themes: it backs a rendered document
      page (a PDF canvas), which pdf.js draws onto transparently — a themed
      surface there would put dark glyphs on a dark ground. Not a UI surface;
      never use it for panel chrome. */
   --color-paper: #ffffff;
-  --color-overlay-scrim: rgba(11, 11, 17, 0.34);
+  --color-overlay-scrim: rgba(34, 26, 18, 0.34);
 
   /* ---- Color: text ----
    * Two text tones cover three usage tiers without introducing a third
@@ -65,34 +58,30 @@
    * than earning its own token — one fewer value to keep measured, and the
    * tier below secondary is never the sole carrier of meaning anyway.
    */
-  --color-text: #16161c; /* 16.81:1 on canvas, 18.02:1 on surface */
-  --color-text-secondary: #5c5e70; /* 5.95:1 on canvas, 6.38:1 on surface */
-  --color-text-on-accent: #04121a; /* --color-accent-fg alias, see below */
+  --color-text: #221a12; /* 15.92:1 on canvas, 17.15:1 on surface */
+  --color-text-secondary: #6b5f52; /* 5.76:1 on canvas, 6.21:1 on surface */
+  --color-text-on-accent: #ffffff; /* --color-accent-fg alias, see below */
 
   /* ---- Color: borders ---- */
-  --color-border-subtle: #e2e4ea; /* decorative only, ~1.2:1 */
-  --color-border: #83859a; /* functional: 3.39 canvas / 3.63 surface / 3.12 sunken */
-  --color-focus-ring: #00607f; /* 6.57:1 on canvas, always paired with a visible outline */
+  --color-border-subtle: #ebe3d6; /* decorative only, ~1.2:1 */
+  --color-border: #8a7a63; /* functional: 3.86 canvas / 4.16 surface / 3.51 sunken */
+  --color-focus-ring: #9a3412; /* 6.78:1 on canvas, always paired with a visible outline */
 
-  /* ---- Color: accent (Aurora cyan) ----
-   * The two Aurora hues are oklch(0.74 0.19 215) cyan and
-   * oklch(0.74 0.19 300) violet: equal lightness and chroma, hue apart.
-   * At that lightness cyan measures only 1.87:1 on the light canvas, so the
-   * light theme steps it down for anything text-sized, while the dark theme
-   * (where it clears 9.62:1) uses it exactly as authored. Violet is the
-   * overlay layer's second hue and does not appear as a token here: nothing
-   * in the panel needs a second accent, and adding one would invite using it
-   * as the sole carrier of meaning. */
-  --color-accent: #008bb9; /* 3.63:1 on canvas -- fills/icons/large elements only */
-  --color-accent-text: #0078a5; /* 4.63:1 on canvas, 4.96:1 on surface -- accent-colored body text/links */
-  --color-accent-fg: #04121a; /* label color on accent-filled surfaces, 4.87:1 on accent */
-  --color-accent-tint: rgba(0, 139, 185, 0.12); /* selected/hover tint, paired with text tokens for contrast */
+  /* ---- Color: accent (Amber burnt orange) ----
+   * One accent only: nothing in the panel needs a second, and adding one
+   * would invite using it as the sole carrier of meaning. It sits well
+   * apart from --color-status-warning (a dark ochre) in both hue and
+   * lightness, so a warning never reads as "just the accent". */
+  --color-accent: #c2410c; /* 4.81:1 on canvas -- fills/icons/large elements */
+  --color-accent-text: #a3360a; /* 6.31:1 on canvas, 6.80:1 on surface -- accent-colored body text/links */
+  --color-accent-fg: #ffffff; /* label color on accent-filled surfaces, 5.18:1 on accent */
+  --color-accent-tint: rgba(194, 65, 12, 0.12); /* selected/hover tint, paired with text tokens for contrast */
 
   /* ---- Color: status ---- */
-  --color-status-running: #1d5fae; /* 5.94:1 */
-  --color-status-success: #1e7a46; /* 4.99:1 */
-  --color-status-danger: #b3261e; /* 6.10:1 */
-  --color-status-warning: #8a5a00; /* 5.53:1 */
+  --color-status-running: #1d5fae; /* 5.91:1 */
+  --color-status-success: #1e7a46; /* 4.96:1 */
+  --color-status-danger: #b3261e; /* 6.07:1 */
+  --color-status-warning: #8a5a00; /* 5.50:1 */
   --color-status-neutral: var(--color-text-secondary);
 
   /* ---- Spacing: 4px base ---- */
@@ -135,8 +124,8 @@
   --radius-pill: 999px;
 
   /* ---- Shadow (subtle elevation only, no glass/gradient effects) ---- */
-  --shadow-sm: 0 1px 2px rgba(11, 11, 17, 0.07);
-  --shadow-md: 0 6px 20px rgba(11, 11, 17, 0.13);
+  --shadow-sm: 0 1px 2px rgba(48, 28, 10, 0.07);
+  --shadow-md: 0 6px 20px rgba(48, 28, 10, 0.13);
 
   /* ---- Icons ---- */
   --icon-size-sm: 16px;
@@ -158,28 +147,28 @@
   :root:not([data-theme="light"]) {
     color-scheme: dark;
 
-    --color-canvas: #0b0b11;
-    --color-surface: #12121b;
-    --color-surface-sunken: #08080c;
+    --color-canvas: #14110d;
+    --color-surface: #1d1914;
+    --color-surface-sunken: #0d0b08;
     --color-overlay-scrim: rgba(0, 0, 0, 0.55);
 
-    --color-text: #e8e6f2; /* 15.91:1 on canvas, 15.10:1 on surface */
-    --color-text-secondary: #9d9ab0; /* 7.18:1 on canvas, 6.81:1 on surface */
+    --color-text: #f3ece1; /* 16.04:1 on canvas, 14.90:1 on surface */
+    --color-text-secondary: #b3a794; /* 7.95:1 on canvas, 7.38:1 on surface */
 
-    --color-border-subtle: #232231;
-    --color-border: #63617e; /* 3.31:1 on canvas, 3.14:1 on surface, 3.37:1 on sunken */
-    --color-focus-ring: #5fd8f5; /* 11.80:1 on canvas */
+    --color-border-subtle: #332b21;
+    --color-border: #7a6c58; /* 3.69:1 on canvas, 3.42:1 on surface, 3.85:1 on sunken */
+    --color-focus-ring: #ffb888; /* 11.17:1 on canvas */
 
-    --color-accent: #00c5f4; /* 9.62:1 on canvas -- the authored Aurora cyan, usable as text here */
-    --color-accent-text: #00c5f4;
-    --color-accent-fg: #04121a; /* 9.30:1 on accent */
-    --color-text-on-accent: #04121a; /* alias of --color-accent-fg, restated so it cannot inherit the light value */
-    --color-accent-tint: rgba(0, 197, 244, 0.16);
+    --color-accent: #ff9a5c; /* 8.99:1 on canvas -- light orange, usable as text here */
+    --color-accent-text: #ff9a5c;
+    --color-accent-fg: #2a1204; /* 8.45:1 on accent */
+    --color-text-on-accent: #2a1204; /* alias of --color-accent-fg, restated so it cannot inherit the light value */
+    --color-accent-tint: rgba(255, 154, 92, 0.16);
 
-    --color-status-running: #7cc4ff; /* 10.46:1 */
-    --color-status-success: #6fdca4; /* 11.63:1 */
-    --color-status-danger: #ff8f84; /* 8.89:1 */
-    --color-status-warning: #f2c16b; /* 11.79:1 */
+    --color-status-running: #7cc4ff; /* 10.04:1 */
+    --color-status-success: #6fdca4; /* 11.16:1 */
+    --color-status-danger: #ff8f84; /* 8.53:1 */
+    --color-status-warning: #f2c16b; /* 11.31:1 */
 
     --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
     --shadow-md: 0 10px 28px rgba(0, 0, 0, 0.5);
@@ -193,23 +182,23 @@
 :root[data-theme="dark"] {
   color-scheme: dark;
 
-  --color-canvas: #0b0b11;
-  --color-surface: #12121b;
-  --color-surface-sunken: #08080c;
+  --color-canvas: #14110d;
+  --color-surface: #1d1914;
+  --color-surface-sunken: #0d0b08;
   --color-overlay-scrim: rgba(0, 0, 0, 0.55);
 
-  --color-text: #e8e6f2;
-  --color-text-secondary: #9d9ab0;
+  --color-text: #f3ece1;
+  --color-text-secondary: #b3a794;
 
-  --color-border-subtle: #232231;
-  --color-border: #63617e;
-  --color-focus-ring: #5fd8f5;
+  --color-border-subtle: #332b21;
+  --color-border: #7a6c58;
+  --color-focus-ring: #ffb888;
 
-  --color-accent: #00c5f4;
-  --color-accent-text: #00c5f4;
-  --color-accent-fg: #04121a;
-  --color-text-on-accent: #04121a;
-  --color-accent-tint: rgba(0, 197, 244, 0.16);
+  --color-accent: #ff9a5c;
+  --color-accent-text: #ff9a5c;
+  --color-accent-fg: #2a1204;
+  --color-text-on-accent: #2a1204;
+  --color-accent-tint: rgba(255, 154, 92, 0.16);
 
   --color-status-running: #7cc4ff;
   --color-status-success: #6fdca4;
