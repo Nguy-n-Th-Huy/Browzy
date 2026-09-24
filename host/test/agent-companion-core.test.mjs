@@ -41,6 +41,19 @@ async function test(name, fn) {
 function assert(cond, msg) {
   if (!cond) throw new Error(msg);
 }
+// Bounded poll for an eventually-true condition — used instead of a fixed
+// setTimeout() delay when a test needs to observe a state change that
+// happens asynchronously after some action (e.g. a released lease being
+// picked up by a queued run). The timeout is a generous upper bound on how
+// long that transition may legitimately take, not a measurement of it, so
+// this does not reintroduce wall-clock flakiness.
+async function waitUntil(predicate, { timeoutMs = 2000, intervalMs = 5, message = "condition not met in time" } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error(message);
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+}
 
 // A local double matching host/agent/settings/profile.js's DOCUMENTED
 // contract exactly (see the delegation's "Interface contract with the
@@ -250,10 +263,26 @@ await test("an unavailable profile (group-4 module not configured/reachable) sur
 });
 
 await test("a run queued behind another conversation's lease is accepted immediately (queued:true), not held until granted", async () => {
+  // Each run's fake query() blocks on a promise THIS TEST resolves itself,
+  // keyed by the run's prompt text, instead of a `setTimeout()` — so "the
+  // first run is still holding the lease" is a state the test controls and
+  // observes directly, never a wall-clock guess. That is what removes the
+  // flakiness: the old version raced a real ~250ms timer against a `< 100ms`
+  // reply-latency assertion, which CPU load under a parallel test run could
+  // blow past for reasons unrelated to the behavior under test.
+  const pendingQueries = new Map();
+  function deferredQueryFor(prompt) {
+    if (!pendingQueries.has(prompt)) {
+      let resolve;
+      const promise = new Promise((r) => { resolve = r; });
+      pendingQueries.set(prompt, { promise, resolve });
+    }
+    return pendingQueries.get(prompt);
+  }
   const core = buildCore({
     sdk: {
-      async *query() {
-        await new Promise((r) => setTimeout(r, 250));
+      async *query({ prompt }) {
+        await deferredQueryFor(prompt).promise;
       }
     }
   });
@@ -266,15 +295,44 @@ await test("a run queued behind another conversation's lease is accepted immedia
   );
   assert(startFirst.accepted && startFirst.queued === false, "the first, uncontested run should not report queued");
 
-  const startedAt = Date.now();
-  const startSecond = await core.handleEnvelope(
-    makeEnvelope(AGENT_MESSAGE_TYPES.START, { conversationId: second.conversationId, prompt: "b" })
-  );
-  const replyLatencyMs = Date.now() - startedAt;
+  // The first run's query() — and therefore its hold on the browser lease —
+  // is now blocked on `deferredQueryFor("a")`, which we deliberately have
+  // NOT resolved yet. Send the second START and prove its reply does not
+  // block on the lease by racing it against a generous timeout: if a
+  // regression made the handler await the lease before replying, this reply
+  // would never arrive (the first run's hold never releases on its own), so
+  // the race would time out with a clear message instead of the suite
+  // hanging or a tight latency threshold flaking under load.
+  const BLOCK_GUARD_MS = 5000;
+  let guardTimer;
+  const guard = new Promise((_, reject) => {
+    guardTimer = setTimeout(() => reject(new Error("START reply blocked on the lease")), BLOCK_GUARD_MS);
+  });
+  let startSecond;
+  try {
+    startSecond = await Promise.race([
+      core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.START, { conversationId: second.conversationId, prompt: "b" })),
+      guard
+    ]);
+  } finally {
+    clearTimeout(guardTimer);
+  }
+
+  // Reaching here at all is the ordering proof: the first run's lease hold
+  // is STILL deliberately unresolved, so a reply that arrived anyway could
+  // not have been waiting on it.
   assert(startSecond.accepted && startSecond.queued === true, "a second conversation contending for the lease must be accepted as queued");
-  assert(replyLatencyMs < 100, `the start reply must return immediately, not block for the ~250ms lease wait (took ${replyLatencyMs}ms)`);
   assert(!core.sessionManager.activeRun(second.conversationId).leaseHeldByThisRun(), "the queued run must not hold the lease yet");
 
+  // Now let the first run actually finish and release the lease, and
+  // confirm the queued run proceeds to acquire it — the other half of the
+  // queued-not-rejected contract.
+  deferredQueryFor("a").resolve();
+  await waitUntil(() => core.sessionManager.activeRun(second.conversationId).leaseHeldByThisRun(), {
+    message: "the queued run never acquired the lease after the first run released it"
+  });
+
+  deferredQueryFor("b").resolve();
   await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.STOP, { conversationId: first.conversationId }));
   await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.STOP, { conversationId: second.conversationId }));
 });
@@ -555,6 +613,101 @@ await test("deleting a conversation with an active run is handled explicitly, no
   // tombstone must not leak into unrelated future conversation ids).
   const another = await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.NEW, {}));
   assert(another.conversationId && another.conversationId !== conversationId, "creating another conversation afterward must work normally");
+});
+
+await test("a conversation deleted while its FIRST skills binding is still resolving must never resurrect the just-removed directory, nor report a misleading skills_binding_failed error", async () => {
+  // A second, earlier variant of the same resurrection race the test above
+  // closes: this one lives in host/agent/companion.js's _bindSkillsForRun(),
+  // which runs BEFORE the SDK's own query() is ever invoked.
+  // buildSessionSkills() (host/agent/skills/session-workspace.js) awaits
+  // listCatalog() and then performs SYNCHRONOUS materialize/mkdir writes
+  // into the conversation's own workspace directory. If
+  // SessionManager.deleteConversation() commits (tombstone set, directory
+  // removed) while any await between run-start and those synchronous writes
+  // is still pending, the writes that follow re-create the just-deleted
+  // directory out from under the delete — a real regression this test
+  // reproduces via a deliberately slow profileProvider.snapshotForRun(),
+  // which resolves strictly BEFORE _bindSkillsForRun/buildSessionSkills is
+  // ever called, so the tombstone is guaranteed to already be set by the
+  // time buildSessionSkills does its own listCatalog()-then-mkdir sequence.
+  //
+  // Crucially, the fake SDK's query() here never settles (mirrors a real
+  // subprocess that can take seconds to actually abort — manager.js's own
+  // "gate-0.2 evidence G5: ~7s abort->settle latency" comment). Without
+  // that, SessionManager.finishRun()'s OWN unconditional late-unwind sweep
+  // (its own tombstone check — see manager.js) would immediately re-remove
+  // whatever the unpatched race just recreated the instant this run's
+  // promise chain reaches it, silently self-healing the very corruption this
+  // test exists to catch and turning a real, persistent resurrection into an
+  // unobservable transient one. Holding query() open keeps that sweep from
+  // ever running during this test, so the assertions below observe exactly
+  // what a real, slow-to-abort subprocess would leave behind on disk.
+  const capturedEvents = [];
+  const core = buildCore({
+    sdk: {
+      async *query() {
+        await new Promise(() => {}); // never resolves, never rejects
+      }
+    },
+    profileProvider: {
+      async snapshotForRun(profileId, modelId) {
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        return {
+          model: modelId || "claude-fake-model",
+          env: { ANTHROPIC_BASE_URL: "https://example.invalid", ANTHROPIC_API_KEY: "fake-key" },
+          revision: 1,
+          profileId: profileId || "default"
+        };
+      }
+    }
+  });
+
+  // Capture every event a run emits, independent of whether
+  // SessionManager.startRun()'s own onEvent sink goes on to drop it for
+  // being post-tombstone (it must not reach the durable store either way,
+  // but this test needs to see it to prove skills_binding_failed was never
+  // even emitted) — the same wrapping runAsForkedChild() applies in
+  // production to forward events live over IPC regardless of the store's
+  // own tombstone guard.
+  const originalStartRun = core.sessionManager.startRun.bind(core.sessionManager);
+  core.sessionManager.startRun = (conversationId, opts) => {
+    const run = originalStartRun(conversationId, opts);
+    const originalEmit = run.emit.bind(run);
+    run.emit = (event) => {
+      capturedEvents.push(event);
+      originalEmit(event);
+    };
+    return run;
+  };
+
+  await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.HELLO, {}));
+  const { conversationId } = await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.NEW, {}));
+  const startReply = await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.START, { conversationId, prompt: "a" }));
+  assert(startReply.accepted, "run must have actually started (queued:false, uncontested lease) for this race to be meaningful");
+
+  const dir = conversationDir(conversationId);
+  assert(fs.existsSync(dir), "conversation directory must exist right after START, before the profile snapshot resolves");
+
+  // Deletes while profileProvider.snapshotForRun()'s 150ms delay is still
+  // pending — strictly before _bindSkillsForRun() (and therefore
+  // buildSessionSkills()) has even been called.
+  const deleteReply = await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.DELETE_CONVERSATION, { conversationId }));
+  assert(deleteReply.deleted === true && deleteReply.hadActiveRun === true, "delete must succeed and report the active run it stopped");
+  assert(!fs.existsSync(dir), "the directory must be gone immediately after delete replies");
+
+  // Let the delayed profile snapshot resolve and _bindSkillsForRun /
+  // buildSessionSkills run to completion (fixed code aborts inside it; old
+  // code proceeds to materialize and recreate the directory).
+  await new Promise((r) => setTimeout(r, 400));
+
+  assert(
+    !fs.existsSync(dir),
+    "buildSessionSkills()'s synchronous materialize/mkdir writes must never resurrect a directory deleted while an earlier await (here, profile resolution) was still pending"
+  );
+  assert(
+    !capturedEvents.some((e) => e.type === "run_error" && e.reason === "skills_binding_failed"),
+    "a conversation deleted mid-binding must end its run cleanly, never as a misreported skills_binding_failed run_error"
+  );
 });
 
 // jev-tools-reuse-primary-provider design.md decision 1 / tasks.md 4.3: the

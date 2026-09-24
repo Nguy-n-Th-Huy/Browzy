@@ -70,6 +70,9 @@ const STATIC_LABELS_VI = {
   // reports the capture/compare, and `page_snapshots` stays distinct from the
   // `page_snapshot` read above.
   page_snapshots: "Đã lưu hoặc so sánh ảnh chụp trang",
+  // page_monitor covers save/check/list/delete for a tracked page baseline —
+  // one label spans all four actions, same pattern as page_snapshots above.
+  page_monitor: "Đã lưu hoặc kiểm tra theo dõi trang",
   ask_user: "Đã hỏi người dùng"
 };
 

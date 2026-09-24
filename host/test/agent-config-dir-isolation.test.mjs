@@ -113,11 +113,17 @@ async function gateNoRealHomeLeak() {
     );
 
     const sdk = await import("@anthropic-ai/claude-agent-sdk");
+    // Deliberately drained to natural completion rather than `break`-ing out
+    // the moment a "result" message arrives (same convention as
+    // host/agent/spike/gates/gate-0.2-sdk-continuity.mjs): the SDK's query()
+    // wraps a real child CLI process, and breaking early only calls the async
+    // generator's implicit `.return()` — it does not guarantee the child
+    // process has actually exited and released its handles in configDir/
+    // scratchRoot before this function proceeds to fs.rmSync() below. Letting
+    // the generator run to its own natural end (it terminates right after the
+    // result message) is what actually waits for the process.
     for await (const msg of sdk.query({ prompt: "hello", options })) {
-      if (msg.type === "result") {
-        result = msg;
-        break;
-      }
+      if (msg.type === "result") result = msg;
     }
   } finally {
     await fixture.close();
@@ -147,7 +153,19 @@ async function gateNoRealHomeLeak() {
     `the session's real SDK session file must land under its OWN isolated configDir/projects/ instead — got entries: ${JSON.stringify(isolatedEntries)} under ${isolatedProjectsDir}`
   );
 
-  fs.rmSync(scratchRoot, { recursive: true, force: true });
+  try {
+    // maxRetries/retryDelay are Node's own documented handling for a Windows
+    // EBUSY/EPERM racing a child process's last handle close (fs.rmSync
+    // docs: "maxRetries ... only used with recursive: true"); the generator
+    // drain above should already have waited for the real SDK child process
+    // to exit, so this is a safety margin, not the primary fix.
+    fs.rmSync(scratchRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  } catch (err) {
+    // Cleanup is not a correctness assertion: a leftover scratch temp dir
+    // must never mask (or fake) a passing test, so this is reported but does
+    // not increment `fail`.
+    console.log(`  WARN  scratch dir cleanup failed (non-fatal): ${err.message}`);
+  }
 }
 
 // --- Gate 2: a legacy conversation binding persisted before configDir

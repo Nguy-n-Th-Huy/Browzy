@@ -70,7 +70,14 @@ function driveHostAsExtension(pipe) {
   };
 }
 
-function waitForAgentMsg(ext, predicate, timeoutMs = 8000) {
+// Spawning a REAL companion (not a stub) takes noticeably longer when the
+// whole host suite runs in parallel (`node --test host/test/*.test.mjs`) —
+// this file alone measured ~16.6s under that load, well past an 8s bound, and
+// two of its waits timed out. 30s is a generous bound for a cold start under
+// contention while still failing a genuinely hung handshake in reasonable time.
+const AGENT_MSG_TIMEOUT_MS = 30000;
+
+function waitForAgentMsg(ext, predicate, timeoutMs = AGENT_MSG_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error("timed out waiting for agent_msg")), timeoutMs);
     ext.onMessage((msg) => {
@@ -86,46 +93,58 @@ console.log("\nNative-host agent-protocol handshake (fail-closed)\n");
 
 await test("an unsupported protocol version fails closed with version_mismatch, naming what IS supported", async () => {
   const ext = driveHostAsExtension(pipeFor(++seq));
-  const waiter = waitForAgentMsg(ext, (e) => e.type === "version_mismatch");
-  ext.send({ type: "agent_msg", envelope: { v: 999999, type: "hello", ts: Date.now() } });
-  const envelope = await waiter;
-  assert(envelope.reason === "unsupported_version", `expected unsupported_version, got ${envelope.reason}`);
-  assert(envelope.requested === 999999, "must echo the requested version");
-  assert(Array.isArray(envelope.supported) && envelope.supported.length > 0, "must name supported versions");
-  ext.kill();
+  try {
+    const waiter = waitForAgentMsg(ext, (e) => e.type === "version_mismatch");
+    ext.send({ type: "agent_msg", envelope: { v: 999999, type: "hello", ts: Date.now() } });
+    const envelope = await waiter;
+    assert(envelope.reason === "unsupported_version", `expected unsupported_version, got ${envelope.reason}`);
+    assert(envelope.requested === 999999, "must echo the requested version");
+    assert(Array.isArray(envelope.supported) && envelope.supported.length > 0, "must name supported versions");
+  } finally {
+    ext.kill();
+  }
 });
 
 await test("a hello missing its version field fails closed rather than assuming the current one", async () => {
   const ext = driveHostAsExtension(pipeFor(++seq));
-  const waiter = waitForAgentMsg(ext, (e) => e.type === "version_mismatch");
-  ext.send({ type: "agent_msg", envelope: { type: "hello", ts: Date.now() } });
-  const envelope = await waiter;
-  assert(envelope.reason === "missing_version", `expected missing_version, got ${envelope.reason}`);
-  ext.kill();
+  try {
+    const waiter = waitForAgentMsg(ext, (e) => e.type === "version_mismatch");
+    ext.send({ type: "agent_msg", envelope: { type: "hello", ts: Date.now() } });
+    const envelope = await waiter;
+    assert(envelope.reason === "missing_version", `expected missing_version, got ${envelope.reason}`);
+  } finally {
+    ext.kill();
+  }
 });
 
 await test("a supported hello is genuinely acknowledged (real companion, not a stub)", async () => {
   const ext = driveHostAsExtension(pipeFor(++seq));
-  const waiter = waitForAgentMsg(ext, (e) => e.type === "hello_ack");
-  ext.send({ type: "agent_msg", envelope: { v: 1, type: "hello", ts: Date.now() } });
-  const envelope = await waiter;
-  assert(envelope.v === 1, "ack should carry the negotiated version");
-  ext.kill();
+  try {
+    const waiter = waitForAgentMsg(ext, (e) => e.type === "hello_ack");
+    ext.send({ type: "agent_msg", envelope: { v: 1, type: "hello", ts: Date.now() } });
+    const envelope = await waiter;
+    assert(envelope.v === 1, "ack should carry the negotiated version");
+  } finally {
+    ext.kill();
+  }
 });
 
 await test("an unsupported hello does not disrupt ordinary tool_request traffic on the same connection", async () => {
   const ext = driveHostAsExtension(pipeFor(++seq));
-  ext.send({ type: "agent_msg", envelope: { v: -1, type: "hello", ts: Date.now() } });
-  await sleep(200); // let the (irrelevant) rejection settle
-  // Ordinary browser-tool traffic is a completely different message type
-  // (tool_request from an attached MCP client, not from "the extension"
-  // stdin at all) — assert only that the host process is still alive and
-  // responsive to a second, valid hello, i.e. one bad handshake did not take
-  // the whole bridge down.
-  const waiter = waitForAgentMsg(ext, (e) => e.type === "hello_ack");
-  ext.send({ type: "agent_msg", envelope: { v: 1, type: "hello", ts: Date.now() } });
-  await waiter;
-  ext.kill();
+  try {
+    ext.send({ type: "agent_msg", envelope: { v: -1, type: "hello", ts: Date.now() } });
+    await sleep(200); // let the (irrelevant) rejection settle
+    // Ordinary browser-tool traffic is a completely different message type
+    // (tool_request from an attached MCP client, not from "the extension"
+    // stdin at all) — assert only that the host process is still alive and
+    // responsive to a second, valid hello, i.e. one bad handshake did not take
+    // the whole bridge down.
+    const waiter = waitForAgentMsg(ext, (e) => e.type === "hello_ack");
+    ext.send({ type: "agent_msg", envelope: { v: 1, type: "hello", ts: Date.now() } });
+    await waiter;
+  } finally {
+    ext.kill();
+  }
 });
 
 const failed = results.filter((r) => !r.ok);

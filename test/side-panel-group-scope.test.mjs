@@ -1,29 +1,36 @@
 #!/usr/bin/env node
-// Requested behaviour: the side panel should close when the operator switches
-// to a tab outside the agent's own tab group, and come back inside it.
+// Current design (per-tab explicit enablement, matching
+// openspec/specs/browser-assistant-panel/spec.md's "each tab the panel is
+// explicitly opened on is an independent agent scope" / "per-tab panel
+// enablement"): side panel visibility is decided per tab by whether the
+// operator explicitly opened it THERE, not by tab-group membership. Chrome
+// has no "close the side panel" call — per-tab `setOptions({enabled})` is the
+// only mechanism, and it applies the moment such a tab becomes active.
 //
-// Chrome has no "close the side panel" call — per-tab `setOptions({enabled})`
-// is the only mechanism, and it applies the moment such a tab becomes active.
-// That makes the interesting part not the closing but the ways it can lock the
-// operator out of their own panel:
-//
-//   1. Before any run there IS no agent group. If the rule hid the panel then,
-//      the extension would be unopenable — the panel is where a run starts.
-//   2. Once a group exists, an ordinary tab would never show the panel again,
-//      so a new conversation could only be started from inside the group. The
-//      toolbar icon is the escape: clicking it ADOPTS that tab into the group,
-//      rather than exempting it from the rule. A first attempt did exempt it,
-//      and since clicking the icon is how the panel is normally opened, the
-//      exemption covered nearly every tab and the panel never closed anywhere.
-//      That is why the assertions below insist there is no exemption left.
-//   3. A blank New Tab was refused adoption outright, which — once the panel
-//      followed the group — made it the one place the panel could not be used.
-//      An explicit click adopts it; passively browsing past one still does not.
+//   1. `isPanelTabExplicitlyEnabled(tabId)` reads a persisted set of tab ids
+//      (chrome.storage.session, survives a service-worker restart) that only
+//      grows via an explicit toolbar-icon click (`markPanelTabEnabled`). A
+//      tab with no record — including every tab before the first click ever
+//      happens — starts DISABLED, the opposite of the old group-based
+//      default-enabled rule.
+//   2. That is not a lockout because the click handler never consults any
+//      prior state: it unconditionally tab-scoped-enables and opens the
+//      panel on whatever tab was clicked, from anywhere, then records it.
+//      One click always works.
+//   3. A blank New Tab stays disabled even if it were somehow marked, unless
+//      it already sits in one of the agent's own tab groups — the guard
+//      inside syncSidePanelForTab, not a separate adoption gate.
 //
 // Two mechanics the click path depends on: openPanelOnActionClick must be OFF
 // (with it on, Chrome swallows the click and action.onClicked never fires, so
 // a disabled tab would have a dead icon), and open() must be reached without
-// an intervening await, which would spend the user gesture it requires.
+// an intervening await, which would spend the user gesture it requires — and
+// before markPanelTabEnabled/adoptSoloAgentGroup, which run unawaited after.
+//
+// The older group-recovery machinery (`resolveAgentGroupId`,
+// AGENT_TAB_GROUP_TITLE title-based lookup across a worker restart) is still
+// live code and is tested below for what it does, but it is no longer read
+// by syncSidePanelForTab — the visibility rule does not call it.
 //
 // Proven structurally against the shipped source, the same technique
 // test/handlers.test.mjs and test/overlay-background-bridge.test.mjs use for
@@ -49,12 +56,12 @@ const syncBody = src.slice(
   src.indexOf("chrome.tabs.onActivated.addListener")
 );
 
-console.log("== the panel follows the agent's tab group ==");
+console.log("== the panel follows explicit per-tab enablement ==");
 {
   ok(syncBody.length > 0, "syncSidePanelForTab exists");
   ok(
-    /enabled = tab\.groupId === agentGroupId;/.test(syncBody),
-    "membership is decided against the agent's own group id, not merely 'is grouped at all'"
+    /const explicit = await isPanelTabExplicitlyEnabled\(tabId\);/.test(syncBody),
+    "membership is decided by the persisted explicit-open record for THIS tab, not by tab-group membership"
   );
   ok(
     /chrome\.sidePanel\.setOptions\(options\)/.test(syncBody),
@@ -95,8 +102,8 @@ console.log("== the group id survives a service-worker restart ==");
     "an unavailable tabGroups API resolves to no group, which KEEPS the panel enabled — the rule never hides the panel on a guess"
   );
   ok(
-    /const agentGroupId = await resolveAgentGroupId\(\);/.test(syncBody),
-    "the sync path goes through the resolver rather than reading the module variable"
+    !/resolveAgentGroupId\(\)/.test(syncBody),
+    "the sync path does NOT call the group resolver at all — visibility comes solely from the explicit per-tab record, never from tab-group membership"
   );
   ok(
     /lastFocusedWindow: true/.test(src),
@@ -111,25 +118,21 @@ console.log("== the group id survives a service-worker restart ==");
 console.log("== the operator can never be locked out of their own panel ==");
 {
   ok(
-    /if \(agentGroupId !== null\) \{/.test(syncBody),
-    "with no agent group yet, every tab keeps the panel — otherwise the extension could not be opened to start the first run"
-  );
-  ok(
-    /let enabled = true;/.test(syncBody),
-    "the default is enabled; the group rule only ever narrows it"
+    /let enabled = explicit;/.test(syncBody),
+    "the default comes straight from the persisted explicit-open record — a tab starts DISABLED unless it was explicitly opened, the opposite of the old group-default-enabled rule"
   );
   ok(
     !/panelForcedTabs/.test(src),
-    "there is no per-tab exemption competing with the group rule — an earlier version had one, and because clicking the icon is how the panel is normally opened it applied to nearly every tab and the panel never closed anywhere"
+    "there is no per-tab exemption competing with the enablement record — an earlier version had one, and because clicking the icon is how the panel is normally opened it applied to nearly every tab and the panel never closed anywhere"
   );
 
   const clickBody = src.slice(
     src.indexOf("chrome.action.onClicked.addListener"),
-    src.indexOf("chrome.action.onClicked.addListener") + 1600
+    src.indexOf("chrome.action.onClicked.addListener") + 1700
   );
   ok(
-    /adoptBorrowedTab\(tab\.id, \{ explicit: true \}\)/.test(clickBody),
-    "clicking the icon adopts that tab into the group — the panel stays open there through the one rule, not an exemption from it"
+    !/isPanelTabExplicitlyEnabled/.test(clickBody),
+    "the click handler never checks the explicit-record state first — it opens unconditionally, so a tab that starts with no record (a fresh install, or one never opened here) is never locked out: one click always enables and opens it"
   );
   ok(
     /openPanelOnActionClick: false/.test(src),
@@ -143,9 +146,17 @@ console.log("== the operator can never be locked out of their own panel ==");
     /chrome\.sidePanel\.open\(\{ tabId: tab\.id \}\)/.test(clickBody),
     "the icon opens a TAB-scoped panel — one opened with { windowId } is window-scoped and ignores per-tab enable/disable, which made the panel appear never to close outside the group"
   );
+  ok(
+    /markPanelTabEnabled\(tab\.id\)\.catch\(\(\) => \{\}\);/.test(clickBody) && /adoptSoloAgentGroup\(tab\.id\)\.catch\(\(\) => \{\}\);/.test(clickBody),
+    "clicking the icon records this tab in the explicit-open set and gives it its own solo group — the group is no longer what grants panel visibility, the explicit record is; the group is a separate, unawaited side effect"
+  );
   const openIdx = clickBody.indexOf("chrome.sidePanel.open(");
-  const adoptIdx = clickBody.indexOf("adoptBorrowedTab(");
-  ok(openIdx !== -1 && adoptIdx !== -1 && openIdx < adoptIdx, "the panel is opened before the async adoption, so the gesture is spent on open() first");
+  const markIdx = clickBody.indexOf("markPanelTabEnabled(");
+  const soloIdx = clickBody.indexOf("adoptSoloAgentGroup(");
+  ok(
+    openIdx !== -1 && markIdx !== -1 && soloIdx !== -1 && openIdx < markIdx && openIdx < soloIdx,
+    "the panel is opened before markPanelTabEnabled/adoptSoloAgentGroup run, so the user gesture is spent on open() first"
+  );
 }
 
 console.log("== an explicitly chosen blank tab joins the group; a passing one does not ==");
