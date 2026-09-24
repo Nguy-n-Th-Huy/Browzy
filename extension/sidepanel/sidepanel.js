@@ -2819,14 +2819,24 @@ function wireCopyButtons(model) {
 }
 
 function emptyStateHtml() {
+  const suggestion = (prompt, icon, title, hint) => `
+        <button class="suggestion-item" type="button" data-suggest="${escapeHtml(prompt)}">
+          <span class="suggestion-icon">${iconMarkup(icon, { size: 18 })}</span>
+          <span class="suggestion-text"><span class="suggestion-title">${escapeHtml(title)}</span><span class="suggestion-hint">${escapeHtml(hint)}</span></span>
+          <span class="suggestion-chevron">${iconMarkup("chevronRight", { size: 16 })}</span>
+        </button>`;
   return `
     <div class="empty-state">
-      <div class="empty-state-icon">${iconMarkup("skills", { size: 24 })}</div>
-      <h1>Chào bạn, tôi có thể giúp gì?</h1>
-      <p>Tôi có thể đọc trang hiện tại và trả lời câu hỏi, hoặc điều khiển trình duyệt khi bạn cần.</p>
-      <div class="suggestion-list">
-        <button class="suggestion-item" type="button" data-suggest="Tóm tắt bài viết trên trang này giúp mình.">${iconMarkup("page", { size: 18 })}<span>Tóm tắt bài viết</span></button>
-        <button class="suggestion-item" type="button" data-suggest="Phân tích nội dung trang này giúp mình.">${iconMarkup("search", { size: 18 })}<span>Phân tích nội dung</span></button>
+      <div class="empty-state-intro">
+        <span class="empty-state-eyebrow">Sẵn sàng trên trang này</span>
+        <h1>Chào bạn, tôi có thể giúp gì?</h1>
+        <p>Tôi có thể đọc trang hiện tại và trả lời câu hỏi, hoặc điều khiển trình duyệt khi bạn cần.</p>
+      </div>
+      <div class="suggestion-list">${[
+        suggestion("Tóm tắt bài viết trên trang này giúp mình.", "page", "Tóm tắt bài viết", "Ý chính của trang đang mở"),
+        suggestion("Phân tích nội dung trang này giúp mình.", "search", "Phân tích nội dung", "Luận điểm, số liệu, nguồn dẫn"),
+        suggestion("Trích xuất dữ liệu trên trang này thành bảng giúp mình.", "table", "Trích xuất thành bảng", "Gom dữ liệu trên trang vào bảng")
+      ].join("")}
       </div>
     </div>`;
 }
@@ -3002,7 +3012,7 @@ function updateRunControls(phase) {
   const running = phase === RUN_PHASE.STREAMING || phase === RUN_PHASE.QUEUED || phase === RUN_PHASE.STOPPING || phase === RUN_PHASE.WAITING_FOR_PERMISSION;
   el.btnSend.className = "btn-icon";
   el.btnSend.setAttribute("aria-label", "Gửi");
-  el.btnSend.innerHTML = iconMarkup("send", { size: 18, title: "Gửi" });
+  el.btnSend.innerHTML = iconMarkup("arrowUp", { size: 18, strokeWidth: 2, title: "Gửi" });
   // See installQueueControls(): `display` is toggled inline because the
   // controls' own classes declare a display that would beat `[hidden]`.
   if (el.btnStop) el.btnStop.style.display = running ? "" : "none";

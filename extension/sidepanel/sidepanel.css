@@ -40,9 +40,23 @@ body {
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  padding: var(--panel-gutter);
+  min-height: 56px;
+  padding: var(--space-2) var(--space-3) var(--space-2) var(--panel-gutter);
   border-bottom: 1px solid var(--color-border-subtle);
   background: var(--color-canvas);
+}
+
+/* Logo mark: two interlocking rings, accent + brand secondary. Decorative
+   (aria-hidden in the markup); the wordmark beside it carries the name. */
+.brand-mark {
+  display: inline-flex;
+  flex: none;
+}
+.brand-ring-a {
+  stroke: var(--color-accent);
+}
+.brand-ring-b {
+  stroke: var(--color-brand-secondary);
 }
 
 /* ===================== Busy/working indicator (Section 6) ================ */
@@ -169,8 +183,10 @@ body {
 }
 
 .panel-header-title {
-  font-weight: 700;
-  font-size: var(--font-size-ui);
+  font-family: var(--font-serif);
+  font-weight: 600;
+  font-size: 18px;
+  letter-spacing: -0.01em;
   flex: 1;
   min-width: 0;
   overflow: hidden;
@@ -199,9 +215,7 @@ body {
 .panel-composer-wrap {
   position: relative;
   flex: none;
-  padding: var(--panel-gutter);
-  padding-top: var(--space-2);
-  border-top: 1px solid var(--color-border-subtle);
+  padding: var(--space-2) var(--space-3) var(--space-3);
   background: var(--color-canvas);
   display: flex;
   flex-direction: column;
@@ -260,6 +274,7 @@ body {
   background: var(--color-surface);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-composer);
+  box-shadow: var(--shadow-md);
   padding: var(--space-2) var(--space-2) var(--space-2) var(--space-4);
   transition: border-color var(--motion-duration) var(--motion-easing), box-shadow var(--motion-duration) var(--motion-easing);
 }
@@ -303,6 +318,48 @@ body {
   gap: var(--space-1);
 }
 
+/* Composer controls read as one family of round pills: an outlined "+" on
+   the left, quiet effort/model pills beside it, and a filled accent circle
+   for Send on the right. */
+.composer-actions .btn-icon {
+  border-radius: var(--radius-pill);
+}
+.composer-add-trigger {
+  border: 1px solid var(--color-border-subtle);
+}
+#btn-send {
+  width: 36px;
+  height: 36px;
+  background: var(--color-accent);
+  color: var(--color-accent-fg);
+}
+#btn-send:hover:not(:disabled) {
+  background: var(--color-accent);
+  color: var(--color-accent-fg);
+  filter: brightness(1.06);
+}
+#btn-send:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+#btn-stop {
+  width: 36px;
+  height: 36px;
+}
+
+.composer-hint {
+  margin: 0;
+  text-align: center;
+  font-size: 11.5px;
+  color: var(--color-text-secondary);
+}
+/* Short panels keep every pixel for the transcript. */
+@media (max-height: 560px) {
+  .composer-hint {
+    display: none;
+  }
+}
+
 /* While a run is active its controls (Stop, "Chạy ngay") join this row; at
    the panel's narrowest supported widths the row can outgrow its width and
    flex-shrink used to crush the trailing icon controls (Stop, Send) to zero
@@ -324,10 +381,11 @@ body {
   align-items: center;
   gap: var(--space-1);
   padding: var(--space-1) var(--space-2);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-pill);
   color: var(--color-text-secondary);
   font-size: var(--font-size-small);
-  min-height: 28px;
+  font-weight: 500;
+  min-height: 32px;
   max-width: 120px;
 }
 .model-select-trigger span:first-child {
@@ -375,65 +433,95 @@ body {
   font-family: inherit;
 }
 
+/* Empty state: a left-aligned greeting (eyebrow, serif headline, one line
+   of context) above a stack of suggestion cards, each an icon tile, a title
+   with a one-line hint, and a trailing chevron. */
 .empty-state {
   flex: 1;
   display: flex;
   flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: var(--space-5);
-  text-align: center;
-  padding: var(--space-6) var(--space-4);
+  justify-content: flex-start;
+  gap: var(--space-6);
+  padding: var(--space-8) var(--space-1) var(--space-4);
 }
-.empty-state-icon {
-  width: 48px;
-  height: 48px;
-  border-radius: var(--radius-md);
-  background: var(--color-accent-tint);
-  color: var(--color-accent-text);
+.empty-state-intro {
   display: flex;
-  align-items: center;
-  justify-content: center;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.empty-state-eyebrow {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-accent-text);
 }
 .empty-state h1 {
   font-family: var(--font-serif);
-  font-size: var(--font-size-h1);
-  font-weight: 600;
+  font-size: 28px;
+  line-height: 1.2;
+  font-weight: 500;
+  letter-spacing: -0.015em;
   margin: 0;
 }
 .empty-state p {
   margin: 0;
   color: var(--color-text-secondary);
-  max-width: 34ch;
 }
 .suggestion-list {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
   width: 100%;
-  max-width: 320px;
 }
 .suggestion-item {
   display: flex;
   align-items: center;
-  gap: var(--space-2);
+  gap: var(--space-3);
   width: 100%;
-  min-height: var(--target-min);
+  min-height: 60px;
   padding: var(--space-2) var(--space-3);
   border: 1px solid var(--color-border-subtle);
   border-radius: var(--radius-md);
   background: var(--color-surface);
   color: var(--color-text);
   text-align: left;
-  font-size: var(--font-size-ui);
   box-shadow: var(--shadow-sm);
+  transition: border-color var(--motion-duration) var(--motion-easing);
 }
 .suggestion-item:hover {
   border-color: var(--color-border);
 }
-.suggestion-item .ui-icon {
-  color: var(--color-accent-text);
+.suggestion-icon {
   flex: none;
+  width: 36px;
+  height: 36px;
+  border-radius: var(--radius-sm);
+  background: var(--color-accent-tint);
+  color: var(--color-accent-text);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.suggestion-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.suggestion-title {
+  font-size: var(--font-size-ui);
+  font-weight: 600;
+}
+.suggestion-hint {
+  font-size: var(--font-size-small);
+  color: var(--color-text-secondary);
+}
+.suggestion-chevron {
+  flex: none;
+  display: inline-flex;
+  color: var(--color-text-secondary);
 }
 
 .msg-row {
@@ -449,10 +537,11 @@ body {
 }
 .msg-user-bubble {
   max-width: 88%;
-  background: var(--color-accent-tint);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border-subtle);
   color: var(--color-text);
-  border-radius: var(--radius-md);
-  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-composer) var(--radius-composer) 4px var(--radius-composer);
+  padding: 10px 14px;
   overflow-wrap: anywhere;
 }
 .msg-user-bubble.is-placeholder {
@@ -791,11 +880,17 @@ body {
  * not alter the underlying record".
  */
 
+/* The group is one card: the summary button is its header and the expanded
+   list sits under a hairline inside the same card. */
 .tool-timeline-group {
   display: flex;
   flex-direction: column;
   min-width: 0;
-  margin-bottom: var(--space-1);
+  margin-bottom: var(--space-2);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  overflow: hidden;
 }
 .tool-timeline-summary {
   display: flex;
@@ -803,14 +898,15 @@ body {
   gap: var(--space-2);
   width: 100%;
   min-width: 0;
-  min-height: var(--target-min);
+  min-height: 44px;
   text-align: left;
-  border: 1px solid var(--color-border-subtle);
-  border-radius: var(--radius-sm);
-  background: var(--color-surface);
-  padding: var(--space-1) var(--space-2);
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  padding: var(--space-2) var(--space-3);
   color: var(--color-text);
   font-size: var(--font-size-ui);
+  font-weight: 600;
   transition: background-color var(--motion-duration) var(--motion-easing);
 }
 .tool-timeline-summary:hover,
@@ -835,7 +931,11 @@ body {
 }
 .tool-timeline-list {
   /* Inherits the shared .tool-timeline rail styling from extension/ui/components.css. */
-  margin-top: var(--space-2);
+  border-top: 1px solid var(--color-border-subtle);
+  padding: var(--space-2) var(--space-3) var(--space-2) calc(var(--space-8) + var(--space-3));
+}
+.tool-timeline-list::before {
+  left: calc(var(--space-3) + 15px);
 }
 .tool-timeline-list[hidden] {
   display: none;
@@ -867,9 +967,9 @@ body {
   min-width: 0;
   min-height: var(--target-min);
   text-align: left;
-  padding: var(--space-1) var(--space-2);
+  padding: var(--space-1) var(--space-3);
   border: 1px dashed var(--color-border-subtle);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-md);
   background: transparent;
   color: var(--color-text-secondary);
   font-size: var(--font-size-small);
@@ -1657,4 +1757,52 @@ body {
 .doc-viewer-status {
   color: var(--color-text-secondary);
   font-size: var(--font-size-small);
+}
+
+/* ===================== Decision cards docked above the composer ========== *
+ * Permission and download decisions sit directly above the composer, so they
+ * lift off the canvas (larger radius, elevated shadow) and stack their
+ * controls: the primary action first and full width, the refusal as an
+ * outlined button beneath it. Scoped to the composer's slots so cards that
+ * reuse the primitive elsewhere keep their compact inline actions. */
+.panel-composer-wrap .permission-card {
+  border-radius: var(--radius-composer);
+  box-shadow: var(--shadow-md);
+}
+.panel-composer-wrap .permission-card-icon {
+  width: 40px;
+  height: 40px;
+  border-radius: var(--radius-md);
+}
+#permission-slot .permission-card-icon,
+#download-decision-slot .permission-card-icon {
+  background: color-mix(in srgb, var(--color-status-warning) 14%, transparent);
+  color: var(--color-status-warning);
+}
+.panel-composer-wrap .permission-card-title {
+  font-family: var(--font-serif);
+  font-size: var(--font-size-h2);
+  font-weight: 600;
+  line-height: var(--line-height-tight);
+}
+.panel-composer-wrap .permission-card-actions {
+  flex-direction: column;
+  align-items: stretch;
+}
+.panel-composer-wrap .permission-card-actions .btn {
+  min-height: 40px;
+}
+.panel-composer-wrap .permission-card-actions .btn-primary {
+  order: -1;
+  min-height: var(--target-primary);
+}
+.panel-composer-wrap .permission-card-actions .btn-ghost {
+  border-color: var(--color-border);
+  color: var(--color-text);
+}
+
+/* Header text buttons (history screen: "Xóa tất cả", "Mới") share the
+   composer's round-pill shape. */
+.panel-header .btn {
+  border-radius: var(--radius-pill);
 }

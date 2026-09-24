@@ -17,6 +17,9 @@
   <!-- ============================= Chat screen ============================= -->
   <div id="chat-view" style="display:flex;flex-direction:column;min-height:0;flex:1">
     <header class="panel-header">
+      <span class="brand-mark" aria-hidden="true">
+        <svg width="22" height="22" viewBox="0 0 22 22" fill="none" stroke-width="2"><circle class="brand-ring-a" cx="8" cy="11" r="6"></circle><circle class="brand-ring-b" cx="14" cy="11" r="6"></circle></svg>
+      </span>
       <span class="panel-header-title">Browzy</span>
       <div class="panel-header-actions">
         <span class="connection-state" id="connection-state" role="status">
@@ -61,7 +64,7 @@
       <div id="attachment-error" class="attachment-error" role="alert" hidden></div>
       <input id="attachment-file-input" type="file" accept=".png,.jpg,.jpeg,.webp,.gif,.pdf,.txt,.md,.markdown,.csv,.json" multiple hidden />
       <div class="composer" id="composer">
-        <textarea id="composer-input" rows="1" placeholder="Nhắn tin…" aria-label="Soạn tin nhắn"></textarea>
+        <textarea id="composer-input" rows="1" placeholder="Nhắn tin, hoặc gõ / để chọn skill…" aria-label="Soạn tin nhắn"></textarea>
         <div class="composer-actions">
           <ui-menu id="add-menu-wrap">
             <button slot="trigger" class="btn-icon composer-add-trigger" type="button" id="btn-add" aria-haspopup="menu" aria-label="Thêm tệp hoặc ảnh"></button>
@@ -98,6 +101,7 @@
           <div class="slash-picker" role="listbox" aria-label="Chọn skill" hidden></div>
         </ui-slash-picker>
       </div>
+      <p class="composer-hint" aria-hidden="true">Enter để gửi · Shift+Enter xuống dòng · / chọn skill</p>
     </div>
 
   <!-- Image picker modal (Ctrl+U) — styled via existing .card/.btn primitives -->
