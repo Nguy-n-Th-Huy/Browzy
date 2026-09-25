@@ -17,6 +17,7 @@ This change replaces `add-document-preview-viewport-modes`. That change put the 
 - **The page re-lays out at once without reloading.** A page that chooses its layout on the server from the user agent only changes after a reload, so the menu offers a reload button and says why.
 - **The mode is per tab and survives navigation.** It lasts until the operator picks Fit, closes the tab, or dismisses Chrome's debugging bar. It is kept in session storage so a service-worker restart can restore and show it.
 - **Agent runs see the same viewport.** Screenshots, coordinates and `read_page` on an emulated tab describe the emulated viewport. `resize_window` states that emulation is holding the page width.
+- **No conflict with F12.** The modes work with DevTools open, re-fit when DevTools docks or undocks, and never reset a device mode the operator set in DevTools. If both try to set the viewport at once, Browzy steps back and says so instead of fighting.
 - **No DevTools and no new permission.** The control is refused, with a reason, on pages the debugger cannot attach to.
 
 ## Capabilities

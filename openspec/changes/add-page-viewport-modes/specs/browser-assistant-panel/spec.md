@@ -33,6 +33,11 @@ The control SHALL reflect the background's per-tab state and SHALL update on eve
 - **WHEN** a device mode is active and the operator cancels the browser's debugging bar
 - **THEN** the page returns to normal and the control reads Vừa khung
 
+#### Scenario: DevTools takes over
+
+- **WHEN** DevTools device mode changes the viewport of a tab that has a Browzy mode
+- **THEN** the control states that DevTools is controlling the viewport, and picking a mode again hands control back to Browzy
+
 #### Scenario: Two panels
 
 - **WHEN** the mode is changed from one side panel window

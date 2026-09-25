@@ -56,3 +56,27 @@ On a tab with an active viewport mode, screenshots and page reads SHALL describe
 
 - **WHEN** a run calls `resize_window` on a tab in Tablet mode
 - **THEN** the result states that the page stays 768 px wide while Tablet is active
+
+### Requirement: Viewport modes do not conflict with DevTools
+
+A viewport mode SHALL work with DevTools (F12) open, whether DevTools was opened before or after the mode was applied. Opening, closing, docking or resizing DevTools SHALL NOT end the mode or detach Browzy, and the page SHALL re-fit to the new content area. The runtime SHALL NOT set or clear any emulation override on a tab unless the operator picked a mode for that tab in the panel. A device mode set in DevTools SHALL NOT be reset by attaching, by browser tools, or by picking Vừa cửa sổ. When DevTools device mode changes the page's viewport while a Browzy mode is active, the runtime SHALL stop re-applying and report that DevTools controls the viewport. The runtime SHALL NOT fight DevTools in a loop.
+
+#### Scenario: Emulating with F12 open
+
+- **WHEN** DevTools is docked on a tab and the operator picks Di động in the panel
+- **THEN** the page switches to the phone layout, and DevTools inspects the emulated page normally
+
+#### Scenario: Toggling F12 while emulating
+
+- **WHEN** a tab is in Tablet mode and the operator opens or closes DevTools
+- **THEN** the tab stays in Tablet mode and re-fits to the new content area
+
+#### Scenario: DevTools device mode is left alone
+
+- **WHEN** the operator has turned on DevTools device mode and Browzy has no mode for that tab
+- **THEN** attaching, running browser tools and taking screenshots leave the DevTools device mode as it was
+
+#### Scenario: Both try to control the viewport
+
+- **WHEN** a Browzy mode is active and the operator turns on the DevTools device toolbar
+- **THEN** Browzy stops re-applying its mode, and the panel states that DevTools is controlling the viewport

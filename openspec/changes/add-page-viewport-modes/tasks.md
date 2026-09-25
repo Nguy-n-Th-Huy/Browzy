@@ -25,6 +25,8 @@ Scope: the bound tab's device emulation, driven from the side panel. No host, MC
 - [ ] 2.2 Add `viewportModeByTab` with a `chrome.storage.session` mirror. Reconcile it against `attachedTabs` at worker start. Drop the entry in `tabs.onRemoved` and in `debugger.onDetach`. Broadcast `viewport_mode_changed` on every change.
 - [ ] 2.3 Add the `viewport_mode_set {tabId, mode}` and `viewport_mode_get {tabId}` messages. Refuse restricted URLs with a reason.
 - [ ] 2.4 Re-apply on `chrome.windows.onBoundsChanged`, debounced by 150 ms.
+- [ ] 2.4b While any tab is emulated, poll `chrome.tabs.get` every 500 ms and re-apply on a content-size change (DevTools docked or undocked). Stop polling when no tab is emulated.
+- [ ] 2.4c Remove the first-attach `Emulation.clearDeviceMetricsOverride` from `ensureAttached`. After each apply, verify `innerWidth`. On a mismatch, mark the tab `overridden` and broadcast it, without re-applying. ← (verify: no code path clears or sets emulation on a tab without an operator pick for that tab)
 - [ ] 2.5 Make `resize_window` append the emulation note from Decision 11. Make `tabs_context_mcp` name the mode per tab.
 - [ ] 2.6 Add wiring tests through `_extract.mjs` with a fake `chrome.debugger`. They check the command order for each mode, the clear on Fit, the clear on failure, the entry dropped on detach and on tab removal, and the `resize_window` note. ← (verify: no test calls a real browser)
 
@@ -45,6 +47,10 @@ Scope: the bound tab's device emulation, driven from the side panel. No host, MC
   - the mode survives clicking a link;
   - resizing the window re-fits;
   - Cancel on the debugging bar returns the tab to normal and the panel to Vừa khung;
+  - with F12 docked, pick Di động: it works, and Elements, Console and Network inspect the emulated page;
+  - open and close F12 while in Tablet: the page re-fits and stays in Tablet;
+  - with Browzy off, turn on DevTools device mode, then use the panel's page tools and run an agent step: the DevTools device mode is not reset;
+  - turn on the DevTools device toolbar while Browzy is in Di động: the panel shows `DevTools đang điều khiển khung nhìn` and nothing loops;
   - record whether `positionX` centred the page;
   - record whether an agent click lands correctly in PC mode below scale 1.
   ← (verify: concrete pass/fail observed in a live browser)

@@ -48,7 +48,7 @@ Reference studied: NotepadAI `WebViewWidget.h` :72–92 (`viewportBoundsFor`) an
    - **What survives:** the mode survives navigation, because CDP overrides persist for the debugger session.
    - **What removes it:** picking Fit; `tabs.onRemoved`, which drops the entry; `debugger.onDetach`, which drops the entry because Chrome already dropped the overrides; and a restart that finds a stored tab not in `attachedTabs`, which drops the entry because a restart ends the debugger session.
    - **Broadcast:** every change is sent as `viewport_mode_changed {tabId, mode}` so every open panel updates.
-8. **Window resize.** `chrome.windows.onBoundsChanged` re-applies emulated tabs in that window after a 150 ms debounce, so height and PC scale track the window.
+8. **Resize, including DevTools docking.** `chrome.windows.onBoundsChanged` re-applies emulated tabs in that window after a 150 ms debounce, so height and PC scale track the window. Opening, closing or resizing a docked DevTools pane shrinks the tab's content area without changing the window bounds, and an emulated page's own `resize` event does not fire either. So while a tab is emulated the worker also compares `chrome.tabs.get(tabId).width/height` with the last applied size every 500 ms, and re-applies on change. The check runs only for emulated tabs and stops when none are left.
 9. **Module shape.** `background.js` is a classic service-worker script, and `test/_extract.mjs` extracts named top-level functions from it. The pure logic (`viewportModeParams(mode, tabWidth, tabHeight, uaMajor)`) therefore lives in `background.js` as a named top-level function with an options-free signature. `test/viewport-modes.test.mjs` exercises it through `extractFunction`. No new module and no build step are needed.
 10. **Panel control.**
     - **Placement:** in `renderContextChip()`, between the page chip and the pin button, a `<button aria-haspopup="menu">` shows the mode icon and its short label (`Vừa khung`, `Di động`, `Tablet`, `PC`).
@@ -64,6 +64,13 @@ Reference studied: NotepadAI `WebViewWidget.h` :72–92 (`viewportBoundsFor`) an
     - **`resize_window`:** it appends a note that the page is emulating `<mode>` at `<w>`px and the window size does not change the page width until the operator picks Fit.
     - **PC scale below 1:** the coordinate space is verified in task 4.2 before PC is declared agent-safe. Until then, `resize_window` and screenshot results name the scale.
 
+12. **Coexisting with DevTools (F12).** Chrome lets an extension's `chrome.debugger` session and DevTools attach to the same tab at the same time, so opening or closing F12 must not break anything:
+    - **Attach with F12 open:** Browzy attaches and emulates normally. The operator can inspect elements, read the console and watch the network of the emulated page in DevTools.
+    - **F12 opened or closed while emulating:** Browzy's session stays attached and the mode stays in force. The page area changes size and Decision 8 re-fits it.
+    - **DevTools device mode is left alone:** Browzy never calls `clearDeviceMetricsOverride` or any other override on a tab unless the operator picked a mode in the panel for that tab. The existing first-attach clear in `ensureAttached` (:3087) is removed, because it would reset a device mode the operator set in DevTools. That clear only served tabs attached by builds older than #28.
+    - **Both set at once:** if the operator turns on the DevTools device toolbar while a Browzy mode is active, the two sessions write the same page settings. Browzy does not fight back and does not re-apply in a loop. After each apply, and on each size check, it reads `innerWidth` in the page. If the value no longer matches what Browzy set, the panel shows `DevTools đang điều khiển khung nhìn` and Browzy stops re-applying until the operator picks a mode again.
+    - **Turning Browzy off:** picking Vừa cửa sổ clears only Browzy's own overrides. Chrome keeps overrides per session, so a device mode set in DevTools is not touched.
+
 ## Risks / Trade-offs
 
 - [Risk] **The debugging bar is visible while emulating.** It is the same bar agent runs already show. It is inherent to CDP without DevTools and is accepted. Dismissing it is a clean way out: the tab returns to Fit and the panel follows.
@@ -78,6 +85,8 @@ Reference studied: NotepadAI `WebViewWidget.h` :72–92 (`viewportBoundsFor`) an
 Additive. Removes the unimplemented `add-document-preview-viewport-modes` change, which targeted the wrong surface. Nothing was built from it. Rollback removes the control and the handlers. A tab left emulated is cleared when the debugger detaches.
 
 ## Open Questions
+
+- How Chrome resolves two sessions writing device metrics at once, which one wins and whether clearing one restores the other. Task 4.2 records it. Decision 12 is written so Browzy stays correct either way.
 
 - Whether `positionX` centring works through `chrome.debugger` in current stable Chrome. Task 4.2 answers this.
 - Whether PC mode's scale below 1 keeps agent input coordinates in page CSS pixels. Task 4.2 answers this. Until then PC is marked "xem" (view) only for the agent: the tool results name the scale.
