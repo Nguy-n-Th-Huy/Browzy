@@ -13,7 +13,7 @@ Scope is the side panel's document viewer only. No host, background, tool-schema
 
 ## 2. Viewer markup and styles
 
-- [ ] 2.1 `sidepanel.html`: add the `role="radiogroup"` control (`aria-label="Khung nhìn xem trước"`, four `role="radio"` buttons `Vừa khung` / `Di động` / `Tablet` / `PC`, each with `title` and `aria-description` naming the CSS width) at the end of `.document-viewer-tabs`, `hidden` by default
+- [ ] 2.1 `sidepanel.html`: add the `role="radiogroup"` control (`aria-label="Khung nhìn xem trước"`, four `role="radio"` buttons `Vừa khung` / `Di động` / `Tablet` / `PC`, each with `title` and `aria-description` naming the CSS width) in a toolbar row directly below `.document-viewer-tabs`, `hidden` by default
 - [ ] 2.2 `sidepanel.css`: `.doc-frame-stage` (`position:relative; margin:0 auto; overflow:hidden`), `.doc-frame-stage > .doc-frame` (`transform-origin: top left`), `.doc-frame-caption` (small secondary text), and the control's layout using only existing tokens and the existing `.document-viewer-tab` / `is-active` treatment; `.doc-frame` rules for `fit` unchanged ← (verify: no new colour literal in `sidepanel.css`; `openspec/ui-dna.md` constraints hold)
 
 ## 3. Viewer behaviour
