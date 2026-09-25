@@ -540,6 +540,340 @@ function renderModelMenu() {
 // it describes.
 let contextStaleNotice = null;
 
+// ---- Viewport mode control (tasks 3.1-3.4; design.md Decision 10) --------
+// Mirrors background.js's own per-tab state — never derived locally.
+// refreshViewportMode() keeps it in sync on bind change (task 3.3), and the
+// viewport_mode_changed broadcast listener (below) keeps it in sync while
+// the panel stays bound to the same tab.
+// design.md Decision 10: the trigger shows the SHORT label ("Vừa khung" for
+// fit — task 4.2's own acceptance check names it exactly), while the menu
+// row spells the mode out ("Vừa cửa sổ"). The other three modes read the
+// same either way.
+const VIEWPORT_MODE_ROWS = [
+  { mode: "fit", label: "Vừa cửa sổ", short: "Vừa khung", desc: "Bỏ giả lập, về kích thước bình thường" },
+  { mode: "mobile", label: "Di động", short: "Di động", desc: "390px, có chạm, giao diện điện thoại" },
+  { mode: "tablet", label: "Tablet", short: "Tablet", desc: "768px, có chạm, giao diện máy tính bảng" },
+  { mode: "pc", label: "PC", short: "PC", desc: "1280px, thu nhỏ nếu cửa sổ hẹp hơn" },
+];
+function viewportModeRowShortLabel(mode) {
+  const row = VIEWPORT_MODE_ROWS.find((r) => r.mode === mode);
+  return row ? row.short : VIEWPORT_MODE_ROWS[0].short;
+}
+let viewportMode = { tabId: null, mode: "fit", overridden: false };
+let viewportMenuOpen = false;
+
+// One dedicated, long-lived port per panel DOCUMENT (design.md Decision 7 —
+// live-Chrome regression fix: background.js used to identify "which panel is
+// this" from MessageSender.documentId, but that field is not reliably
+// populated for a side-panel/extension-page sender, so closing the panel
+// while a tab sat in a non-fit mode left it emulated forever — background.js
+// always saw docId === null and its cleanup was a silent no-op). This panel
+// instead mints its own random id ONCE per document load and announces it as
+// this port's first message; background.js's onDisconnect for this exact
+// port is what now drives "clear every mode this panel set" (see
+// background.js's "browzy-viewport" chrome.runtime.onConnect listener).
+// viewport_mode_set and panel_bind_tab keep going over chrome.runtime.
+// sendMessage (a request/response is a poor fit for a fire-and-forget port,
+// and set/get already worked correctly) — they just carry this same
+// instanceId in their own message body so background.js can attribute them
+// to this port without touching MessageSender at all.
+const VIEWPORT_PANEL_INSTANCE_ID =
+  (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function")
+    ? crypto.randomUUID()
+    : `viewport-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+const VIEWPORT_PORT_RECONNECT_MAX_ATTEMPTS = 5;
+let viewportPort = null;
+let viewportReconnectAttempts = 0;
+let viewportReconnectTimer = null;
+
+/** Opens (or re-opens) this panel's dedicated viewport port and registers
+ * VIEWPORT_PANEL_INSTANCE_ID on it. Called once at boot, and again from
+ * viewportPort.onDisconnect whenever the port drops while this panel
+ * document is still alive — e.g. a service-worker restart, which tears down
+ * every port without closing the panel itself. Guards against a reconnect
+ * loop (e.g. the extension itself was reloaded/updated, so chrome.runtime.
+ * connect() will never succeed again for this document) with a bounded,
+ * backed-off retry count rather than reconnecting forever. */
+function connectViewportPort() {
+  if (viewportPort || viewportReconnectTimer) return;
+  let port;
+  try {
+    port = chrome.runtime.connect({ name: "browzy-viewport" });
+  } catch {
+    scheduleViewportPortReconnect();
+    return;
+  }
+  viewportPort = port;
+  try {
+    port.postMessage({ type: "register", instanceId: VIEWPORT_PANEL_INSTANCE_ID });
+  } catch {
+    // Connected but couldn't even post the register message — treat exactly
+    // like an immediate disconnect below.
+  }
+  port.onDisconnect.addListener(() => {
+    viewportPort = null;
+    scheduleViewportPortReconnect();
+  });
+  // A connect that got this far is a real success: reset the backoff, and
+  // re-announce the tab this panel is CURRENTLY bound to (background.js's
+  // own bookkeeping of that binding is per-service-worker-lifetime and does
+  // not survive a restart, even though this panel document does).
+  viewportReconnectAttempts = 0;
+  if (typeof adoptedContextTabId === "number") {
+    try {
+      chrome.runtime.sendMessage(
+        { type: "panel_bind_tab", tabId: adoptedContextTabId, previousTabId: null, instanceId: VIEWPORT_PANEL_INSTANCE_ID },
+        () => void chrome.runtime.lastError
+      );
+    } catch {}
+  }
+}
+
+function scheduleViewportPortReconnect() {
+  if (viewportReconnectTimer) return;
+  if (viewportReconnectAttempts >= VIEWPORT_PORT_RECONNECT_MAX_ATTEMPTS) return; // give up — see connectViewportPort's header
+  const delay = Math.min(5000, 250 * 2 ** viewportReconnectAttempts);
+  viewportReconnectAttempts += 1;
+  viewportReconnectTimer = setTimeout(() => {
+    viewportReconnectTimer = null;
+    connectViewportPort();
+  }, delay);
+}
+
+/** task 3.3: "On bind change ... the panel asks viewport_mode_get and
+ * re-renders" — called both from pageContext.onChange() below (a bind
+ * change, where closeMenu defaults on: an open menu described the PREVIOUS
+ * tab) and from the viewport_mode_changed listener below (same tab, so the
+ * operator's open menu is left alone). */
+async function refreshViewportMode(tabId, { closeMenu = true } = {}) {
+  if (closeMenu) viewportMenuOpen = false;
+  if (typeof tabId !== "number") {
+    viewportMode = { tabId: null, mode: "fit", overridden: false };
+    renderContextChip();
+    return;
+  }
+  let res = null;
+  try {
+    res = await chrome.runtime.sendMessage({ type: "viewport_mode_get", tabId });
+  } catch {
+    res = null;
+  }
+  viewportMode = { tabId, mode: (res && res.mode) || "fit", overridden: Boolean(res && res.overridden) };
+  renderContextChip();
+}
+
+function closeViewportMenu({ returnFocus = false } = {}) {
+  if (!viewportMenuOpen) return;
+  viewportMenuOpen = false;
+  renderContextChip();
+  if (returnFocus) {
+    requestAnimationFrame(() => {
+      const btn = el.contextChipRow.querySelector(".viewport-mode-trigger");
+      if (btn) btn.focus();
+    });
+  }
+}
+
+function openViewportMenu() {
+  if (viewportMenuOpen) return;
+  viewportMenuOpen = true;
+  renderContextChip();
+  requestAnimationFrame(() => {
+    const first = el.contextChipRow.querySelector('.viewport-mode-menu [role="menuitemradio"]');
+    if (first) first.focus();
+  });
+}
+
+async function selectViewportMode(tabId, mode) {
+  closeViewportMenu({ returnFocus: true });
+  if (typeof tabId !== "number") return;
+  // Optimistic: the background reply or the viewport_mode_changed broadcast
+  // (whichever lands first) corrects this if the pick was refused.
+  viewportMode = { tabId, mode, overridden: false };
+  renderContextChip();
+  let res = null;
+  try {
+    res = await chrome.runtime.sendMessage({ type: "viewport_mode_set", tabId, mode, instanceId: VIEWPORT_PANEL_INSTANCE_ID });
+  } catch {
+    res = null;
+  }
+  if (!res || res.ok !== true) {
+    let message;
+    if (res && res.reason === "restricted_page") {
+      message = "Không thể giả lập khung nhìn trên trang trình duyệt/nội bộ.";
+    } else {
+      // applyViewportMode's failure response carries the concrete reason
+      // (e.g. a CDP error message on apply_failed/clear_failed, or a short
+      // reason code like tab_unavailable/unknown_mode) — surface it instead
+      // of a generic toast that hides why the mode change was refused.
+      const detail = (res && (res.error || res.reason)) || "";
+      message = detail ? `Không thể đổi khung nhìn của trang: ${detail}` : "Không thể đổi khung nhìn của trang.";
+    }
+    showAttachmentError(message);
+    refreshViewportMode(tabId);
+    return;
+  }
+  viewportMode = { tabId, mode: res.mode, overridden: false };
+  renderContextChip();
+}
+
+/** task 3.2: the four `menuitemradio` rows plus the reload footer. */
+function buildViewportMenu(snap, mode, overridden) {
+  const menu = document.createElement("div");
+  menu.className = "menu viewport-mode-menu";
+  menu.setAttribute("role", "menu");
+
+  if (overridden) {
+    const notice = document.createElement("div");
+    notice.className = "viewport-mode-notice";
+    notice.textContent = "DevTools đang điều khiển khung nhìn.";
+    menu.appendChild(notice);
+  }
+
+  const items = [];
+  for (const row of VIEWPORT_MODE_ROWS) {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "menu-item viewport-mode-item";
+    item.setAttribute("role", "menuitemradio");
+    item.setAttribute("aria-checked", String(row.mode === mode));
+    item.innerHTML = `<span class="viewport-mode-item-label"></span><span class="viewport-mode-item-desc"></span>`;
+    item.querySelector(".viewport-mode-item-label").textContent = row.label;
+    item.querySelector(".viewport-mode-item-desc").textContent = row.desc;
+    item.addEventListener("click", () => selectViewportMode(snap.tabId, row.mode));
+    items.push(item);
+    menu.appendChild(item);
+  }
+
+  const footer = document.createElement("div");
+  footer.className = "viewport-mode-footer";
+  const note = document.createElement("span");
+  note.className = "viewport-mode-footer-note";
+  note.textContent = "Trang chọn giao diện theo user agent chỉ đổi sau khi tải lại.";
+  footer.appendChild(note);
+  const reloadBtn = document.createElement("button");
+  reloadBtn.type = "button";
+  reloadBtn.className = "viewport-mode-reload";
+  reloadBtn.textContent = "Tải lại trang";
+  reloadBtn.addEventListener("click", () => {
+    if (typeof snap.tabId === "number") chrome.tabs.reload(snap.tabId).catch(() => {});
+    closeViewportMenu({ returnFocus: true });
+  });
+  footer.appendChild(reloadBtn);
+  menu.appendChild(footer);
+
+  menu.addEventListener("keydown", (e) => {
+    const idx = items.indexOf(document.activeElement);
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      items[(idx + 1 + items.length) % items.length].focus();
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      items[(idx - 1 + items.length) % items.length].focus();
+    } else if (e.key === "Home") {
+      e.preventDefault();
+      items[0].focus();
+    } else if (e.key === "End") {
+      e.preventDefault();
+      items[items.length - 1].focus();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      closeViewportMenu({ returnFocus: true });
+    } else if (e.key === "Tab") {
+      closeViewportMenu();
+    }
+  });
+
+  return menu;
+}
+
+/** task 3.1: the trigger button between the page chip and the pin button. */
+function buildViewportModeControl(snap, mode, overridden) {
+  const wrap = document.createElement("span");
+  wrap.className = "viewport-mode";
+
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "viewport-mode-trigger" + (mode !== "fit" ? " is-active" : "");
+  btn.setAttribute("aria-haspopup", "menu");
+  btn.setAttribute("aria-expanded", String(viewportMenuOpen));
+  btn.setAttribute("aria-label", `Khung nhìn của trang: ${viewportModeRowShortLabel(mode)}`);
+  btn.innerHTML =
+    `<span class="viewport-mode-icon">${iconMarkup("monitor", { size: 14 })}</span>` +
+    `<span class="viewport-mode-label"></span>`;
+  btn.querySelector(".viewport-mode-label").textContent = viewportModeRowShortLabel(mode);
+
+  if (snap.restricted) {
+    btn.disabled = true;
+    btn.title = "Trang này là trang trình duyệt/nội bộ — không thể giả lập khung nhìn.";
+  } else if (overridden) {
+    btn.title = "DevTools đang điều khiển khung nhìn.";
+  } else {
+    btn.title = "Đổi khung nhìn của trang (Vừa cửa sổ, Di động, Tablet, PC)";
+  }
+
+  btn.addEventListener("click", () => {
+    if (btn.disabled) return;
+    if (viewportMenuOpen) closeViewportMenu();
+    else openViewportMenu();
+  });
+  btn.addEventListener("keydown", (e) => {
+    if (btn.disabled) return;
+    if (e.key === "ArrowDown" || e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      openViewportMenu();
+    } else if (e.key === "Escape" && viewportMenuOpen) {
+      // The menu's own keydown handler only covers focus already inside it;
+      // Escape pressed on the trigger itself (menu just opened, focus not
+      // yet moved onto a row) would otherwise reach neither handler.
+      e.preventDefault();
+      closeViewportMenu();
+    }
+  });
+  wrap.appendChild(btn);
+
+  if (viewportMenuOpen && !snap.restricted) wrap.appendChild(buildViewportMenu(snap, mode, overridden));
+  return wrap;
+}
+
+if (typeof document !== "undefined") {
+  // Registered once (rather than per-render, since renderContextChip() tears
+  // down and rebuilds this control's DOM on every call): closes the menu on
+  // an outside click or Escape, looking up the CURRENT trigger/menu through
+  // el.contextChipRow rather than a stale reference from whichever render
+  // last ran.
+  document.addEventListener("click", (e) => {
+    if (!viewportMenuOpen) return;
+    // e.target can be detached by the time this bubbles here: opening the
+    // menu re-renders (and thus replaces) the trigger button synchronously
+    // inside its own click handler, before this same click event finishes
+    // bubbling to document. A detached e.target always fails
+    // el.contextChipRow.contains(e.target), so the menu that was just opened
+    // would look like an outside click and close itself immediately.
+    // e.composedPath() is captured once at dispatch time and still lists the
+    // original (pre-detach) ancestors, so it survives the re-render.
+    const path = typeof e.composedPath === "function" ? e.composedPath() : [e.target];
+    if (el.contextChipRow && path.includes(el.contextChipRow)) return;
+    closeViewportMenu();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (!viewportMenuOpen || e.key !== "Escape") return;
+    if (el.contextChipRow && el.contextChipRow.contains(document.activeElement)) return; // the menu's own keydown handler already handles this
+    closeViewportMenu({ returnFocus: true });
+  });
+}
+
+if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.onMessage && typeof chrome.runtime.onMessage.addListener === "function") {
+  chrome.runtime.onMessage.addListener((msg) => {
+    if (!msg || msg.type !== "viewport_mode_changed") return;
+    if (viewportMode.tabId !== msg.tabId) return; // describes a tab the panel isn't currently bound to
+    // task 3.3: re-asks viewport_mode_get rather than trusting the broadcast
+    // payload directly, so the panel and background.js can never drift onto
+    // two different ideas of the current mode.
+    refreshViewportMode(msg.tabId, { closeMenu: false }).catch(() => {});
+  });
+}
+
 function renderContextChip() {
   el.contextChipRow.innerHTML = "";
   if (!pageContext) return;
@@ -581,6 +915,14 @@ function renderContextChip() {
     hint.textContent = "Sẽ đọc trang này";
     el.contextChipRow.appendChild(hint);
   }
+
+  // task 3.1: between the page chip and the pin button. viewportMode.tabId
+  // can momentarily lag snap.tabId right after a bind change (the async
+  // viewport_mode_get is still in flight) — shown as Fit until it resolves
+  // rather than a stale mode borrowed from the previous tab.
+  const currentViewportMode = viewportMode.tabId === snap.tabId ? viewportMode.mode : "fit";
+  const currentViewportOverridden = viewportMode.tabId === snap.tabId ? viewportMode.overridden : false;
+  el.contextChipRow.appendChild(buildViewportModeControl(snap, currentViewportMode, currentViewportOverridden));
 
   const pinBtn = document.createElement("button");
   pinBtn.className = "btn-icon";
@@ -4832,9 +5174,12 @@ function syncAdoptedTabGroup() {
   const previousTabId = adoptedContextTabId;
   adoptedContextTabId = tabId;
   try {
-    chrome.runtime.sendMessage({ type: "panel_bind_tab", tabId, previousTabId }, () => {
-      void chrome.runtime.lastError; // never surface: see note above
-    });
+    chrome.runtime.sendMessage(
+      { type: "panel_bind_tab", tabId, previousTabId, instanceId: VIEWPORT_PANEL_INSTANCE_ID },
+      () => {
+        void chrome.runtime.lastError; // never surface: see note above
+      }
+    );
   } catch {
     // sendMessage can throw if the worker is mid-restart; the next context
     // change re-syncs, so there is nothing useful to do here.
@@ -4843,6 +5188,11 @@ function syncAdoptedTabGroup() {
 
 async function boot() {
   panel.onUpdate(render);
+  // Viewport control init (design.md Decision 7): open this panel's
+  // dedicated port before the first panel_bind_tab/viewport_mode_set can
+  // fire below, so background.js already has VIEWPORT_PANEL_INSTANCE_ID
+  // registered by the time either message arrives.
+  connectViewportPort();
   const windowId = await currentWindowId();
   pageContext = new PageContextTracker({ windowId });
   pageContext.onChange(() => {
@@ -4854,6 +5204,10 @@ async function boot() {
     // describe a page the panel is no longer bound to.
     cancelDesignModeIfActive();
     if (pickedElement) clearPickedElement();
+    // task 3.3: "On bind change ... the panel asks viewport_mode_get and
+    // re-renders" — never derives the mode locally.
+    const boundSnap = pageContext.snapshot();
+    refreshViewportMode(boundSnap && boundSnap.tabId != null ? boundSnap.tabId : null).catch(() => {});
   });
   await pageContext.start();
   // scope-conversation-restore-per-tab (design.md "Scope by the tab the panel

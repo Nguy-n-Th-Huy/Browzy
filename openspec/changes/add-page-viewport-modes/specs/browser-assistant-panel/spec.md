@@ -26,12 +26,17 @@ The page-context row SHALL offer a viewport control for the bound tab. It opens 
 
 ### Requirement: The panel never shows a viewport mode that is not in force
 
-The control SHALL reflect the background's per-tab state and SHALL update on every change, including changes the operator did not make from this panel. If emulation ends for any reason, the control SHALL return to Vừa khung. That includes the operator dismissing the browser's debugging bar, the debugger detaching, and the service worker restarting without the attachment.
+The control SHALL reflect the background's per-tab state and SHALL update on every change, including changes the operator did not make from this panel. If emulation ends for any reason, the control SHALL return to Vừa khung. That includes the operator dismissing the browser's debugging bar, the debugger detaching, the service worker restarting without the attachment, and the side panel that set the mode closing or reloading — unless another open panel is bound to the same tab, in which case that other panel keeps showing the mode.
 
 #### Scenario: The operator dismisses the debugging bar
 
 - **WHEN** a device mode is active and the operator cancels the browser's debugging bar
 - **THEN** the page returns to normal and the control reads Vừa khung
+
+#### Scenario: Closing the panel that set the mode
+
+- **WHEN** the operator picks Tablet, then closes the side panel
+- **THEN** the tab returns to normal; if the panel is reopened bound to that tab, its control reads Vừa khung
 
 #### Scenario: DevTools takes over
 

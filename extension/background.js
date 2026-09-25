@@ -1115,6 +1115,12 @@ function handleAgentMessage(envelope) {
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== "ocic-agent") return;
   agentPorts.add(port);
+  // Viewport-mode panel-close cleanup (design.md Decision 7) does NOT hook
+  // this port: a MessageSender's documentId is not reliably populated for a
+  // side-panel (extension-page) sender, so this port cannot identify which
+  // panel it belongs to. That cleanup instead lives on the panel's own
+  // dedicated "browzy-viewport" port — see its chrome.runtime.onConnect
+  // listener below.
   // A late-connecting panel gets the current handshake state immediately,
   // rather than waiting for the next native-host event (which may never
   // come again once the handshake has already settled).
@@ -1161,7 +1167,9 @@ chrome.runtime.onConnect.addListener((port) => {
       nativePort.postMessage(msg);
     } catch {}
   });
-  port.onDisconnect.addListener(() => agentPorts.delete(port));
+  port.onDisconnect.addListener(() => {
+    agentPorts.delete(port);
+  });
 });
 
 // --- Per-call timing forensics -------------------------------------------
@@ -1724,15 +1732,20 @@ async function ensureTabGroup(createIfEmpty, titleOverride) {
 }
 
 function formatTabContext(tabs) {
-  const available = tabs.map((t) => ({
-    tabId: t.id,
-    title: t.title || "Untitled",
-    url: t.url || "",
-  }));
+  const available = tabs.map((t) => {
+    // design.md (add-page-viewport-modes) Decision 11: tabs_context_mcp
+    // names the mode per tab, so the agent knows a screenshot or coordinate
+    // on this tab describes an emulated viewport, not the tab's real one.
+    const emu = viewportModeByTab.get(t.id);
+    const out = { tabId: t.id, title: t.title || "Untitled", url: t.url || "" };
+    if (emu) out.viewportMode = emu.mode;
+    return out;
+  });
 
   let text = `Tab Context:\n- Available tabs:\n`;
   for (const t of available) {
-    text += `  \u2022 tabId ${t.tabId}: "${t.title}" (${t.url})\n`;
+    const modeNote = t.viewportMode ? ` [emulating ${t.viewportMode}]` : "";
+    text += `  \u2022 tabId ${t.tabId}: "${t.title}" (${t.url})${modeNote}\n`;
   }
 
   return {
@@ -3069,23 +3082,23 @@ async function ensureAttached(tabId) {
       // domain enable through ensureDomain and reports a normal capture miss if
       // the debugger cannot provide Network.
     }
-  // No device-metrics emulation here. Screenshots get CSS-pixel framing from an
-  // explicit capture clip instead (see takeScreenshot), which is more direct and
-  // touches nothing about the page — no re-layout, no resize handlers fired.
+  // No device-metrics emulation here on attach. Screenshots get CSS-pixel
+  // framing from an explicit capture clip instead (see takeScreenshot), which
+  // is more direct and touches nothing about the page — no re-layout, no
+  // resize handlers fired.
   //
-  // An earlier version of this comment claimed the override was what froze the
-  // viewport against resize_window. That was wrong. The real cause is below:
-  // Chrome does not re-layout a tab that is not the SELECTED tab in its window,
-  // and since #28 we never select tabs. Removing the override did not change
-  // that, and restoring it would not either.
+  // Chrome does not re-layout a tab that is not the SELECTED tab in its
+  // window, and since #28 we never select tabs — that is what actually holds
+  // a driven tab's viewport still against resize_window, not any override.
   //
-  // Builds before this one DID install an override (at the outer window size,
-  // which is larger than the viewport, so pages laid out for a size that did not
-  // exist). A tab attached by one of those builds still carries it, so clear it
-  // once here rather than inheriting a stale viewport from whatever ran before.
-  try {
-    await chrome.debugger.sendCommand({ tabId }, "Emulation.clearDeviceMetricsOverride", {});
-  } catch {}
+  // An earlier build cleared Emulation.clearDeviceMetricsOverride here on
+  // every attach, to wipe out a stale override left by an older build. That
+  // clear is gone: it ran unconditionally, so it would just as happily wipe
+  // out a device mode the operator turned on in DevTools, or a mode this
+  // extension's own viewport control (applyViewportMode, below) had just set
+  // for this tab — see design.md's viewport-modes Decision 12. Nothing here
+  // clears or sets emulation on a tab unless the operator picked a mode for
+  // that tab.
   // Make the tab behave as focused/active for input purposes WITHOUT selecting
   // it. Since we stopped foregrounding tabs (#28), a driven tab is often not
   // the selected one, and Chromium throttles a hidden tab: synthesized
@@ -3174,6 +3187,837 @@ function cdpDetail(method, p) {
   return "";
 }
 
+// --- Viewport modes (device emulation for the bound tab) -------------------
+//
+// design.md (add-page-viewport-modes) Decisions 1-12: the panel's viewport
+// control drives Chrome's own device-emulation CDP commands on the tab it is
+// bound to, without opening DevTools. VIEWPORT_MODES is the one source of
+// truth for each mode's raw numbers; viewportModeParams() below turns a mode
+// plus the tab's own current size into the exact CDP command bodies, and is
+// deliberately pure (no chrome.*) so test/viewport-modes.test.mjs can
+// exercise it in plain Node through test/_extract.mjs, the same way
+// test/screenshot-scale.test.mjs already does for requestedScale() and
+// captureScaleForViewport().
+const VIEWPORT_MODES = Object.freeze({
+  mobile: Object.freeze({ width: 390, deviceScaleFactor: 3 }),
+  tablet: Object.freeze({ width: 768, deviceScaleFactor: 2 }),
+  pc: Object.freeze({ width: 1280, deviceScaleFactor: 0 }), // 0 = the window's own DPR, left unmodified
+});
+
+// A fallback only: a real Chrome always exposes navigator.userAgentData in
+// the service worker, so getChromeMajorVersion() below reaches this literal
+// only on a Chromium fork that doesn't.
+const VIEWPORT_UA_FALLBACK_MAJOR = 131;
+
+/** The browser's own major version, read from Client Hints — brands[].version
+ * is already the "significant version" a real Chrome sends (e.g. "131"), not
+ * the full x.y.z.w string — so the emulated mobile/tablet user agent claims a
+ * real, current Chrome rather than one hand-picked here that drifts stale. */
+function getChromeMajorVersion() {
+  try {
+    const brands = (navigator.userAgentData && navigator.userAgentData.brands) || [];
+    const brand = brands.find((b) => b.brand === "Google Chrome" || b.brand === "Chromium");
+    const n = brand && parseInt(brand.version, 10);
+    if (Number.isFinite(n) && n > 0) return n;
+  } catch {}
+  const m = /Chrome\/(\d+)/.exec(navigator.userAgent || "");
+  const n = m && parseInt(m[1], 10);
+  if (Number.isFinite(n) && n > 0) return n;
+  return VIEWPORT_UA_FALLBACK_MAJOR;
+}
+
+function coercePositiveNumber(value, fallback) {
+  const n = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+/**
+ * Pure: a mode plus the tab's own current size -> the CDP command bodies to
+ * apply it. Returns null for "fit" or any mode VIEWPORT_MODES does not know,
+ * which callers take to mean "clear every override instead."
+ *
+ * design.md Decision 2: height always follows the tab's own current content
+ * height, read before any override is applied, so it is never contaminated by
+ * a previous one. Decision 3: every device mode is drawn at its full width
+ * and scaled down to fit a narrower tab, never clamped to it (a clamp would
+ * make it indistinguishable from fit in a narrow window) — `scale = min(1,
+ * tabWidth / width)`, the same rule for pc, mobile and tablet alike, and the
+ * scale actually applied is recorded on the tab's viewportModeByTab entry so
+ * tool results can name it. Decision 4: positionX/positionY are dropped
+ * entirely (measured empirically: Chrome always paints the emulated view at
+ * the tab's top-left — positionX changes only the page's own reported
+ * window.screenX/screenLeft, it does not move where anything is painted, so
+ * a non-zero value only makes the page misreport itself). Decision 5: the
+ * user agent claims Chrome on Android, in the browser's own real major
+ * version, with Client Hints (userAgentMetadata) agreeing with the string.
+ */
+function viewportModeParams(mode, tabWidth, tabHeight, uaMajor) {
+  const spec = VIEWPORT_MODES[mode];
+  if (!spec) return null; // "fit" or an unrecognized mode
+  const isDesktop = mode === "pc";
+  const width = spec.width;
+  const height = coercePositiveNumber(tabHeight, 800);
+  const rawTabWidth = coercePositiveNumber(tabWidth, width);
+  const major = coercePositiveNumber(uaMajor, VIEWPORT_UA_FALLBACK_MAJOR);
+
+  const metrics = {
+    width,
+    height,
+    deviceScaleFactor: spec.deviceScaleFactor,
+    mobile: !isDesktop,
+    screenWidth: width,
+    screenHeight: height,
+    scale: Math.min(1, rawTabWidth / width),
+    screenOrientation: { type: "portraitPrimary", angle: 0 },
+  };
+
+  // Chrome validates maxTouchPoints against 1..16 even when touch is being
+  // turned OFF — sending it alongside enabled:false (as the previous build
+  // did with a literal 0) is rejected outright with -32602, which is why PC
+  // always failed to apply. Sending only {enabled:false} clears touch with
+  // no such field to validate.
+  const touchOn = !isDesktop;
+  const touch = touchOn ? { enabled: true, maxTouchPoints: 5 } : { enabled: false };
+  const emitTouch = touchOn ? { enabled: true, configuration: "mobile" } : { enabled: false };
+
+  let userAgent = null;
+  let userAgentMetadata = null;
+  if (mode === "mobile" || mode === "tablet") {
+    // Real Chrome on Android tablets drops the "Mobile" token both builds
+    // send on phones — omitting it here (and agreeing in userAgentMetadata
+    // below) is what keeps a site's own UA sniffing picking a tablet, not a
+    // phone, layout for this mode.
+    const mobileToken = mode === "mobile" ? " Mobile" : "";
+    userAgent =
+      `Mozilla/5.0 (Linux; Android 14; K) AppleWebKit/537.36 (KHTML, like Gecko) ` +
+      `Chrome/${major}.0.0.0${mobileToken} Safari/537.36`;
+    userAgentMetadata = {
+      platform: "Android",
+      platformVersion: "14",
+      architecture: "",
+      model: "K",
+      mobile: mode === "mobile",
+      brands: [
+        { brand: "Not)A;Brand", version: "99" },
+        { brand: "Chromium", version: String(major) },
+        { brand: "Google Chrome", version: String(major) },
+      ],
+      fullVersionList: [
+        { brand: "Not)A;Brand", version: "99.0.0.0" },
+        { brand: "Chromium", version: `${major}.0.0.0` },
+        { brand: "Google Chrome", version: `${major}.0.0.0` },
+      ],
+    };
+  }
+
+  return { metrics, touch, emitTouch, userAgent, userAgentMetadata };
+}
+
+// tabId -> { mode, appliedAt, width, scale, overridden, tabWidth, tabHeight, setBy, generation }
+// width/scale are what was actually applied (resize_window's own note reads
+// them back rather than recomputing). tabWidth/tabHeight are the RAW
+// chrome.tabs.get width/height read at apply time — design.md Decision 8:
+// what the 500ms poll and the windows.onBoundsChanged handler both compare
+// against to notice DevTools docking or undocking, which shrinks a tab's
+// content area without moving the window or firing the emulated page's own
+// resize event. setBy is the random instanceId the panel that issued
+// viewport_mode_set generated for itself once and registered on its own
+// dedicated "browzy-viewport" port (see that port's chrome.runtime.onConnect
+// listener, below) — deliberately NOT MessageSender.documentId, which is not
+// reliably populated for a side-panel (extension-page) sender and left the
+// panel-close cleanup below silently inert in real Chrome (it always saw
+// docId === null and returned immediately). setBy is null/undefined when no
+// panel is known (e.g. an entry restored from storage.session before this
+// field existed) — design.md Decision 7 "What removes it": a mode must not
+// outlive the panel that set it, and this is what onViewportPanelDisconnected
+// (below) checks before clearing. generation is the value
+// currentViewportGeneration(tabId) held when this entry's CDP commands were
+// decided (see the generation machinery right below) — a re-apply
+// (viewportPollTick, reapplyEmulatedTabsInWindow) threads this same value
+// through unchanged so it can tell, right before it would send a CDP
+// command, whether something newer (an operator pick, a clear) has already
+// superseded the entry it read before its own await.
+const viewportModeByTab = new Map();
+const VIEWPORT_MODE_STORAGE_KEY = "viewport_mode_by_tab_v1";
+
+// tabId a LIVE panel instance is currently bound to, keyed by that panel's
+// own instanceId (the same one it registered on its "browzy-viewport" port —
+// see that port's onConnect listener, below). Populated from panel_bind_tab's
+// message body (onViewportPanelBind) and dropped when that panel's
+// "browzy-viewport" port disconnects (onViewportPanelDisconnected) — purely
+// so onViewportPanelDisconnected can tell whether ANOTHER open panel is
+// still bound to a tab before clearing that tab's mode (design.md Decision
+// 7's exception: leave the mode in force when another panel is bound to it).
+const viewportBoundTabByInstanceId = new Map();
+
+// --- Per-tab serialisation (root fix for the panel-close resize race) -----
+//
+// Live-reported bug: closing the side panel while a device mode was active
+// left the tab emulated at the old mode even though the panel's own state
+// said "Fit". Root cause, found by reading the code that was here before:
+// clearViewportMode() used to await ensureAttached()/runViewportClearCommands()
+// BEFORE dropping the tab's viewportModeByTab entry. During that await
+// window, closing the panel ALSO widens the tab (Chrome grows it back to
+// full width the instant the side panel's iframe goes away) — the exact
+// same moment the "browzy-viewport" port disconnects — so the 500ms
+// viewportPollTick (or windows.onBoundsChanged's reapplyEmulatedTabsInWindow)
+// could see that size change, find the entry still present (the clear
+// hadn't reached the point of dropping it yet) and re-apply the OLD mode.
+// Nothing serialised the clear's CDP commands against the re-apply's, so
+// their chrome.debugger.sendCommand calls could interleave or land in
+// either order — the tab could end up emulated while Browzy's own state
+// said Fit, or the entry could be resurrected right after the clear wiped
+// it.
+//
+// The fix has two parts, both required:
+//   1. viewportOpQueue below serialises EVERY apply/clear for the SAME tab
+//      (an operator pick, a Fit, a panel-close clear, a poll/bounds
+//      re-apply) through one promise chain, so two operations for one tab
+//      never have their CDP commands in flight at the same time.
+//   2. viewportGenerationByTab below is bumped SYNCHRONOUSLY — before
+//      anything is even queued — by every operator pick (including Fit) and
+//      every clear. A queued apply re-checks its own captured generation
+//      immediately before each CDP command it is about to send (and once
+//      more right after they all land, in case it was superseded while
+//      they were in flight) and turns itself into a no-op the moment it no
+//      longer matches: this is what stops a re-apply that was already
+//      queued (or already mid-flight) from resurrecting a mode a clear
+//      just invalidated, even though the queue alone only guarantees
+//      commands don't INTERLEAVE, not that a stale re-apply skips itself.
+//   3. clearViewportMode (below) drops the tab's entry and bumps the
+//      generation SYNCHRONOUSLY, the instant it is called — not after its
+//      CDP commands finish — so the panel's own state is truthful
+//      immediately and any apply that checks in afterward sees it.
+
+// tabId -> number. Never deleted (so it still works once a tab's entry is
+// gone), only ever incremented, by bumpViewportGeneration below.
+const viewportGenerationByTab = new Map();
+
+function bumpViewportGeneration(tabId) {
+  const next = (viewportGenerationByTab.get(tabId) || 0) + 1;
+  viewportGenerationByTab.set(tabId, next);
+  return next;
+}
+
+function currentViewportGeneration(tabId) {
+  return viewportGenerationByTab.get(tabId) || 0;
+}
+
+// tabId -> the tail Promise of that tab's own serial operation queue.
+// queueViewportOp chains `fn` onto it, so `fn` never starts running until
+// every earlier queued operation for the SAME tab has fully finished —
+// this is what makes it structurally impossible for two operations on one
+// tab to have their CDP commands in flight at the same time, regardless of
+// how chrome.debugger.sendCommand happens to resolve.
+const viewportOpQueue = new Map();
+
+function queueViewportOp(tabId, fn) {
+  const tail = viewportOpQueue.get(tabId) || Promise.resolve();
+  const result = tail.then(fn);
+  // The STORED tail always resolves, even when this op's own result
+  // rejects — a failed op must not wedge every later op queued for this
+  // tab. Callers still observe this op's real outcome through `result`,
+  // which is what this function returns.
+  viewportOpQueue.set(tabId, result.then(() => {}, () => {}));
+  return result;
+}
+
+// tabId -> the most recent NEW operator-driven pick's (applyViewportMode
+// for a device mode, or clearViewportMode) own externally-visible result
+// promise — deliberately NOT viewportOpQueue, which must stay purely about
+// CDP-command sequencing. A queued device-mode apply that discovers it was
+// superseded (see the per-tab serialisation notes above viewportModeByTab)
+// never resolves its OWN caller straight to {ok:false, reason:"superseded"}
+// — a fast second pick superseding a first one is the OPERATOR changing
+// their mind, not an error, and viewport_mode_set's handler pipes whatever
+// this resolves to straight into the panel's error toast on any `!ok`. So a
+// superseded apply instead chains to whatever this map currently holds —
+// the newer pick that superseded it — which resolves once THAT one finishes
+// (possibly chaining again itself, if a third pick raced too), bottoming
+// out at whichever pick genuinely won or genuinely failed. This is safe
+// against the deadlock it looks like it should cause: chaining happens on a
+// SEPARATE promise layered on top of each op's own queued result, never on
+// the queue's own internal tail, so a superseded op's own queued fn always
+// settles on its own schedule and never waits on the pick that superseded
+// it before letting that pick's own queued fn start.
+const viewportLatestResultByTab = new Map();
+
+function persistViewportModes() {
+  const obj = {};
+  for (const [tabId, entry] of viewportModeByTab) obj[String(tabId)] = entry;
+  try {
+    chrome.storage.session.set({ [VIEWPORT_MODE_STORAGE_KEY]: obj });
+  } catch {}
+}
+
+function setViewportEntry(tabId, entry) {
+  if (entry) viewportModeByTab.set(tabId, entry);
+  else viewportModeByTab.delete(tabId);
+  persistViewportModes();
+}
+
+function broadcastViewportMode(tabId, mode, extra) {
+  chrome.runtime.sendMessage({ type: "viewport_mode_changed", tabId, mode, ...extra }).catch(() => {});
+}
+
+// design.md (add-page-viewport-modes) Decision 11 "scale below 1" and Open
+// Questions: task 4.2 has not yet verified that a click coordinate lands in
+// the page's own CSS pixels once a mode is drawn below scale 1 — the page
+// lays out at its full mode width but is drawn smaller in a narrower tab.
+// This applies to any mode (pc, mobile or tablet), not just pc: a narrow tab
+// scales mobile/tablet down exactly the same way pc already scaled down.
+// Until verified, every tool result that could feed the model a coordinate
+// on this tab must say so — resize_window and the screenshot action both
+// call this so the wording lives in exactly one place. Returns "" for a tab
+// that is not emulated, or once its applied scale reaches 1 (no scaling, no
+// coordinate risk).
+function viewportScaleAgentNote(tabId) {
+  const entry = viewportModeByTab.get(tabId);
+  if (!entry || !(entry.scale < 1)) return "";
+  return (
+    `this tab is emulating "${entry.mode}" at ${entry.width}px, drawn at scale ${entry.scale.toFixed(2)} — ` +
+    `click coordinates at this scale are not yet verified to land in the page's own CSS pixels`
+  );
+}
+
+// design.md Decision 7: a mode is never shown without a live attachment
+// behind it. attachedTabs is an in-memory Map that starts empty on every
+// service-worker start (a restart ends the debugger session it tracked), so
+// this reconcile — run once at module load — drops every persisted entry
+// whose tab is not (yet) in attachedTabs, rather than trusting the storage
+// mirror blindly.
+async function reconcileViewportModes() {
+  let stored;
+  try {
+    stored = await chrome.storage.session.get(VIEWPORT_MODE_STORAGE_KEY);
+  } catch {
+    return;
+  }
+  const obj = (stored && stored[VIEWPORT_MODE_STORAGE_KEY]) || {};
+  let dropped = false;
+  for (const [key, entry] of Object.entries(obj)) {
+    const tabId = Number(key);
+    if (attachedTabs.has(tabId)) viewportModeByTab.set(tabId, entry);
+    else dropped = true;
+  }
+  if (dropped) persistViewportModes();
+}
+reconcileViewportModes();
+
+// Low-level CDP-only clear: the "clear or disable forms" of the same four
+// commands apply issues (design.md Decision 6), with no state bookkeeping of
+// its own. Used both by the operator picking "fit" and by applyViewportMode's
+// own failure path, which must leave a tab fully cleared rather than half
+// emulated (Decision 6 "Failure").
+async function runViewportClearCommands(tabId) {
+  await cdp(tabId, "Emulation.clearDeviceMetricsOverride", {});
+  await cdp(tabId, "Emulation.setTouchEmulationEnabled", { enabled: false });
+  await cdp(tabId, "Emulation.setEmitTouchEventsForMouse", { enabled: false });
+  await cdp(tabId, "Emulation.setUserAgentOverride", { userAgent: "" });
+}
+
+// "Clear invalidates first" (see the per-tab serialisation notes above): the
+// generation bump and the entry drop happen SYNCHRONOUSLY, the instant this
+// is called — before anything is even queued — so the panel's own state is
+// truthful immediately, and an apply that is already queued behind this
+// clear, or already mid-flight and about to check in, sees the invalidation
+// no matter when it checks. The actual CDP clear commands still go through
+// the per-tab queue like every other operation, so they can never interleave
+// with another operation's commands for this tab. A clear on a tab with no
+// entry (e.g. Browzy overrides left over from a failed apply) still runs the
+// same CDP clear commands — dropping an already-absent entry is a no-op.
+function clearViewportMode(tabId) {
+  bumpViewportGeneration(tabId);
+  setViewportEntry(tabId, null);
+  const result = queueViewportOp(tabId, async () => {
+    try {
+      await ensureAttached(tabId);
+      await runViewportClearCommands(tabId);
+    } catch (e) {
+      // The entry is already dropped, synchronously, above — only the
+      // reported outcome differs from the success path.
+      return { ok: false, reason: "clear_failed", error: String(e && e.message) };
+    }
+    broadcastViewportMode(tabId, "fit");
+    return { ok: true, mode: "fit" };
+  });
+  // A clear is always a fresh, operator-visible intent (never a re-apply of
+  // an existing entry — clearViewportMode has no "carry the generation
+  // through" caller) — register it so a device-mode apply that this clear
+  // supersedes chains to this result instead of reporting itself as a
+  // failure (see viewportLatestResultByTab above).
+  viewportLatestResultByTab.set(tabId, result);
+  return result;
+}
+
+/** After applying, read the page's own innerWidth back. design.md Decision
+ * 12: Browzy never fights DevTools for the viewport — if the page no longer
+ * reports the width Browzy just set, something else (DevTools' own device
+ * toolbar) is holding it, and re-applying is exactly what would fight it.
+ * Marks the tab `overridden` instead, which the 500ms poll and the
+ * bounds-changed handler both skip until the operator picks a mode again.
+ *
+ * A single mismatch is not enough to flag it: called right after apply, the
+ * renderer may simply not have reflowed to the just-set metrics yet, which
+ * would otherwise show a false "DevTools đang điều khiển khung nhìn" on an
+ * ordinary apply. Only a SECOND consecutive mismatch — supplied by the next
+ * 500ms poll tick if the first one was a false alarm — actually flags it.
+ * Recovery (the width matching again) is immediate, not debounced: nothing
+ * is fighting the viewport at that point, so there is nothing to protect
+ * against re-flagging too eagerly. */
+async function verifyViewportApplied(tabId, expectedWidth) {
+  const entry = viewportModeByTab.get(tabId);
+  if (!entry) return;
+  let actual = null;
+  try {
+    const r = await cdp(tabId, "Runtime.evaluate", { expression: "innerWidth", returnByValue: true });
+    if (r && r.result && typeof r.result.value === "number") actual = r.result.value;
+  } catch {
+    return; // can't tell right now — leave the last known state alone
+  }
+  const mismatched = actual !== null && actual !== expectedWidth;
+  if (!mismatched) {
+    entry.overrideMismatchStreak = 0;
+    if (entry.overridden) {
+      entry.overridden = false;
+      persistViewportModes();
+      broadcastViewportMode(tabId, entry.mode, { overridden: false });
+    }
+    return;
+  }
+  entry.overrideMismatchStreak = (entry.overrideMismatchStreak || 0) + 1;
+  if (entry.overrideMismatchStreak >= 2 && !entry.overridden) {
+    entry.overridden = true;
+    persistViewportModes();
+    broadcastViewportMode(tabId, entry.mode, { overridden: true });
+  }
+}
+
+// setBy: the panel instanceId (registered on its "browzy-viewport" port,
+// below) that picked `mode`, when known — passed explicitly by the
+// viewport_mode_set handler (below) and threaded back through by the poll
+// tick / bounds-changed re-apply so a re-apply never strips an entry's
+// existing owner.
+//
+// generation: see the per-tab serialisation notes above viewportModeByTab.
+//   - omitted (undefined): this call is a brand-new operator intent (a
+//     viewport_mode_set pick). A fresh generation is minted for this tab,
+//     SYNCHRONOUSLY, right now — before anything is even queued — so it
+//     immediately invalidates any apply/re-apply already queued or
+//     in-flight for this tab.
+//   - a number: this call is an AUTOMATIC re-apply of an existing entry
+//     (viewportPollTick, reapplyEmulatedTabsInWindow). It must carry that
+//     entry's OWN generation through unchanged rather than minting a new
+//     one — minting one here would let a re-apply invalidate a genuinely
+//     newer operator pick that raced it.
+//
+// The whole operation — reading the tab, computing the CDP bodies, sending
+// them, recording the result — runs inside queueViewportOp, so it can never
+// have its commands in flight at the same time as another apply/clear for
+// this same tab. Before EVERY command it is about to send, and once more
+// right after they have all landed, it re-checks that its own generation is
+// still the tab's current one AND that the debugger is still attached; the
+// moment either check fails it undoes whatever it already sent (full clear —
+// but ONLY when the debugger is still actually attached; see stillAttached
+// below) and reports itself superseded, rather than resurrecting a mode
+// something newer already moved past.
+//
+// isNewIntent (generation omitted) additionally wraps the returned promise:
+// viewport_mode_set's handler pipes this straight into the panel, which
+// toasts an error on any `!ok` — so a device-mode pick that gets superseded
+// by the operator immediately picking something else must never resolve to
+// {ok:false}. Its wrapper instead chains to viewportLatestResultByTab (see
+// above), which is whatever superseded it, so the operator's stale first
+// request quietly resolves to the SAME truthful outcome as their second one
+// rather than flashing an error for a request they themselves overrode. A
+// re-apply (generation given — viewportPollTick, reapplyEmulatedTabsInWindow)
+// skips this: its result is only ever awaited and discarded by its caller.
+function applyViewportMode(tabId, mode, setBy, generation) {
+  if (mode === "fit") return clearViewportMode(tabId);
+  const isNewIntent = typeof generation !== "number";
+  const gen = isNewIntent ? bumpViewportGeneration(tabId) : generation;
+  // Bumping unconditionally, even for a pick that is about to bail out below
+  // (restricted_page/tab_unavailable/unknown_mode), is a deliberate accepted
+  // trade-off, not an oversight: the bump MUST happen synchronously, before
+  // anything is queued, for the mid-flight-abort guarantee above to hold at
+  // all (see the per-tab serialisation notes above viewportModeByTab) — a
+  // bump deferred until after an async eligibility check would let a
+  // concurrent stale re-apply run to completion before this pick could ever
+  // invalidate it. The one edge this trades away: a pick that bails out on
+  // an EXISTING mode's tab (e.g. the tab navigated to a restricted URL
+  // between the panel reading its snapshot and this call landing) bumps that
+  // tab's generation without ever writing a new entry, so that existing
+  // entry's OWN generation now reads stale and its poll/bounds re-applies
+  // become no-ops until the next successful pick or clear touches this tab.
+  // The panel already disables the picker on a restricted snapshot (Decision
+  // 10), so reaching this specific edge needs the tab to go restricted in
+  // the narrow window between snapshot and pick — accepted as low-probability
+  // rather than reworked, since reworking it would remove the very
+  // synchronicity the race fix depends on.
+  //
+  // Two predicates, deliberately different: generationCurrent() alone is
+  // what the checks BEFORE ensureAttached use, because a brand-new tab
+  // legitimately is not in attachedTabs yet at that point — ensureAttached
+  // is what is about to put it there, so requiring it already would break
+  // every first-ever apply on a tab. stillCurrent() additionally requires
+  // attachedTabs.has(tabId) and is used for every check AFTER
+  // ensureAttached has run, where the debugger really is expected to be
+  // attached and a detach racing in is exactly what must be caught.
+  const generationCurrent = () => currentViewportGeneration(tabId) === gen;
+  const stillAttached = () => attachedTabs.has(tabId);
+  const stillCurrent = () => generationCurrent() && stillAttached();
+  // Undo-on-supersession must never re-attach a detached debugger: Chrome
+  // already dropped every override when it detached (design.md Decision 7),
+  // so if stillCurrent() failed because the debugger is gone there is
+  // nothing left to clear, and running the clear commands anyway would call
+  // cdp() -> ensureAttached() and bring the "Browzy is debugging this
+  // browser" bar right back after the operator (or Chrome) just dismissed
+  // it. Only actually attempt the clear when a real override might still be
+  // sitting on the tab (generation stale, debugger still attached).
+  const undoIfNeeded = async () => {
+    if (stillAttached()) await runViewportClearCommands(tabId).catch(() => {});
+  };
+  const supersededReason = () => (stillAttached() ? "superseded" : "detached");
+
+  const queued = queueViewportOp(tabId, async () => {
+    if (!generationCurrent()) return { ok: false, reason: supersededReason() };
+
+    let tab;
+    try {
+      tab = await chrome.tabs.get(tabId);
+    } catch {
+      return { ok: false, reason: "tab_unavailable" };
+    }
+    if (tab.url && RESTRICTED_URL_PATTERN.test(tab.url)) {
+      return { ok: false, reason: "restricted_page" };
+    }
+    const params = viewportModeParams(mode, tab.width, tab.height, getChromeMajorVersion());
+    if (!params) return { ok: false, reason: "unknown_mode" };
+
+    if (!generationCurrent()) return { ok: false, reason: supersededReason() };
+
+    // design.md Decision 6 "Apply order" — exactly these four commands, in
+    // this order.
+    const steps = [
+      ["Emulation.setDeviceMetricsOverride", params.metrics],
+      ["Emulation.setTouchEmulationEnabled", params.touch],
+      ["Emulation.setEmitTouchEventsForMouse", params.emitTouch],
+      [
+        "Emulation.setUserAgentOverride",
+        params.userAgent
+          ? { userAgent: params.userAgent, platform: "Android", userAgentMetadata: params.userAgentMetadata }
+          : { userAgent: "" },
+      ],
+    ];
+    try {
+      await ensureAttached(tabId);
+      for (const [command, cmdParams] of steps) {
+        if (!stillCurrent()) {
+          // Superseded while this op was suspended (ensureAttached, or the
+          // previous command's own await) — never send the next command.
+          const reason = supersededReason();
+          await undoIfNeeded();
+          return { ok: false, reason };
+        }
+        await cdp(tabId, command, cmdParams);
+      }
+    } catch (e) {
+      // Decision 6 "Failure": never leave a tab half-emulated while the
+      // panel shows a mode.
+      try { await runViewportClearCommands(tabId); } catch {}
+      setViewportEntry(tabId, null);
+      return { ok: false, reason: "apply_failed", error: String(e && e.message) };
+    }
+
+    if (!stillCurrent()) {
+      // All four commands landed, but something invalidated this generation
+      // while they were in flight — undo rather than leave the tab emulated
+      // under a generation nothing claims any more.
+      const reason = supersededReason();
+      await undoIfNeeded();
+      return { ok: false, reason };
+    }
+
+    setViewportEntry(tabId, {
+      mode,
+      appliedAt: Date.now(),
+      width: params.metrics.width,
+      scale: params.metrics.scale || 1,
+      overridden: false,
+      tabWidth: coercePositiveNumber(tab.width, params.metrics.width),
+      tabHeight: coercePositiveNumber(tab.height, params.metrics.height),
+      setBy: setBy != null ? setBy : null,
+      generation: gen,
+    });
+    broadcastViewportMode(tabId, mode);
+    ensureViewportPolling();
+    await verifyViewportApplied(tabId, params.metrics.width);
+    return { ok: true, mode };
+  });
+
+  if (!isNewIntent) return queued; // re-applies: the caller discards the result
+
+  const wrapped = queued.then((result) => {
+    if (result && result.reason === "superseded") {
+      // Chain to whatever superseded us (see viewportLatestResultByTab
+      // above) rather than reporting our own {ok:false} — this does NOT
+      // wait on the queue itself (that already let the superseding op run
+      // the moment our own queued fn above returned), only on its own
+      // separately-layered result promise, so this can never deadlock
+      // against the very op it is chaining to.
+      //
+      // `latest !== wrapped` guards a real self-chaining cycle: bumping the
+      // generation and registering the new "latest" entry are two separate
+      // steps everywhere EXCEPT onViewportDebuggerDetach, which bumps but
+      // (below) also registers a plain "detached" result — but if this op's
+      // own generationCurrent() check somehow still finds `wrapped` as the
+      // map's current entry (nothing else has registered since), chaining to
+      // itself would make a promise resolve to itself, which V8 rejects with
+      // "Chaining cycle detected" instead of ever settling — silently
+      // breaking `.then(sendResponse)` and the panel's response with it.
+      const latest = viewportLatestResultByTab.get(tabId);
+      return latest && latest !== wrapped ? latest : result;
+    }
+    return result;
+  });
+  viewportLatestResultByTab.set(tabId, wrapped);
+  return wrapped;
+}
+
+// design.md Decision 8: DevTools docking/undocking shrinks a tab's content
+// area without changing the window's own bounds, and an emulated page's own
+// resize event does not fire either — so this polls chrome.tabs.get for
+// every currently emulated tab while at least one exists, and re-applies on
+// a genuine size change. Decision 12 additionally wants this same "size
+// check" to catch the operator turning on DevTools' OWN device toolbar,
+// which competes for the viewport without changing chrome.tabs.get's
+// width/height at all (DevTools' device mode lives inside the page area, not
+// around it) — so a tab whose raw size did NOT change still gets a cheap
+// innerWidth re-verify every tick, not just a re-apply on an actual resize.
+// Stops itself the moment no tab is emulated.
+let viewportPollTimer = null;
+function ensureViewportPolling() {
+  if (viewportPollTimer || viewportModeByTab.size === 0) return;
+  viewportPollTimer = setInterval(viewportPollTick, 500);
+}
+
+// The poll tick body, pulled out as its own named top-level function (rather
+// than staying an inline setInterval arrow) so test/viewport-modes-wiring
+// .test.mjs can extract and exercise it directly through test/_extract.mjs —
+// same reasoning as onViewportTabRemoved/onViewportDebuggerDetach below.
+//
+// `await chrome.tabs.get(tabId)` is a yield point: while this tick is
+// suspended there, the operator can click Cancel on the debugging bar
+// (chrome.debugger.onDetach -> onViewportDebuggerDetach drops the entry),
+// pick Fit, or close the panel that set this tab's mode
+// (onViewportPanelDisconnected, below) — any of which removes or replaces
+// this tab's viewportModeByTab entry out from under the STALE `entry`
+// closed over by this loop. Re-checking the entry's identity against the
+// live map, and that the debugger is still attached, right after that
+// await is a cheap first-line filter that skips the common case outright.
+// It is NOT sufficient on its own (this is the live-reported panel-close
+// bug): the entry can still be PRESENT here even though a clear has already
+// started (clearViewportMode's own await hasn't reached the point of
+// dropping it yet), so applyViewportMode is still called below — passing
+// entry.generation is what lets it catch a clear that starts after this
+// point and turn itself into a no-op right before it would send a CDP
+// command, per the per-tab serialisation notes above viewportModeByTab.
+async function viewportPollTick() {
+  if (viewportModeByTab.size === 0) {
+    clearInterval(viewportPollTimer);
+    viewportPollTimer = null;
+    return;
+  }
+  for (const [tabId, entry] of [...viewportModeByTab]) {
+    if (entry.overridden) continue; // Decision 12: DevTools is holding the viewport — wait for the operator
+    let tab;
+    try {
+      tab = await chrome.tabs.get(tabId);
+    } catch {
+      continue; // the dedicated tabs.onRemoved listener below drops the entry
+    }
+    if (viewportModeByTab.get(tabId) !== entry || !attachedTabs.has(tabId)) continue;
+    if (tab.width !== entry.tabWidth || tab.height !== entry.tabHeight) {
+      const gen = typeof entry.generation === "number" ? entry.generation : currentViewportGeneration(tabId);
+      await applyViewportMode(tabId, entry.mode, entry.setBy, gen); // re-applies and re-verifies together
+      continue;
+    }
+    await verifyViewportApplied(tabId, entry.width);
+  }
+}
+
+// design.md Decision 8: re-apply on a window resize too (moving/resizing the
+// window itself), debounced per window so a drag that fires many bounds
+// events re-applies once after it settles rather than on every intermediate
+// frame.
+const viewportBoundsDebounce = new Map(); // windowId -> timer
+chrome.windows.onBoundsChanged.addListener((win) => {
+  const windowId = win.id;
+  if (viewportBoundsDebounce.has(windowId)) clearTimeout(viewportBoundsDebounce.get(windowId));
+  viewportBoundsDebounce.set(
+    windowId,
+    setTimeout(() => {
+      viewportBoundsDebounce.delete(windowId);
+      reapplyEmulatedTabsInWindow(windowId).catch(() => {});
+    }, 150)
+  );
+});
+
+async function reapplyEmulatedTabsInWindow(windowId) {
+  for (const [tabId, entry] of [...viewportModeByTab]) {
+    if (entry.overridden) continue; // Decision 12
+    let tab;
+    try {
+      tab = await chrome.tabs.get(tabId);
+    } catch {
+      continue;
+    }
+    // Same race as viewportPollTick, above — the await can let the entry be
+    // cleared or replaced (Fit, debugger detach, panel-close cleanup) before
+    // this line runs. This check alone is not sufficient either (same
+    // reasoning as viewportPollTick) — entry.generation, threaded through
+    // applyViewportMode, is what catches a clear that starts AFTER this
+    // point too.
+    if (viewportModeByTab.get(tabId) !== entry || !attachedTabs.has(tabId)) continue;
+    if (tab.windowId !== windowId) continue;
+    const gen = typeof entry.generation === "number" ? entry.generation : currentViewportGeneration(tabId);
+    await applyViewportMode(tabId, entry.mode, entry.setBy, gen);
+  }
+}
+
+// Viewport-mode cleanup (design.md Decision 7 "What removes it"). Named
+// (rather than inline arrows) so test/viewport-modes-wiring.test.mjs can
+// extract and exercise each one directly through test/_extract.mjs.
+//
+// onViewportTabRemoved is wired below as its own SEPARATE
+// tabs.onRemoved.addListener call, matching this file's existing convention
+// of one registration per concern (see the overlay-teardown listener
+// earlier in this file) so this addition never touches the several other
+// already-shipped tabs.onRemoved bodies elsewhere.
+//
+// onViewportDebuggerDetach is instead CALLED FROM the pre-existing
+// "Handle user dismissing debugger bar" listener a little further down
+// (attachedTabs.delete(source.tabId)), rather than registered as a third
+// onDetach.addListener of its own — chrome.debugger.onDetach only ever
+// fires once per detach either way, and a structural test elsewhere in this
+// repo (test/overlay-background-bridge.test.mjs) asserts this file
+// registers exactly two of them.
+function onViewportTabRemoved(tabId) {
+  if (viewportModeByTab.has(tabId)) setViewportEntry(tabId, null);
+  // Tab ids are recycled by the browser (same reasoning as the config
+  // override cleanup elsewhere in this listener's file) — drop this tab's
+  // generation counter and operation queue too, rather than letting a
+  // future, unrelated tab that reuses this id inherit either.
+  viewportGenerationByTab.delete(tabId);
+  viewportOpQueue.delete(tabId);
+  viewportLatestResultByTab.delete(tabId);
+}
+chrome.tabs.onRemoved.addListener(onViewportTabRemoved);
+
+function onViewportDebuggerDetach(source) {
+  // Bump first (see the per-tab serialisation notes above viewportModeByTab):
+  // Chrome already dropped whatever overrides the detached session held, so
+  // any apply already queued or mid-flight for this tab must not resurrect
+  // one on re-attach.
+  bumpViewportGeneration(source.tabId);
+  // Register this as the tab's "latest intent" too (see
+  // viewportLatestResultByTab above) — not just the generation bump. A
+  // detach is the one bump site that has no apply/clearViewportMode call of
+  // its own to register one automatically; without this, a device-mode pick
+  // that gets superseded specifically by THIS detach, then finds the
+  // debugger re-attached again before it checks in (any agent tool call on
+  // this tab attaches it), would report itself "superseded" (attached is
+  // true again) rather than "detached", and — absent this registration —
+  // chain to itself, which the fix above guards against but would otherwise
+  // fall back to reporting its own stale answer instead of the
+  // semantically correct "your pick was interrupted by a detach".
+  viewportLatestResultByTab.set(source.tabId, Promise.resolve({ ok: false, reason: "detached" }));
+  if (viewportModeByTab.has(source.tabId)) {
+    setViewportEntry(source.tabId, null);
+    broadcastViewportMode(source.tabId, "fit");
+  }
+}
+
+// design.md Decision 7 "What removes it": panel_bind_tab already fires on
+// every bind change (sidepanel.js's syncAdoptedTabGroup, on every context
+// change including the first one at startup). This additionally records
+// which tab each LIVE panel instance is currently bound to, purely so
+// onViewportPanelDisconnected (below) can tell whether ANOTHER open panel is
+// still bound to a tab before clearing that tab's mode. Called from the
+// pre-existing panel_bind_tab handler further down, not a new listener.
+// instanceId travels in panel_bind_tab's own message body (not
+// MessageSender), the same random id the panel registered on its
+// "browzy-viewport" port — see that port's onConnect listener, below.
+function onViewportPanelBind(instanceId, tabId) {
+  if (typeof instanceId === "string" && instanceId && typeof tabId === "number") {
+    viewportBoundTabByInstanceId.set(instanceId, tabId);
+  }
+}
+
+// design.md Decision 7 "What removes it": a viewport mode must not outlive
+// the panel that set it. Called from the panel's dedicated "browzy-viewport"
+// port's onDisconnect (chrome.runtime.onConnect, below) with the instanceId
+// that port registered right after connecting. Clears every tab whose
+// CURRENT entry was set by this exact panel (entry.setBy) via the same path
+// as the operator picking "Vừa cửa sổ" (clearViewportMode) — so only
+// Browzy's own overrides are cleared and a DevTools device mode is never
+// touched — unless another still-open panel is bound to that same tab right
+// now, in which case the exception in Decision 7 leaves the mode in force.
+async function onViewportPanelDisconnected(instanceId) {
+  if (!instanceId) return;
+  viewportBoundTabByInstanceId.delete(instanceId);
+  const stillBound = new Set(viewportBoundTabByInstanceId.values());
+  for (const [tabId, entry] of [...viewportModeByTab]) {
+    if (entry.setBy !== instanceId) continue;
+    if (stillBound.has(tabId)) continue; // another open panel owns this tab now
+    await clearViewportMode(tabId);
+  }
+}
+
+// The panel's dedicated, long-lived viewport port (design.md Decision 7).
+// extension/sidepanel/sidepanel.js opens one of these per panel document,
+// when its viewport control initialises, specifically because a
+// MessageSender's documentId is not reliably populated for a side-panel
+// (extension-page) sender — the panel instead mints its own random
+// instanceId once and announces it as this port's first message
+// ({type:"register", instanceId}). That instanceId is what tags
+// viewport_mode_set's setBy (below) and panel_bind_tab's binding
+// (onViewportPanelBind, above); this port's onDisconnect — the panel
+// closing, or reloading into a fresh document — is what runs
+// onViewportPanelDisconnected so a mode never outlives the panel that set
+// it. A SEPARATE listener registration from the "ocic-agent" port above:
+// same panel document, but a distinct port so the large agent-channel
+// plumbing above never has to reason about viewport identity.
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== "browzy-viewport") return;
+  let instanceId = null;
+  port.onMessage.addListener((msg) => {
+    if (msg && msg.type === "register" && typeof msg.instanceId === "string" && msg.instanceId) {
+      instanceId = msg.instanceId;
+    }
+  });
+  port.onDisconnect.addListener(() => {
+    onViewportPanelDisconnected(instanceId).catch(() => {});
+  });
+});
+
+// Panel <-> background viewport-mode messages (design.md Decision 7/10). A
+// SEPARATE listener registration, same reasoning as the cleanup listeners
+// above: this never touches the large pre-existing onMessage listener below.
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (!msg || typeof msg.type !== "string") return;
+  if (msg.type === "viewport_mode_set") {
+    const setBy = typeof msg.instanceId === "string" && msg.instanceId ? msg.instanceId : null;
+    applyViewportMode(msg.tabId, msg.mode, setBy).then(sendResponse);
+    return true; // async response
+  }
+  if (msg.type === "viewport_mode_get") {
+    const entry = viewportModeByTab.get(msg.tabId);
+    sendResponse({ ok: true, mode: entry ? entry.mode : "fit", overridden: entry ? Boolean(entry.overridden) : false });
+    return; // sync response
+  }
+});
+
 // Clean up when tab is closed
 chrome.tabs.onRemoved.addListener((tabId) => {
   tabGroupTabs.delete(tabId);
@@ -3206,6 +4050,13 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 // Handle user dismissing debugger bar
 chrome.debugger.onDetach.addListener((source, reason) => {
   attachedTabs.delete(source.tabId);
+  // design.md (add-page-viewport-modes) Decision 7: Chrome already dropped
+  // whatever device-emulation overrides the detached session held, so this
+  // is also where our own record of a tab's viewport mode gets dropped —
+  // called from here rather than a third onDetach.addListener registration
+  // so a test elsewhere that counts this file's onDetach listeners keeps
+  // seeing the two it already knew about.
+  onViewportDebuggerDetach(source);
 });
 
 // --- CDP event listeners for console and network ---
@@ -6203,6 +7054,14 @@ const toolHandlers = {
         const annotateNote = shotAnnotated
           ? " — annotated: every interactive element is outlined and labelled with its reference (the same refs find/read_page return). Read a label off the picture and pass that reference straight to a click, form_input or scroll_to; no lookup call is needed."
           : "";
+        // design.md (add-page-viewport-modes) Decision 11 "scale below 1":
+        // this shot's own coordinate space is not the risk `scaleNote` above
+        // already covers (the image-vs-page scale) — it is whether the PAGE
+        // itself is being drawn smaller than its emulated mode's own layout
+        // width. Shared wording with resize_window's own note; see
+        // viewportScaleAgentNote().
+        const emuScaleNoteText = viewportScaleAgentNote(tabId);
+        const emuScaleNote = emuScaleNoteText ? ` — NOTE: ${emuScaleNoteText}.` : "";
         // save_to_disk: write the captured image to disk and report the path so
         // Claude Code can open it. Best-effort — never fails the screenshot.
         let saveNote = "";
@@ -6216,7 +7075,7 @@ const toolHandlers = {
         }
         return {
           content: [
-            { type: "text", text: `Successfully captured screenshot (${dims}, jpeg) - ID: ${imageId}${scaleNote}${annotateNote}${blankNote}${saveNote}` },
+            { type: "text", text: `Successfully captured screenshot (${dims}, jpeg) - ID: ${imageId}${scaleNote}${annotateNote}${emuScaleNote}${blankNote}${saveNote}` },
             { type: "image", data: base64, mimeType: "image/jpeg" },
           ],
         };
@@ -7288,12 +8147,27 @@ const toolHandlers = {
         `hasFocus() true either way. Until then, anything measured at this "new size" is really ` +
         `still the old one.`;
     }
+    // design.md (add-page-viewport-modes) Decision 11: a tab the panel's
+    // viewport control is emulating holds its page width regardless of the
+    // window's own size, so say so here rather than let the caller read this
+    // resize as having failed to reach the page.
+    const emu = viewportModeByTab.get(tabId);
+    // The below-scale-1 caveat already names the mode, width and scale, so
+    // when it applies it replaces the plain "(drawn at scale X)" parenthetical
+    // below rather than repeating those same three facts twice.
+    const scaleNote = viewportScaleAgentNote(tabId);
+    const emuNote = emu
+      ? ` Note: this tab is emulating "${emu.mode}" at ${emu.width}px` +
+        `${!scaleNote && emu.scale < 1 ? ` (drawn at scale ${emu.scale.toFixed(2)})` : ""} — the window size will not ` +
+        `change the page width until the operator picks Fit (Vừa cửa sổ) in the panel.` +
+        (scaleNote ? ` Also, ${scaleNote}.` : "")
+      : "";
     return {
       content: [
         {
           type: "text",
           text: `Resized window to ${width}x${height}${after ? ` (window is ${after.w}x${after.h})` : ""}; ` +
-            `viewport is now ${actual ? `${actual[0]}x${actual[1]}` : "unknown"}.${note}`
+            `viewport is now ${actual ? `${actual[0]}x${actual[1]}` : "unknown"}.${note}${emuNote}`
         }
       ]
     };
@@ -9194,6 +10068,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // tab on every switch would dismantle those groups as the operator
     // browses. Grouping changes come solely from explicit icon clicks
     // (adoptSoloAgentGroup) and agent-created tabs.
+    // design.md (add-page-viewport-modes) Decision 7's exception: record
+    // which tab this live panel is bound to, so onViewportPanelDisconnected
+    // knows not to clear a mode another open panel is still bound to.
+    // msg.instanceId is the panel's own random id, the same one it
+    // registered on its dedicated "browzy-viewport" port — NOT sender's
+    // MessageSender.documentId, which is not reliably populated for a
+    // side-panel sender (see that port's onConnect listener).
+    onViewportPanelBind(msg.instanceId, msg.tabId);
     sendResponse({ ok: true, adopted: false });
     return; // sync response
   }

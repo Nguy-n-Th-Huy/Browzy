@@ -26,7 +26,17 @@ The runtime SHALL apply viewport modes to a tab through the debugger attachment 
 
 ### Requirement: Emulation lifetime is per tab and follows the debugger session
 
-A viewport mode SHALL apply only to the tab it was set on. It SHALL persist across navigations in that tab and follow window resizes. It SHALL end when the operator selects Vừa cửa sổ, when the tab closes, or when the debugger detaches for any reason. The runtime SHALL keep the per-tab mode where a service-worker restart can read it. The runtime SHALL discard any stored mode that has no live debugger attachment behind it.
+A viewport mode SHALL apply only to the tab it was set on. It SHALL persist across navigations in that tab and follow window resizes. It SHALL end when the operator selects Vừa cửa sổ, when the tab closes, when the debugger detaches for any reason, or when the side panel that set the mode closes or reloads — unless another open side panel is currently bound to that same tab, in which case the mode SHALL stay in force. The runtime SHALL keep the per-tab mode where a service-worker restart can read it. The runtime SHALL discard any stored mode that has no live debugger attachment behind it.
+
+#### Scenario: The setting panel closes
+
+- **WHEN** the operator picks Tablet from the side panel, then closes that panel
+- **THEN** the tab returns to Vừa cửa sổ through the same clear path as picking it, and `viewport_mode_changed` is broadcast
+
+#### Scenario: Another panel is still bound to the tab
+
+- **WHEN** the panel that set Di động for a tab closes, and another open side panel is currently bound to that same tab
+- **THEN** the mode stays in force
 
 #### Scenario: Following a link
 

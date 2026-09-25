@@ -253,6 +253,97 @@ body {
   font-size: var(--font-size-small);
   color: var(--color-accent-text);
 }
+/* Viewport mode control (task 3.4; design.md Decision 10) — reuses the
+   shared .menu/.menu-item primitives from ui/components.css (loaded before
+   this file) for the popover shell and each row; only the trigger pill, the
+   checked-row state (menuitemradio has no [aria-selected], the rule the
+   shared .menu-item already matches), the description line and the reload
+   footer are new here. Every color below is an existing token. */
+.viewport-mode {
+  position: relative;
+}
+.viewport-mode-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-pill);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-small);
+  font-weight: 500;
+  min-height: 32px;
+}
+.viewport-mode-trigger:hover:not(:disabled) {
+  background: var(--color-surface-sunken);
+  color: var(--color-text);
+}
+.viewport-mode-trigger.is-active {
+  background: var(--color-accent-tint);
+  color: var(--color-accent-text);
+}
+.viewport-mode-trigger:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.viewport-mode-menu {
+  /* The context-chip row sits directly above the composer, at the bottom of
+     the panel (sidepanel.html), and body{overflow:hidden} clips an absolute
+     descendant that opens downward — so this opens UPWARD instead, same as
+     ui-menu's own _position() does once space below is tight. left:0 keeps
+     it flush with the trigger; the width cap keeps it inside the panel's
+     16px gutters even at the narrowest supported width. */
+  bottom: calc(100% + var(--space-1));
+  left: 0;
+  width: 260px;
+  max-width: calc(100vw - 32px);
+}
+.viewport-mode-item {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+}
+.viewport-mode-item[aria-checked="true"] {
+  background: var(--color-accent-tint);
+  color: var(--color-accent-text);
+}
+.viewport-mode-item-desc {
+  font-size: var(--font-size-small);
+  color: var(--color-text-secondary);
+}
+.viewport-mode-item[aria-checked="true"] .viewport-mode-item-desc {
+  color: inherit;
+}
+.viewport-mode-notice {
+  padding: var(--space-1) var(--space-2);
+  font-size: var(--font-size-small);
+  color: var(--color-status-warning);
+}
+.viewport-mode-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  margin-top: var(--space-1);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--color-border-subtle);
+}
+.viewport-mode-footer-note {
+  font-size: var(--font-size-small);
+  color: var(--color-text-secondary);
+}
+.viewport-mode-reload {
+  flex: none;
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-border-subtle);
+  color: var(--color-text);
+  font-size: var(--font-size-small);
+  white-space: nowrap;
+}
+.viewport-mode-reload:hover {
+  background: var(--color-surface-sunken);
+}
+
 .context-stale-notice {
   display: flex;
   align-items: center;
