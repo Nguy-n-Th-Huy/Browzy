@@ -186,7 +186,7 @@ Migrated:
 
 Not re-pinned, not deleted: nothing. Every other assertion in the settings and panel suites is left to hold on its own; if one of them breaks, the change is wrong, not the test.
 
-Verified by hand, because these are the layers the house protocol excludes from unit tests: the settings page and the panel, in a real Chromium, at the default width and at 320 px, in light and dark theme, by keyboard only — open/close each section, arrive via each deep link, and confirm the companion-missing and not-configured first-run states.
+Verified from rendered pixels, because these are the layers the house protocol excludes from unit tests: the settings page in a real Chromium through a committed harness, at a 400 px-wide panel and at 320 px, light and dark, across seven profile states, plus keyboard reachability and both deep links. The 13 captures, their harness and their own self-check live in `design-review/`, and `reports/01-settings-ui-evidence.md` records the method, the before/after measurements and the limits — including the one thing this does not cover: the side panel, whose pre-setup state is executed in Node through `test/_extract.mjs` instead, because `sidepanel.js` needs the whole `chrome.*` surface to boot and this repository has no stand-alone panel harness.
 
 ## Constraints from existing tests
 
