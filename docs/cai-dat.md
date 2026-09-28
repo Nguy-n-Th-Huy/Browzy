@@ -72,12 +72,15 @@ Không phải copy ID nào cả. Manifest mang sẵn một khoá công khai cố
 
 ### 4. Chọn nhà cung cấp
 
-Mở panel Browzy → **Settings**. Mục **Loại nhà cung cấp** có hai lựa chọn:
+Mở panel Browzy → **Settings**. Trang Cài đặt mở đầu bằng **thẻ thiết lập**: nó cho biết còn bước nào chưa xong và bước tiếp theo là gì. Đúng theo thứ tự đó:
 
-- **API tương thích Anthropic** (mặc định) — dán Base URL + API key. Key nằm lại trên máy bạn.
-- **Tài khoản ChatGPT** — dùng gói ChatGPT trả phí của bạn, không cần key nào. Xem [Đăng nhập bằng gói ChatGPT](#đăng-nhập-bằng-gói-chatgpt).
+1. **Nhà cung cấp** — mục **Loại nhà cung cấp** có hai lựa chọn:
+   - **API tương thích Anthropic** (mặc định) — dán Base URL + API key. Key nằm lại trên máy bạn.
+   - **Tài khoản ChatGPT** — dùng gói ChatGPT trả phí của bạn, không cần key nào. Xem [Đăng nhập bằng gói ChatGPT](#đăng-nhập-bằng-gói-chatgpt).
+2. **Mô hình** — thêm ít nhất một mô hình rồi chọn mô hình mặc định.
+3. **Kiểm tra kết nối** — bấm **Kiểm tra lại** ngay trên thẻ thiết lập (hoặc **Kiểm tra kết nối** trong mục *Nhà cung cấp*). Panel sẽ không chạy cho tới khi phép thử này đạt với đúng cấu hình hiện tại.
 
-Sau khi chọn, bấm **Kiểm tra kết nối**. Panel sẽ không chạy cho tới khi phép thử này đạt với đúng cấu hình hiện tại.
+Các mục *Nhà cung cấp*, *Mô hình*, *Jev browser tools*, *Skills & tiện ích* và *Sao lưu cài đặt* đều **đóng/mở được**: bấm vào tiêu đề mục để mở. Mục nào đang cần bạn thì tiêu đề ghi rõ trạng thái (`Cần làm`, `Xong`, `Đã bật`…). Mục đang có lỗi luôn tự mở, không thể bị đóng lại. *Jev browser tools* là phần tuỳ chọn, chỉ dành cho người đã có khoá vận chuyển Jev, nên mặc định đóng — bạn không cần đi qua nó để lưu cấu hình chính.
 
 ---
 

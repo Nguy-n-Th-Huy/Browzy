@@ -6,6 +6,7 @@
 // exercises directly.
 
 import { iconMarkup } from "../ui/icons.js";
+import { deriveSetupSteps, SETUP_STEP } from "../setup-walkthrough.js";
 import { ProtocolClient, MSG } from "./protocol-client.js";
 import { PanelController } from "./panel-controller.js";
 import { HistoryStore } from "./history-store.js";
@@ -334,6 +335,10 @@ function renderConnectionState() {
   const detail = phase === RUN_PHASE.ERROR ? panel.protocol.handshakeDetail() : null;
   const label = (detail && HANDSHAKE_LABEL_VI[detail]) || PHASE_LABEL_VI[phase] || phase;
   el.connectionLabel.textContent = label;
+  // The tooltip is not redundant with the setup walkthrough: the walkthrough
+  // only renders while the panel has no transcript, and the companion can be
+  // unregistered later (a moved repo, a reinstall) while a conversation is
+  // still open. That case has no other place to state the fix.
   el.connectionState.title =
     detail === "companion_not_installed"
       ? "Máy này chưa đăng ký native messaging host. Chạy install.ps1 (Windows) hoặc ./install.sh (macOS/Linux) trong thư mục dự án, rồi tải lại extension."
@@ -378,6 +383,9 @@ function renderSetupBanner() {
   el.setupBannerSlot.innerHTML = "";
   const readiness = panel.readinessState();
   if (readiness.state === READINESS.READY) return;
+  const model = panel.currentModel();
+  if (!model || !Array.isArray(model.items) || model.items.length === 0) return;
+
 
   const div = document.createElement("div");
   div.className = "setup-banner";
@@ -2578,6 +2586,7 @@ function renderTranscript({ force = false } = {}) {
     el.transcript.innerHTML = "";
     el.emptyStateSlot.innerHTML = emptyStateHtml();
     wireEmptyStateSuggestions();
+    wireSetupStepLinks();
     return;
   }
   const preserveScroll = isNearBottom();
@@ -2847,7 +2856,92 @@ function wireCopyButtons(model) {
   });
 }
 
+/** The walkthrough's input, assembled from the panel's own two sources: the
+ * profile half from the readiness state (profile-cache.js capsuled by
+ * panel-controller.js's readinessState()), the companion half from the
+ * handshake detail the connection pill already classifies. The panel is the
+ * ONLY caller that can supply `companion`; the settings page passes null. */
+function deriveSetupInput() {
+  const profile = panel.profile || {};
+  const readiness = panel.readinessState();
+  // `READINESS` has no "testing" state — the capability test runs from the
+  // settings page — and it collapses every not-yet-passing case into its own
+  // reasons, which the walkthrough re-derives from the same profile fields.
+  const connectionStatus =
+    readiness.state === READINESS.READY
+      ? { status: "pass" }
+      : readiness.state === READINESS.TEST_FAILED
+        ? { status: "fail" }
+        : null;
+  return {
+    companion: panel.currentPhase() === RUN_PHASE.ERROR ? panel.protocol.handshakeDetail() : null,
+    providerType: profile.providerType,
+    hasCredential: profile.hasCredential,
+    chatgptSessionState: profile.chatgptSessionState,
+    models: profile.models,
+    defaultModelId: profile.defaultModelId,
+    connectionStatus,
+    busy: {}
+  };
+}
+
+/** Which settings surface resolves each step. The companion step has none: its
+ * fix is a command on the machine, which the step's own detail states. */
+const SETUP_STEP_ANCHOR = {
+  [SETUP_STEP.PROVIDER]: "section-provider",
+  [SETUP_STEP.MODELS]: "section-models",
+  [SETUP_STEP.CONNECTION]: "btn-test-connection"
+};
+
+const SETUP_STEP_STATE_VI = { done: "Xong", pending: "Đang làm…", todo: "Cần làm" };
+const SETUP_STEP_STATE_TONE = { done: "is-succeeded", pending: "is-running", todo: "is-unknown" };
+const SETUP_STEP_LINK_VI = { [SETUP_STEP.CONNECTION]: "Kiểm tra kết nối" };
+
+/** The pre-setup empty state: the same ordered walkthrough the settings page
+ * shows, so a first-run user reads one story instead of a panel that claims to
+ * be ready while a one-line strip below it says otherwise.
+ *
+ * The greeting and the three example requests are deliberately NOT rendered
+ * here: each of those prompts fills the composer with text the send path
+ * refuses while the profile is incomplete (see panel-controller.js's
+ * send-gating), so offering them would be inviting a click that cannot work.
+ * They return, byte-identical, as soon as the profile is ready. */
 function emptyStateHtml() {
+  const setup = deriveSetupSteps(deriveSetupInput());
+
+  if (!setup.ready) {
+    const remaining = setup.steps.filter((step) => step.state !== "done").length;
+    const current = setup.steps.find((step) => step.key === setup.currentKey);
+    const rows = setup.steps
+      .map((step, index) => {
+        const anchor = SETUP_STEP_ANCHOR[step.key];
+        const isCurrent = step.key === setup.currentKey;
+        const action = anchor
+          ? `<button class="btn btn-secondary btn-sm setup-step-link" type="button" data-setup-anchor="${escapeHtml(anchor)}">${escapeHtml(SETUP_STEP_LINK_VI[step.key] || "Mở Cài đặt")}</button>`
+          : "";
+        return `<div class="setup-step" data-step="${escapeHtml(step.key)}"${isCurrent ? ' aria-current="step"' : ""}>
+          <div class="setup-step-head">
+            <span class="setup-step-index" aria-hidden="true">${index + 1}</span>
+            <span class="setup-step-title">${escapeHtml(step.title)}</span>
+            <span class="status-pill ${SETUP_STEP_STATE_TONE[step.state] || "is-unknown"}">${escapeHtml(SETUP_STEP_STATE_VI[step.state] || "")}</span>
+          </div>
+          <p class="setup-step-detail">${escapeHtml(step.detail)}</p>
+          ${action}
+        </div>`;
+      })
+      .join("");
+    return `
+    <div class="empty-state">
+      <div class="empty-state-intro">
+        <span class="empty-state-eyebrow">Thiết lập để bắt đầu</span>
+        <p>Còn <strong>${remaining} bước</strong> nữa là trò chuyện được.${
+          current ? ` Bước tiếp theo: <strong>${escapeHtml(current.title)}</strong>.` : ""
+        }</p>
+      </div>
+      <div class="setup-walkthrough">${rows}</div>
+    </div>`;
+  }
+
   const suggestion = (prompt, icon, title, hint) => `
         <button class="suggestion-item" type="button" data-suggest="${escapeHtml(prompt)}">
           <span class="suggestion-icon">${iconMarkup(icon, { size: 18 })}</span>
@@ -2878,6 +2972,12 @@ function wireEmptyStateSuggestions() {
       autoGrow();
       updateSendEnabled();
     });
+  });
+}
+
+function wireSetupStepLinks() {
+  el.emptyStateSlot.querySelectorAll("button[data-setup-anchor]").forEach((btn) => {
+    btn.addEventListener("click", () => openSettings(btn.getAttribute("data-setup-anchor")));
   });
 }
 
