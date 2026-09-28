@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Screenshot harness: settings (live page)</title>
+<script>
+  // Screenshot harness for this change's captures. It loads the page as
+  // SHIPPED rather than restating its markup, so a capture cannot drift from
+  // the code it is evidence for — the archived design-review/screens/*.html
+  // files are hand-written reference mockups from before their
+  // implementation existed; this one has an implementation to load.
+  //
+  // Why a harness and a stub at all: extension/settings/settings-app.js touches
+  // `document` at import time and reads the profile over chrome.runtime, so the
+  // page cannot be opened from disk and has no companion here. Everything else
+  // — the markup, the page-local styles, the shared tokens/components, the
+  // module graph — is the real thing.
+  //
+  // Served from the REPO ROOT:
+  //   python3 -m http.server 8866
+  //   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+  //     --headless=new --disable-gpu --hide-scrollbars --no-first-run \
+  //     --user-data-dir=/tmp/chrome-shots --window-size=400,900 \
+  //     --virtual-time-budget=4000 --screenshot=out.png \
+  //     "http://localhost:8866/openspec/changes/improve-browser-setup-onboarding/design-review/screens/settings-live.html?state=fresh"
+  //
+  //   ?state=  fresh | credential | models | passed | chatgpt | jev | loaderror
+  //   ?theme=  light | dark
+  //   ?sections= default | open | closed
+  const params = new URLSearchParams(location.search);
+  const SMOKE_STATES = {
+    fresh: { providerType: "anthropic", hasCredential: false, models: [], defaultModelId: null },
+    credential: { providerType: "anthropic", hasCredential: true, models: [], defaultModelId: null },
+    models: { providerType: "anthropic", hasCredential: true, models: [{ id: "m1", label: "M1" }], defaultModelId: null },
+    passed: {
+      providerType: "anthropic",
+      hasCredential: true,
+      models: [{ id: "m1", label: "M1" }],
+      defaultModelId: "m1"
+    },
+    chatgpt: { providerType: "chatgpt", hasCredential: false, chatgptSessionState: "signed_out", models: [] },
+    jev: {
+      providerType: "anthropic",
+      hasCredential: true,
+      models: [{ id: "m1", label: "M1" }],
+      defaultModelId: "m1",
+      hasTypesafeKey: true
+    }
+  };
+  // A browser may hand us the query doubled (`?state=x?state=x`); take the
+  // first segment, and refuse an unrecognised state loudly rather than
+  // silently capturing the default one.
+  const requested = (params.get("state") || "fresh").split("?")[0];
+  const known = requested === "loaderror" || Object.prototype.hasOwnProperty.call(SMOKE_STATES, requested);
+  window.__smoke = { profileError: null, calls: [], harnessError: known ? null : `unknown state: ${requested}` };
+  if (requested === "loaderror") window.__smoke.profileError = "NETWORK_ERROR";
+  else if (known) {
+    window.__smoke.profile = Object.assign(
+      {
+        profileId: "default",
+        baseUrl: "https://api.anthropic.com",
+        chatgptSessionState: "signed_out",
+        hasAnthropicKey: false,
+        hasTypesafeKey: false,
+        typesafeSource: "typesafe"
+      },
+      SMOKE_STATES[requested] || SMOKE_STATES.fresh
+    );
+  }
+  window.chrome = {
+    runtime: {
+      getURL: (rel) => new URL("../../../../../extension/" + rel, location.href).href,
+      sendMessage: async (msg) => {
+        window.__smoke.calls.push(msg);
+        if (msg.op === "get_profile") {
+          if (window.__smoke.profileError) {
+            return { ok: false, error: { code: window.__smoke.profileError, message: "harness: profile unreadable" } };
+          }
+          return { ok: true, result: window.__smoke.profile };
+        }
+        if (msg.op === "chatgpt_usage") return { ok: true, result: { plan: "plus", windows: [] } };
+        return { ok: false, error: { code: "NETWORK_ERROR", message: "harness: " + msg.op + " not implemented" } };
+      }
+    }
+  };
+  // Recorded here, applied after theme.js loads: theme.js sets data-theme from
+  // the stored/system preference on import and would otherwise overwrite this.
+  window.__smokeTheme = params.get("theme") === "dark" ? "dark" : null;
+</script>
+</head>
+<body>
+<!-- Frame the page the way it is really framed: a fixed-height shell whose
+     .panel-scroll scrolls internally. Without this the document grows instead
+     of the panel, and a framed capture scrolls the whole document away. -->
+<style>
+  html, body { height: 100%; margin: 0; }
+  #host, .panel-shell { height: 100%; min-height: 0; }
+</style>
+<div id="host"></div>
+<script type="module">
+  const root = new URL("../../../../../", import.meta.url);
+  const base = new URL("extension/settings/", root);
+  const html = await (await fetch(new URL("settings.html", base))).text();
+  const doc = new DOMParser().parseFromString(html, "text/html");
+
+  // The page's real stylesheets and its own page-local <style>, verbatim.
+  for (const link of doc.querySelectorAll('link[rel="stylesheet"]')) {
+    const el = document.createElement("link");
+    el.rel = "stylesheet";
+    el.href = new URL(link.getAttribute("href"), base).href;
+    document.head.appendChild(el);
+  }
+  for (const style of doc.querySelectorAll("style")) document.head.appendChild(style.cloneNode(true));
+
+  document.getElementById("host").appendChild(doc.querySelector(".panel-shell"));
+  document.title = params.get("state") || "settings";
+
+  await import(new URL("extension/ui/theme.js", root).href);
+  await import(new URL("extension/ui/behaviors.js", root).href);
+  await import(new URL("extension/settings/settings-app.js", root).href);
+
+  if (window.__smokeTheme) document.documentElement.dataset.theme = window.__smokeTheme;
+
+  // Self-check: if the page's own module did not run, every capture from this
+  // harness would be a picture of unstyled markup that still looks like a
+  // page. Say so on the page itself rather than letting a broken render pass
+  // for evidence.
+  const problems = [];
+  if (!window.__settingsDebug) problems.push("settings-app.js did not load");
+  if (window.__smoke.harnessError) problems.push(window.__smoke.harnessError);
+  if (problems.length) {
+    document.body.insertAdjacentHTML(
+      "afterbegin",
+      `<div id="harness-error" style="position:sticky;top:0;z-index:9;padding:8px 12px;background:#b3261e;color:#fff;font:600 14px system-ui">HARNESS ERROR: ${problems.join("; ")} — this capture is not evidence</div>`
+    );
+  }
+
+  // `sections=` drives the disclosure so a capture can show either extreme
+  // without a second code path, and `scroll=` parks the scrolling container so
+  // a capture can show what a given control's position actually costs the
+  // reader (the "Save is below 76 lines of advanced config" comparison).
+  const wanted = params.get("sections");
+  if (wanted === "open" || wanted === "closed") {
+    for (const toggle of document.querySelectorAll(".settings-section-toggle")) {
+      const isOpen = toggle.getAttribute("aria-expanded") === "true";
+      if ((wanted === "open" && !isOpen) || (wanted === "closed" && isOpen)) toggle.click();
+    }
+  }
+  // `scrollTo` centres a named control; `scroll` sets a raw offset. Either one
+  // frames a capture, and a missing target is an error rather than a silent
+  // top-of-page capture — three "before" images once came out byte-identical
+  // because a scroll that never ran still looked like a page.
+  const anchor = params.get("scrollTo");
+  const offset = Number(params.get("scroll") || 0);
+  if (anchor || offset > 0) {
+    const scroller = document.querySelector(".panel-scroll");
+    const target = anchor ? document.getElementById(anchor) : null;
+    if (target) {
+      // Set the container's own offset rather than calling scrollIntoView:
+      // this is the container the panel really scrolls, and the arithmetic is
+      // the same one a reader performs when they look for the control.
+      const top = target.getBoundingClientRect().top - scroller.getBoundingClientRect().top + scroller.scrollTop;
+      scroller.scrollTop = Math.max(0, Math.round(top - (scroller.clientHeight - target.offsetHeight) / 2));
+    } else if (offset > 0) {
+      scroller.scrollTop = offset;
+    } else {
+      window.__smoke.harnessError = `scrollTo target not found: ${anchor}`;
+    }
+  }
+  if (window.__smoke.harnessError && !document.getElementById("harness-error")) {
+    document.body.insertAdjacentHTML(
+      "afterbegin",
+      `<div id="harness-error" style="position:sticky;top:0;z-index:9;padding:8px 12px;background:#b3261e;color:#fff;font:600 14px system-ui">HARNESS ERROR: ${window.__smoke.harnessError} — this capture is not evidence</div>`
+    );
+  }
+  document.documentElement.setAttribute("data-ready", "1");
+</script>
+</body>
+</html>
