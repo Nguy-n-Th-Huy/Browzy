@@ -209,7 +209,7 @@ console.log("\n== shipped sources: one gate behind both controls, and the old pr
   ok((appJs.match(/\bconnectionGate\(/g) || []).length === 1, "settings-app.js calls connectionGate() exactly once per render pass — one answer for the whole page");
   const renderBody = appJs.slice(appJs.indexOf("function render(state) {"));
   const gateAt = renderBody.indexOf("const gate = connectionGate(state);");
-  const statusAt = renderBody.indexOf("renderStatusCard(state, gate);");
+  const statusAt = renderBody.indexOf("renderSetupCard(state, gate);");
   const providerAt = renderBody.indexOf("renderProvider(state, gate);");
   ok(
     gateAt >= 0 && gateAt < statusAt && statusAt < providerAt,

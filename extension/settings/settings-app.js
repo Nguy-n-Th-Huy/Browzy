@@ -12,6 +12,15 @@ import { createSettingsClient } from "./settings-client.js";
 import { SettingsController, typesafeSourceCopy } from "./settings-controller.js";
 import { describeErrorCode, typesafeStageLabel } from "./errors-ui.js";
 import { connectionGate, connectionBlockedTitle } from "./connection-gate.js";
+import { deriveSetupSteps, SETUP_STEP, STEP_STATE } from "../setup-walkthrough.js";
+import {
+  resolveSections,
+  sectionForControl,
+  sectionStateLabel,
+  setupInputFromSettingsState,
+  STEP_LABEL_VI,
+  STEP_TONE
+} from "./settings-sections.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -44,6 +53,10 @@ $("ic-chevr-skills").innerHTML = iconMarkup("chevronRight", { size: 16 });
 $("ic-permissions").innerHTML = iconMarkup("lock", { size: 18 });
 $("ic-chevr-permissions").innerHTML = iconMarkup("chevronRight", { size: 16 });
 $("ic-memory").innerHTML = iconMarkup("history", { size: 18 });
+for (const key of ["provider", "jevtools", "models", "other", "backup"]) {
+  const icon = $("ic-section-" + key);
+  if (icon) icon.innerHTML = iconMarkup("chevronDown", { size: 16 });
+}
 $("ic-chevr-memory").innerHTML = iconMarkup("chevronRight", { size: 16 });
 
 // ChatGPT sign-in copy per phase (add-chatgpt-subscription-provider tasks.md
@@ -359,17 +372,7 @@ function iconEl(name, opts) {
 function renderBanner(state) {
   const area = $("banner-area");
   area.innerHTML = "";
-  if (state.isFirstRun && !state.banner) {
-    const box = document.createElement("div");
-    box.className = "card settings-banner settings-banner-info";
-    box.setAttribute("role", "status");
-    box.innerHTML =
-      '<p class="card-title">Kết nối một nhà cung cấp tương thích Anthropic</p>' +
-      '<p class="card-body">Nhập Base URL, API key và ít nhất một mô hình để bắt đầu. ' +
-      "Không cần tài khoản Claude hay đăng nhập. Chi phí sử dụng phụ thuộc vào nhà cung cấp bạn cấu hình " +
-      "— không có suy luận miễn phí và không phải mọi gateway đều tương thích.</p>";
-    area.appendChild(box);
-  }
+
   if (!state.banner) return;
   const box = document.createElement("div");
   const kindClass = state.banner.kind === "error" ? "is-failed" : state.banner.kind === "success" ? "is-succeeded" : "is-unknown";
@@ -466,40 +469,72 @@ function renderTestGateFeedback(gate) {
 // (connectionStatus/hasCredential/defaultModelId) and never initiates a
 // connection test on load — testing costs API usage and stays an explicit
 // user action.
-function renderStatusCard(state, gate) {
+function renderSetupCard(state, gate) {
   const icon = $("status-card-icon");
   const title = $("status-card-title");
   const sub = $("status-card-sub");
+  const stepsEl = $("setup-steps");
   icon.className = "status-card-icon";
+  stepsEl.innerHTML = "";
+  stepsEl.hidden = true;
 
   let iconName = "helpCircle";
-  let toneClass = "is-warn";
+  let tone = "is-warn";
   let titleText = "Chưa cấu hình";
-  let subText = "Nhập Base URL, API key và ít nhất một mô hình ở mục Nhà cung cấp bên dưới.";
+  // The cost/billing statement is a first-run obligation (specs/agent-settings
+  // "No Claude product account required"); it used to live in the first-run
+  // banner this card replaced, so it lives here now. It names the model
+  // section, which is where the model list actually is — the line this
+  // replaced said "Nhà cung cấp", the section next to it.
+  let subText =
+    "Nhập Base URL, API key và chọn một mô hình ở mục Mô hình. Chi phí sử dụng phụ thuộc vào nhà cung cấp bạn cấu hình — không có suy luận miễn phí.";
+  let showSteps = true;
 
-  if (state.connectionStatus && state.connectionStatus.status === "testing") {
+  if (!state.loaded) {
+    // Nothing is known yet: the controller notifies once before its first
+    // getProfile reply and once after, and claiming "Chưa cấu hình" in that
+    // window would flash a false state on every open for a configured user.
+    titleText = "Đang đọc cấu hình…";
+    subText = "Đang hỏi companion cấu hình hiện tại.";
+    showSteps = false;
+  } else if (state.loadError) {
+    // The step list is a set of instructions the page cannot make actionable
+    // while it cannot read the profile, so none is shown here — the matching
+    // error banner above states the failure itself, with the error code's own
+    // copy (errors-ui.js). This line therefore names the dependency rather
+    // than diagnosing: `get_profile` travels over the native port, but a
+    // failure here is not distinguishable, from this side, between a companion
+    // that is not installed and one that is installed and not running.
+    iconName = "xCircle";
+    tone = "is-fail";
+    titleText = "Chưa đọc được cấu hình";
+    subText = "Cấu hình được đọc từ companion. Kiểm tra companion đang chạy, rồi tải lại trang này.";
+    showSteps = false;
+  } else if (state.connectionStatus && state.connectionStatus.status === "testing") {
     iconName = "clock";
-    toneClass = "is-warn";
     titleText = "Đang kiểm tra kết nối…";
     subText = "Đang gửi một yêu cầu nhỏ tới nhà cung cấp.";
   } else if (state.connectionStatus && state.connectionStatus.status === "pass") {
     iconName = "checkCircle";
-    toneClass = "is-ok";
+    tone = "is-ok";
     titleText = state.connectionStatus.textOnly ? "Sẵn sàng (chỉ văn bản)" : "Sẵn sàng chạy";
-    subText = "API key đã lưu trong kho bảo mật hệ điều hành · đã kiểm tra kết nối thành công.";
+    // The storage half of the "Secret isolation" disclosure stays here rather
+    // than only on the key field: this line is what a settled profile shows.
+    subText = "Đã lưu trong kho bảo mật hệ điều hành · đã kiểm tra kết nối thành công.";
   } else if (state.connectionStatus && state.connectionStatus.status === "fail") {
     iconName = "xCircle";
-    toneClass = "is-fail";
+    tone = "is-fail";
     titleText = "Kiểm tra kết nối thất bại";
-    subText = "Xem chi tiết lỗi ở mục Nhà cung cấp bên dưới.";
+    subText = "Sửa cấu hình ở mục Nhà cung cấp rồi kiểm tra lại.";
   } else if (state.hasCredential) {
-    iconName = "helpCircle";
-    toneClass = "is-warn";
-    titleText = "Đã lưu API key — chưa kiểm tra";
+    // "chưa xác nhận", not "chưa kiểm tra": the page cannot know whether a
+    // previous session's test passed (SettingsController.connectionStatus is
+    // only written by a test run in this page), so it states what it knows.
+    titleText = "Đã lưu API key — chưa xác nhận";
     subText = "Bấm Kiểm tra lại để xác nhận kết nối trước khi trò chuyện.";
   }
 
-  icon.classList.add(toneClass);
+  icon.classList.add(tone);
   icon.innerHTML = iconMarkup(iconName, { size: 20 });
   title.textContent = titleText;
   sub.textContent = subText;
@@ -507,6 +542,53 @@ function renderStatusCard(state, gate) {
   const retestBtn = $("btn-status-retest");
   retestBtn.disabled = !gate.canTest;
   retestBtn.textContent = state.testing ? "Đang kiểm tra…" : "Kiểm tra lại";
+
+  if (!showSteps) return;
+  const derived = deriveSetupSteps(setupInputFromSettingsState(state));
+  if (derived.ready) return;
+
+  stepsEl.hidden = false;
+  for (const step of derived.steps) {
+    const li = document.createElement("li");
+    li.className = "setup-step";
+    if (step.key === derived.currentKey) {
+      li.classList.add("is-current");
+      li.setAttribute("aria-current", "step");
+    }
+    const stepTitle = document.createElement("span");
+    stepTitle.className = "setup-step-title";
+    stepTitle.textContent = step.title;
+    const pill = document.createElement("span");
+    pill.className = `status-pill ${STEP_TONE[step.state]}`;
+    // "Chưa xác nhận", not "Cần làm": this page only learns a test's result
+    // from a test run in THIS page (`_applyProfile` never reads the profile's
+    // stored result), so for the connection step it states what it knows
+    // rather than claiming the test has never run. The panel can read the
+    // stored result, so its walkthrough keeps the plain label.
+    pill.textContent =
+      step.state === STEP_STATE.TODO && step.key === SETUP_STEP.CONNECTION
+        ? "Chưa xác nhận"
+        : STEP_LABEL_VI[step.state];
+    // The step's detail is visible text on the row, never a hover-only
+    // `title`: a pointer is not the only way to read what a step needs.
+    const stepDetail = document.createElement("p");
+    stepDetail.className = "setup-step-detail";
+    stepDetail.textContent = step.detail;
+    const head = document.createElement("div");
+    head.className = "setup-step-head";
+    head.append(stepTitle, pill);
+    li.append(head, stepDetail);
+    if (step.key === SETUP_STEP.PROVIDER || step.key === SETUP_STEP.MODELS) {
+      const jump = document.createElement("button");
+      jump.type = "button";
+      jump.className = "btn btn-ghost btn-sm";
+      jump.textContent = step.key === SETUP_STEP.PROVIDER ? "Mở Nhà cung cấp" : "Mở Mô hình";
+      const key = step.key;
+      jump.addEventListener("click", () => revealSection(key));
+      li.appendChild(jump);
+    }
+    stepsEl.appendChild(li);
+  }
 }
 
 // design.md decision D6: marks the chip nearest the top of the viewport as
@@ -880,14 +962,33 @@ function renderModels(state) {
   $("btn-discover-models").textContent = state.discovering ? "Đang tìm…" : "Tìm mô hình";
 }
 
+const sectionOverrides = new Map();
+function revealSection(key) {
+  sectionOverrides.set(key, true);
+  applySections(controller.getState());
+}
+function applySections(state) {
+  const resolved = resolveSections(state, sectionOverrides);
+  const derived = deriveSetupSteps(setupInputFromSettingsState(state));
+  for (const key of ["provider", "jevtools", "models", "other", "backup"]) {
+    const body = document.getElementById("section-" + key + "-body");
+    const btn = document.getElementById("section-" + key);
+    if (!body || !btn) continue;
+    body.hidden = !resolved[key];
+    btn.setAttribute("aria-expanded", String(Boolean(resolved[key])));
+    const label = document.getElementById("section-" + key + "-state");
+    if (label) label.textContent = sectionStateLabel(state, key);
+  }
+}
+
 function render(state) {
-  // One gate per render pass, shared by both renderers that own a test
-  // control — the page has exactly one answer to "can a test run right now".
   const gate = connectionGate(state);
+  applySections(state);
   renderBanner(state);
-  renderStatusCard(state, gate);
+  renderSetupCard(state, gate);
   renderProvider(state, gate);
   renderModels(state);
+  scrollToPendingReveal();
 }
 
 /** Opens `url` in a new tab via `chrome.tabs.create` (tasks.md 5.3); falls
@@ -1129,8 +1230,56 @@ function wireEvents() {
   $("theme-system").addEventListener("click", () => setThemeOverride(null));
   $("theme-light").addEventListener("click", () => setThemeOverride("light"));
   $("theme-dark").addEventListener("click", () => setThemeOverride("dark"));
+  for (const k of ["provider", "jevtools", "models", "other", "backup"]) {
+    const btn = document.getElementById("section-" + k);
+    if (!btn) continue;
+    btn.addEventListener("click", () => {
+      const cur = resolveSections(controller.getState(), sectionOverrides)[k];
+      sectionOverrides.set(k, !cur);
+      applySections(controller.getState());
+    });
+  }
 }
 
+// A hash this page can be opened at is a destination someone else chose: the
+// side panel opens settings.html#btn-test-connection directly
+// (sidepanel.js's testConnectionButton) and the connection gate's hint links
+// to #section-models. An element inside a COLLAPSED section has no box at all
+// (display:none), so the browser's own fragment scroll cannot reach it — the
+// section has to be revealed first, which is why this runs synchronously in
+// module scope rather than waiting for the profile.
+//
+// The override it writes is what keeps the section open through the
+// controller's later state renders (applySections reads resolveSections on
+// every pass). The scroll is repeated once after the next render because that
+// render is what settles the page's final height — the profile arriving can
+// add the setup card's steps and the banner above the target.
+let pendingRevealId = null;
+function scrollToId(id) {
+  const target = document.getElementById(id);
+  if (target && !target.closest("[hidden]")) target.scrollIntoView({ block: "start" });
+}
+function scrollToPendingReveal() {
+  if (!pendingRevealId) return;
+  const id = pendingRevealId;
+  // Consume ONLY here. The immediate scroll in revealHashTarget must not
+  // consume it: that scroll lands before the profile arrives, and the render
+  // that follows is what settles the page's final height (it can add the
+  // setup card's steps and the banner above the target), so the pending id
+  // has to survive until that render has painted.
+  pendingRevealId = null;
+  scrollToId(id);
+}
+function revealHashTarget() {
+  const hash = (location.hash || "").slice(1);
+  if (!hash) return;
+  const sectionKey = sectionForControl(hash);
+  if (sectionKey) revealSection(sectionKey);
+  pendingRevealId = hash;
+  scrollToId(hash);
+}
+revealHashTarget();
+window.addEventListener("hashchange", revealHashTarget);
 wireEvents();
 wireChipNav();
 controller.init();

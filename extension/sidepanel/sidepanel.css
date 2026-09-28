@@ -468,6 +468,63 @@ body {
   margin: 0;
   color: var(--color-text-secondary);
 }
+/* The pre-setup empty state (extension/setup-walkthrough.js): the ordered
+   setup steps in place of the greeting and its example requests, while the
+   profile is not ready. Each row reuses the shared status pill for its own
+   state, so the state is carried by text as well as by tone. */
+.setup-walkthrough {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  width: 100%;
+}
+.setup-step {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  box-shadow: var(--shadow-sm);
+}
+.setup-step[aria-current="step"] {
+  border-color: var(--color-accent);
+}
+.setup-step-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.setup-step-index {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-pill);
+  background: var(--color-surface-sunken);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-small);
+  font-weight: 600;
+}
+.setup-step-title {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--font-size-ui);
+  font-weight: 600;
+  color: var(--color-text);
+}
+.setup-step-detail {
+  margin: 0;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-small);
+  line-height: var(--line-height-body);
+}
+.setup-step-link {
+  align-self: flex-start;
+}
 .suggestion-list {
   display: flex;
   flex-direction: column;

@@ -154,9 +154,48 @@
     background: var(--color-accent-tint);
     color: var(--color-accent-text);
   }
+  .settings-section { margin: 0; }
+  .settings-section-head { margin: var(--space-4) 0 0; }
+  .settings-section-head:first-of-type { margin-top: var(--space-2); }
+  .settings-section-toggle {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    width: 100%;
+    min-height: var(--target-primary);
+    padding: 0 var(--space-2);
+    border: none;
+    border-bottom: 1px solid var(--color-border-subtle);
+    background: transparent;
+    color: var(--color-text);
+    font: inherit;
+    font-weight: 700;
+    font-size: var(--font-size-h3);
+    text-align: left;
+    cursor: pointer;
+    border-radius: var(--radius-sm);
+  }
+  .settings-section-toggle:hover { background: var(--color-surface-sunken); }
+  .settings-section-toggle:focus-visible {
+    outline: 2px solid var(--color-focus-ring);
+    outline-offset: 2px;
+  }
+  .settings-section-title { flex: 1; min-width: 0; }
+  .settings-section-state {
+    font-size: var(--font-size-small);
+    font-weight: 600;
+    color: var(--color-text-secondary);
+    white-space: nowrap;
+  }
+  .settings-section-chevron {
+    flex: none;
+    color: var(--color-text-secondary);
+    transition: transform var(--motion-duration) ease;
+  }
+  .settings-section-toggle[aria-expanded="true"] .settings-section-chevron { transform: rotate(180deg); }
+  .settings-section-toggle[id] { scroll-margin-top: 64px; }
   /* The nav sticks to the top, so an anchor jump would otherwise land the
      heading underneath it. */
-  .section-heading[id] { scroll-margin-top: 64px; }
   .settings-chip[aria-current="true"] {
     background: var(--color-accent-tint);
     color: var(--color-accent-text);
@@ -166,8 +205,35 @@
     outline-offset: 2px;
   }
 
-  /* Connection-status card (design.md D8) */
-  .status-card { display: flex; align-items: center; gap: var(--space-3); }
+  /* Setup card: a headline row, then the ordered setup steps beneath it
+     (design.md D5). Column layout because the step list is a full-width
+     child, not a third item in the headline row. */
+  .status-card { display: flex; flex-direction: column; gap: var(--space-3); }
+  .status-card-row { display: flex; align-items: center; gap: var(--space-3); }
+  .setup-steps {
+    list-style: none;
+    margin: 0;
+    padding: var(--space-3) 0 0;
+    border-top: 1px solid var(--color-border-subtle);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+  .setup-steps[hidden] { display: none; }
+  /* The next unmet step is marked with a rule as well as by being first, but
+     its STATE is carried by the pill's own text — never by colour alone. */
+  .setup-step {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-1) var(--space-2);
+    padding-left: var(--space-2);
+    border-left: 2px solid transparent;
+  }
+  .setup-step.is-current { border-left-color: var(--color-accent); }
+  .setup-step-head { display: flex; align-items: center; flex: 1; min-width: 130px; gap: var(--space-2); }
+  .setup-step-title { flex: 1; min-width: 0; font-size: var(--font-size-ui); font-weight: 600; }
+  .setup-step-detail { flex-basis: 100%; margin: 0; color: var(--color-text-secondary); font-size: var(--font-size-small); }
   .status-card-icon {
     width: 36px; height: 36px; border-radius: var(--radius-sm); flex: none;
     display: flex; align-items: center; justify-content: center;
@@ -217,23 +283,33 @@
     <nav class="settings-navbar" aria-label="Điều hướng mục cài đặt">
       <a class="settings-chip" href="#section-provider" data-section="section-provider">Nhà cung cấp</a>
       <a class="settings-chip" href="#section-models" data-section="section-models">Mô hình</a>
+      <a class="settings-chip" href="#section-jevtools" data-section="section-jevtools">Jev</a>
       <a class="settings-chip" href="#section-other" data-section="section-other">Skills</a>
       <a class="settings-chip" href="#section-backup" data-section="section-backup">Sao lưu</a>
     </nav>
 
     <div id="banner-area"></div>
 
+    <!-- The setup card: one headline for the profile's overall state, then —
+         while the profile is not ready — the ordered walkthrough of what is
+         still missing (extension/setup-walkthrough.js). It replaces the
+         first-run banner and the status card's own instruction line, which
+         stated the same requirements twice, once in the wrong section. -->
     <div class="card status-card" id="status-card" role="status">
-      <span class="status-card-icon" id="status-card-icon"></span>
-      <span class="status-card-main">
-        <span class="status-card-title" id="status-card-title"></span>
-        <span class="status-card-sub" id="status-card-sub"></span>
-      </span>
-      <button class="btn btn-secondary btn-sm" type="button" id="btn-status-retest">Kiểm tra lại</button>
+      <div class="status-card-row">
+        <span class="status-card-icon" id="status-card-icon"></span>
+        <span class="status-card-main">
+          <span class="status-card-title" id="status-card-title"></span>
+          <span class="status-card-sub" id="status-card-sub"></span>
+        </span>
+        <button class="btn btn-secondary btn-sm" type="button" id="btn-status-retest">Kiểm tra lại</button>
+      </div>
+      <ul class="setup-steps" id="setup-steps" hidden></ul>
     </div>
 
-    <p class="section-heading" id="section-provider">Nhà cung cấp</p>
-    <div class="field-group">
+    <section class="settings-section" aria-labelledby="section-provider">
+      <h2 class="settings-section-head"><button type="button" class="settings-section-toggle" id="section-provider" aria-expanded="true" aria-controls="section-provider-body"><span class="settings-section-title">Nhà cung cấp</span><span class="settings-section-state" id="section-provider-state"></span><span class="settings-section-chevron" id="ic-section-provider"></span></button></h2>
+      <div class="field-group" id="section-provider-body">
       <div class="field-group-item">
         <div class="field" style="margin-bottom:0">
           <span class="field-label" id="provider-type-label">Loại nhà cung cấp</span>
@@ -265,7 +341,7 @@
         <div class="field" style="margin-bottom:0">
           <label class="field-label" for="key-input" id="key-input-label">API key</label>
           <input class="input" id="key-input" type="password" autocomplete="off" placeholder="Nhập API key mới…" />
-          <p class="field-hint">Được lưu trong kho bảo mật của hệ điều hành. Không bao giờ hiển thị lại khóa đã lưu; trang chỉ giữ giá trị vừa nhập tạm thời để gửi đi, và xóa ngay sau khi gửi.</p>
+          <p class="field-hint">Được lưu trong kho bảo mật của hệ điều hành. Không bao giờ hiển thị lại khóa đã lưu.</p>
         </div>
       </div>
 
@@ -364,14 +440,42 @@
            comment). Only this section's own Save button persists it; the
            page's main Save button above never sends these fields. Shown for
            every profile. -->
-      <div class="field-group-item" id="jevtools-fields">
-        <p class="field-hint" id="jevtools-beta-notice">
-          Jev browser tools cho phép trợ lý dùng thêm hai công cụ ẩn (browser_subgoal, extract_page), dùng chính tài khoản ChatGPT hoặc API tương thích Anthropic bạn đã cấu hình ở trên cùng mô hình bạn đang chọn — không cần cấu hình mô hình văn bản riêng. Việc này có thể tiêu tốn thêm hạn mức/chi phí của nhà cung cấp chính. Lưu khóa vận chuyển Jev bên dưới là bước duy nhất để bật cả hai công cụ; để trống thì cả hai đều không xuất hiện, đúng như hiện tại. Cấu hình dở dang không báo lỗi, công cụ chỉ đơn giản là không xuất hiện.
+            <div class="field-group-item">
+        <div class="field-row">
+          <span class="connection-state" id="connection-state"><span class="connection-dot"></span> Chưa kiểm tra kết nối</span>
+          <div class="field-row-actions">
+            <button class="btn btn-ghost btn-sm" type="button" id="btn-remove-key" hidden>Xóa key</button>
+            <button class="btn btn-secondary btn-sm" type="button" id="btn-test-connection">Kiểm tra kết nối</button>
+            <button class="btn btn-primary btn-sm" type="button" id="btn-save">Lưu</button>
+          </div>
+        </div>
+        <p class="field-hint test-disclosure" id="test-disclosure-anthropic">Kiểm tra kết nối gửi một yêu cầu nhỏ tới nhà cung cấp và có thể phát sinh chi phí API.</p>
+        <p class="field-hint test-disclosure" id="test-disclosure-chatgpt" hidden>Kiểm tra kết nối sẽ tính vào giới hạn sử dụng của tài khoản ChatGPT.</p>
+        <p class="field-hint" id="key-status-text">Chưa lưu API key</p>
+        <!-- Why the two test controls ("Kiểm tra lại" above, "Kiểm tra kết
+             nối" here) are disabled, when the reason is one this page can
+             point at: an empty model list, or a list with no default chosen —
+             both fixed in the "Mô hình" section below. Filled by
+             settings-app.js from connection-gate.js's hint, with a jump link
+             to that section; both controls carry
+             aria-describedby="test-gate-hint" while it is showing. -->
+        <p class="field-hint" id="test-gate-hint" hidden></p>
+        <div id="capability-detail"></div>
+      </div>
+    </div>
+    </section>
+
+    <section class="settings-section" aria-labelledby="section-jevtools">
+      <h2 class="settings-section-head"><button type="button" class="settings-section-toggle" id="section-jevtools" aria-expanded="false" aria-controls="section-jevtools-body"><span class="settings-section-title">Jev browser tools</span><span class="settings-section-state" id="section-jevtools-state"></span><span class="settings-section-chevron" id="ic-section-jevtools"></span></button></h2>
+      <div class="field-group" id="section-jevtools-body" hidden>
+<div class="field-group-item" id="jevtools-fields">
+                <p class="field-hint" id="jevtools-beta-notice">
+          Jev browser tools cho phép trợ lý dùng thêm hai công cụ ẩn, dùng chính tài khoản và hạn mức/chi phí của nhà cung cấp chính bạn đã cấu hình ở trên.
         </p>
 
         <div class="jevtools-group">
           <p class="field-label" style="margin-bottom:var(--space-1)">1. Vận chuyển Jev — bật cả extract_page và browser_subgoal</p>
-          <p class="field-hint">Lưu khóa API vận chuyển ở đây là điều kiện duy nhất: khi đã lưu, cả hai công cụ cùng xuất hiện; khi chưa lưu (hoặc xoá), cả hai đều không xuất hiện.</p>
+          <p class="field-hint">Lưu khóa API vận chuyển ở đây là điều kiện duy nhất: khi đã lưu, cả hai công cụ cùng xuất hiện; khi chưa lưu (hoặc xoá), cả hai đều không xuất hiện. Cấu hình dở dang không báo lỗi, công cụ chỉ đơn giản là không xuất hiện.</p>
 
           <div class="field">
             <label class="field-label" for="jevtools-transport-source-select">Nguồn vận chuyển Jev</label>
@@ -413,7 +517,7 @@
           <div class="field-row">
             <span class="status-main" style="flex:1;min-width:0">
               <span class="field-label" style="display:block">Gửi ảnh chụp màn hình</span>
-              <span class="field-hint">Mặc định tắt: Jev tự chọn hành động dựa trên trạng thái trang có cấu trúc (page_snapshot), không cần ảnh. Bật để mỗi lượt browser_subgoal chụp thêm ảnh tab đang điều khiển và gửi kèm cho mô hình của nhà cung cấp chính (mục 1 ở trên) tham khảo khi lập kế hoạch — không ảnh hưởng tới cách Jev chọn hành động.</span>
+              <span class="field-hint">Mặc định tắt: Jev tự chọn hành động dựa trên trạng thái trang có cấu trúc (page_snapshot), không cần ảnh. Bật để mỗi lượt browser_subgoal chụp thêm ảnh tab đang điều khiển và gửi kèm cho mô hình bạn đang chọn của nhà cung cấp chính tham khảo khi lập kế hoạch — không ảnh hưởng tới cách Jev chọn hành động. Không cần cấu hình mô hình văn bản riêng.</span>
             </span>
             <label class="switch">
               <input type="checkbox" id="jevtools-send-screenshots" aria-label="Gửi ảnh chụp màn hình" />
@@ -437,33 +541,12 @@
         <p class="field-hint" id="jevtools-test-status"></p>
         <div id="jevtools-test-result"></div>
       </div>
-
-      <div class="field-group-item">
-        <div class="field-row">
-          <span class="connection-state" id="connection-state"><span class="connection-dot"></span> Chưa kiểm tra kết nối</span>
-          <div class="field-row-actions">
-            <button class="btn btn-ghost btn-sm" type="button" id="btn-remove-key" hidden>Xóa key</button>
-            <button class="btn btn-secondary btn-sm" type="button" id="btn-test-connection">Kiểm tra kết nối</button>
-            <button class="btn btn-primary btn-sm" type="button" id="btn-save">Lưu</button>
-          </div>
-        </div>
-        <p class="field-hint test-disclosure" id="test-disclosure-anthropic">Kiểm tra kết nối gửi một yêu cầu nhỏ tới nhà cung cấp và có thể phát sinh chi phí API.</p>
-        <p class="field-hint test-disclosure" id="test-disclosure-chatgpt" hidden>Kiểm tra kết nối sẽ tính vào giới hạn sử dụng của tài khoản ChatGPT.</p>
-        <p class="field-hint" id="key-status-text">Chưa lưu API key</p>
-        <!-- Why the two test controls ("Kiểm tra lại" above, "Kiểm tra kết
-             nối" here) are disabled, when the reason is one this page can
-             point at: an empty model list, or a list with no default chosen —
-             both fixed in the "Mô hình" section below. Filled by
-             settings-app.js from connection-gate.js's hint, with a jump link
-             to that section; both controls carry
-             aria-describedby="test-gate-hint" while it is showing. -->
-        <p class="field-hint" id="test-gate-hint" hidden></p>
-        <div id="capability-detail"></div>
       </div>
-    </div>
+    </section>
 
-    <p class="section-heading" id="section-models">Mô hình</p>
-    <div class="field-group">
+    <section class="settings-section" aria-labelledby="section-models">
+      <h2 class="settings-section-head"><button type="button" class="settings-section-toggle" id="section-models" aria-expanded="false" aria-controls="section-models-body"><span class="settings-section-title">Mô hình</span><span class="settings-section-state" id="section-models-state"></span><span class="settings-section-chevron" id="ic-section-models"></span></button></h2>
+      <div class="field-group" id="section-models-body" hidden>
       <div id="model-list" role="radiogroup" aria-label="Mô hình mặc định"></div>
       <div class="field-group-item">
         <div class="field-row">
@@ -487,9 +570,11 @@
         <p class="field-hint" id="model-list-error" role="alert" hidden style="color:var(--color-status-danger)"></p>
       </div>
     </div>
+    </section>
 
-    <p class="section-heading" id="section-other">Skills &amp; tiện ích</p>
-    <div class="field-group">
+    <section class="settings-section" aria-labelledby="section-other">
+      <h2 class="settings-section-head"><button type="button" class="settings-section-toggle" id="section-other" aria-expanded="false" aria-controls="section-other-body"><span class="settings-section-title">Skills &amp; tiện ích</span><span class="settings-section-state" id="section-other-state"></span><span class="settings-section-chevron" id="ic-section-other"></span></button></h2>
+      <div class="field-group" id="section-other-body" hidden>
       <div class="field-group-item">
         <button class="list-item" type="button" style="width:100%;border:none;box-shadow:none;text-align:left" id="nav-skills">
           <span class="list-item-icon" id="ic-skills"></span>
@@ -531,8 +616,10 @@
         </button>
       </div>
     </div>
-    <p class="section-heading" id="section-backup">Sao lưu cài đặt</p>
-    <div class="field-group">
+    </section>
+    <section class="settings-section" aria-labelledby="section-backup">
+      <h2 class="settings-section-head"><button type="button" class="settings-section-toggle" id="section-backup" aria-expanded="false" aria-controls="section-backup-body"><span class="settings-section-title">Sao lưu cài đặt</span><span class="settings-section-state" id="section-backup-state"></span><span class="settings-section-chevron" id="ic-section-backup"></span></button></h2>
+      <div class="field-group" id="section-backup-body" hidden>
       <div class="field-group-item">
         <div class="field-row-actions">
           <button class="btn btn-secondary btn-sm" type="button" id="btn-export">Xuất cài đặt</button>
@@ -542,6 +629,7 @@
         <p class="field-hint">Tệp xuất KHÔNG chứa API key. Sau khi nhập trên máy mới, bạn cần nhập lại API key.</p>
       </div>
     </div>
+    </section>
 
   </main>
 </div>
