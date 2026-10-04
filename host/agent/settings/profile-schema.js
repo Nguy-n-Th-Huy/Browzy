@@ -52,18 +52,24 @@ export const DEFAULT_TYPESAFE_GATEWAY_BASE_URL = "https://ai-gateway.vercel.sh";
 // is the one whose protocol is expected to move.
 export const DEFAULT_TYPESAFE_OPENROUTER_BASE_URL = "https://openrouter.ai";
 
+// The RunAnywhere endpoint the Jev transport uses when its source is
+// `runanywhere` (Eve over `POST /v1/decisions`).
+export const DEFAULT_TYPESAFE_RUNANYWHERE_BASE_URL = "https://inference.runanywhere.ai";
+
 // The ways the Jev browser tools (`extract_page`, `browser_subgoal`) reach
 // the Jev transport. `typesafe` is the provider's own System One endpoint
 // (`POST /v1/systemone`, a TypeSafe API key); `vercel` is the Vercel AI
 // Gateway's evaluation endpoint (`POST /v4/ai/evaluation-model`, a Vercel AI
 // Gateway key); `openrouter` is OpenRouter's decision route
-// (`POST /api/alpha/decisions`, an OpenRouter key) — the same typed questions
+// (`POST /api/alpha/decisions`, an OpenRouter key); `runanywhere` is
+// RunAnywhere's Eve decision route (`POST /v1/decisions`, a RunAnywhere key,
+// its array-question protocol translated by the client) — the same typed questions
 // and answers over different wire protocols (see host/agent/jev/client.js's
 // source paths). Jev is never reachable through any of these providers'
 // chat-completion or Messages ports: it is an evaluation model, and those
 // ports refuse it. The profile persists the choice; every consumer branches
 // on it, and nothing sniffs the endpoint URL to guess.
-export const TYPESAFE_SOURCES = /** @type {const} */ (["typesafe", "vercel", "openrouter"]);
+export const TYPESAFE_SOURCES = /** @type {const} */ (["typesafe", "vercel", "openrouter", "runanywhere"]);
 export const DEFAULT_TYPESAFE_SOURCE = "typesafe";
 
 // The Jev-tools screenshot toggle: controls ONLY whether a `browser_subgoal`
@@ -80,6 +86,33 @@ export const DEFAULT_JEV_TOOLS_SEND_SCREENSHOTS = false;
  */
 export function resolveJevToolsSendScreenshots(profile) {
   return Boolean(profile && profile.jevToolsSendScreenshots === true);
+}
+
+/**
+ * The operator's own Jev transport endpoint (a proxy, a private gateway, or a
+ * provider's alternate host), or null for the selected source's documented
+ * default. Only an absolute http(s) URL is honored; anything else stored
+ * (a hand-edited file) resolves to the default rather than a broken request.
+ * @param {{ jevToolsBaseUrl?: unknown }} profile
+ * @returns {string|null}
+ */
+export function resolveJevToolsBaseUrl(profile) {
+  const stored = profile && profile.jevToolsBaseUrl;
+  return isJevToolsBaseUrl(stored) ? stored.trim().replace(/\/+$/, "") : null;
+}
+
+/**
+ * @param {unknown} value
+ * @returns {boolean} true for an absolute http(s) URL string.
+ */
+export function isJevToolsBaseUrl(value) {
+  if (typeof value !== "string" || !value.trim()) return false;
+  try {
+    const url = new URL(value.trim());
+    return url.protocol === "https:" || url.protocol === "http:";
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -157,6 +190,9 @@ export function createEmptyProfile(profileId = DEFAULT_PROFILE_ID) {
     // Jev browser tools' resolvers; absent on a profile saved before it
     // existed, which every reader treats as this default.
     typesafeSource: DEFAULT_TYPESAFE_SOURCE,
+    // The operator's own Jev transport endpoint; null uses the source's
+    // documented default (resolveJevToolsBaseUrl above).
+    jevToolsBaseUrl: null,
     // The Jev-tools screenshot toggle (DEFAULT_JEV_TOOLS_SEND_SCREENSHOTS
     // below) — stored as a plain boolean and resolved through
     // resolveJevToolsSendScreenshots() on every read, so "absent" and
@@ -174,7 +210,8 @@ export function createEmptyProfile(profileId = DEFAULT_PROFILE_ID) {
 export const TYPESAFE_MODEL_SEEDS = Object.freeze({
   typesafe: [{ id: "jev-latest", label: "Jev (ultrafast)" }],
   vercel: [{ id: "typesafe-ai/jev", label: "Jev (Vercel AI Gateway)" }],
-  openrouter: [{ id: "typesafe/jev-1.13", label: "Jev (OpenRouter, alpha)" }]
+  openrouter: [{ id: "typesafe/jev-1.13", label: "Jev (OpenRouter, alpha)" }],
+  runanywhere: [{ id: "eve", label: "Eve (RunAnywhere)" }]
 });
 
 /**

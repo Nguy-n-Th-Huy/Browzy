@@ -117,6 +117,9 @@ function emptyState(profileId) {
     // default (host/agent/settings/profile-schema.js's
     // resolveJevToolsSendScreenshots()); only an explicit `true` enables it.
     jevToolsSendScreenshots: false,
+    // The operator's own Jev transport base URL draft ("" = the selected
+    // source's documented default). Persisted only by saveJevTools().
+    jevToolsBaseUrlDraft: "",
     // ChatGPT account usage (add-chatgpt-usage-check design.md decision 6).
     // Display-only: `usage` is the companion's display-shaped result (the
     // exact six-key reply — see settings-client.js's wire contract) and is
@@ -203,6 +206,15 @@ const TYPESAFE_SOURCE_COPY = Object.freeze({
     endpointHint: "Mặc định của OpenRouter là https://openrouter.ai. OpenRouter công bố tuyến quyết định dưới /api/alpha/, nên giao thức có thể thay đổi giữa các bản cập nhật. Khi đổi nguồn, điểm cuối chỉ được đặt lại nếu nó vẫn đang là mặc định; điểm cuối bạn tự nhập (gateway riêng, proxy) được giữ nguyên.",
     keyLabel: "API key OpenRouter",
     keyRemoveLabel: "Xóa key OpenRouter"
+  }),
+  // RunAnywhere: Eve over `POST /v1/decisions`, its array-question protocol
+  // translated host-side (host/agent/jev/client.js's RunAnywhere section).
+  runanywhere: Object.freeze({
+    endpointDefault: "https://inference.runanywhere.ai",
+    endpointLabel: "Điểm cuối Jev — RunAnywhere",
+    endpointHint: "Mặc định của RunAnywhere là https://inference.runanywhere.ai (mô hình Eve, POST /v1/decisions).",
+    keyLabel: "API key RunAnywhere",
+    keyRemoveLabel: "Xóa key RunAnywhere"
   })
 });
 
@@ -213,6 +225,7 @@ const TYPESAFE_SOURCE_COPY = Object.freeze({
 export function typesafeSourceCopy(source) {
   if (source === "vercel") return TYPESAFE_SOURCE_COPY.vercel;
   if (source === "openrouter") return TYPESAFE_SOURCE_COPY.openrouter;
+  if (source === "runanywhere") return TYPESAFE_SOURCE_COPY.runanywhere;
   return TYPESAFE_SOURCE_COPY.typesafe;
 }
 
@@ -303,8 +316,8 @@ export class SettingsController {
     // fresh state after every init()/switchProfile(), but also after
     // setProviderType()/save() replies.
     s.hasTypesafeKey = Boolean(profile.hasTypesafeKey);
-    s.typesafeSource =
-      profile.typesafeSource === "vercel" ? "vercel" : profile.typesafeSource === "openrouter" ? "openrouter" : "typesafe";
+    s.typesafeSource = ["vercel", "openrouter", "runanywhere"].includes(profile.typesafeSource) ? profile.typesafeSource : "typesafe";
+    s.jevToolsBaseUrlDraft = typeof profile.jevToolsBaseUrl === "string" ? profile.jevToolsBaseUrl : "";
     // The Jev-tools screenshot toggle (jev-subgoal-screenshots-default-off
     // task 3.2). The companion resolves the default and sends a boolean, but
     // an ABSENT field — a profile stored before the toggle existed, or a
@@ -769,10 +782,19 @@ export class SettingsController {
    * `typesafeDefaultForSource`. So this setter touches ONLY
    * `state.typesafeSource` and nothing else. */
   setJevToolsTransportSource(source) {
-    if (source !== "typesafe" && source !== "vercel" && source !== "openrouter") {
+    if (!["typesafe", "vercel", "openrouter", "runanywhere"].includes(source)) {
       return { ok: false, error: `unknown TypeSafe source: ${source}` };
     }
     this.state.typesafeSource = source;
+    this._notify();
+    return { ok: true };
+  }
+
+  /** The Jev transport base URL draft. Validated (empty, or an absolute
+   * http(s) URL) and persisted only by saveJevTools(); never touches the
+   * profile's primary `baseUrlDraft`. */
+  setJevToolsBaseUrlDraft(value) {
+    this.state.jevToolsBaseUrlDraft = String(value ?? "");
     this._notify();
     return { ok: true };
   }
@@ -1054,10 +1076,10 @@ export class SettingsController {
    * flat profile field. Saving the transport key (below) is the ONLY switch:
    * it enables `extract_page` and `browser_subgoal` together.
    *
-   * The endpoint is never sent: `resolveJevBrowserSubgoalConfig` always
-   * derives it from the transport source (`typesafeDefaultForSource`), never
-   * from `profile.baseUrl` — which on this profile type holds the Anthropic
-   * endpoint. Sending a `baseUrl` here would silently overwrite it.
+   * The Jev endpoint travels as its own `jevToolsBaseUrl` field (empty means
+   * the source's documented default), never as `baseUrl` — which on this
+   * profile type holds the Anthropic endpoint. Sending a `baseUrl` here would
+   * silently overwrite it.
    *
    * `state.hasCredential`/`memoryOnlyCredential`/`secretBackend` are
    * deliberately left untouched by the credentials half below: they describe
@@ -1072,18 +1094,37 @@ export class SettingsController {
     this._notify();
 
     const pendingTransportSource = this.state.typesafeSource;
+    const pendingBaseUrl = this.state.jevToolsBaseUrlDraft.trim();
+    if (pendingBaseUrl) {
+      let valid = false;
+      try {
+        const url = new URL(pendingBaseUrl);
+        valid = url.protocol === "https:" || url.protocol === "http:";
+      } catch {
+        valid = false;
+      }
+      if (!valid) {
+        this.state.savingJevTools = false;
+        this.state.banner = { kind: "error", title: "Base URL không hợp lệ", message: "Base URL vận chuyển Jev phải là địa chỉ http(s) đầy đủ, ví dụ https://inference.runanywhere.ai. Để trống để dùng mặc định.", action: "" };
+        this._notify();
+        return { ok: false, error: "invalid Jev transport base URL" };
+      }
+    }
     let inFlightOp = null;
     try {
       inFlightOp = "set_typesafe_config";
       const config = await this.client.setTypesafeConfig(this.state.profileId, {
         typesafeSource: pendingTransportSource,
+        // The Jev transport's own endpoint ("" returns to the source's
+        // default) — a separate field from the profile's primary `baseUrl`.
+        jevToolsBaseUrl: pendingBaseUrl,
         // The Jev-tools screenshot toggle
         // (jev-subgoal-screenshots-default-off task 3.2), sent explicitly on
         // every save so unchecking it in the DOM actually reaches the wire
         // (an omitted value would keep whatever is stored, exactly like
         // every other field here).
         jevToolsSendScreenshots: this.state.jevToolsSendScreenshots
-        // No `baseUrl`, no text-model fields: see this method's doc comment
+        // No primary `baseUrl`, no text-model fields: see this method's doc comment
         // above.
       });
       this._applyProfile(config);
@@ -1447,6 +1488,9 @@ export class SettingsController {
     // above, so the next Save (saveJevTools()) — and only it — writes it back.
     if (typeof imported.jevToolsSendScreenshots === "boolean") {
       this.state.jevToolsSendScreenshots = imported.jevToolsSendScreenshots;
+    }
+    if (typeof imported.jevToolsBaseUrl === "string") {
+      this.state.jevToolsBaseUrlDraft = imported.jevToolsBaseUrl;
     }
     this.state.banner = {
       kind: "info",

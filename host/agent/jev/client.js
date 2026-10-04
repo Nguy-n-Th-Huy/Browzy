@@ -415,10 +415,160 @@ export function openrouterDecisionsUrl(endpoint) {
   return `${String(endpoint ?? "").replace(/\/+$/, "")}${OPENROUTER_DECISIONS_PATH}`;
 }
 
+// --- The RunAnywhere source -----------------------------------------------
+//
+// A `runanywhere`-source profile asks RunAnywhere's Eve decision model
+// (`POST /v1/decisions`, https://docs.runanywhere.ai/wally-cloud/decisions).
+// Its wire differs from Jev's in three ways, all bridged here so the rest of
+// the subsystem keeps speaking the one Jev shape:
+//
+//   - the request is `{ model, input, questions: [...] }`: the Jev `state`
+//     rides as the JSON `input` string, and each Jev head becomes one array
+//     question — a `yes`/`no` head as `yes_no` (its criteria as the labels),
+//     every other head as `choice` with `options: [{ name, description }]`;
+//   - a `choice` question takes at most RUNANYWHERE_MAX_OPTIONS options, while
+//     a Jev action head offers up to 250. A larger head is decided as a
+//     two-round bracket: the options are split into balanced groups asked
+//     together in the first request, then the group winners are asked in a
+//     second. Every option is offered, none is dropped;
+//   - the answer carries `probabilities` (summing to 1) but no `confidence`.
+//     The confidence is the chosen option's probability. For a bracket, an
+//     option's probability is P(its group's winner wins the final) * P(it
+//     wins its group), which still sums to 1 across every offered option, and
+//     the choice is the highest of those — so `validateDecision` checks a
+//     bracket answer exactly as it checks a direct one.
+export const RUNANYWHERE_DECISIONS_PATH = "/v1/decisions";
+export const RUNANYWHERE_MAX_OPTIONS = 26;
+
+export function runanywhereDecisionsUrl(endpoint) {
+  return `${String(endpoint ?? "").replace(/\/+$/, "")}${RUNANYWHERE_DECISIONS_PATH}`;
+}
+
+function runanywhereQuestionText(head) {
+  const rules = head?.instructions?.rules;
+  const text = Array.isArray(rules) ? rules.join("\n") : typeof rules === "string" ? rules : "";
+  const extra = head?.instructions && typeof head.instructions === "object" ? { ...head.instructions } : {};
+  delete extra.rules;
+  const context = Object.keys(extra).length ? `\n${JSON.stringify(extra)}` : "";
+  return `${text || "Choose the best option."}${context}`;
+}
+
+function isYesNoCriteria(ids) {
+  return ids.length === 2 && ids.includes("yes") && ids.includes("no");
+}
+
+/** Split `ids` into the fewest balanced groups of at most `max` ids each. */
+function balancedGroups(ids, max) {
+  const count = Math.ceil(ids.length / max);
+  const groups = [];
+  for (let g = 0, start = 0; g < count; g++) {
+    const size = Math.floor(ids.length / count) + (g < ids.length % count ? 1 : 0);
+    groups.push(ids.slice(start, start + size));
+    start += size;
+  }
+  return groups;
+}
+
+function runanywhereQuestion(id, question, ids, criteria) {
+  if (isYesNoCriteria(ids)) return { id, type: "yes_no", question, yes: String(criteria.yes ?? "yes"), no: String(criteria.no ?? "no") };
+  return { id, type: "choice", question, options: ids.map((name) => ({ name, description: String(criteria[name] ?? "") })) };
+}
+
+/** The answer's probabilities over exactly `ids`, or null when they do not cover them. */
+function runanywhereProbabilities(json, qid, ids) {
+  const probabilities = json?.answers?.[qid]?.probabilities;
+  if (!probabilities || typeof probabilities !== "object" || Array.isArray(probabilities)) return null;
+  const picked = {};
+  for (const id of ids) {
+    if (typeof probabilities[id] !== "number") return null;
+    picked[id] = probabilities[id];
+  }
+  return picked;
+}
+
+function choiceAnswer(probabilities) {
+  const ids = Object.keys(probabilities);
+  const choice = ids.reduce((best, id) => (probabilities[id] > probabilities[best] ? id : best), ids[0]);
+  return { choice, probabilities, confidence: probabilities[choice] };
+}
+
+/**
+ * Ask RunAnywhere every head of a Jev body and return Jev-shaped `answers`
+ * (still to be validated by the caller) plus summed usage.
+ */
+async function runanywhereAnswers({ endpoint, apiKey, model, body, post }) {
+  const heads = Object.entries(body?.questions ?? {}).filter(([, head]) => head && typeof head === "object" && !Array.isArray(head));
+  const input = JSON.stringify(body?.state ?? {});
+  const answers = {};
+  const usage = { prompt_tokens: 0, total_tokens: 0 };
+  const ask = async (questions) => {
+    const { json } = await post({ url: runanywhereDecisionsUrl(endpoint), apiKey, body: { model, input, questions } });
+    usage.prompt_tokens += Number(json?.usage?.prompt_tokens) || 0;
+    usage.total_tokens += Number(json?.usage?.total_tokens) || 0;
+    return json;
+  };
+  const missing = (qid) =>
+    new JevError("INVALID_RESPONSE", `RunAnywhere returned no usable probabilities for "${qid}"; no action executed.`, { detail: { reason: `${qid}:probabilities_missing` } });
+
+  // Round 1: every head (a large head as its groups) in one request.
+  const round1 = [];
+  const plans = [];
+  for (const [name, head] of heads) {
+    const criteria = head.criteria ?? {};
+    const ids = Object.keys(criteria);
+    const question = runanywhereQuestionText(head);
+    if (ids.length === 1) {
+      // One offered option is the whole probability mass; there is nothing to ask.
+      answers[name] = choiceAnswer({ [ids[0]]: 1 });
+    } else if (ids.length <= RUNANYWHERE_MAX_OPTIONS) {
+      round1.push(runanywhereQuestion(name, question, ids, criteria));
+      plans.push({ name, ids });
+    } else {
+      const groups = balancedGroups(ids, RUNANYWHERE_MAX_OPTIONS);
+      if (groups.length > RUNANYWHERE_MAX_OPTIONS) throw new DecisionRequestTooLargeError();
+      groups.forEach((group, g) => round1.push(runanywhereQuestion(`${name}__g${g}`, question, group, criteria)));
+      plans.push({ name, ids, groups, question, criteria });
+    }
+  }
+  if (!round1.length) return { answers, usage };
+  const first = await ask(round1);
+
+  // Round 2: the final between each bracketed head's group winners.
+  const finals = [];
+  for (const plan of plans) {
+    if (!plan.groups) {
+      const probabilities = runanywhereProbabilities(first, plan.name, plan.ids);
+      if (!probabilities) throw missing(plan.name);
+      answers[plan.name] = choiceAnswer(probabilities);
+      continue;
+    }
+    plan.groupProbabilities = plan.groups.map((group, g) => {
+      const probabilities = runanywhereProbabilities(first, `${plan.name}__g${g}`, group);
+      if (!probabilities) throw missing(`${plan.name}__g${g}`);
+      return probabilities;
+    });
+    plan.winners = plan.groupProbabilities.map((probabilities) => choiceAnswer(probabilities).choice);
+    finals.push(runanywhereQuestion(`${plan.name}__final`, plan.question, plan.winners, plan.criteria));
+  }
+  if (finals.length) {
+    const second = await ask(finals);
+    for (const plan of plans.filter((p) => p.groups)) {
+      const final = runanywhereProbabilities(second, `${plan.name}__final`, plan.winners);
+      if (!final) throw missing(`${plan.name}__final`);
+      const probabilities = {};
+      plan.groups.forEach((group, g) => {
+        for (const id of group) probabilities[id] = final[plan.winners[g]] * plan.groupProbabilities[g][id];
+      });
+      answers[plan.name] = choiceAnswer(probabilities);
+    }
+  }
+  return { answers, usage };
+}
+
 /**
  * One decision cycle's request, validated. See the file header.
  *
- * Three sources, one validated result:
+ * Four sources, one validated result:
  *   - `typesafe` (default): `POST {endpoint}/v1/systemone`, the body exactly
  *     as `buildSelectionRequest` built it;
  *   - `vercel`: `POST {endpoint}/v4/ai/evaluation-model` — the gateway's
@@ -427,10 +577,12 @@ export function openrouterDecisionsUrl(endpoint) {
  *     from `providerMetadata` before validation;
  *   - `openrouter`: `POST {endpoint}/api/alpha/decisions`, the same body the
  *     direct source sends (the model id rides in it) and the same answer
- *     shape read back.
+ *     shape read back;
+ *   - `runanywhere`: `POST {endpoint}/v1/decisions`, translated to and from
+ *     RunAnywhere's array-question protocol (see its section above).
  *
  * @param {object} opts
- * @param {"typesafe"|"vercel"|"openrouter"} [opts.source] - which wire this profile uses
+ * @param {"typesafe"|"vercel"|"openrouter"|"runanywhere"} [opts.source] - which wire this profile uses
  * @param {string} opts.endpoint - base endpoint (path appended per source)
  * @param {string} opts.apiKey
  * @param {string} [opts.model] - required by the `vercel` source (header)
@@ -440,6 +592,18 @@ export function openrouterDecisionsUrl(endpoint) {
  */
 export async function requestDecision({ source = "typesafe", endpoint, apiKey, model, body, fetchImpl, timeoutMs, now, sleep }) {
   if (body?.questions?.action && decisionRequestBytes(body) > MAX_REQUEST_BYTES) throw new DecisionRequestTooLargeError();
+  if (source === "runanywhere") {
+    const startedAt = (now ?? Date.now)();
+    const post = (request) => postJson({ ...request, fetchImpl, timeoutMs, now, sleep });
+    const { answers, usage } = await runanywhereAnswers({ endpoint, apiKey, model, body, post });
+    const validation = validateDecision({ questions: body?.questions, answers });
+    if (!validation.ok) {
+      throw new JevError("INVALID_RESPONSE", `the provider returned a decision that failed validation (${validation.reason}); no action executed.`, {
+        detail: { reason: validation.reason }
+      });
+    }
+    return { decision: validation.decision, usage, latencyMs: (now ?? Date.now)() - startedAt };
+  }
   let url;
   let requestBody = body;
   let extraHeaders;

@@ -615,14 +615,16 @@ function renderProvider(state, gate) {
   // snapshot.
   {
     // The transport source select and its key's label/status/remove action
-    // all name the selected source through the typesafeSourceCopy table. The
-    // endpoint is display-only — it is never sent (settings-controller.js's
-    // saveJevTools() doc comment: the host always derives it from the
-    // source, never from a stored value) — so it is a hint, not an editable
-    // field.
+    // all name the selected source through the typesafeSourceCopy table.
     $("jevtools-transport-source-select").value = state.typesafeSource;
+    // The Jev transport base URL: a controlled input over its own draft
+    // (never the primary `baseUrlDraft`); empty means the source's default,
+    // shown as the placeholder.
+    const baseUrlInput = $("jevtools-transport-baseurl-input");
+    if (baseUrlInput.value !== state.jevToolsBaseUrlDraft) baseUrlInput.value = state.jevToolsBaseUrlDraft;
+    baseUrlInput.placeholder = sourceCopy.endpointDefault;
     $("jevtools-transport-endpoint-text").textContent =
-      `Điểm cuối (theo nguồn đã chọn, không thể chỉnh riêng): ${sourceCopy.endpointDefault}`;
+      `Để trống để dùng mặc định của nguồn đã chọn (${sourceCopy.endpointDefault}). Nhập địa chỉ riêng (proxy, gateway) nếu nó nói cùng giao thức với nguồn đã chọn.`;
     $("jevtools-transport-key-label").textContent = sourceCopy.keyLabel;
     $("jevtools-transport-key-status-text").textContent = state.hasTypesafeKey
       ? `Đã lưu ${sourceCopy.keyLabel}`
@@ -919,6 +921,7 @@ function wireEvents() {
   // comment. The key input is deliberately NOT wired to any per-keystroke
   // controller call, exactly like every other secret input on this page.
   $("jevtools-transport-source-select").addEventListener("change", (e) => controller.setJevToolsTransportSource(e.target.value));
+  $("jevtools-transport-baseurl-input").addEventListener("input", (e) => controller.setJevToolsBaseUrlDraft(e.target.value));
   // The Jev-tools screenshot toggle (jev-subgoal-screenshots-default-off
   // task 3.2): ordinary non-secret configuration — the change lands in
   // controller state and this section's own Save (btn-save-jevtools) is the

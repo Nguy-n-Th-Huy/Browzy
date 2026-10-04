@@ -116,6 +116,38 @@ test("the vercel source resolves the Vercel AI Gateway endpoint, not the direct 
   assert.equal(config.endpoint, "https://ai-gateway.vercel.sh");
 });
 
+test("the runanywhere source resolves the RunAnywhere endpoint and the Eve model", async () => {
+  await anthropicProfileWithJev({ typesafeSource: "runanywhere" });
+  const config = await profile.resolveJevBrowserSubgoalConfig(TEST_PROFILE_ID, { textModel: PRIMARY_TEXT_MODEL });
+  assert(config);
+  assert.equal(config.source, "runanywhere");
+  assert.equal(config.endpoint, "https://inference.runanywhere.ai");
+  assert.equal(config.model, "eve");
+});
+
+test("a saved Jev base URL overrides the source default without touching the primary baseUrl, and clearing it restores the default", async () => {
+  await anthropicProfileWithJev({ typesafeSource: "runanywhere" });
+  await profile.setTypesafeConfig(TEST_PROFILE_ID, { jevToolsBaseUrl: " https://proxy.example/jev/ " });
+  const saved = await profile.loadProfile();
+  assert.equal(saved.jevToolsBaseUrl, "https://proxy.example/jev");
+  assert.equal(saved.baseUrl, "https://api.anthropic.com", "the primary endpoint is untouched");
+  const config = await profile.resolveJevBrowserSubgoalConfig(TEST_PROFILE_ID, { textModel: PRIMARY_TEXT_MODEL });
+  assert.equal(config.endpoint, "https://proxy.example/jev");
+
+  await profile.setTypesafeConfig(TEST_PROFILE_ID, { typesafeSource: "runanywhere" });
+  assert.equal((await profile.loadProfile()).jevToolsBaseUrl, "https://proxy.example/jev", "an omitted base URL keeps the stored one");
+
+  await profile.setTypesafeConfig(TEST_PROFILE_ID, { jevToolsBaseUrl: "" });
+  const cleared = await profile.resolveJevBrowserSubgoalConfig(TEST_PROFILE_ID, { textModel: PRIMARY_TEXT_MODEL });
+  assert.equal(cleared.endpoint, "https://inference.runanywhere.ai");
+});
+
+test("a Jev base URL that is not an http(s) URL is refused", async () => {
+  await anthropicProfileWithJev();
+  await assert.rejects(profile.setTypesafeConfig(TEST_PROFILE_ID, { jevToolsBaseUrl: "ftp://nope" }), /http\(s\)/);
+  await assert.rejects(profile.setTypesafeConfig(TEST_PROFILE_ID, { jevToolsBaseUrl: "not a url" }), /http\(s\)/);
+});
+
 test("a missing typesafe transport key resolves null even though a textModel is supplied", async () => {
   await anthropicProfileWithJev({ typesafeApiKey: null });
   const config = await profile.resolveJevBrowserSubgoalConfig(TEST_PROFILE_ID, { textModel: PRIMARY_TEXT_MODEL });

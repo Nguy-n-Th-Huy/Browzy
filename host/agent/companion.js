@@ -2861,7 +2861,7 @@ export class CompanionCore {
         // the ChatGPT ops use, so a future helper that echoed a key back
         // would be refused rather than forwarded.
         //
-        // Only `typesafeSource`/`jevToolsSendScreenshots` (and, for
+        // Only `typesafeSource`/`jevToolsBaseUrl`/`jevToolsSendScreenshots` (and, for
         // `set_typesafe_credentials`, `typesafeApiKey`/`memoryOnly`) are ever
         // read by the host now. The other fields below (the legacy text-model
         // and decision-model fields, from the now-removed standalone Jev
@@ -2880,7 +2880,7 @@ export class CompanionCore {
               return fail("PROTOCOL_ERROR", `set_typesafe_config ${field} must be a string when present`);
             }
           }
-          // The Jev source ("typesafe" | "vercel" | "openrouter"). Shape-checked here; the
+          // The Jev source ("typesafe" | "vercel" | "openrouter" | "runanywhere"). Shape-checked here; the
           // VALUE is validated by settings.setTypesafeConfig() so exactly one
           // place owns the known list (profile-schema.js's TYPESAFE_SOURCES).
           if (envelope.typesafeSource !== undefined && typeof envelope.typesafeSource !== "string") {
@@ -2896,8 +2896,15 @@ export class CompanionCore {
           if (envelope.jevToolsSendScreenshots !== undefined && typeof envelope.jevToolsSendScreenshots !== "boolean") {
             return fail("PROTOCOL_ERROR", "set_typesafe_config jevToolsSendScreenshots must be a boolean when present");
           }
+          // The operator's own Jev transport endpoint: a string (empty clears
+          // it back to the source's default) or null. Its URL shape is
+          // validated by settings.setTypesafeConfig().
+          if (envelope.jevToolsBaseUrl !== undefined && envelope.jevToolsBaseUrl !== null && typeof envelope.jevToolsBaseUrl !== "string") {
+            return fail("PROTOCOL_ERROR", "set_typesafe_config jevToolsBaseUrl must be a string or null when present");
+          }
           const profile = await settings.setTypesafeConfig(envelope.profileId, {
             typesafeSource: envelope.typesafeSource,
+            jevToolsBaseUrl: envelope.jevToolsBaseUrl,
             jevToolsSendScreenshots: envelope.jevToolsSendScreenshots
           });
           return ok(this._assertAgentSettingsResultSecretFree(profile));

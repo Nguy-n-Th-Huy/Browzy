@@ -38,12 +38,15 @@ import {
   DEFAULT_TYPESAFE_BASE_URL,
   DEFAULT_TYPESAFE_GATEWAY_BASE_URL,
   DEFAULT_TYPESAFE_OPENROUTER_BASE_URL,
+  DEFAULT_TYPESAFE_RUNANYWHERE_BASE_URL,
   DEFAULT_TYPESAFE_SOURCE,
   TYPESAFE_MODEL_SEEDS,
   isKnownProviderType,
   isKnownTypesafeSource,
   resolveProviderType,
   resolveJevToolsSendScreenshots,
+  resolveJevToolsBaseUrl,
+  isJevToolsBaseUrl,
   CHATGPT_CAPABILITY_TEST_MARKER
 } from "./profile-schema.js";
 import { normalizeBaseUrl, DEFAULT_BASE_URL } from "./url.js";
@@ -167,7 +170,18 @@ function resolveTypesafeSource(profile) {
 function typesafeDefaultForSource(source) {
   if (source === "vercel") return DEFAULT_TYPESAFE_GATEWAY_BASE_URL;
   if (source === "openrouter") return DEFAULT_TYPESAFE_OPENROUTER_BASE_URL;
+  if (source === "runanywhere") return DEFAULT_TYPESAFE_RUNANYWHERE_BASE_URL;
   return DEFAULT_TYPESAFE_BASE_URL;
+}
+
+/**
+ * The endpoint the Jev transport actually calls: the operator's own Jev
+ * base URL when one is saved, otherwise the selected source's documented
+ * default. Never `profile.baseUrl` — on an `anthropic`/`chatgpt` profile that
+ * is the primary provider's endpoint, not a Jev one.
+ */
+function jevTransportEndpoint(profile, source) {
+  return resolveJevToolsBaseUrl(profile) ?? typesafeDefaultForSource(source);
 }
 
 /**
@@ -224,11 +238,14 @@ export async function loadProfile() {
     textModelId: stored.textModelId || null,
     hasTypesafeKey: Boolean(stored.hasTypesafeKey),
     hasTextModelKey: Boolean(stored.hasTextModelKey),
-    // The persisted Jev source ("typesafe" | "vercel" | "openrouter"), read
+    // The persisted Jev source ("typesafe" | "vercel" | "openrouter" | "runanywhere"), read
     // by the Jev browser tools' resolvers; a profile saved before the field
     // existed loads as the default source (resolveTypesafeSource(),
     // profile-schema.js's TYPESAFE_SOURCES).
     typesafeSource: resolveTypesafeSource(stored),
+    // The operator's own Jev transport endpoint, or null for the source's
+    // documented default.
+    jevToolsBaseUrl: resolveJevToolsBaseUrl(stored),
     // The Jev-tools screenshot toggle: resolved here so every reader (the
     // settings surface and resolveJevBrowserSubgoalConfig below) sees the
     // documented default (disabled) on a profile stored before this field
@@ -595,13 +612,16 @@ export async function removeCredential(profileId) {
 /**
  * Persist the "Jev browser tools" settings section for an `anthropic`/
  * `chatgpt` profile: the Jev transport source (`typesafe` direct, `vercel`
- * AI Gateway, or `openrouter`) and the Jev-tools screenshot toggle. Never
+ * AI Gateway, `openrouter` or `runanywhere`), the operator's own Jev
+ * transport base URL, and the Jev-tools screenshot toggle. Never
  * touches a key — that lives only in the merged secret record below.
  *
  * Scoped down sharply: this section's text/decision model is the profile's
  * OWN primary provider — resolved at run/test time from the run snapshot
  * (primaryTextModelFromSnapshot below), never a second stored configuration.
- * Only `typesafeSource` and `jevToolsSendScreenshots` are ever written;
+ * Only `typesafeSource`, `jevToolsBaseUrl` and `jevToolsSendScreenshots`
+ * are ever written (`jevToolsBaseUrl`: an http(s) URL, or null/"" to return
+ * to the source's default);
  * every other argument (a caller's stale `baseUrl`, legacy text-model or
  * decision-model fields from a settings page that predates their removal) is
  * silently ignored — never validated, never persisted — because none of it
@@ -611,11 +631,11 @@ export async function removeCredential(profileId) {
  * Jev-transport-only save.
  *
  * @param {string} profileId
- * @param {{ typesafeSource?: string, jevToolsSendScreenshots?: boolean }} input
+ * @param {{ typesafeSource?: string, jevToolsBaseUrl?: string|null, jevToolsSendScreenshots?: boolean }} input
  * @returns {Promise<ReturnType<typeof loadProfile>>}
- * @throws {ProviderError} INVALID_PROFILE when the source is unknown or the screenshot toggle is not a boolean
+ * @throws {ProviderError} INVALID_PROFILE when the source is unknown, the base URL is not an http(s) URL, or the screenshot toggle is not a boolean
  */
-export async function setTypesafeConfig(profileId, { typesafeSource, jevToolsSendScreenshots } = {}) {
+export async function setTypesafeConfig(profileId, { typesafeSource, jevToolsBaseUrl, jevToolsSendScreenshots } = {}) {
   const existing = readProfileFromDisk();
   if (!existing || existing.profileId !== profileId) {
     throw new ProviderError("NO_CREDENTIAL", `no profile found for profileId "${profileId}"`);
@@ -623,17 +643,24 @@ export async function setTypesafeConfig(profileId, { typesafeSource, jevToolsSen
   if (typesafeSource !== undefined && !isKnownTypesafeSource(typesafeSource)) {
     throw new ProviderError("INVALID_PROFILE", `unknown TypeSafe source "${typesafeSource}"`);
   }
+  const clearsBaseUrl = jevToolsBaseUrl === null || (typeof jevToolsBaseUrl === "string" && !jevToolsBaseUrl.trim());
+  if (jevToolsBaseUrl !== undefined && !clearsBaseUrl && !isJevToolsBaseUrl(jevToolsBaseUrl)) {
+    throw new ProviderError("INVALID_PROFILE", "the Jev transport base URL must be an absolute http(s) URL");
+  }
   if (jevToolsSendScreenshots !== undefined && typeof jevToolsSendScreenshots !== "boolean") {
     throw new ProviderError("INVALID_PROFILE", "the jevToolsSendScreenshots toggle must be a boolean");
   }
   const cleanJevToolsSendScreenshots =
     jevToolsSendScreenshots === undefined ? resolveJevToolsSendScreenshots(existing) : jevToolsSendScreenshots;
   const cleanSource = typesafeSource === undefined ? resolveTypesafeSource(existing) : typesafeSource;
+  const cleanBaseUrl =
+    jevToolsBaseUrl === undefined ? resolveJevToolsBaseUrl(existing) : clearsBaseUrl ? null : jevToolsBaseUrl.trim().replace(/\/+$/, "");
 
   const next = {
     ...existing,
     profileId,
     typesafeSource: cleanSource,
+    jevToolsBaseUrl: cleanBaseUrl,
     jevToolsSendScreenshots: cleanJevToolsSendScreenshots,
     revision: existing.revision + 1
   };
@@ -989,7 +1016,8 @@ export function primaryTextModelFromSnapshot(snapshot) {
  * removed should not lose them) are never read here: the primary credential
  * IS the text model, and only the Jev transport keeps its own, separate key.
  *
- * The endpoint is ALWAYS `typesafeDefaultForSource(resolveTypesafeSource(profile))`
+ * The endpoint is the operator's own Jev base URL when saved, else
+ * `typesafeDefaultForSource(resolveTypesafeSource(profile))` (jevTransportEndpoint)
  * — never `profile.baseUrl`, which on an `anthropic`/`chatgpt` profile holds
  * the Anthropic endpoint, not a Jev one.
  *
@@ -1009,7 +1037,7 @@ export function primaryTextModelFromSnapshot(snapshot) {
  * @param {string} profileId
  * @param {{ textModel?: { kind: "anthropic", baseUrl: string, model: string, apiKey: string } | null }} [opts]
  * @returns {Promise<null | {
- *   source: "typesafe"|"vercel"|"openrouter", endpoint: string, apiKey: string, model: string,
+ *   source: "typesafe"|"vercel"|"openrouter"|"runanywhere", endpoint: string, apiKey: string, model: string,
  *   decisionSource: "anthropic"|"chatgpt",
  *   textModel: { kind: "anthropic", baseUrl: string, model: string, apiKey: string },
  *   sendScreenshots: boolean, consultSources: boolean, searchSources: boolean
@@ -1034,7 +1062,7 @@ export async function resolveJevBrowserSubgoalConfig(profileId, { textModel } = 
   const source = resolveTypesafeSource(profile);
   return {
     source,
-    endpoint: typesafeDefaultForSource(source),
+    endpoint: jevTransportEndpoint(profile, source),
     apiKey: secret.typesafe_api_key,
     model: typesafeModelSeeds(source)[0].id,
     decisionSource: providerType,
@@ -1191,7 +1219,7 @@ async function testCapabilityForJevTools(profile, { fetchImpl, sleep, now } = {}
   try {
     raw = await runTypesafeCapabilityTest({
       source,
-      endpoint: typesafeDefaultForSource(source),
+      endpoint: jevTransportEndpoint(profile, source),
       apiKey: secret.typesafe_api_key,
       model: typesafeModelSeeds(source)[0].id,
       textModel,

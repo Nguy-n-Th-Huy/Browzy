@@ -81,7 +81,7 @@
 // the tools' text/decision model is always the profile's own primary
 // Anthropic/ChatGPT provider, resolved host-side, and is never configured
 // through these ops:
-//   op: "set_typesafe_config"      payload: { profileId, typesafeSource?, jevToolsSendScreenshots? }
+//   op: "set_typesafe_config"      payload: { profileId, typesafeSource?, jevToolsBaseUrl?, jevToolsSendScreenshots? }
 //                                 -> result: the updated secret-free profile
 //                                 (same result shape as "get_profile":
 //                                 `hasTypesafeKey` boolean, alongside the

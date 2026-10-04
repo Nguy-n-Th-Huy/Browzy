@@ -32,6 +32,7 @@
 
 import {
   postJson,
+  requestDecision,
   systemoneUrl,
   openrouterDecisionsUrl,
   vercelEvaluationUrl,
@@ -98,7 +99,7 @@ function classifyFailure(err) {
 
 /**
  * @param {object} opts
- * @param {"typesafe"|"vercel"|"openrouter"} [opts.source] - which Jev wire
+ * @param {"typesafe"|"vercel"|"openrouter"|"runanywhere"} [opts.source] - which Jev wire
  *   this profile uses; the stage-1 request is built exactly as a live
  *   decision for it is
  * @param {string} opts.endpoint - TypeSafe base endpoint (or the Vercel
@@ -141,31 +142,37 @@ export async function runTypesafeCapabilityTest({ source = "typesafe", endpoint,
   // will actually speak.
   try {
     const body = capabilityQuestionBody(model);
-    const { json } =
-      source === "vercel"
-        ? await postJson({
-            url: vercelEvaluationUrl(endpoint),
-            apiKey,
-            body: vercelRequestBody(body),
-            extraHeaders: { ...VERCEL_PROTOCOL_HEADERS, "ai-model-id": String(model ?? "") },
-            fetchImpl,
-            timeoutMs,
-            now,
-            sleep
-          })
-        : await postJson({
-            url: source === "openrouter" ? openrouterDecisionsUrl(endpoint) : systemoneUrl(endpoint),
-            apiKey,
-            body,
-            fetchImpl,
-            timeoutMs,
-            now,
-            sleep
-          });
-    const answers = source === "vercel" ? normalizeVercelResponse(json).answers : json && typeof json === "object" ? json.answers : null;
-    const answer = validateDecision({ questions: body.questions, answers });
-    if (!answer.ok) {
-      throw new JevError("INVALID_RESPONSE", `the endpoint answered 200 with a choice answer that failed validation (${answer.reason}); no action executed.`);
+    if (source === "runanywhere") {
+      // RunAnywhere speaks its own question protocol; requestDecision
+      // translates and validates it exactly as a live decision does.
+      await requestDecision({ source, endpoint, apiKey, model, body, fetchImpl, timeoutMs, now, sleep });
+    } else {
+      const { json } =
+        source === "vercel"
+          ? await postJson({
+              url: vercelEvaluationUrl(endpoint),
+              apiKey,
+              body: vercelRequestBody(body),
+              extraHeaders: { ...VERCEL_PROTOCOL_HEADERS, "ai-model-id": String(model ?? "") },
+              fetchImpl,
+              timeoutMs,
+              now,
+              sleep
+            })
+          : await postJson({
+              url: source === "openrouter" ? openrouterDecisionsUrl(endpoint) : systemoneUrl(endpoint),
+              apiKey,
+              body,
+              fetchImpl,
+              timeoutMs,
+              now,
+              sleep
+            });
+      const answers = source === "vercel" ? normalizeVercelResponse(json).answers : json && typeof json === "object" ? json.answers : null;
+      const answer = validateDecision({ questions: body.questions, answers });
+      if (!answer.ok) {
+        throw new JevError("INVALID_RESPONSE", `the endpoint answered 200 with a choice answer that failed validation (${answer.reason}); no action executed.`);
+      }
     }
     capabilities.systemone = "pass";
   } catch (err) {
