@@ -521,7 +521,7 @@ console.log("== a Jev run renders its steps and outcome with no assistant text, 
   failed.applyEvent({ type: "jev_end", runId: RUN, outcome: "error", reason: "invalid_decision", steps: 0, doneIsDecided: false });
   const failedHtml = turnRender.renderTurnHtml(turnOf(failed), renderOpts);
   ok(failedHtml.includes('data-jev-outcome="error"') && failedHtml.includes("Thất bại"), "a failed Jev run is labelled as a failure");
-  ok(failedHtml.includes("câu trả lời của TypeSafe không hợp lệ"), "…with the invalid decision translated, not the raw reason token");
+  ok(failedHtml.includes("câu trả lời của mô hình quyết định (Jev) không hợp lệ"), "…with the invalid decision translated, not the raw reason token");
   ok(!failedHtml.includes("invalid_decision"), "…so the runtime's English identifier never reaches the operator");
   ok(/class="turn-status-note is-error"[^>]*data-jev-outcome="error"/.test(failedHtml), "…in the error treatment, so it reads as an error and not as a quieter outcome");
   ok(turnRender.renderJevOutcomeHtml({ toolRows: [] }) === "", "a turn with no Jev outcome renders no outcome line at all (every LLM turn is unchanged)");

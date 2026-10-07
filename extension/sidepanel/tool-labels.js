@@ -357,8 +357,8 @@ export const JEV_REASON_LABELS_VI = {
   // Error outcomes.
   observation_failed: "không đọc được trạng thái trang",
   navigation_failed: "không mở được trang web",
-  provider_error: "dịch vụ TypeSafe gặp lỗi",
-  invalid_decision: "câu trả lời của TypeSafe không hợp lệ",
+  provider_error: "dịch vụ quyết định (Jev) gặp lỗi",
+  invalid_decision: "câu trả lời của mô hình quyết định (Jev) không hợp lệ",
   text_model_error: "mô hình văn bản gặp lỗi",
   tool_result_unknown: "mất phản hồi sau khi thao tác đã được gửi đi",
   // Step-level reasons: a cycle whose dispatch was refused or skipped.

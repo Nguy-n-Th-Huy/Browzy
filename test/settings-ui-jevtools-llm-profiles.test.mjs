@@ -104,6 +104,23 @@ console.log("== Jev tools on an anthropic profile: saveJevTools() persists the t
     "the primary Anthropic credential's stored-ness is completely untouched");
 }
 
+console.log("== the bottom Save button persists the Jev transport source picked in the dropdown, before saving its key ==");
+{
+  const companion = createScriptedCompanion(anthropicProfile());
+  const c = new SettingsController(companion.client);
+  await c.init();
+
+  c.setJevToolsTransportSource("openai");
+  const result = await c.save(null, { typesafeApiKey: "test-key" });
+  ok(result.ok === true, "the page save succeeds");
+  const configIndex = companion.calls.findIndex((x) => x.op === "set_typesafe_config");
+  const keyIndex = companion.calls.findIndex((x) => x.op === "set_typesafe_credentials");
+  ok(configIndex >= 0 && companion.calls[configIndex].typesafeSource === "openai",
+    `the chosen source rides the config op — got ${JSON.stringify(companion.calls[configIndex])}`);
+  ok(configIndex >= 0 && keyIndex > configIndex, "the source is saved before the key, so the key belongs to the chosen source");
+  ok(c.getState().typesafeSource === "openai", `the dropdown keeps the chosen source after saving — got ${c.getState().typesafeSource}`);
+}
+
 console.log("== Jev tools on an anthropic profile: saving the transport key persists it and never mirrors a raw value, without touching the Anthropic credential fields ==");
 {
   const companion = createScriptedCompanion(anthropicProfile());

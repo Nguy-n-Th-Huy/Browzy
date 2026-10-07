@@ -215,6 +215,16 @@ const TYPESAFE_SOURCE_COPY = Object.freeze({
     endpointHint: "Mặc định của RunAnywhere là https://inference.runanywhere.ai (mô hình Eve, POST /v1/decisions).",
     keyLabel: "API key RunAnywhere",
     keyRemoveLabel: "Xóa key RunAnywhere"
+  }),
+  // OpenAI Decisions: `POST /v1/decisions` (model gpt-6-luna). Accepts inline
+  // images, so with the screenshot toggle on the page capture goes to this
+  // decision model instead of the primary LLM.
+  openai: Object.freeze({
+    endpointDefault: "https://api.openai.com",
+    endpointLabel: "Điểm cuối Jev — OpenAI Decisions",
+    endpointHint: "Mặc định của OpenAI là https://api.openai.com (mô hình gpt-6-luna, POST /v1/decisions). Khi bật ảnh chụp trang, ảnh được gửi cho mô hình quyết định này thay vì LLM chính.",
+    keyLabel: "API key OpenAI",
+    keyRemoveLabel: "Xóa key OpenAI"
   })
 });
 
@@ -226,6 +236,7 @@ export function typesafeSourceCopy(source) {
   if (source === "vercel") return TYPESAFE_SOURCE_COPY.vercel;
   if (source === "openrouter") return TYPESAFE_SOURCE_COPY.openrouter;
   if (source === "runanywhere") return TYPESAFE_SOURCE_COPY.runanywhere;
+  if (source === "openai") return TYPESAFE_SOURCE_COPY.openai;
   return TYPESAFE_SOURCE_COPY.typesafe;
 }
 
@@ -316,7 +327,7 @@ export class SettingsController {
     // fresh state after every init()/switchProfile(), but also after
     // setProviderType()/save() replies.
     s.hasTypesafeKey = Boolean(profile.hasTypesafeKey);
-    s.typesafeSource = ["vercel", "openrouter", "runanywhere"].includes(profile.typesafeSource) ? profile.typesafeSource : "typesafe";
+    s.typesafeSource = ["vercel", "openrouter", "runanywhere", "openai"].includes(profile.typesafeSource) ? profile.typesafeSource : "typesafe";
     s.jevToolsBaseUrlDraft = typeof profile.jevToolsBaseUrl === "string" ? profile.jevToolsBaseUrl : "";
     // The Jev-tools screenshot toggle (jev-subgoal-screenshots-default-off
     // task 3.2). The companion resolves the default and sends a boolean, but
@@ -782,7 +793,7 @@ export class SettingsController {
    * `typesafeDefaultForSource`. So this setter touches ONLY
    * `state.typesafeSource` and nothing else. */
   setJevToolsTransportSource(source) {
-    if (!["typesafe", "vercel", "openrouter", "runanywhere"].includes(source)) {
+    if (!["typesafe", "vercel", "openrouter", "runanywhere", "openai"].includes(source)) {
       return { ok: false, error: `unknown TypeSafe source: ${source}` };
     }
     this.state.typesafeSource = source;
@@ -982,6 +993,16 @@ export class SettingsController {
       return { ok: false, error: modelsResult.error };
     }
 
+    // The Jev-tools section's source, base URL and screenshot toggle are read
+    // BEFORE save_profile: applying the saved profile below resets them to the
+    // stored values, which silently dropped a source picked in the dropdown.
+    const jevConfig = this.#pendingJevToolsConfig();
+    if (!jevConfig) {
+      this.state.banner = { kind: "error", title: "Base URL không hợp lệ", message: "Base URL vận chuyển Jev phải là địa chỉ http(s) đầy đủ, ví dụ https://inference.runanywhere.ai. Để trống để dùng mặc định.", action: "" };
+      this._notify();
+      return { ok: false, error: "invalid Jev transport base URL" };
+    }
+
     this.state.fieldErrors.baseUrl = null;
     this.state.fieldErrors.models = null;
     this.state.saving = true;
@@ -1040,7 +1061,13 @@ export class SettingsController {
       // (jev-tools-settings-on-llm-profiles), sent through the shared
       // #saveJevToolsCredentials() helper (see its doc comment) — this page's
       // one bottom Save button is the fix for that section previously having
-      // no key-saving path other than its own #btn-save-jevtools.
+      // no key-saving path other than its own #btn-save-jevtools. Its config
+      // goes first so the key is saved against the source the operator chose.
+      inFlightOp = "set_typesafe_config";
+      const config = await this.client.setTypesafeConfig(this.state.profileId, jevConfig);
+      this._applyProfile(config);
+      this.state.jevToolsTest = null;
+
       inFlightOp = "set_typesafe_credentials";
       await this.#saveJevToolsCredentials(jevToolsSecrets);
 
@@ -1088,45 +1115,46 @@ export class SettingsController {
    *
    * @param {{ typesafeApiKey?: string }} [typesafeSecrets]
    */
+  /** The Jev-tools config as currently shown in the section, or null when its
+   * base URL draft is not a full http(s) address. No primary `baseUrl` and no
+   * text-model fields: see saveJevTools()'s doc comment. */
+  #pendingJevToolsConfig() {
+    const jevToolsBaseUrl = this.state.jevToolsBaseUrlDraft.trim();
+    if (jevToolsBaseUrl) {
+      try {
+        const { protocol } = new URL(jevToolsBaseUrl);
+        if (protocol !== "https:" && protocol !== "http:") return null;
+      } catch {
+        return null;
+      }
+    }
+    return {
+      typesafeSource: this.state.typesafeSource,
+      // The Jev transport's own endpoint ("" returns to the source's default)
+      // — a separate field from the profile's primary `baseUrl`.
+      jevToolsBaseUrl,
+      // Sent explicitly on every save so unchecking it actually reaches the
+      // wire (an omitted value keeps whatever is stored).
+      jevToolsSendScreenshots: this.state.jevToolsSendScreenshots
+    };
+  }
+
   async saveJevTools(typesafeSecrets = {}) {
     this.state.savingJevTools = true;
     this.state.banner = null;
     this._notify();
 
-    const pendingTransportSource = this.state.typesafeSource;
-    const pendingBaseUrl = this.state.jevToolsBaseUrlDraft.trim();
-    if (pendingBaseUrl) {
-      let valid = false;
-      try {
-        const url = new URL(pendingBaseUrl);
-        valid = url.protocol === "https:" || url.protocol === "http:";
-      } catch {
-        valid = false;
-      }
-      if (!valid) {
-        this.state.savingJevTools = false;
-        this.state.banner = { kind: "error", title: "Base URL không hợp lệ", message: "Base URL vận chuyển Jev phải là địa chỉ http(s) đầy đủ, ví dụ https://inference.runanywhere.ai. Để trống để dùng mặc định.", action: "" };
-        this._notify();
-        return { ok: false, error: "invalid Jev transport base URL" };
-      }
+    const jevConfig = this.#pendingJevToolsConfig();
+    if (!jevConfig) {
+      this.state.savingJevTools = false;
+      this.state.banner = { kind: "error", title: "Base URL không hợp lệ", message: "Base URL vận chuyển Jev phải là địa chỉ http(s) đầy đủ, ví dụ https://inference.runanywhere.ai. Để trống để dùng mặc định.", action: "" };
+      this._notify();
+      return { ok: false, error: "invalid Jev transport base URL" };
     }
     let inFlightOp = null;
     try {
       inFlightOp = "set_typesafe_config";
-      const config = await this.client.setTypesafeConfig(this.state.profileId, {
-        typesafeSource: pendingTransportSource,
-        // The Jev transport's own endpoint ("" returns to the source's
-        // default) — a separate field from the profile's primary `baseUrl`.
-        jevToolsBaseUrl: pendingBaseUrl,
-        // The Jev-tools screenshot toggle
-        // (jev-subgoal-screenshots-default-off task 3.2), sent explicitly on
-        // every save so unchecking it in the DOM actually reaches the wire
-        // (an omitted value would keep whatever is stored, exactly like
-        // every other field here).
-        jevToolsSendScreenshots: this.state.jevToolsSendScreenshots
-        // No primary `baseUrl`, no text-model fields: see this method's doc comment
-        // above.
-      });
+      const config = await this.client.setTypesafeConfig(this.state.profileId, jevConfig);
       this._applyProfile(config);
       // The config just changed host-side, so a previously recorded Jev-tools
       // test result no longer describes this profile — same reasoning as

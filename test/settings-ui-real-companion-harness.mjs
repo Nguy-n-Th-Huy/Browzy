@@ -65,6 +65,15 @@ export async function createRealCompanionHarness(opts = {}) {
             defaultModelId: msg.defaultModelId
           });
           break;
+        case "set_typesafe_config":
+          // Mirrors companion.js's routing of the Jev-tools config, which the
+          // bottom Save button now sends alongside save_profile.
+          result = await profileModule.setTypesafeConfig(msg.profileId, {
+            typesafeSource: msg.typesafeSource,
+            jevToolsBaseUrl: msg.jevToolsBaseUrl,
+            jevToolsSendScreenshots: msg.jevToolsSendScreenshots
+          });
+          break;
         case "set_credential":
           result = await profileModule.setCredential(msg.profileId, msg.secret, { memoryOnly: true }); // memoryOnly forced true — see file header
           break;

@@ -2880,7 +2880,7 @@ export class CompanionCore {
               return fail("PROTOCOL_ERROR", `set_typesafe_config ${field} must be a string when present`);
             }
           }
-          // The Jev source ("typesafe" | "vercel" | "openrouter" | "runanywhere"). Shape-checked here; the
+          // The Jev source ("typesafe" | "vercel" | "openrouter" | "runanywhere" | "openai"). Shape-checked here; the
           // VALUE is validated by settings.setTypesafeConfig() so exactly one
           // place owns the known list (profile-schema.js's TYPESAFE_SOURCES).
           if (envelope.typesafeSource !== undefined && typeof envelope.typesafeSource !== "string") {

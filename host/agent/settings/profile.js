@@ -39,6 +39,7 @@ import {
   DEFAULT_TYPESAFE_GATEWAY_BASE_URL,
   DEFAULT_TYPESAFE_OPENROUTER_BASE_URL,
   DEFAULT_TYPESAFE_RUNANYWHERE_BASE_URL,
+  DEFAULT_TYPESAFE_OPENAI_BASE_URL,
   DEFAULT_TYPESAFE_SOURCE,
   TYPESAFE_MODEL_SEEDS,
   isKnownProviderType,
@@ -171,6 +172,7 @@ function typesafeDefaultForSource(source) {
   if (source === "vercel") return DEFAULT_TYPESAFE_GATEWAY_BASE_URL;
   if (source === "openrouter") return DEFAULT_TYPESAFE_OPENROUTER_BASE_URL;
   if (source === "runanywhere") return DEFAULT_TYPESAFE_RUNANYWHERE_BASE_URL;
+  if (source === "openai") return DEFAULT_TYPESAFE_OPENAI_BASE_URL;
   return DEFAULT_TYPESAFE_BASE_URL;
 }
 
@@ -238,7 +240,7 @@ export async function loadProfile() {
     textModelId: stored.textModelId || null,
     hasTypesafeKey: Boolean(stored.hasTypesafeKey),
     hasTextModelKey: Boolean(stored.hasTextModelKey),
-    // The persisted Jev source ("typesafe" | "vercel" | "openrouter" | "runanywhere"), read
+    // The persisted Jev source ("typesafe" | "vercel" | "openrouter" | "runanywhere" | "openai"), read
     // by the Jev browser tools' resolvers; a profile saved before the field
     // existed loads as the default source (resolveTypesafeSource(),
     // profile-schema.js's TYPESAFE_SOURCES).
@@ -612,7 +614,7 @@ export async function removeCredential(profileId) {
 /**
  * Persist the "Jev browser tools" settings section for an `anthropic`/
  * `chatgpt` profile: the Jev transport source (`typesafe` direct, `vercel`
- * AI Gateway, `openrouter` or `runanywhere`), the operator's own Jev
+ * AI Gateway, `openrouter`, `runanywhere` or `openai`), the operator's own Jev
  * transport base URL, and the Jev-tools screenshot toggle. Never
  * touches a key — that lives only in the merged secret record below.
  *
@@ -1037,7 +1039,7 @@ export function primaryTextModelFromSnapshot(snapshot) {
  * @param {string} profileId
  * @param {{ textModel?: { kind: "anthropic", baseUrl: string, model: string, apiKey: string } | null }} [opts]
  * @returns {Promise<null | {
- *   source: "typesafe"|"vercel"|"openrouter"|"runanywhere", endpoint: string, apiKey: string, model: string,
+ *   source: "typesafe"|"vercel"|"openrouter"|"runanywhere"|"openai", endpoint: string, apiKey: string, model: string,
  *   decisionSource: "anthropic"|"chatgpt",
  *   textModel: { kind: "anthropic", baseUrl: string, model: string, apiKey: string },
  *   sendScreenshots: boolean, consultSources: boolean, searchSources: boolean

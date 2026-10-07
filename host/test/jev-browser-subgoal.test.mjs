@@ -125,6 +125,18 @@ test("the runanywhere source resolves the RunAnywhere endpoint and the Eve model
   assert.equal(config.model, "eve");
 });
 
+test("the openai source resolves the OpenAI endpoint and the gpt-6-luna model, and a custom base URL overrides it", async () => {
+  await anthropicProfileWithJev({ typesafeSource: "openai" });
+  const config = await profile.resolveJevBrowserSubgoalConfig(TEST_PROFILE_ID, { textModel: PRIMARY_TEXT_MODEL });
+  assert(config);
+  assert.equal(config.source, "openai");
+  assert.equal(config.endpoint, "https://api.openai.com");
+  assert.equal(config.model, "gpt-6-luna");
+  await profile.setTypesafeConfig(TEST_PROFILE_ID, { jevToolsBaseUrl: "https://proxy.example/oai/" });
+  const custom = await profile.resolveJevBrowserSubgoalConfig(TEST_PROFILE_ID, { textModel: PRIMARY_TEXT_MODEL });
+  assert.equal(custom.endpoint, "https://proxy.example/oai");
+});
+
 test("a saved Jev base URL overrides the source default without touching the primary baseUrl, and clearing it restores the default", async () => {
   await anthropicProfileWithJev({ typesafeSource: "runanywhere" });
   await profile.setTypesafeConfig(TEST_PROFILE_ID, { jevToolsBaseUrl: " https://proxy.example/jev/ " });

@@ -56,6 +56,10 @@ export const DEFAULT_TYPESAFE_OPENROUTER_BASE_URL = "https://openrouter.ai";
 // `runanywhere` (Eve over `POST /v1/decisions`).
 export const DEFAULT_TYPESAFE_RUNANYWHERE_BASE_URL = "https://inference.runanywhere.ai";
 
+// The OpenAI endpoint the Jev transport uses when its source is `openai`
+// (the Decisions API, `POST /v1/decisions`, which also accepts inline images).
+export const DEFAULT_TYPESAFE_OPENAI_BASE_URL = "https://api.openai.com";
+
 // The ways the Jev browser tools (`extract_page`, `browser_subgoal`) reach
 // the Jev transport. `typesafe` is the provider's own System One endpoint
 // (`POST /v1/systemone`, a TypeSafe API key); `vercel` is the Vercel AI
@@ -69,7 +73,7 @@ export const DEFAULT_TYPESAFE_RUNANYWHERE_BASE_URL = "https://inference.runanywh
 // chat-completion or Messages ports: it is an evaluation model, and those
 // ports refuse it. The profile persists the choice; every consumer branches
 // on it, and nothing sniffs the endpoint URL to guess.
-export const TYPESAFE_SOURCES = /** @type {const} */ (["typesafe", "vercel", "openrouter", "runanywhere"]);
+export const TYPESAFE_SOURCES = /** @type {const} */ (["typesafe", "vercel", "openrouter", "runanywhere", "openai"]);
 export const DEFAULT_TYPESAFE_SOURCE = "typesafe";
 
 // The Jev-tools screenshot toggle: controls ONLY whether a `browser_subgoal`
@@ -211,7 +215,8 @@ export const TYPESAFE_MODEL_SEEDS = Object.freeze({
   typesafe: [{ id: "jev-latest", label: "Jev (ultrafast)" }],
   vercel: [{ id: "typesafe-ai/jev", label: "Jev (Vercel AI Gateway)" }],
   openrouter: [{ id: "typesafe/jev-1.13", label: "Jev (OpenRouter, alpha)" }],
-  runanywhere: [{ id: "eve", label: "Eve (RunAnywhere)" }]
+  runanywhere: [{ id: "eve", label: "Eve (RunAnywhere)" }],
+  openai: [{ id: "gpt-6-luna", label: "GPT-6 Luna (OpenAI Decisions)" }]
 });
 
 /**

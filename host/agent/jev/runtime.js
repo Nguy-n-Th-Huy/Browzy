@@ -332,7 +332,7 @@ const BOOTSTRAP_FAILURE_TEXT = Object.freeze({
  * @param {(toolName: string, args: object) => Promise<{behavior: string, message?: string}>} opts.canUseTool
  *   - the approval gate, called with the LEGACY tool name (can-use-tool.js
  *   accepts both call shapes)
- * @param {{ source?: "typesafe"|"vercel"|"openrouter", conversation?: Array<object>, endpoint: string, apiKey: string, model: string, goal: string, tabId: number,
+ * @param {{ source?: "typesafe"|"vercel"|"openrouter"|"runanywhere"|"openai", conversation?: Array<object>, endpoint: string, apiKey: string, model: string, goal: string, tabId: number,
  *   sendScreenshots?: boolean,
  *   textModel: { baseUrl: string, model: string, apiKey: string } }} opts.provider
  *   - `sendScreenshots` is the profile's screenshot toggle, already resolved
@@ -409,6 +409,12 @@ export async function runTypesafeRun({
   // default and hands the runtime a boolean; ONLY an explicit `true` enables
   // captures, so an unresolved/absent flag makes every request text-only.
   const screenshotsEnabled = provider.sendScreenshots === true;
+  // The OpenAI Decisions source looks at the page itself: with screenshots on,
+  // each decision request carries the capture and the primary LLM (planning,
+  // completion) only generates text, receiving no image and producing no
+  // image-derived visual notes. Every other source keeps the capture on the
+  // primary LLM and decides from the structured snapshot alone.
+  const imageToDecision = provider.source === "openai" && screenshotsEnabled;
   // Operator literal field values (openspec/changes/jev-literal-field-values):
   // parsed ONCE, here, from `provider.goal` alone — the operator's own prompt
   // for this turn, never plan memory, model output, conversation history or
@@ -613,6 +619,9 @@ export async function runTypesafeRun({
       doneIsDecided: outcome === "done",
       ...(outcome === "done" ? { doneVerified: verified } : {}),
       ...(disclosedError ? { summaryError: disclosedError } : {}),
+      // The failure itself (code and bounded message, never a credential:
+      // JevError messages carry none), so a log names why a run errored.
+      ...(outcome === "error" && error ? { error: { code: error.code ?? null, message: String(error.message ?? "").slice(0, 300) } } : {}),
       // Whether this run produced an answer at all, so a turn without one
       // shows a disclosed absence rather than reading as a blank reply.
       hasResult: resultEmitted,
@@ -792,6 +801,20 @@ export async function runTypesafeRun({
     if (!data || !mimeType) return null;
     captureFailure = null;
     return { data, mimeType, artifactId: screenshotArtifact(content) };
+  }
+
+  // The capture attached to one decision request (`imageToDecision` only): a
+  // fresh capture of the observation `snap` — re-read after the capture, and
+  // dropped when the page moved meanwhile, so the picture never depicts a
+  // different page than the structured state beside it. Advisory like every
+  // capture: no image means a text-only decision and nothing else changes.
+  async function captureForDecision(snap, snapSignature) {
+    if (!imageToDecision || !snap) return null;
+    const image = await capturePage();
+    if (!image || !isRunning()) return null;
+    const current = await observe();
+    if (!current.ok || current.snapshot.docNonce !== snap.docNonce || observationSignature(current.snapshot) !== snapSignature) return null;
+    return { data: image.data, mimeType: image.mimeType };
   }
 
   async function captureStepEvidence(snap, target, operation) {
@@ -1066,7 +1089,7 @@ export async function runTypesafeRun({
   // shortened and must never become the identity of a persistent value.
   async function prepare(trigger) {
     const space = snapshot ? buildActionSpace(snapshot) : { elements: [], omitted: null, targets: {} };
-    const image = snapshot && screenshotsEnabled ? await capturePage() : null;
+    const image = snapshot && screenshotsEnabled && !imageToDecision ? await capturePage() : null;
     if (!isRunning()) return false;
     emitPhase("planning");
     const planned = await requestActionPlan({
@@ -1076,7 +1099,7 @@ export async function runTypesafeRun({
       // site, when the caller supplied any. Plan-request context only; no
       // selection, verification or bound in this loop reads it.
       ...(typeof provider.priorPathAdvice === "string" && provider.priorPathAdvice ? { priorPathAdvice: provider.priorPathAdvice } : {}),
-      elementsOmitted: space.omitted, history, image, reason: trigger, now, sleep
+      elementsOmitted: space.omitted, history, image, visualNotes: !imageToDecision, reason: trigger, now, sleep
     });
     if (!isRunning()) return false;
     const revision = planRevision + 1;
@@ -1285,7 +1308,7 @@ export async function runTypesafeRun({
       signature = freshSignature;
       recordObservation(snapshot);
     }
-    let built, selected;
+    let built, selected, decisionImage = null;
     try {
       if (snapshot?.docNonce && snapshot.docNonce === pendingNewDocument) {
         snapshot = { ...snapshot, elements: snapshot.elements.map((element) =>
@@ -1293,9 +1316,10 @@ export async function runTypesafeRun({
       }
       built = buildDecisionRequest({ model: provider.model, goal: provider.goal, snapshot, memory, history, prepared: eligiblePreparation() });
       pendingNewRefs.clear();
+      decisionImage = await captureForDecision(snapshot, signature);
       emitPhase("deciding");
       selected = await requestDecision({ source: provider.source, endpoint: provider.endpoint,
-        apiKey: provider.apiKey, model: provider.model, body: built.body, now, sleep });
+        apiKey: provider.apiKey, model: provider.model, body: built.body, ...(decisionImage ? { image: decisionImage } : {}), now, sleep });
     } catch (err) {
       if (!isRunning()) {
         emitStep({ step: executed + 1, operation: null, target: null, tool: null, skippedReason: "stopped", decisionSource: "jev", pageChanged: false });
@@ -1339,6 +1363,9 @@ export async function runTypesafeRun({
       tool: null,
       argsSummary: null,
       latencies: { decisionMs: decidedStep.latencyMs },
+      // Whether this decision request carried the page capture (only ever
+      // true for a source that takes images in the decision itself).
+      ...(imageToDecision ? { decisionImage: Boolean(decisionImage) } : {}),
       pageChanged: false,
       // What the model was looking at when it decided, bounded — a diagnostic
       // record, never model input. Live runs that scrolled away from a page
@@ -1405,7 +1432,7 @@ export async function runTypesafeRun({
         emitStep(step);
         return finish({ outcome: "done", reason: null, doneVerified: false });
       }
-      image = screenshotsEnabled ? await capturePage() : null;
+      image = screenshotsEnabled && !imageToDecision ? await capturePage() : null;
       if (!isRunning()) return finish({ outcome: "stopped", reason: "stopped" });
       // A fresh completion consultation gets one optional screenshot. Jev
       // receives only structured text; its positive monitor is not proof.

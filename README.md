@@ -463,8 +463,10 @@ lets `browser_subgoal` reach Jev's structured-choice decisions.
 
 1. **Turn them on.** In **Settings**, the **Jev browser tools** section is
    shown for every profile. Choose the **Nguồn vận chuyển Jev** ("Jev transport
-   source"): **TypeSafe API**, **Vercel AI Gateway**, or **OpenRouter
-   (alpha)**. Enter and save the transport key for that source. Saving that
+   source"): **TypeSafe API**, **Vercel AI Gateway**, **OpenRouter
+   (alpha)**, **RunAnywhere (Eve)**, or **OpenAI Decisions** (`POST
+   /v1/decisions`, model `gpt-6-luna`, default base
+   `https://api.openai.com`). Enter and save the transport key for that source. Saving that
    key is the only switch: once it is saved, both tools appear together; while
    it is missing or cleared, neither appears, and an incomplete configuration
    never errors — the tools simply don't show up.
@@ -487,7 +489,13 @@ lets `browser_subgoal` reach Jev's structured-choice decisions.
    `browser_subgoal` cycle also sends a screenshot of the controlled tab to
    the profile's primary provider, for that provider's own optional
    planning/content step. Jev's own action selection is unaffected either way:
-   it always decides from the structured `page_snapshot`, never from an image.
+   it decides from the structured `page_snapshot`, never from an image. The
+   exception is the **OpenAI Decisions** source, which accepts images: with
+   screenshots on, the capture is sent to the decision request itself and the
+   primary provider receives no image (it only generates text). If a capture
+   fails or goes stale, that decision falls back to text input. The settings
+   test for this source runs a text probe and an image probe, and both must
+   pass.
 
 Every dispatch behind these tools passes exactly the same host-side
 authorization any other tool call passes: run-state and lease checks, tab
@@ -496,9 +504,12 @@ could submit, send, pay, or confirm.
 
 **Usage and billing follow those services separately**: the `browser_subgoal`
 structured-choice requests are billed by whichever Jev transport source you
-chose (TypeSafe, Vercel AI Gateway, or OpenRouter); the profile's primary
-provider bills whatever calls the tools make to it (the `extract_page`
-extraction call, and `browser_subgoal`'s optional planning screenshot).
+chose (TypeSafe, Vercel AI Gateway, OpenRouter, RunAnywhere, or OpenAI — the
+last bills input tokens, including any screenshot, at OpenAI's Decisions rate);
+the profile's primary provider bills whatever calls the tools make to it (the
+`extract_page` extraction call, and `browser_subgoal`'s optional planning
+screenshot, except on the OpenAI source where the screenshot goes to the
+decision request).
 
 The external-MCP path is unaffected — it keeps using whatever model/auth your
 Claude Code session supplies.

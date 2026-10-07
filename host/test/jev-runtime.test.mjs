@@ -32,7 +32,7 @@ import { createCanUseTool } from "../agent/policy/can-use-tool.js";
 import { ToolBridge } from "../agent/broker/tool-bridge.js";
 import { isBorrowedTabMutationAuthorized, authorizeBorrowedTabMutation } from "../agent/tools/mapping.js";
 import { runTypesafeRun, MAX_ACTIONS, MAX_DECISIONS, MAX_REPLAY_URL_CHARS, MEMORY_UPDATE_EVERY_ACTIONS, MAX_MEMORY_UPDATES, MAX_VERIFICATION_REJECTIONS, MAX_RECOVERIES, SCROLL_ONLY_STREAK_LIMIT } from "../agent/jev/runtime.js";
-import { ACTION_PLAN, NEXT_STEP, TARGET_SELECTION, RUN_PLAN, MEMORY_REVISION, COMPLETION_CHECK, STALL_RECOVERY, FINAL_REPORT } from "../agent/jev/text-helper.js";
+import { ACTION_PLAN, ACTION_PLAN_TEXT_ONLY, NEXT_STEP, TARGET_SELECTION, RUN_PLAN, MEMORY_REVISION, COMPLETION_CHECK, STALL_RECOVERY, FINAL_REPORT } from "../agent/jev/text-helper.js";
 import { HOST_DROPPED_ERROR } from "../tool-runtime.js";
 import { fetchSource } from "../agent/jev/source-fetch.js";
 import { deriveRunDraft } from "../agent/skills/workflows-materialize.js";
@@ -266,12 +266,33 @@ async function startModelServer({ steps, select, text } = {}) {
       if (String(req.url).endsWith("/chat/completions")) {
         state.chat += 1;
         const index = state.chat - 1;
-        if (instructionOf(body) === ACTION_PLAN) {
+        if (instructionOf(body) === ACTION_PLAN || instructionOf(body) === ACTION_PLAN_TEXT_ONLY) {
           state.preparationContexts.push(contextOf(body));
           return respondChat(res, (text ? text(body, index) : undefined) ?? defaultPlan(body));
         }
         const reply = (text ? text(body, index) : undefined) ?? defaultTextReply(body);
         return respondChat(res, reply);
+      }
+      if (String(req.url).endsWith("/v1/decisions")) {
+        // The OpenAI Decisions wire asks the action factored: `operation`,
+        // one `target_<OPERATION>` per multi-candidate family (each choice
+        // ends in `[ref]`), then `goal_done`/`stuck`. The scripted step is
+        // answered as the operation plus, when its family was asked, the
+        // first candidate (the scripted scenarios name operations only).
+        const stateText = typeof body.input === "string" ? body.input : body.input[0].content[0].text;
+        state.decisions += 1;
+        const step = scripted({ state: JSON.parse(stateText), questions: {} }, state.decisions - 1);
+        const operation = step?.operation === "BLOCKED" ? "ASK" : step?.operation;
+        const winnerOf = (q) => {
+          if (q.name === "operation") return q.choices.find((c) => c.value === operation)?.value ?? "NOT_OFFERED";
+          if (q.name.startsWith("target_")) return q.choices[0].value;
+          return "no";
+        };
+        const answers = body.questions.map((q) => {
+          const choice = winnerOf(q);
+          return { name: q.name, type: "choice", choice, probabilities: q.choices.map((c) => ({ value: c.value, probability: c.value === choice ? 1 : 0 })), confidence: 0.9 };
+        });
+        return sendJson(res, 200, { answers, usage: { total_tokens: 11 } });
       }
       state.systemone += 1;
       const index = state.systemone - 1;
@@ -2027,6 +2048,8 @@ await test("a malformed step decision is refused as invalid_decision and dispatc
       outcome.error.message.includes("action:choice_not_offered"),
       outcome.error.message
     );
+    const end = h.events.find((e) => e.type === "jev_end");
+    assert(end?.error?.code === "INVALID_RESPONSE" && end.error.message.includes("action:choice_not_offered"), `the terminal record names why the run errored — got ${JSON.stringify(end?.error)}`);
     assert(dispatches(h.bridgeCalls).length === 0, "a refused decision must never reach the bridge");
     assert(server.state.systemone === 1, "the malformed Jev answer is the only decision request");
     assert(jevSteps(h.events).length === 0, "no step may be fabricated for a refused decision");
@@ -2688,6 +2711,79 @@ await test("screenshots on: read-only captures accompany preparation, step evide
     assert(!JSON.stringify(jevSteps(h.events)).includes(SCREENSHOT_B64), "no durable step record carries the image");
     const actions = dispatches(h.bridgeCalls).filter((c) => !(c.name === "computer" && c.args?.action === "screenshot"));
     assert(actions.length === 1 && actions[0].name === "form_input", `the only non-capture dispatch is the typed step (got ${actions.length})`);
+  } finally {
+    await server.close();
+  }
+});
+
+// The OpenAI Decisions source: the capture goes to the decision request and the
+// primary LLM only generates text.
+const openaiDecisionBodies = (server) => server.state.bodies.filter((b, i) => String(server.state.paths[i]).endsWith("/v1/decisions"));
+
+await test("openai source with screenshots: the decision input carries the capture and the primary LLM gets text only", async () => {
+  const server = await startModelServer({
+    steps: [{ operation: "TYPE_TEXT", intent: "the destination field", text: "Zurich" }, { operation: "DONE" }]
+  });
+  const h = await harness({ snapshots: [snapshot(), filledSnapshot()], callTool: captureStub });
+  try {
+    const outcome = await runTypesafeRun({
+      run: h.run, toolBridge: h.toolBridge, coerceArgs: h.coerceArgs, canUseTool: h.canUseTool,
+      provider: providerFor(server, { source: "openai", model: "gpt-6-luna", sendScreenshots: true })
+    });
+    assert(outcome.outcome === "done" && outcome.doneVerified === true, JSON.stringify(outcome));
+    const decisions = openaiDecisionBodies(server);
+    assert(decisions.length === 2, `two decision requests (got ${decisions.length})`);
+    for (const body of decisions) {
+      assert(Array.isArray(body.input), "the decision input is a message array");
+      const image = body.input[0].content[1];
+      assert(image.type === "input_image" && image.image_url === expectedImageUrl(), JSON.stringify(image).slice(0, 120));
+    }
+    assert(chatCalls(server, ACTION_PLAN).length === 0 && chatCalls(server, ACTION_PLAN_TEXT_ONLY).length === 1, "the openai plan uses its text-only instruction");
+    const chat = server.state.bodies.filter((b, i) => String(server.state.paths[i]).endsWith("/chat/completions"));
+    assert(chat.length === 2, `preparation and completion check (got ${chat.length})`);
+    assert(chat.every((b) => typeof b.messages[1].content === "string"), "the primary LLM receives no image part");
+    assert(!chat.some((b) => /visualNotes/.test(instructionOf(b))) , "no visual notes are requested");
+    const decided = jevSteps(h.events).filter((e) => e.latencies?.decisionMs !== undefined);
+    assert(decided.length && decided.every((e) => e.decisionImage === true), `every decided step records that its decision carried the capture — got ${JSON.stringify(decided.map((e) => e.decisionImage))}`);
+    const evidence = jevSteps(h.events).find((e) => e.evidence?.screenshot);
+    assert(!evidence || evidence.evidence.screenshot.status !== undefined, "step evidence records the screenshot status as before");
+  } finally {
+    await server.close();
+  }
+});
+
+await test("openai source: a failed capture sends string input and the run continues", async () => {
+  const server = await startModelServer({ steps: [{ operation: "DONE" }] });
+  const h = await harness({
+    snapshots: [snapshot()],
+    callTool: async ({ name, args }) => (name === "computer" && args?.action === "screenshot" ? { content: [{ type: "text", text: "Error: the tab is gone" }] } : undefined)
+  });
+  try {
+    const outcome = await runTypesafeRun({
+      run: h.run, toolBridge: h.toolBridge, coerceArgs: h.coerceArgs, canUseTool: h.canUseTool,
+      provider: providerFor(server, { source: "openai", model: "gpt-6-luna", sendScreenshots: true })
+    });
+    assert(outcome.outcome === "done", JSON.stringify(outcome));
+    const decisions = openaiDecisionBodies(server);
+    assert(decisions.length >= 1 && decisions.every((b) => typeof b.input === "string"), "decision input is a string when the capture fails");
+    const decided = jevSteps(h.events).filter((e) => e.latencies?.decisionMs !== undefined);
+    assert(decided.length && decided.every((e) => e.decisionImage === false), `a decision without the capture records decisionImage false — got ${JSON.stringify(decided.map((e) => e.decisionImage))}`);
+  } finally {
+    await server.close();
+  }
+});
+
+await test("openai source with screenshots off: no capture is made and the input is a string", async () => {
+  const server = await startModelServer({ steps: [{ operation: "DONE" }] });
+  const h = await harness({ snapshots: [snapshot()], callTool: captureStub });
+  try {
+    const outcome = await runTypesafeRun({
+      run: h.run, toolBridge: h.toolBridge, coerceArgs: h.coerceArgs, canUseTool: h.canUseTool,
+      provider: providerFor(server, { source: "openai", model: "gpt-6-luna", sendScreenshots: false })
+    });
+    assert(outcome.outcome === "done", JSON.stringify(outcome));
+    assert(captureCalls(h.bridgeCalls).length === 0, "no capture");
+    assert(openaiDecisionBodies(server).every((b) => typeof b.input === "string"), "string input");
   } finally {
     await server.close();
   }

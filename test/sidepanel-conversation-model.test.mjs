@@ -1466,7 +1466,7 @@ console.log("== an interrupted Jev run keeps its executed steps and is labelled 
   ok(failedTurn.toolRows.length === 1 && failedTurn.toolRows[0].status === "succeeded", "the step that did run stays visible under the failure");
   ok(failedTurn.jevOutcome.outcome === "error" && failedTurn.jevOutcome.reason === "invalid_decision", "the failure is named by its own recorded reason");
   const failedLine = jevOutcomeLineVi(failedTurn.jevOutcome);
-  ok(failedLine.includes("câu trả lời của TypeSafe không hợp lệ"), `the invalid decision is shown in Vietnamese: ${failedLine}`);
+  ok(failedLine.includes("câu trả lời của mô hình quyết định (Jev) không hợp lệ"), `the invalid decision is shown in Vietnamese: ${failedLine}`);
   ok(!failedLine.includes("invalid_decision"), "no raw reason token survives the label table");
 }
 

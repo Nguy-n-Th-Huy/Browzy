@@ -565,10 +565,230 @@ async function runanywhereAnswers({ endpoint, apiKey, model, body, post }) {
   return { answers, usage };
 }
 
+// --- The OpenAI Decisions source ------------------------------------------
+//
+// An `openai`-source profile asks OpenAI's Decisions API (`POST /v1/decisions`,
+// model `gpt-6-luna`), which answers typed questions over text and inline
+// images. Every question is a `choice` (a yes/no head too: the `predicate`
+// type returns no `confidence`, which the validator needs), every offered
+// option is sent without bracketing, and the `answers` array is mapped back to
+// the Jev shape. The runtime's `action` head is asked factored (operation, then
+// element per operation; see below) in the same request. A missing probability
+// or confidence is a malformed response; nothing is derived or invented.
+export const OPENAI_DECISIONS_PATH = "/v1/decisions";
+
+export function openaiDecisionsUrl(endpoint) {
+  return `${String(endpoint ?? "").replace(/\/+$/, "")}${OPENAI_DECISIONS_PATH}`;
+}
+
+// The runtime's `action` head offers every element once per operation, each
+// described only as `{"operation","ref"}`. Jev is trained on that table; a
+// general decision model is not: CLICK and HOVER on the same element split the
+// mass between them, and a bare ref has to be looked up in `state.elements`.
+// Observed live (2026-10): top choices of 0.1–0.3 with a runner-up within 0.05,
+// so most cycles abstained. The `action` head is therefore asked factored, in
+// the same single request: one `operation` question over the operation
+// families, and one `target_<OPERATION>` question per family that offers more
+// than one candidate, each choice described by the element's role and label.
+// The joint P(key) = P(operation) * P(key | operation) sums to 1 over every
+// offered key, so `validateDecision` checks it exactly as a direct answer.
+const OPENAI_OPERATION_DESCRIPTIONS = Object.freeze({
+  CLICK: "Click an element: links, buttons, checkboxes, radios, tabs, fields to focus.",
+  HOVER: "Only move the pointer over an element to open a pointer-only menu. Never for a link or button that should be activated.",
+  TYPE_TEXT: "Type prepared text into a field. For a date field with a prepared date, type it rather than using its calendar.",
+  SELECT: "Choose an option in a dropdown (native select).",
+  NAVIGATE: "Open a prepared URL.",
+  SCROLL_DOWN: "Scroll down to reveal more of the page.",
+  SCROLL_UP: "Scroll up.",
+  WAIT: "Wait for the page to finish changing.",
+  REPLAN: "Request fresh planning or content for a new field.",
+  ASK: "Ask the operator for help.",
+  DONE: "Request verification that the goal is complete; never proves success."
+});
+
+function parseActionCriterion(text) {
+  try {
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === "object" && typeof parsed.operation === "string" && parsed.operation ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function describeOpenAITarget(action, element) {
+  const role = element?.role ? `${element.role} ` : "";
+  const label = element?.label ? JSON.stringify(element.label) : "(no label)";
+  const parts = [`${role}${label} [${action.ref}]`];
+  if (element?.value) parts.push(`current value ${JSON.stringify(element.value)}`);
+  if (action.option !== undefined) parts.push(`option ${JSON.stringify(action.option)}`);
+  else if (action.value !== undefined) parts.push(`value ${JSON.stringify(action.value)}`);
+  if (action.url) parts.push(`url ${action.url}${action.purpose ? ` (${action.purpose})` : ""}`);
+  return parts.join(", ");
+}
+
+/**
+ * The factored questions for a runtime `action`/`goal_done`/`stuck` body, or
+ * null when the body is not that protocol or an action criterion cannot be
+ * read (then every head is asked as-is).
+ */
+function openaiFactoredQuestions(body) {
+  const heads = body?.questions;
+  if (!heads?.action || !heads.goal_done || !heads.stuck) return null;
+  const families = new Map();
+  for (const [key, text] of Object.entries(heads.action.criteria ?? {})) {
+    const action = parseActionCriterion(text);
+    if (!action) return null;
+    if (!families.has(action.operation)) families.set(action.operation, []);
+    families.get(action.operation).push({ key, action });
+  }
+  if (!families.size) return null;
+  const elements = new Map((Array.isArray(body?.state?.elements) ? body.state.elements : []).map((el) => [el?.ref, el]));
+  const rules = runanywhereQuestionText(heads.action);
+  const questions = [];
+  if (families.size > 1) {
+    questions.push({
+      type: "choice",
+      name: "operation",
+      instructions: `${rules}\nChoose the kind of action to take next; the element is chosen separately.`,
+      choices: [...families.keys()].map((value) => ({ value, description: OPENAI_OPERATION_DESCRIPTIONS[value] ?? value }))
+    });
+  }
+  for (const [operation, members] of families) {
+    if (members.length < 2) continue;
+    questions.push({
+      type: "choice",
+      name: `target_${operation}`,
+      instructions: `${rules}\nIf the next action is ${operation}, which element should it act on?`,
+      choices: members.map(({ key, action }) => ({ value: key, description: describeOpenAITarget(action, elements.get(action.ref)) }))
+    });
+  }
+  for (const name of ["goal_done", "stuck"]) {
+    const head = heads[name];
+    questions.push({
+      type: "choice",
+      name,
+      instructions: runanywhereQuestionText(head),
+      choices: Object.keys(head.criteria ?? {}).map((value) => ({ value, description: String(head.criteria[value] ?? "") }))
+    });
+  }
+  return { questions, families };
+}
+
+/** Recompose the factored answers into the Jev `action` answer (joint probabilities). */
+function composeFactoredAction(answers, families) {
+  const operationProbabilities = families.size > 1 ? answers.operation.probabilities : { [families.keys().next().value]: 1 };
+  const probabilities = {};
+  for (const [operation, members] of families) {
+    const within = members.length > 1 ? answers[`target_${operation}`].probabilities : { [members[0].key]: 1 };
+    for (const { key } of members) probabilities[key] = operationProbabilities[operation] * within[key];
+  }
+  return choiceAnswer(probabilities);
+}
+
+/**
+ * The OpenAI request for one Jev body, plus the answers decided locally.
+ * `input` is the state JSON string, or one user message carrying the state and
+ * an inline base64 `input_image` when `image` ({ data, mimeType }) is given.
+ * A head with exactly one option is answered locally (probability 1) and not
+ * sent; `request.questions` is empty when nothing remains to ask.
+ */
+export function openaiRequestBody(body, image) {
+  const stateText = JSON.stringify(body?.state ?? {});
+  const hasImage = image && typeof image.data === "string" && image.data && typeof image.mimeType === "string" && image.mimeType;
+  const input = hasImage
+    ? [
+        {
+          role: "user",
+          content: [
+            { type: "input_text", text: stateText },
+            { type: "input_image", image_url: `data:${image.mimeType};base64,${image.data}` }
+          ]
+        }
+      ]
+    : stateText;
+  const factored = openaiFactoredQuestions(body);
+  if (factored) return { request: { input, questions: factored.questions }, local: {}, factored };
+  const questions = [];
+  const local = {};
+  const heads = Object.entries(body?.questions ?? {}).filter(([, head]) => head && typeof head === "object" && !Array.isArray(head));
+  for (const [name, head] of heads) {
+    const criteria = head.criteria ?? {};
+    const ids = Object.keys(criteria);
+    if (ids.length === 1) {
+      local[name] = choiceAnswer({ [ids[0]]: 1 });
+    } else {
+      questions.push({
+        type: "choice",
+        name,
+        instructions: runanywhereQuestionText(head),
+        choices: ids.map((value) => ({ value, description: String(criteria[value] ?? "") }))
+      });
+    }
+  }
+  return { request: { input, questions }, local };
+}
+
+/** Map OpenAI's `answers[]` to Jev answers for the asked `questions`; throws INVALID_RESPONSE on any gap. */
+export function normalizeOpenAIResponse(json, questions) {
+  const bad = (reason) => new JevError("INVALID_RESPONSE", `OpenAI returned an unusable decision (${reason}); no action executed.`, { detail: { reason } });
+  const list = json && typeof json === "object" ? json.answers : null;
+  if (!Array.isArray(list)) throw bad("answers_missing");
+  const answers = {};
+  for (const question of questions) {
+    const item = list.find((entry) => entry && typeof entry === "object" && entry.name === question.name);
+    if (!item) throw bad(`${question.name}:answer_missing`);
+    // Observed live (2026-10-07): the API may abstain from a conditional
+    // `target_<OPERATION>` question ("if the next action is X, which
+    // element?") when it judges X unlikely — the answer then carries only
+    // `type` and `name`. An abstention expresses no preference within that
+    // family, so it is uniform there; the joint and the selection floor decide
+    // whether anything in it is decisive enough to act. Every other question
+    // must be answered in full.
+    const abstained = item.choice === undefined && item.probabilities === undefined && item.confidence === undefined;
+    if (abstained && question.name.startsWith("target_")) {
+      const uniform = Object.fromEntries(question.choices.map(({ value }) => [value, 1 / question.choices.length]));
+      answers[question.name] = { choice: question.choices[0].value, probabilities: uniform, confidence: 0 };
+      continue;
+    }
+    if (!Array.isArray(item.probabilities)) {
+      // Observed live (2026-10-07): an answer to a many-choice question came
+      // back without the documented array. Its shape — never its values — is
+      // named so the log shows what the API actually sent.
+      const kind = item.probabilities === null ? "null" : typeof item.probabilities;
+      throw bad(`${question.name}:probabilities_missing; answer fields ${Object.keys(item).join(",")}; probabilities ${kind}; ${question.choices.length} choices offered`);
+    }
+    const probabilities = {};
+    for (const entry of item.probabilities) {
+      if (entry && typeof entry === "object" && typeof entry.value === "string" && typeof entry.probability === "number") {
+        probabilities[entry.value] = entry.probability;
+      }
+    }
+    for (const { value } of question.choices) {
+      if (typeof probabilities[value] !== "number") throw bad(`${question.name}:probabilities_incomplete`);
+    }
+    // The API reports rounded probabilities (observed live: two decimals, so a
+    // 0.91 operation times a 0.99 element is 0.9009). Over a question with many
+    // near-equal choices, those roundings move the sum far from 1 — even to 0
+    // when every choice rounds down — though the answer itself is sound. Each
+    // question's distribution is therefore rescaled by its own sum; an all-zero
+    // report carries no preference and becomes uniform. Either way the
+    // selection floor still decides whether the result is decisive enough to act.
+    const sum = question.choices.reduce((total, { value }) => total + probabilities[value], 0);
+    for (const { value } of question.choices) {
+      if (probabilities[value] < 0) throw bad(`${question.name}:probability_negative`);
+      probabilities[value] = sum > 0 ? probabilities[value] / sum : 1 / question.choices.length;
+    }
+    if (typeof item.confidence !== "number") throw bad(`${question.name}:confidence_missing`);
+    answers[question.name] = { choice: item.choice, probabilities, confidence: item.confidence };
+  }
+  const usage = json.usage && typeof json.usage === "object" ? json.usage : {};
+  return { answers, usage };
+}
+
 /**
  * One decision cycle's request, validated. See the file header.
  *
- * Four sources, one validated result:
+ * Five sources, one validated result:
  *   - `typesafe` (default): `POST {endpoint}/v1/systemone`, the body exactly
  *     as `buildSelectionRequest` built it;
  *   - `vercel`: `POST {endpoint}/v4/ai/evaluation-model` — the gateway's
@@ -579,19 +799,43 @@ async function runanywhereAnswers({ endpoint, apiKey, model, body, post }) {
  *     direct source sends (the model id rides in it) and the same answer
  *     shape read back;
  *   - `runanywhere`: `POST {endpoint}/v1/decisions`, translated to and from
- *     RunAnywhere's array-question protocol (see its section above).
+ *     RunAnywhere's array-question protocol (see its section above);
+ *   - `openai`: `POST {endpoint}/v1/decisions`, translated to and from OpenAI's
+ *     `choice` questions, optionally with an inline `image` (see its section).
  *
  * @param {object} opts
- * @param {"typesafe"|"vercel"|"openrouter"|"runanywhere"} [opts.source] - which wire this profile uses
+ * @param {"typesafe"|"vercel"|"openrouter"|"runanywhere"|"openai"} [opts.source] - which wire this profile uses
  * @param {string} opts.endpoint - base endpoint (path appended per source)
  * @param {string} opts.apiKey
  * @param {string} [opts.model] - required by the `vercel` source (header)
  * @param {object} opts.body - the body questions.js's `buildSelectionRequest` returned
+ * @param {{ data: string, mimeType: string }} [opts.image] - page capture sent as an inline `input_image`; only the `openai` source uses it
  * @returns {Promise<{ decision: object, usage: object, latencyMs: number }>}
  * @throws {JevError}
  */
-export async function requestDecision({ source = "typesafe", endpoint, apiKey, model, body, fetchImpl, timeoutMs, now, sleep }) {
+export async function requestDecision({ source = "typesafe", endpoint, apiKey, model, body, image, fetchImpl, timeoutMs, now, sleep }) {
   if (body?.questions?.action && decisionRequestBytes(body) > MAX_REQUEST_BYTES) throw new DecisionRequestTooLargeError();
+  if (source === "openai") {
+    const startedAt = (now ?? Date.now)();
+    const { request, local, factored } = openaiRequestBody(body, image);
+    let answers = local;
+    let usage = {};
+    if (request.questions.length) {
+      const { json } = await postJson({ url: openaiDecisionsUrl(endpoint), apiKey, body: { model, ...request }, fetchImpl, timeoutMs, now, sleep });
+      const mapped = normalizeOpenAIResponse(json, request.questions);
+      answers = factored
+        ? { action: composeFactoredAction(mapped.answers, factored.families), goal_done: mapped.answers.goal_done, stuck: mapped.answers.stuck }
+        : { ...local, ...mapped.answers };
+      usage = mapped.usage;
+    }
+    const validation = validateDecision({ questions: body?.questions, answers });
+    if (!validation.ok) {
+      throw new JevError("INVALID_RESPONSE", `the provider returned a decision that failed validation (${validation.reason}); no action executed.`, {
+        detail: { reason: validation.reason }
+      });
+    }
+    return { decision: validation.decision, usage, latencyMs: (now ?? Date.now)() - startedAt };
+  }
   if (source === "runanywhere") {
     const startedAt = (now ?? Date.now)();
     const post = (request) => postJson({ ...request, fetchImpl, timeoutMs, now, sleep });

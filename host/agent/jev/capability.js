@@ -99,7 +99,7 @@ function classifyFailure(err) {
 
 /**
  * @param {object} opts
- * @param {"typesafe"|"vercel"|"openrouter"|"runanywhere"} [opts.source] - which Jev wire
+ * @param {"typesafe"|"vercel"|"openrouter"|"runanywhere"|"openai"} [opts.source] - which Jev wire
  *   this profile uses; the stage-1 request is built exactly as a live
  *   decision for it is
  * @param {string} opts.endpoint - TypeSafe base endpoint (or the Vercel
@@ -142,9 +142,10 @@ export async function runTypesafeCapabilityTest({ source = "typesafe", endpoint,
   // will actually speak.
   try {
     const body = capabilityQuestionBody(model);
-    if (source === "runanywhere") {
-      // RunAnywhere speaks its own question protocol; requestDecision
-      // translates and validates it exactly as a live decision does.
+    if (source === "runanywhere" || source === "openai") {
+      // These sources speak their own question protocols; requestDecision
+      // translates and validates them exactly as a live decision does (for
+      // `openai` this is the text-input probe; the image probe is stage 3).
       await requestDecision({ source, endpoint, apiKey, model, body, fetchImpl, timeoutMs, now, sleep });
     } else {
       const { json } =
@@ -225,6 +226,13 @@ export async function runTypesafeCapabilityTest({ source = "typesafe", endpoint,
   // remains runnable (the toggle exists for exactly that case), and a combined
   // failure could not tell the operator which capability broke.
   try {
+    if (source === "openai") {
+      // The OpenAI source sends the page capture to the decision model, not
+      // the primary model, so its image stage probes the decision wire with
+      // the embedded PNG (and, unlike the other sources, gates `status`).
+      await requestDecision({ source, endpoint, apiKey, model, body: capabilityQuestionBody(model), image: CAPABILITY_IMAGE, fetchImpl, timeoutMs, now, sleep });
+      capabilities.image = "pass";
+    } else {
     const body = buildImageProbeRequest({
       textModel,
       image: CAPABILITY_IMAGE,
@@ -251,6 +259,7 @@ export async function runTypesafeCapabilityTest({ source = "typesafe", endpoint,
       throw new JevError("INVALID_RESPONSE", `${parsed.message}; the text model did not produce the required {"text": ...} object for the image test.`);
     }
     capabilities.image = "pass";
+    }
   } catch (err) {
     errors.image = classifyFailure(err);
   }
@@ -300,6 +309,9 @@ export async function runTypesafeCapabilityTest({ source = "typesafe", endpoint,
     errors.search = classifyFailure(err);
   }
 
-  const status = capabilities.systemone === "pass" && capabilities.textModel === "pass" ? "pass" : "fail";
+  // The OpenAI source decides from the screenshot, so it is capable only when
+  // the image-input decision probe passed too.
+  const imageGate = source !== "openai" || capabilities.image === "pass";
+  const status = capabilities.systemone === "pass" && capabilities.textModel === "pass" && imageGate ? "pass" : "fail";
   return { status, capabilities, errors, timestamp: new Date(now()).toISOString() };
 }
