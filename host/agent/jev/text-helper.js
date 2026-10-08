@@ -423,15 +423,32 @@ export const ANTHROPIC_THINKING_ANSWER_HEADROOM = 512;
  * Exported so a test can assert what each wire and host is sent without
  * issuing a request.
  */
-export function decisionReasoningParams(baseUrl, { wire = "openai", maxTokens = TEXT_MODEL_MAX_TOKENS } = {}) {
+export function decisionReasoningParams(baseUrl, { wire = "openai", maxTokens = TEXT_MODEL_MAX_TOKENS, model = "" } = {}) {
   if (wire === "anthropic") {
     if (maxTokens < ANTHROPIC_THINKING_BUDGET_TOKENS + ANTHROPIC_THINKING_ANSWER_HEADROOM) return {};
+    // Current models reject a fixed budget ("thinking.type.enabled is not
+    // supported") and take adaptive thinking with an effort level instead.
+    if (!usesBudgetedThinking(model)) {
+      return { thinking: { type: "adaptive" }, output_config: { effort: DECISION_REASONING_EFFORT } };
+    }
     return { thinking: { type: "enabled", budget_tokens: ANTHROPIC_THINKING_BUDGET_TOKENS } };
   }
   if (isDeepSeekHost(baseUrl)) {
     return { thinking: { type: "enabled" } };
   }
   return { reasoning: { effort: DECISION_REASONING_EFFORT } };
+}
+
+// Claude models older than the 4.6 generation only accept a fixed thinking
+// budget. An unrecognized id (a gateway alias) is treated as current.
+function usesBudgetedThinking(model) {
+  const id = String(model ?? "").toLowerCase();
+  if (/claude-3/.test(id)) return true;
+  const match = id.match(/claude-(?:opus|sonnet|haiku)-(\d+)(?:-(\d{1,2})(?!\d))?/);
+  if (!match) return false;
+  const major = Number(match[1]);
+  const minor = match[2] === undefined ? 0 : Number(match[2]);
+  return major < 4 || (major === 4 && minor < 6);
 }
 
 export function chatCompletionsUrl(baseUrl) {
@@ -650,7 +667,7 @@ export function buildDecisionProbeRequest({ textModel, goal, field, page, histor
   const { reasoning, thinking, ...rest } = request;
   void reasoning;
   void thinking;
-  return { ...rest, ...decisionReasoningParams(textModel?.baseUrl, { wire, maxTokens: request.max_tokens }) };
+  return { ...rest, ...decisionReasoningParams(textModel?.baseUrl, { wire, maxTokens: request.max_tokens, model: textModel?.model }) };
 }
 
 /**
@@ -1478,14 +1495,14 @@ async function postMemoryRequest({ instruction, user, image, textModel, fetchImp
           max_tokens: maxTokens,
           system: instruction,
           ...searchTools,
-          ...decisionReasoningParams(textModel?.baseUrl, { wire, maxTokens }),
+          ...decisionReasoningParams(textModel?.baseUrl, { wire, maxTokens, model: textModel?.model }),
           messages
         }
       : {
           model: textModel?.model,
           max_tokens: maxTokens,
           response_format: { type: "json_object" },
-          ...decisionReasoningParams(textModel?.baseUrl, { wire, maxTokens }),
+          ...decisionReasoningParams(textModel?.baseUrl, { wire, maxTokens, model: textModel?.model }),
           messages
         };
   const send = (requestBody) =>

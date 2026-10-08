@@ -1254,6 +1254,18 @@ await test("the reasoning budget follows the call's job: probes stay cheap, deci
       JSON.stringify(decisionReasoningParams("https://api.openai.com/v1")) === '{"reasoning":{"effort":"medium"}}',
       "a decision-class call on any other OpenAI-compatible host reasons deliberately"
     );
+    for (const model of ["claude-opus-5-5", "claude-sonnet-4-6", "claude-fable-5-1", "gateway-alias"]) {
+      assert(
+        decisionReasoningParams("", { wire: "anthropic", maxTokens: 4096, model }).thinking.type === "adaptive",
+        `a current Claude model gets adaptive thinking: ${model}`
+      );
+    }
+    for (const model of ["claude-haiku-4-5-20251001", "claude-sonnet-4-5", "claude-opus-4-20250514", "claude-3-7-sonnet-latest"]) {
+      assert(
+        JSON.stringify(decisionReasoningParams("", { wire: "anthropic", maxTokens: 4096, model })) === '{"thinking":{"type":"enabled","budget_tokens":1024}}',
+        `an older Claude model keeps a fixed thinking budget: ${model}`
+      );
+    }
     await requestStepDecision({ textModel: { ...TEXT_MODEL, baseUrl: `${stub.url}/v1` }, goal: "g", page: {}, history: [] });
     assert(stub.state.bodies[0].thinking === undefined, "a non-deepseek host must not send thinking");
     assert(stub.state.bodies[0].reasoning.effort === "medium", "the decision-class reasoning parameter must reach the wire");
@@ -1510,7 +1522,8 @@ await test("the Anthropic decision wire posts /v1/messages with x-api-key, a sys
     assert(body.system === NEXT_STEP, "the instruction is the request's system prompt");
     assert(body.response_format === undefined, "this wire has no strict JSON mode to ask for");
     assert(body.messages.length === 1 && body.messages[0].role === "user", JSON.stringify(body.messages));
-    assert(body.thinking && body.thinking.type === "enabled", `a decision-class call thinks: ${JSON.stringify(body.thinking)}`);
+    assert(body.thinking && body.thinking.type === "adaptive", `a decision-class call thinks: ${JSON.stringify(body.thinking)}`);
+    assert(body.output_config?.effort === "medium", `adaptive thinking carries an effort: ${JSON.stringify(body.output_config)}`);
     assert(body.max_tokens === STEP_DECISION_MAX_TOKENS, `the step decision's own budget: ${body.max_tokens}`);
     assert(anthropicMessagesUrl("https://api.anthropic.com/") === "https://api.anthropic.com/v1/messages", "the URL helper trims trailing slashes");
   } finally {
