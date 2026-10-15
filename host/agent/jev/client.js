@@ -785,6 +785,33 @@ export function normalizeOpenAIResponse(json, questions) {
   return { answers, usage };
 }
 
+/** Sources whose decision request itself accepts the page capture. */
+export function decisionAcceptsImage(source) {
+  return source === "openai" || source === "typesafe";
+}
+
+// TypeSafe image input is an opt-in, experimental ("danger zone") feature:
+// every request carrying an asset must send this header.
+export const TYPESAFE_IMAGE_HEADERS = Object.freeze({ "TypeSafe-Danger-Zone-Images": "true" });
+const TYPESAFE_SCREENSHOT_REF = "browzy-page-screenshot";
+
+/**
+ * The System One body with the capture attached as a TypeSafe asset: the
+ * reference string is placed in `state.screenshot`, where TypeSafe replaces
+ * it with the image. `null` when there is no usable image, so the caller
+ * sends the body unchanged.
+ */
+export function typesafeImageBody(body, image) {
+  if (!image || typeof image.data !== "string" || !image.data || typeof image.mimeType !== "string") return null;
+  const format = image.mimeType === "image/png" ? "png" : image.mimeType === "image/jpeg" || image.mimeType === "image/jpg" ? "jpg" : null;
+  if (!format) return null;
+  return {
+    ...body,
+    state: { ...(body?.state ?? {}), screenshot: TYPESAFE_SCREENSHOT_REF },
+    assets: { [TYPESAFE_SCREENSHOT_REF]: { type: "image", format, data_base64: image.data } }
+  };
+}
+
 /**
  * One decision cycle's request, validated. See the file header.
  *
@@ -809,7 +836,7 @@ export function normalizeOpenAIResponse(json, questions) {
  * @param {string} opts.apiKey
  * @param {string} [opts.model] - required by the `vercel` source (header)
  * @param {object} opts.body - the body questions.js's `buildSelectionRequest` returned
- * @param {{ data: string, mimeType: string }} [opts.image] - page capture sent as an inline `input_image`; only the `openai` source uses it
+ * @param {{ data: string, mimeType: string }} [opts.image] - page capture: an inline `input_image` on `openai`, a `state.screenshot` asset on `typesafe`; other sources ignore it
  * @returns {Promise<{ decision: object, usage: object, latencyMs: number }>}
  * @throws {JevError}
  */
@@ -853,6 +880,11 @@ export async function requestDecision({ source = "typesafe", endpoint, apiKey, m
   let extraHeaders;
   if (source === "typesafe") {
     url = systemoneUrl(endpoint);
+    const withImage = typesafeImageBody(body, image);
+    if (withImage) {
+      requestBody = withImage;
+      extraHeaders = TYPESAFE_IMAGE_HEADERS;
+    }
   } else if (source === "vercel") {
     url = vercelEvaluationUrl(endpoint);
     requestBody = vercelRequestBody(body);

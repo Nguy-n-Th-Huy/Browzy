@@ -7,7 +7,7 @@ import { RUN_STATES } from "../session/run.js";
 import { runHostSideChecks, firstTextOf } from "../tools/dispatch-checks.js";
 import { buildActionSpace, buildDecisionRequest, observationSignature, OPERATIONS } from "./questions.js";
 import { parseOperatorLiteral, literalFieldEligible } from "./literal-field-value.js";
-import { requestDecision, JevError } from "./client.js";
+import { requestDecision, decisionAcceptsImage, JevError } from "./client.js";
 import { fetchSource, SourceFetchError } from "./source-fetch.js";
 import { observationEvidence, screenshotArtifact } from "./evidence.js";
 import {
@@ -409,12 +409,12 @@ export async function runTypesafeRun({
   // default and hands the runtime a boolean; ONLY an explicit `true` enables
   // captures, so an unresolved/absent flag makes every request text-only.
   const screenshotsEnabled = provider.sendScreenshots === true;
-  // The OpenAI Decisions source looks at the page itself: with screenshots on,
-  // each decision request carries the capture and the primary LLM (planning,
-  // completion) only generates text, receiving no image and producing no
-  // image-derived visual notes. Every other source keeps the capture on the
-  // primary LLM and decides from the structured snapshot alone.
-  const imageToDecision = provider.source === "openai" && screenshotsEnabled;
+  // The OpenAI Decisions and TypeSafe sources look at the page themselves:
+  // with screenshots on, each decision request carries the capture and the
+  // primary LLM (planning, completion) only generates text, receiving no image
+  // and producing no image-derived visual notes. Every other source keeps the
+  // capture on the primary LLM and decides from the structured snapshot alone.
+  const imageToDecision = decisionAcceptsImage(provider.source) && screenshotsEnabled;
   // Operator literal field values (openspec/changes/jev-literal-field-values):
   // parsed ONCE, here, from `provider.goal` alone — the operator's own prompt
   // for this turn, never plan memory, model output, conversation history or

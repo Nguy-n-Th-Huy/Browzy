@@ -490,12 +490,15 @@ lets `browser_subgoal` reach Jev's structured-choice decisions.
    the profile's primary provider, for that provider's own optional
    planning/content step. Jev's own action selection is unaffected either way:
    it decides from the structured `page_snapshot`, never from an image. The
-   exception is the **OpenAI Decisions** source, which accepts images: with
-   screenshots on, the capture is sent to the decision request itself and the
-   primary provider receives no image (it only generates text). If a capture
-   fails or goes stale, that decision falls back to text input. The settings
-   test for this source runs a text probe and an image probe, and both must
-   pass.
+   exceptions are the **OpenAI Decisions** and **TypeSafe API** sources, which
+   accept images: with screenshots on, the capture is sent to the decision
+   request itself and the primary provider receives no image (it only
+   generates text). TypeSafe receives it as an asset referenced from
+   `state.screenshot`, with the `TypeSafe-Danger-Zone-Images: true` header;
+   TypeSafe labels image input experimental. If a capture fails or goes stale,
+   that decision falls back to text input. The settings test for both sources
+   runs a text probe and an image probe; on OpenAI both must pass, while on
+   TypeSafe a failed image probe is reported but does not block the tools.
 
 Every dispatch behind these tools passes exactly the same host-side
 authorization any other tool call passes: run-state and lease checks, tab
@@ -508,8 +511,8 @@ chose (TypeSafe, Vercel AI Gateway, OpenRouter, RunAnywhere, or OpenAI — the
 last bills input tokens, including any screenshot, at OpenAI's Decisions rate);
 the profile's primary provider bills whatever calls the tools make to it (the
 `extract_page` extraction call, and `browser_subgoal`'s optional planning
-screenshot, except on the OpenAI source where the screenshot goes to the
-decision request).
+screenshot, except on the OpenAI and TypeSafe sources where the screenshot goes
+to the decision request).
 
 The external-MCP path is unaffected — it keeps using whatever model/auth your
 Claude Code session supplies.

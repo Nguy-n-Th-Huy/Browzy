@@ -84,6 +84,14 @@ export const CAPABILITY_IMAGE = Object.freeze({
     "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAS0lEQVR42u3PMQ0AAAwDoEqv9ErYvQQckD4XAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAYHLAB8+AWnmfUycAAAAAElFTkSuQmCC"
 });
 
+// 256x256 (white left half, dark right half): the smallest size TypeSafe's
+// image input accepts.
+export const TYPESAFE_CAPABILITY_IMAGE = Object.freeze({
+  mimeType: "image/png",
+  data:
+    "iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAIAAADTED8xAAAC+0lEQVR42u3TMQEAAAjDsMnBv0G4UbAn1dBkVW1ULRYEAAABAIAAAEAAACAAABAAAAgAAAQAAAIAAAEAgAAAQAAAIAAAEAAACAAABAAAAgAAAQCAAABAAAAgAAAQAAAIAAAEAAACAAABAAAAAgAAAQCAAABAAAAgAAAQAAAIAAAEAAACAAABAIAAAEAAACAAABAAAAgAAAQAAAIAAAEAgAAAQAAAIAAAEAAACAAABAAAAgAAAAQAAAIAAAEAgAAAQAAAIAAAEAAACAAABAAAAgAAAQCAAABAAAAgAAAQAAAIAAAEAAACAAABAIAAAEAAACAAABAAAAgAAAQAAAAIAAAEAAACAAABAIAAAEAAACAAABAAAAgAAAQAAAIAAAEAgAAAQAAAIAAAEAAACAAABAAAAgAAAQCAAABAAAAgAAAQAAAIAAAEAAAACAAABAAAAgAAAQCAAABAAAAgAAAQAAAIAAAEAAACAAABAIAAAEAAACAAABAAAAgAAAQAAAIAAAEAgAAAQAAAIAAAEAAACAAAABAAAAgAAAQAAAIAAAEAgAAAQAAAIAAAEAAACAAABAAAAgAAAQCAAABAAAAgAAAQAAAIAAAEAAACAAABAIAAAEAAACAAABAAAAAgAAAQAAAIAAAEAAACAAABAIAAAEAAACAAABAAAAgAAAQAAAIAAAEAgAAAQAAAIAAAEAAACAAABAAAAgAAAQCAAABAAAAgAACQBQEAQAAAIAAAEAAACAAABAAAAgAAAQCAAABAAAAgAAAQAAAIAAAEAAACAAABAIAAAEAAACAAABAAAAgAAAQAAAIAAAEAgAAAQAAAAIAAAEAAACAAABAAAAgAAAQAAAIAAAEAgAAAQAAAIAAAEAAACAAABAAAAgAAAQCAAABAAAAgAAAQAAAIAAAEAAACAAABAIAAAAAAAQCAAABAAAAgAAAQAAAIAAAEAAACAAABAIAAAEAAACAAABAAAAgAAAQAAAIAAAEAgAAAQAAAIAAAEAAACAAA9DutHJnnYXaN/QAAAABJRU5ErkJggg=="
+});
+
 // Exercise the actual runtime builder and all three heads over a tiny page.
 function capabilityQuestionBody(model) {
   return buildDecisionRequest({ model, goal: CAPABILITY_GOAL, snapshot: { url: "about:blank", title: "TypeSafe capability check", text: "", elements: [{ ref: "ref_1", role: "button", label: "Continue", tag: "button" }] } }).body;
@@ -231,6 +239,13 @@ export async function runTypesafeCapabilityTest({ source = "typesafe", endpoint,
       // the primary model, so its image stage probes the decision wire with
       // the embedded PNG (and, unlike the other sources, gates `status`).
       await requestDecision({ source, endpoint, apiKey, model, body: capabilityQuestionBody(model), image: CAPABILITY_IMAGE, fetchImpl, timeoutMs, now, sleep });
+      capabilities.image = "pass";
+    } else if (source === "typesafe") {
+      // TypeSafe also takes the capture on the decision request, but its image
+      // input is experimental: the probe is recorded without gating `status`,
+      // so a profile that never turns screenshots on is not blocked by it.
+      // TypeSafe rejects images under 256px a side, hence the larger probe.
+      await requestDecision({ source, endpoint, apiKey, model, body: capabilityQuestionBody(model), image: TYPESAFE_CAPABILITY_IMAGE, fetchImpl, timeoutMs, now, sleep });
       capabilities.image = "pass";
     } else {
     const body = buildImageProbeRequest({

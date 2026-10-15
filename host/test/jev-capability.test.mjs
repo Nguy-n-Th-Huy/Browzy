@@ -15,7 +15,7 @@
 
 import http from "node:http";
 
-import { runTypesafeCapabilityTest, CAPABILITY_IMAGE, CAPABILITY_TEXT_GOAL } from "../agent/jev/capability.js";
+import { runTypesafeCapabilityTest, CAPABILITY_IMAGE, TYPESAFE_CAPABILITY_IMAGE, CAPABILITY_TEXT_GOAL } from "../agent/jev/capability.js";
 import { TEXT_PROBE } from "../agent/jev/text-helper.js";
 
 const results = [];
@@ -359,13 +359,17 @@ await test("the text stage's context names a concrete value, so a correct model 
   }
 });
 
+// Sources whose decision request takes no image send the probe to the primary
+// model instead; TypeSafe and OpenAI probe their decision wire (tested below).
+const IMAGE_TO_PRIMARY = { source: "openrouter", model: "typesafe/jev-1.13" };
+
 await test("the image stage is the text probe with one embedded PNG added", async () => {
   const stub = await startStub((req, res, state) => {
-    if (req.url === "/v1/systemone") return sendJson(res, 200, validAnswers(state.bodies[state.bodies.length - 1]));
+    if (req.url === "/api/alpha/decisions") return sendJson(res, 200, validAnswers(state.bodies[state.bodies.length - 1]));
     return sendJson(res, 200, validCompletion());
   });
   try {
-    const result = await runAgainst(stub);
+    const result = await runAgainst(stub, IMAGE_TO_PRIMARY);
     assert(result.capabilities.image === "pass", JSON.stringify(result.capabilities));
     const completions = stub.state.bodies.filter((body) => Array.isArray(body?.messages));
     const imageRequest = completions.find((body) => Array.isArray(body.messages[1].content));
@@ -404,7 +408,7 @@ await test("a model that rejects image content fails only the image stage and st
   // A text-only endpoint: it answers plain completions and refuses any request
   // whose user message is the multimodal array.
   const stub = await startStub((req, res, state) => {
-    if (req.url === "/v1/systemone") return sendJson(res, 200, validAnswers(state.bodies[state.bodies.length - 1]));
+    if (req.url === "/api/alpha/decisions") return sendJson(res, 200, validAnswers(state.bodies[state.bodies.length - 1]));
     const body = state.bodies[state.bodies.length - 1];
     if (Array.isArray(body?.messages?.[1]?.content)) {
       return sendJson(res, 400, { error: { type: "invalid_request_error", message: "this model does not support image input" } });
@@ -412,7 +416,7 @@ await test("a model that rejects image content fails only the image stage and st
     return sendJson(res, 200, validCompletion());
   });
   try {
-    const result = await runAgainst(stub);
+    const result = await runAgainst(stub, IMAGE_TO_PRIMARY);
     assert(result.capabilities.systemone === "pass" && result.capabilities.textModel === "pass", JSON.stringify(result.capabilities));
     assert(result.capabilities.image === "fail", JSON.stringify(result.capabilities));
     assert(result.errors.image && result.errors.image.code === "INVALID_RESPONSE", JSON.stringify(result.errors));
@@ -425,15 +429,59 @@ await test("a model that rejects image content fails only the image stage and st
   }
 });
 
-await test("an image stage answering outside the single-key contract is INVALID_RESPONSE for the image stage alone", async () => {
+await test("the typesafe source probes images on the decision wire as a header-gated asset", async () => {
   const stub = await startStub((req, res, state) => {
     if (req.url === "/v1/systemone") return sendJson(res, 200, validAnswers(state.bodies[state.bodies.length - 1]));
+    return sendJson(res, 200, validCompletion());
+  });
+  try {
+    const result = await runAgainst(stub);
+    assert(result.capabilities.image === "pass", JSON.stringify(result.capabilities));
+    const indexes = stub.state.paths.map((p, i) => (p === "/v1/systemone" ? i : -1)).filter((i) => i !== -1);
+    assert(indexes.length === 2, `a text probe and an image probe, got ${indexes.length}`);
+    const [textIndex, imageIndex] = indexes;
+    assert(stub.state.bodies[textIndex].assets === undefined, "the text probe carries no asset");
+    assert(stub.state.headers[textIndex]["typesafe-danger-zone-images"] === undefined, "the text probe does not opt into images");
+    const body = stub.state.bodies[imageIndex];
+    const ref = body.state.screenshot;
+    assert(typeof ref === "string" && body.assets[ref], JSON.stringify(Object.keys(body.assets ?? {})));
+    assert(body.assets[ref].format === "png" && body.assets[ref].data_base64 === TYPESAFE_CAPABILITY_IMAGE.data, "the probe rides as a png asset");
+    assert(stub.state.headers[imageIndex]["typesafe-danger-zone-images"] === "true", "the image probe sends the opt-in header");
+    const bytes = Buffer.from(TYPESAFE_CAPABILITY_IMAGE.data, "base64");
+    assert(bytes.readUInt32BE(16) >= 256 && bytes.readUInt32BE(20) >= 256, "TypeSafe rejects images under 256px a side");
+    assert(!stub.state.bodies.some((b) => Array.isArray(b?.messages?.[1]?.content)), "the primary model receives no image");
+  } finally {
+    await stub.close();
+  }
+});
+
+await test("a typesafe image rejection fails only the image stage and stays runnable", async () => {
+  const stub = await startStub((req, res, state) => {
+    const body = state.bodies[state.bodies.length - 1];
+    if (req.url === "/v1/systemone") {
+      if (body?.assets) return sendJson(res, 400, { error: { message: "images are not enabled" } });
+      return sendJson(res, 200, validAnswers(body));
+    }
+    return sendJson(res, 200, validCompletion());
+  });
+  try {
+    const result = await runAgainst(stub);
+    assert(result.capabilities.systemone === "pass" && result.capabilities.image === "fail", JSON.stringify(result.capabilities));
+    assert(result.status === "pass", JSON.stringify(result));
+  } finally {
+    await stub.close();
+  }
+});
+
+await test("an image stage answering outside the single-key contract is INVALID_RESPONSE for the image stage alone", async () => {
+  const stub = await startStub((req, res, state) => {
+    if (req.url === "/api/alpha/decisions") return sendJson(res, 200, validAnswers(state.bodies[state.bodies.length - 1]));
     const body = state.bodies[state.bodies.length - 1];
     if (Array.isArray(body?.messages?.[1]?.content)) return sendJson(res, 200, { choices: [{ message: { content: '{"text": null}' } }] });
     return sendJson(res, 200, validCompletion());
   });
   try {
-    const result = await runAgainst(stub);
+    const result = await runAgainst(stub, IMAGE_TO_PRIMARY);
     assert(result.capabilities.textModel === "pass" && result.capabilities.image === "fail", JSON.stringify(result.capabilities));
     assert(result.errors.image.code === "INVALID_RESPONSE", JSON.stringify(result.errors.image));
     assert(result.status === "pass", JSON.stringify(result.status));
